@@ -138,7 +138,25 @@ namespace remix_rsx
 			u32 instructions = 0;
 			// Earliest instruction of the matched chain: the bound for the next search back.
 			u32 first_instruction = 0;
+
+			// Set when every constant read of the group went through the address register,
+			// i.e. this group is a palette rather than a fixed matrix.
+			bool indexed = false;
+			u32 addr_reg = 0;
+			u32 addr_swz = 0;
 		};
+
+		// Component of 'src' selected by position 'slot' of its swizzle.
+		u32 swizzle_component(const SRC& s, u32 slot)
+		{
+			switch (slot)
+			{
+			case 0: return s.swz_x;
+			case 1: return s.swz_y;
+			case 2: return s.swz_z;
+			default: return s.swz_w;
+			}
+		}
 
 		bool single_component(u32 mask, u32& out_component)
 		{
@@ -363,7 +381,10 @@ namespace remix_rsx
 		}
 
 		// MUL + MAD/ADD accumulation through a temp: c[base+k] scaled by pos_k.
-		bool match_mad_chain(const program_walker& prog, const std::vector<u32>& writers, chain_result& out)
+		// With 'allow_indexed' the four constant reads may go through the address register, in
+		// which case the group is a bone palette; all four must agree on the same register and
+		// component, and a partially indexed group is rejected outright.
+		bool match_mad_chain(const program_walker& prog, const std::vector<u32>& writers, chain_result& out, bool allow_indexed)
 		{
 			if (writers.empty())
 			{
@@ -395,6 +416,10 @@ namespace remix_rsx
 			u32 chain_consts[4] = { umax, umax, umax, umax };
 			u32 chain_components[4] = { umax, umax, umax, umax };
 
+			u32 indexed_steps = 0;
+			u32 addr_reg = umax;
+			u32 addr_swz = umax;
+
 			for (u32 step = 0; step < 4; ++step)
 			{
 				const decoded_instr& in = prog[cursor];
@@ -402,7 +427,27 @@ namespace remix_rsx
 
 				if (in.d3.index_const)
 				{
-					return false;
+					if (!allow_indexed)
+					{
+						return false;
+					}
+
+					const u32 reg = u32{in.d0.addr_reg_sel_1};
+					const u32 swz = u32{in.d0.addr_swz};
+
+					if (addr_reg == umax)
+					{
+						addr_reg = reg;
+						addr_swz = swz;
+					}
+					else if (addr_reg != reg || addr_swz != swz)
+					{
+						// Two different address registers inside one group is not a palette
+						// this code understands.
+						return false;
+					}
+
+					++indexed_steps;
 				}
 
 				const bool terminal = (step == 3);
@@ -542,13 +587,230 @@ namespace remix_rsx
 				seen[offset] = true;
 			}
 
+			// All four or none. A half-indexed group would mean the four rows do not come from
+			// one matrix, and guessing there is exactly how meshes end up at the origin.
+			if (indexed_steps != 0 && indexed_steps != 4)
+			{
+				return false;
+			}
+
 			out.found = true;
 			out.shape = chain_shape::mad;
 			out.base = base;
 			out.source = source;
 			out.instructions = 4;
 			out.first_instruction = cursor;
+			out.indexed = (indexed_steps == 4);
+			out.addr_reg = (addr_reg == umax) ? 0 : addr_reg;
+			out.addr_swz = (addr_swz == umax) ? 0 : addr_swz;
 			return true;
+		}
+
+		// Follows the address register back to the vertex attribute that produced it, recording
+		// the affine steps applied on the way. Anything it cannot follow comes back false, and
+		// the caller then skips the draw rather than drawing it at identity.
+		bool resolve_bone_index(const program_walker& prog, u32 addr_reg, u32 addr_swz, u32 before, vp_fingerprint& out)
+		{
+			// The ARL that last loaded this address register. ARL is a VEC opcode writing
+			// d0.dst_tmp; only a0/a1 exist, which is why the interpreter masks with 1.
+			u32 arl = umax;
+
+			for (u32 i = 0; i < before && i < static_cast<u32>(prog.size()); ++i)
+			{
+				const decoded_instr& in = prog[i];
+
+				if (in.d1.vec_opcode == RSX_VEC_OPCODE_ARL && (u32{in.d0.dst_tmp} & 1u) == addr_reg)
+				{
+					arl = i;
+				}
+			}
+
+			if (arl == umax)
+			{
+				out.skin_note = "no ARL writes the address register";
+				return false;
+			}
+
+			// The indexed read picks component 'addr_swz' of the address vector, so the ARL's
+			// source swizzle has to be sampled at the same position.
+			const decoded_instr& load = prog[arl];
+
+			if (load.d3.index_const)
+			{
+				out.skin_note = "ARL source is itself indexed";
+				return false;
+			}
+
+			chain_source source{};
+			source.reg_type = load.src[0].reg_type;
+			source.index = (source.reg_type == RSX_VP_REGISTER_TYPE_INPUT) ? u32{load.d1.input_src} : u32{load.src[0].tmp_src};
+
+			u32 component = swizzle_component(load.src[0], addr_swz);
+			u32 cursor = arl;
+
+			// Collected from the address register inwards, so reversed at the end.
+			bone_index_op ops[max_bone_index_ops]{};
+			u32 op_count = 0;
+
+			for (u32 hop = 0; hop <= max_bone_index_ops; ++hop)
+			{
+				if (source.reg_type == RSX_VP_REGISTER_TYPE_INPUT)
+				{
+					out.bone_attribute = source.index;
+					out.bone_component = component;
+					out.bone_op_count = op_count;
+
+					for (u32 i = 0; i < op_count; ++i)
+					{
+						out.bone_ops[i] = ops[op_count - 1 - i];
+					}
+
+					out.bone_resolved = true;
+					return true;
+				}
+
+				if (source.reg_type != RSX_VP_REGISTER_TYPE_TEMP)
+				{
+					out.skin_note = "bone index does not come from a temp or an attribute";
+					return false;
+				}
+
+				const u32 writer = prog.last_temp_writer(source.index, cursor);
+
+				if (writer == umax)
+				{
+					out.skin_note = "bone index temp has no producer";
+					return false;
+				}
+
+				const decoded_instr& in = prog[writer];
+
+				if (in.d3.index_const || !(vec_writemask(in) & (1u << component)))
+				{
+					out.skin_note = "bone index producer does not write the component";
+					return false;
+				}
+
+				if (op_count >= max_bone_index_ops)
+				{
+					out.skin_note = "bone index chain too long";
+					return false;
+				}
+
+				const u32 opcode = in.d1.vec_opcode;
+				u32 next_slot = umax;
+
+				switch (opcode)
+				{
+				case RSX_VEC_OPCODE_MOV:
+				{
+					next_slot = 0;
+					break;
+				}
+				case RSX_VEC_OPCODE_FLR:
+				{
+					// ARL truncates anyway, but recording the floor keeps a negative index
+					// evaluating the way the hardware would.
+					bone_index_op op{};
+					op.op = bone_index_op::kind::floor;
+					ops[op_count++] = op;
+					next_slot = 0;
+					break;
+				}
+				case RSX_VEC_OPCODE_MUL:
+				case RSX_VEC_OPCODE_MAD:
+				case RSX_VEC_OPCODE_ADD:
+				{
+					const u32 mask = vec_source_mask(opcode);
+					u32 const_slot = umax;
+					u32 value_slot = umax;
+
+					for (u32 s = 0; s < 2; ++s)
+					{
+						if (!(mask & (1u << s)))
+						{
+							continue;
+						}
+
+						if (in.src[s].reg_type == RSX_VP_REGISTER_TYPE_CONSTANT)
+						{
+							if (const_slot != umax)
+							{
+								out.skin_note = "bone index step multiplies two constants";
+								return false;
+							}
+
+							const_slot = s;
+						}
+						else
+						{
+							value_slot = s;
+						}
+					}
+
+					bone_index_op op{};
+
+					if (opcode == RSX_VEC_OPCODE_ADD)
+					{
+						// $0 + $2, and the addend is the constant bias.
+						if (in.src[2].reg_type != RSX_VP_REGISTER_TYPE_CONSTANT)
+						{
+							out.skin_note = "bone index ADD has no constant bias";
+							return false;
+						}
+
+						op.op = bone_index_op::kind::affine;
+						op.mul_slot = umax; // multiplier of 1
+						op.add_slot = in.d1.const_src;
+						op.add_component = static_cast<u8>(swizzle_component(in.src[2], component));
+						value_slot = 0;
+					}
+					else
+					{
+						if (const_slot == umax || value_slot == umax)
+						{
+							out.skin_note = "bone index step has no constant factor";
+							return false;
+						}
+
+						op.op = bone_index_op::kind::scale;
+						op.mul_slot = in.d1.const_src;
+						op.mul_component = static_cast<u8>(swizzle_component(in.src[const_slot], component));
+
+						if (opcode == RSX_VEC_OPCODE_MAD)
+						{
+							// One const_src per instruction, so the bias shares the slot and
+							// differs only in its swizzle.
+							if (in.src[2].reg_type != RSX_VP_REGISTER_TYPE_CONSTANT)
+							{
+								out.skin_note = "bone index MAD addend is not a constant";
+								return false;
+							}
+
+							op.op = bone_index_op::kind::affine;
+							op.add_slot = in.d1.const_src;
+							op.add_component = static_cast<u8>(swizzle_component(in.src[2], component));
+						}
+					}
+
+					ops[op_count++] = op;
+					next_slot = value_slot;
+					break;
+				}
+				default:
+					out.skin_note = "bone index producer opcode is not affine";
+					return false;
+				}
+
+				const SRC& next = in.src[next_slot];
+				component = swizzle_component(next, component);
+				source.reg_type = next.reg_type;
+				source.index = (next.reg_type == RSX_VP_REGISTER_TYPE_INPUT) ? u32{in.d1.input_src} : u32{next.tmp_src};
+				cursor = writer;
+			}
+
+			out.skin_note = "bone index chain did not reach an attribute";
+			return false;
 		}
 
 		struct prescale_result
@@ -636,7 +898,7 @@ namespace remix_rsx
 			return false;
 		}
 
-		chain_result find_chain(const program_walker& prog, const walk_target& target, u32 before, u32 depth = 0)
+		chain_result find_chain(const program_walker& prog, const walk_target& target, u32 before, u32 depth = 0, bool allow_indexed = false)
 		{
 			chain_result result{};
 
@@ -653,6 +915,8 @@ namespace remix_rsx
 				return result;
 			}
 
+			// The DP4 form is left non-indexed on purpose: no title has presented an indexed
+			// dot-product palette here, and inventing a matcher for one would be speculation.
 			if (match_dp4_chain(prog, writers, result))
 			{
 				return result;
@@ -660,7 +924,7 @@ namespace remix_rsx
 
 			result = chain_result{};
 
-			if (match_mad_chain(prog, writers, result))
+			if (match_mad_chain(prog, writers, result, allow_indexed))
 			{
 				return result;
 			}
@@ -677,7 +941,7 @@ namespace remix_rsx
 					&& vec_writemask(in) == 0xf
 					&& in.src[0].reg_type == RSX_VP_REGISTER_TYPE_TEMP)
 				{
-					return find_chain(prog, walk_target{ false, in.src[0].tmp_src }, last, depth + 1);
+					return find_chain(prog, walk_target{ false, in.src[0].tmp_src }, last, depth + 1, allow_indexed);
 				}
 			}
 
@@ -1234,12 +1498,6 @@ namespace remix_rsx
 			return result;
 		}
 
-		if (result.indexed_const)
-		{
-			result.note = "indexed constants";
-			return result;
-		}
-
 		if (result.distinct_consts <= 1)
 		{
 			result.archetype = vp_archetype::screen_space;
@@ -1256,10 +1514,42 @@ namespace remix_rsx
 
 		while (count < max_transform_groups)
 		{
-			const chain_result chain = find_chain(prog, target, before);
+			const chain_result chain = find_chain(prog, target, before, 0, true);
 
 			if (!chain.found || (chain.base + 4) > s_legal_constant_slots)
 			{
+				break;
+			}
+
+			if (chain.indexed)
+			{
+				// A bone palette. It is the innermost group by construction - the address
+				// register is loaded from a vertex attribute - so the walk stops here and the
+				// palette is handed to Remix as per-instance bone transforms instead of being
+				// folded into the object-to-world matrix.
+				result.skinned = true;
+				result.palette_base = chain.base;
+				result.palette_shape = chain.shape;
+
+				if (resolve_bone_index(prog, chain.addr_reg, chain.addr_swz, chain.first_instruction, result))
+				{
+					const chain_source palette_source = resolve_source(prog, chain.source, chain.first_instruction);
+					reached_input = (palette_source.reg_type == RSX_VP_REGISTER_TYPE_INPUT);
+
+					if (!reached_input && palette_source.reg_type == RSX_VP_REGISTER_TYPE_TEMP)
+					{
+						prescale_result prescale{};
+						if (match_prescale(prog, palette_source.index, chain.first_instruction, prescale))
+						{
+							result.has_prescale = true;
+							result.prescale_scale_slot = prescale.scale_slot;
+							result.prescale_scale_component = prescale.scale_component;
+							result.prescale_bias_slot = prescale.bias_slot;
+							reached_input = true;
+						}
+					}
+				}
+
 				break;
 			}
 
@@ -1296,6 +1586,14 @@ namespace remix_rsx
 
 		if (count == 0)
 		{
+			if (result.skinned)
+			{
+				// The palette is the only group: there is nothing left to be the projection,
+				// so there is no camera to anchor this draw against. Skipped, not guessed.
+				result.note = "skinned with no outer group";
+				return result;
+			}
+
 			// A 4x4 transform needs four distinct constant slots by construction (one constant
 			// per instruction, digest 1.3). Fewer than that and no chain means the program cannot
 			// be transforming a position at all - it is a 2D / pre-projected program.
@@ -1304,11 +1602,23 @@ namespace remix_rsx
 				result.archetype = vp_archetype::screen_space;
 				result.note = "no matrix chain, <4 constants";
 			}
+			else if (result.indexed_const)
+			{
+				result.note = "indexed constants";
+			}
 			else
 			{
 				result.note = "no matrix chain into HPOS";
 			}
 
+			return result;
+		}
+
+		if (result.skinned && !result.bone_resolved)
+		{
+			// Recognised the palette but not the index that selects from it. Everything the
+			// program draws is skipped; 'skin_note' says which hop failed.
+			result.note = "skinned, bone index unresolved";
 			return result;
 		}
 
@@ -1321,9 +1631,89 @@ namespace remix_rsx
 		}
 
 		result.inner_is_input = reached_input;
-		result.archetype = (count == 1) ? vp_archetype::fused : vp_archetype::layered;
+
+		if (result.skinned)
+		{
+			result.archetype = vp_archetype::skinned_layered;
+		}
+		else
+		{
+			result.archetype = (count == 1) ? vp_archetype::fused : vp_archetype::layered;
+		}
+
 		result.note = reached_input ? "chain reaches the vertex attribute" : "innermost operand is not an attribute";
 		return result;
+	}
+
+	bool evaluate_bone_offset(const vp_fingerprint& fp, f32 value, u32& out)
+	{
+		out = 0;
+
+		if (!fp.skinned || !fp.bone_resolved)
+		{
+			return false;
+		}
+
+		f32 v = value;
+
+		for (u32 i = 0; i < fp.bone_op_count; ++i)
+		{
+			const bone_index_op& op = fp.bone_ops[i];
+
+			switch (op.op)
+			{
+			case bone_index_op::kind::floor:
+			{
+				v = std::floor(v);
+				break;
+			}
+			case bone_index_op::kind::scale:
+			case bone_index_op::kind::affine:
+			{
+				if (op.mul_slot != umax)
+				{
+					f32 factor[4]{};
+					if (!read_slot(op.mul_slot, factor))
+					{
+						return false;
+					}
+
+					v *= factor[op.mul_component];
+				}
+
+				if (op.op == bone_index_op::kind::affine)
+				{
+					f32 bias[4]{};
+					if (!read_slot(op.add_slot, bias))
+					{
+						return false;
+					}
+
+					v += bias[op.add_component];
+				}
+
+				break;
+			}
+			default:
+				return false;
+			}
+		}
+
+		if (!std::isfinite(v))
+		{
+			return false;
+		}
+
+		// ARL truncates toward zero (both rpcs3 implementations do, whatever the name says).
+		const f32 truncated = std::trunc(v);
+
+		if (truncated < 0.f || truncated >= static_cast<f32>(s_legal_constant_slots))
+		{
+			return false;
+		}
+
+		out = static_cast<u32>(truncated);
+		return true;
 	}
 
 	const char* archetype_name(vp_archetype a)
@@ -1333,6 +1723,7 @@ namespace remix_rsx
 		case vp_archetype::screen_space: return "screen_space";
 		case vp_archetype::fused: return "fused";
 		case vp_archetype::layered: return "layered";
+		case vp_archetype::skinned_layered: return "skinned_layered";
 		default: return "unknown";
 		}
 	}
@@ -1834,6 +2225,30 @@ namespace remix_rsx
 	bool nocam_enabled()
 	{
 		static const bool value = env_flag(L"RPCS3_REMIX_NOCAM");
+		return value;
+	}
+
+	bool noskin_enabled()
+	{
+		static const bool value = env_flag(L"RPCS3_REMIX_NOSKIN");
+		return value;
+	}
+
+	u64 skip_vp_hash()
+	{
+		static const u64 value = []() -> u64
+		{
+			wchar_t buffer[32]{};
+			const DWORD written = GetEnvironmentVariableW(L"RPCS3_REMIX_SKIPVP", buffer, static_cast<DWORD>(std::size(buffer)));
+
+			if (written == 0 || written >= std::size(buffer))
+			{
+				return 0;
+			}
+
+			return ::_wcstoui64(buffer, nullptr, 16);
+		}();
+
 		return value;
 	}
 

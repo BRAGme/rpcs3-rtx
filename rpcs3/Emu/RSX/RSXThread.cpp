@@ -708,7 +708,10 @@ namespace rsx
 
 		m_draw_processor.init(m_ctx);
 
-		if (g_cfg.misc.use_native_interface && (g_cfg.video.renderer == video_renderer::opengl || g_cfg.video.renderer == video_renderer::vulkan))
+		// The remix backend renders the overlay through its own CPU compositor, so it takes the
+		// manager too. On non-Windows the whole backend is a no-op renderer and the overlay is
+		// created-but-invisible there, exactly as everything else it draws is.
+		if (g_cfg.misc.use_native_interface && (g_cfg.video.renderer == video_renderer::opengl || g_cfg.video.renderer == video_renderer::vulkan || g_cfg.video.renderer == video_renderer::remix))
 		{
 			m_overlay_manager = g_fxo->init<rsx::overlays::display_manager>(0);
 

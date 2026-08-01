@@ -28,6 +28,13 @@ namespace remix_rsx
 	// Returns false for a format we do not decode.
 	bool decode_position(const u8* src, rsx::vertex_base_type type, u32 size, f32 (&out)[4]);
 
+	// Sibling of decode_position that returns the components as the guest stored them: no
+	// s_scale divide and no SNORM16 half-unit bias. A 'ub' bone index therefore reads as
+	// 0..255 rather than idx/255, and 'ub' colours read as bytes. Absent components come back
+	// as 0, except w which defaults to 1.
+	// Returns false for a format we do not decode.
+	bool decode_attribute_raw(const u8* src, rsx::vertex_base_type type, u32 size, f32 (&out)[4]);
+
 	// [first, first + count) read as a triangle strip, appended to 'out' as a triangle list.
 	void strip_to_list(u32 first, u32 count, std::vector<u32>& out);
 

@@ -7,6 +7,8 @@
 #include "Emu/RSX/Common/BufferUtils.h"
 #include "Emu/RSX/Program/ProgramStateCache.h"
 #include "Emu/RSX/Remix/RemixVertexDecode.h"
+#include "Emu/RSX/Overlays/overlay_manager.h"
+#include "Emu/RSX/Overlays/overlays.h"
 #include "Emu/RSX/rsx_methods.h"
 #include "Emu/RSX/rsx_utils.h"
 #include "util/fnv_hash.hpp"
@@ -133,6 +135,20 @@ void RemixGSRender::flip(const rsx::display_flip_info_t& info)
 	{
 		submit_camera();
 
+		if (remix_rsx::ui_probe_enabled() && m_remix.fork_features() && !remix_rsx::compositor_disabled())
+		{
+			draw_ui_probe();
+		}
+
+		// rpcs3's own overlay goes on top of the title's 2D draws, then everything 2D for this
+		// frame reaches the runtime in one call, before the present.
+		if (m_remix.fork_features() && !remix_rsx::compositor_disabled())
+		{
+			composite_native_overlay();
+		}
+
+		submit_compositor();
+
 		const u32 status = remix_rsx::guarded_present(m_remix.api().Present, nullptr);
 		if (status != REMIXAPI_ERROR_CODE_SUCCESS)
 		{
@@ -164,6 +180,32 @@ void RemixGSRender::flip(const rsx::display_flip_info_t& info)
 	// GL and VK both call it explicitly (GLPresent.cpp:518, VKPresent.cpp:966); GSRender::flip
 	// does not.
 	rsx::thread::flip(info);
+}
+
+void RemixGSRender::do_local_task(rsx::FIFO::state state)
+{
+	rsx::thread::do_local_task(state);
+
+	if (state == rsx::FIFO::state::lock_wait)
+	{
+		// Critical check finished.
+		return;
+	}
+
+	// A native-UI flip request has to present while the guest thread is stalled waiting on the
+	// dialog it just opened - otherwise the dialog is never drawn and the guest never advances.
+	// Mirrors GLGSRender::do_local_task.
+	if (m_overlay_manager)
+	{
+		const auto should_ignore = in_begin_end && state != rsx::FIFO::state::empty;
+
+		if ((async_flip_requested & flip_request::native_ui) && !should_ignore && !is_stopped())
+		{
+			rsx::display_flip_info_t info{};
+			info.buffer = current_display_buffer;
+			flip(info);
+		}
+	}
 }
 
 void RemixGSRender::end()
@@ -492,6 +534,765 @@ int RemixGSRender::albedo_texture_unit() const
 	return -1;
 }
 
+const rsx::interleaved_range_info* RemixGSRender::find_attribute_block(u32 index) const
+{
+	// Every block is searched, not just the first: a bone index or a texcoord routinely lives
+	// in a different interleaved block than the position.
+	for (const auto* candidate : m_vertex_layout.interleaved_blocks)
+	{
+		for (const auto& location : candidate->locations)
+		{
+			if (location.index == index)
+			{
+				return candidate;
+			}
+		}
+	}
+
+	return nullptr;
+}
+
+RemixGSRender::attribute_status RemixGSRender::map_attribute(u32 index, u32 first_vertex, u32 vertex_count, attribute_view& out) const
+{
+	out = attribute_view{};
+
+	if (index >= 16 || vertex_count == 0)
+	{
+		return attribute_status::absent;
+	}
+
+	if (m_vertex_layout.attribute_placement[index] != rsx::attribute_buffer_placement::persistent)
+	{
+		// Register-sourced, inline, or not fed at all: there is no strided stream to read.
+		return attribute_status::absent;
+	}
+
+	const rsx::interleaved_range_info* block = find_attribute_block(index);
+
+	if (!block || block->attribute_stride == 0)
+	{
+		return attribute_status::absent;
+	}
+
+	const auto& info = rsx::method_registers.vertex_arrays_info[index];
+	const u32 attr_base = info.offset() & 0x7fffffff;
+
+	if (attr_base < block->base_offset)
+	{
+		return attribute_status::layout;
+	}
+
+	const u32 attr_offset = attr_base - block->base_offset;
+	const u32 attr_bytes = remix_rsx::attribute_byte_size(info.type(), info.size());
+
+	if (attr_bytes == 0)
+	{
+		return attribute_status::layout;
+	}
+
+	const u32 stride = block->attribute_stride;
+
+	// The span is this attribute's own: it starts at the block base and ends at the last
+	// vertex's copy of this attribute, which is not where ATTR0's span ends.
+	const u64 span_base = u64{block->real_offset_address} + (u64{first_vertex} * stride);
+	const u64 span_bytes = (u64{vertex_count - 1} * stride) + attr_offset + attr_bytes;
+
+	if ((span_base + span_bytes) > 0xFFFFFFFFull ||
+		!vm::check_addr(span_base, vm::page_readable, static_cast<u32>(span_bytes)))
+	{
+		return attribute_status::memory;
+	}
+
+	out.base = vm::_ptr<const u8>(static_cast<u32>(span_base));
+	out.stride = stride;
+	out.offset = attr_offset;
+	out.type = info.type();
+	out.size = info.size();
+
+	return attribute_status::ok;
+}
+
+bool RemixGSRender::compositor_target(u32& width, u32& height) const
+{
+	// Measured, not assumed: DrawScreenOverlay composites the buffer 1:1 in output pixels and
+	// does not stretch it, so the buffer has to be the window's client size or the UI lands in
+	// the top-left corner at the wrong scale. The guest's own surface is only the fallback.
+	u32 w = m_frame ? static_cast<u32>(std::max(0, m_frame->client_width())) : 0;
+	u32 h = m_frame ? static_cast<u32>(std::max(0, m_frame->client_height())) : 0;
+
+	if (w == 0 || h == 0)
+	{
+		w = rsx::method_registers.surface_clip_width();
+		h = rsx::method_registers.surface_clip_height();
+	}
+
+	width = w;
+	height = h;
+
+	return w != 0 && h != 0;
+}
+
+void RemixGSRender::draw_ui_probe()
+{
+	u32 width = 0;
+	u32 height = 0;
+
+	if (!compositor_target(width, height))
+	{
+		return;
+	}
+
+	m_compositor.begin_frame(width, height);
+	m_compositor_open = true;
+
+	const f32 w = static_cast<f32>(width);
+	const f32 h = static_cast<f32>(height);
+
+	// A pattern chosen to be unmistakable and to answer three questions at once: is anything
+	// composited, is the buffer stretched to the output, and is the channel order BGRA.
+	// Opaque red bar across the top (B=0x00 G=0x00 R=0xFF), opaque blue bar down the left.
+	m_compositor.draw_quad(0.f, 0.f, w, h * 0.06f, 0.f, 0.f, 1.f, 1.f, nullptr, 0xFF0000FFu, true);
+	m_compositor.draw_quad(0.f, 0.f, w * 0.04f, h, 0.f, 0.f, 1.f, 1.f, nullptr, 0xFFFF0000u, true);
+
+	// Half-alpha green block in the middle: proves the alpha path, and shows the scene through it.
+	m_compositor.draw_quad(w * 0.35f, h * 0.4f, w * 0.65f, h * 0.6f, 0.f, 0.f, 1.f, 1.f, nullptr, 0x8000FF00u, true);
+
+	// One triangle, so the barycentric rasterizer is exercised too.
+	const f32 tx[3] = { w * 0.75f, w * 0.95f, w * 0.85f };
+	const f32 ty[3] = { h * 0.80f, h * 0.80f, h * 0.55f };
+	const f32 tu[3] = { 0.f, 0.f, 0.f };
+	const f32 tv[3] = { 0.f, 0.f, 0.f };
+	m_compositor.draw_triangle(tx, ty, tu, tv, nullptr, 0xFFFFFFFFu, true);
+}
+
+void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
+{
+	u32 width = 0;
+	u32 height = 0;
+
+	if (!compositor_target(width, height) || m_scratch_indices.size() < 3)
+	{
+		++m_stats.ui_skipped;
+		return;
+	}
+
+	if (!m_compositor_open)
+	{
+		m_compositor.begin_frame(width, height);
+		m_compositor_open = true;
+	}
+
+	const remix_rsx::vp_fingerprint& fp = *m_current_fingerprint;
+
+	// The decoded positions are the *raw* attribute values, so the program's own matrix chain
+	// has to be applied before they mean anything on screen. A program with no chain (the
+	// pure screen_space archetype) already hands over post-projection coordinates.
+	remix_rsx::mat4 clip = remix_rsx::mat4_identity();
+
+	for (u32 i = 0; i < fp.group_count; ++i)
+	{
+		remix_rsx::slot_block slots{};
+
+		if (!remix_rsx::read_slot_block(fp.group_base[i], slots))
+		{
+			++m_stats.ui_skipped;
+			return;
+		}
+
+		clip = remix_rsx::mat4_multiply(clip, remix_rsx::slots_to_matrix(slots, fp.group_shape[i]));
+	}
+
+	if (remix_rsx::mat4 prescale{}; fp.group_count && remix_rsx::build_prescale(fp, prescale))
+	{
+		clip = remix_rsx::mat4_multiply(prescale, clip);
+	}
+
+	if (!remix_rsx::mat4_is_finite(clip))
+	{
+		++m_stats.ui_skipped;
+		return;
+	}
+
+	m_scratch_ui_x.clear();
+	m_scratch_ui_y.clear();
+	m_scratch_ui_x.resize(vertex_count);
+	m_scratch_ui_y.resize(vertex_count);
+
+	f32 lo[2] = { +3.4e38f, +3.4e38f };
+	f32 hi[2] = { -3.4e38f, -3.4e38f };
+
+	for (u32 i = 0; i < vertex_count; ++i)
+	{
+		const remixapi_HardcodedVertex& v = m_scratch_vertices[i];
+		const f32 p[4] = { v.position[0], v.position[1], v.position[2], 1.f };
+		f32 out[4]{};
+
+		for (u32 j = 0; j < 4; ++j)
+		{
+			out[j] = (p[0] * clip.m[0][j]) + (p[1] * clip.m[1][j]) + (p[2] * clip.m[2][j]) + (p[3] * clip.m[3][j]);
+		}
+
+		if (std::isfinite(out[3]) && std::abs(out[3]) > 1e-6f && std::abs(out[3] - 1.f) > 1e-6f)
+		{
+			out[0] /= out[3];
+			out[1] /= out[3];
+		}
+
+		if (!std::isfinite(out[0]) || !std::isfinite(out[1]))
+		{
+			++m_stats.ui_skipped;
+			return;
+		}
+
+		m_scratch_ui_x[i] = out[0];
+		m_scratch_ui_y[i] = out[1];
+
+		lo[0] = std::min(lo[0], out[0]);
+		hi[0] = std::max(hi[0], out[0]);
+		lo[1] = std::min(lo[1], out[1]);
+		hi[1] = std::max(hi[1], out[1]);
+	}
+
+	const f32 fw = static_cast<f32>(width);
+	const f32 fh = static_cast<f32>(height);
+
+	// The guest authors its 2D against the render surface; the compositor buffer is the
+	// window. Pixel-space draws therefore need the ratio between them.
+	const f32 clip_w = static_cast<f32>(std::max<u32>(1, rsx::method_registers.surface_clip_width()));
+	const f32 clip_h = static_cast<f32>(std::max<u32>(1, rsx::method_registers.surface_clip_height()));
+
+	// Two shapes were observed in M2's dumps and both survive here: normalised device
+	// coordinates, and coordinates already in clip pixels.
+	const f32 extent = std::max(std::max(std::abs(lo[0]), std::abs(hi[0])), std::max(std::abs(lo[1]), std::abs(hi[1])));
+
+	if (extent <= 1.5f)
+	{
+		for (u32 i = 0; i < vertex_count; ++i)
+		{
+			m_scratch_ui_x[i] = (m_scratch_ui_x[i] + 1.f) * 0.5f * fw;
+			m_scratch_ui_y[i] = (1.f - m_scratch_ui_y[i]) * 0.5f * fh;
+		}
+	}
+	else if (extent <= (std::max(clip_w, clip_h) * 2.f))
+	{
+		const f32 sx = fw / clip_w;
+		const f32 sy = fh / clip_h;
+
+		for (u32 i = 0; i < vertex_count; ++i)
+		{
+			m_scratch_ui_x[i] *= sx;
+			m_scratch_ui_y[i] *= sy;
+		}
+	}
+	else
+	{
+		// Neither space. Guessing would put the UI somewhere arbitrary; counting is honest.
+		++m_stats.ui_skipped;
+		return;
+	}
+
+	// --- texture and texcoords ----------------------------------------------------------
+	const remix_rsx::texture_entry* entry = nullptr;
+	attribute_view uvs{};
+	bool have_uv = false;
+	f32 uv_scale[2] = { 1.f, 1.f };
+
+	if (const int unit = albedo_texture_unit(); unit >= 0)
+	{
+		const auto& tex = rsx::method_registers.fragment_textures[unit];
+		m_textures.bind(m_remix.api(), tex, m_frame_counter, &entry);
+
+		if (entry && entry->pixels.empty())
+		{
+			entry = nullptr;
+		}
+
+		if (entry)
+		{
+			// The texcoord set follows the texture unit: ATTR8 is in_tc0.
+			have_uv = map_attribute(8 + static_cast<u32>(unit), first_vertex, vertex_count, uvs) == attribute_status::ok;
+
+			if (tex.format() & CELL_GCM_TEXTURE_UN)
+			{
+				// Unnormalised coordinates are in texels.
+				uv_scale[0] = (entry->width != 0) ? (1.f / static_cast<f32>(entry->width)) : 1.f;
+				uv_scale[1] = (entry->height != 0) ? (1.f / static_cast<f32>(entry->height)) : 1.f;
+			}
+		}
+	}
+
+	// --- flat tint ----------------------------------------------------------------------
+	// Per-vertex interpolation is out of scope; vertex 0's colour is the whole draw's tint.
+	u32 tint = 0xFFFFFFFFu;
+
+	if (attribute_view colours{}; map_attribute(3, first_vertex, vertex_count, colours) == attribute_status::ok)
+	{
+		f32 rgba[4] = { 1.f, 1.f, 1.f, 1.f };
+
+		if (remix_rsx::decode_position(colours.at(0), colours.type, colours.size, rgba))
+		{
+			const auto channel = [](f32 v)
+			{
+				return static_cast<u32>(std::clamp(v, 0.f, 1.f) * 255.f + 0.5f);
+			};
+
+			// The compositor works in BGRA; RSX ATTR3 is R,G,B,A in component order.
+			tint = channel(rgba[2]) | (channel(rgba[1]) << 8) | (channel(rgba[0]) << 16) | (channel(rgba[3]) << 24);
+		}
+	}
+
+	const bool clamp_uv = entry && (entry->wrap_u == 0 || entry->wrap_v == 0);
+
+	for (usz t = 0; (t + 2) < m_scratch_indices.size(); t += 3)
+	{
+		const u32 i0 = m_scratch_indices[t + 0];
+		const u32 i1 = m_scratch_indices[t + 1];
+		const u32 i2 = m_scratch_indices[t + 2];
+
+		const f32 x[3] = { m_scratch_ui_x[i0], m_scratch_ui_x[i1], m_scratch_ui_x[i2] };
+		const f32 y[3] = { m_scratch_ui_y[i0], m_scratch_ui_y[i1], m_scratch_ui_y[i2] };
+
+		f32 u[3] = { 0.f, 0.f, 0.f };
+		f32 v[3] = { 0.f, 0.f, 0.f };
+
+		if (have_uv)
+		{
+			const u32 tri[3] = { i0, i1, i2 };
+
+			for (u32 c = 0; c < 3; ++c)
+			{
+				f32 uv[4]{};
+
+				if (!remix_rsx::decode_position(uvs.at(tri[c]), uvs.type, uvs.size, uv))
+				{
+					have_uv = false;
+					break;
+				}
+
+				u[c] = uv[0] * uv_scale[0];
+				v[c] = uv[1] * uv_scale[1];
+			}
+		}
+
+		m_compositor.draw_triangle(x, y, u, v, have_uv ? entry : nullptr, tint, clamp_uv);
+	}
+
+	++m_stats.ui_draws;
+}
+
+const remix_rsx::texture_entry* RemixGSRender::overlay_image(const void* key, const u8* rgba, u32 width, u32 height)
+{
+	if (!key || !rgba || width == 0 || height == 0)
+	{
+		return nullptr;
+	}
+
+	auto it = m_overlay_images.find(key);
+
+	if (it != m_overlay_images.end() && it->second.width == width && it->second.height == height)
+	{
+		return &it->second;
+	}
+
+	remix_rsx::texture_entry entry{};
+	entry.width = width;
+	entry.height = height;
+	entry.wrap_u = 0;
+	entry.wrap_v = 0;
+	entry.pixels.resize(static_cast<usz>(width) * height * 4);
+
+	// stb hands these over as RGBA8; the compositor is BGRA8. GL papers over the difference
+	// with a sampler swizzle (GLOverlays.cpp:229), which a CPU rasterizer cannot do.
+	for (usz i = 0; i < (static_cast<usz>(width) * height); ++i)
+	{
+		entry.pixels[(i * 4) + 0] = rgba[(i * 4) + 2];
+		entry.pixels[(i * 4) + 1] = rgba[(i * 4) + 1];
+		entry.pixels[(i * 4) + 2] = rgba[(i * 4) + 0];
+		entry.pixels[(i * 4) + 3] = rgba[(i * 4) + 3];
+	}
+
+	it = m_overlay_images.insert_or_assign(key, std::move(entry)).first;
+	return &it->second;
+}
+
+void RemixGSRender::composite_overlay_command(const rsx::overlays::compiled_resource::command& cmd, f32 scale_x, f32 scale_y)
+{
+	const auto& config = cmd.config;
+	const auto& verts = cmd.verts;
+
+	if (verts.empty())
+	{
+		return;
+	}
+
+	const auto channel = [](f32 v) { return static_cast<u32>(std::clamp(v, 0.f, 1.f) * 255.f + 0.5f); };
+	const u32 tint = channel(config.color.b)
+		| (channel(config.color.g) << 8)
+		| (channel(config.color.r) << 16)
+		| (channel(config.color.a) << 24);
+
+	if (config.clip_region)
+	{
+		m_compositor.set_clip(config.clip_rect.x1 * scale_x, config.clip_rect.y1 * scale_y,
+			config.clip_rect.x2 * scale_x, config.clip_rect.y2 * scale_y);
+	}
+	else
+	{
+		m_compositor.clear_clip();
+	}
+
+	const rsx::overlays::font* font_ref = (config.texture_ref == rsx::overlays::image_resource_id::font_file) ? config.font_ref : nullptr;
+	const remix_rsx::texture_entry* image = nullptr;
+
+	if (config.texture_ref == rsx::overlays::image_resource_id::raw_image)
+	{
+		if (const auto* info = static_cast<const rsx::overlays::image_info_base*>(config.external_data_ref))
+		{
+			image = overlay_image(config.external_data_ref, info->get_data(),
+				static_cast<u32>(info->w), static_cast<u32>(info->h));
+		}
+	}
+	else if (config.texture_ref != rsx::overlays::image_resource_id::none && !font_ref)
+	{
+		// game_icon (254) and backbuffer (255) are TODO in GL and VK too; everything from 1 to
+		// the end of the standard set comes from resource_config.
+		const u32 index = u32{config.texture_ref};
+
+		if (index >= 1 && index < 252 && m_ui_resources.texture_raw_data.size() >= index)
+		{
+			const auto& res = m_ui_resources.texture_raw_data[index - 1];
+
+			if (res)
+			{
+				image = overlay_image(res.get(), res->get_data(), static_cast<u32>(res->w), static_cast<u32>(res->h));
+			}
+		}
+	}
+
+	u32 glyph_w = 0;
+	u32 glyph_h = 0;
+	u32 glyph_pages = 1;
+	const u8* glyph_data = nullptr;
+
+	if (font_ref)
+	{
+		const auto dims = font_ref->get_glyph_data_dimensions();
+		glyph_w = dims.width;
+		glyph_h = dims.height;
+		glyph_pages = std::max(1u, dims.depth);
+		glyph_data = font_ref->get_glyph_data().data();
+	}
+
+	// Emits one triangle from three overlay vertices, in compositor pixels.
+	const auto emit = [&](usz a, usz b, usz c)
+	{
+		const f32 x[3] = { verts[a].values[0] * scale_x, verts[b].values[0] * scale_x, verts[c].values[0] * scale_x };
+		const f32 y[3] = { verts[a].values[1] * scale_y, verts[b].values[1] * scale_y, verts[c].values[1] * scale_y };
+		f32 u[3] = { verts[a].values[2], verts[b].values[2], verts[c].values[2] };
+		f32 v[3] = { verts[a].values[3], verts[b].values[3], verts[c].values[3] };
+
+		if (glyph_data)
+		{
+			// OverlayRenderFS.glsl:212 - the integer part of V picks the atlas page.
+			const u32 page = std::min(glyph_pages - 1, static_cast<u32>(std::max(0.f, std::trunc(v[0]))));
+			const u8* coverage = glyph_data + (static_cast<usz>(page) * glyph_w * glyph_h);
+
+			for (u32 i = 0; i < 3; ++i)
+			{
+				v[i] -= std::trunc(v[i]);
+			}
+
+			// draw_glyph_quad is axis aligned, so text is emitted as the quad it always is.
+			const f32 x0 = std::min({ x[0], x[1], x[2] });
+			const f32 x1 = std::max({ x[0], x[1], x[2] });
+			const f32 y0 = std::min({ y[0], y[1], y[2] });
+			const f32 y1 = std::max({ y[0], y[1], y[2] });
+			const f32 u0 = std::min({ u[0], u[1], u[2] });
+			const f32 u1 = std::max({ u[0], u[1], u[2] });
+			const f32 v0 = std::min({ v[0], v[1], v[2] });
+			const f32 v1 = std::max({ v[0], v[1], v[2] });
+
+			m_compositor.draw_glyph_quad(x0, y0, x1, y1, u0, v0, u1, v1, coverage, glyph_w, glyph_h, tint);
+			return;
+		}
+
+		m_compositor.draw_triangle(x, y, u, v, image, tint, true);
+	};
+
+	switch (config.primitives)
+	{
+	case rsx::overlays::primitive_type::quad_list:
+	{
+		// Disjoint 4-vertex triangle strips (GLOverlays.cpp:371-391).
+		for (usz i = 0; (i + 3) < verts.size(); i += 4)
+		{
+			emit(i + 0, i + 1, i + 2);
+			emit(i + 1, i + 3, i + 2);
+		}
+		break;
+	}
+	case rsx::overlays::primitive_type::triangle_strip:
+	{
+		for (usz i = 0; (i + 2) < verts.size(); ++i)
+		{
+			if (i & 1)
+			{
+				emit(i + 1, i + 0, i + 2);
+			}
+			else
+			{
+				emit(i + 0, i + 1, i + 2);
+			}
+		}
+		break;
+	}
+	case rsx::overlays::primitive_type::triangle_fan:
+	{
+		for (usz i = 1; (i + 1) < verts.size(); ++i)
+		{
+			emit(0, i, i + 1);
+		}
+		break;
+	}
+	case rsx::overlays::primitive_type::line_list:
+	case rsx::overlays::primitive_type::line_strip:
+	{
+		// The perf graph is line geometry; a 1px quad per segment is the cheapest honest
+		// stand-in for a hardware line.
+		const usz step = (config.primitives == rsx::overlays::primitive_type::line_list) ? 2 : 1;
+
+		for (usz i = 0; (i + 1) < verts.size(); i += step)
+		{
+			const f32 x0 = verts[i].values[0] * scale_x;
+			const f32 y0 = verts[i].values[1] * scale_y;
+			const f32 x1 = verts[i + 1].values[0] * scale_x;
+			const f32 y1 = verts[i + 1].values[1] * scale_y;
+
+			m_compositor.draw_quad(std::min(x0, x1), std::min(y0, y1),
+				std::max(x0, x1) + 1.f, std::max(y0, y1) + 1.f, 0.f, 0.f, 1.f, 1.f, nullptr, tint, true);
+		}
+		break;
+	}
+	default:
+		break;
+	}
+
+	m_compositor.clear_clip();
+}
+
+void RemixGSRender::composite_native_overlay()
+{
+	if (!m_overlay_manager)
+	{
+		return;
+	}
+
+	// Reclaim first, exactly as GLPresent.cpp:283-298 does: a disposed view's cached image
+	// data must not outlive it.
+	if (m_overlay_manager->has_dirty())
+	{
+		m_overlay_manager->lock_shared();
+
+		std::vector<u32> uids_to_dispose;
+		uids_to_dispose.reserve(m_overlay_manager->get_dirty().size());
+
+		for (const auto& view : m_overlay_manager->get_dirty())
+		{
+			uids_to_dispose.push_back(view->uid);
+		}
+
+		m_overlay_manager->unlock_shared();
+		m_overlay_manager->dispose(uids_to_dispose);
+		m_overlay_images.clear();
+	}
+
+	if (!m_overlay_manager->has_visible())
+	{
+		return;
+	}
+
+	u32 width = 0;
+	u32 height = 0;
+
+	if (!compositor_target(width, height))
+	{
+		return;
+	}
+
+	if (!m_compositor_open)
+	{
+		m_compositor.begin_frame(width, height);
+		m_compositor_open = true;
+	}
+
+	if (!m_ui_resources_loaded)
+	{
+		m_ui_resources.load_files();
+		m_ui_resources_loaded = true;
+	}
+
+	std::lock_guard lock(*m_overlay_manager);
+
+	for (const auto& view : m_overlay_manager->get_views())
+	{
+		if (!view || !view->visible)
+		{
+			continue;
+		}
+
+		// Views are authored against a virtual 1280x720 unless they asked for window space.
+		const f32 vw = view->use_window_space ? static_cast<f32>(width) : static_cast<f32>(view->get_virtual_width());
+		const f32 vh = view->use_window_space ? static_cast<f32>(height) : static_cast<f32>(view->get_virtual_height());
+
+		if (vw <= 0.f || vh <= 0.f)
+		{
+			continue;
+		}
+
+		const f32 scale_x = static_cast<f32>(width) / vw;
+		const f32 scale_y = static_cast<f32>(height) / vh;
+
+		for (const auto& cmd : view->get_compiled().draw_commands)
+		{
+			composite_overlay_command(cmd, scale_x, scale_y);
+		}
+
+		view->update(get_system_time());
+	}
+}
+
+void RemixGSRender::submit_compositor()
+{
+	if (!m_remix.fork_features() || remix_rsx::compositor_disabled())
+	{
+		m_compositor_open = false;
+		return;
+	}
+
+	if (!m_compositor.dirty())
+	{
+		m_compositor_open = false;
+		return;
+	}
+
+	const u32 status = m_compositor.submit(m_remix.api());
+
+	if (status != REMIXAPI_ERROR_CODE_SUCCESS)
+	{
+		++m_stats.ui_skipped;
+
+		// Loud once: a failing DrawScreenOverlay means the whole 2D path is dead, and a
+		// per-frame log would drown the file.
+		if (m_stats.ui_skipped == 1)
+		{
+			rsx_log.error("Remix: DrawScreenOverlay failed (%s), UI compositing is not reaching the runtime",
+				remix_rsx::error_name(status));
+		}
+	}
+
+	m_compositor_open = false;
+}
+
+bool RemixGSRender::build_skinning(u32 first_vertex, u32 vertex_count)
+{
+	const remix_rsx::vp_fingerprint& fp = *m_current_fingerprint;
+
+	attribute_view bones{};
+
+	if (map_attribute(fp.bone_attribute, first_vertex, vertex_count, bones) != attribute_status::ok)
+	{
+		return false;
+	}
+
+	m_scratch_bone_indices.clear();
+	m_scratch_bone_indices.resize(vertex_count);
+	m_scratch_bone_raw.clear();
+	m_scratch_bone_raw.resize(vertex_count);
+	m_scratch_bone_slots.clear();
+	m_scratch_bone_transforms.clear();
+
+	for (u32 i = 0; i < vertex_count; ++i)
+	{
+		// The ucode's constants are authored against what the vertex fetch hands the shader,
+		// i.e. the *scaled* value, so the index chain has to start from the same number.
+		// decode_attribute_raw is used separately below, for the hash, where the stored bytes
+		// are exactly what identifies the rigging.
+		f32 scaled[4] = {};
+		f32 raw[4] = {};
+
+		if (!remix_rsx::decode_position(bones.at(i), bones.type, bones.size, scaled) ||
+			!remix_rsx::decode_attribute_raw(bones.at(i), bones.type, bones.size, raw))
+		{
+			return false;
+		}
+
+		u32 offset = 0;
+
+		if (!remix_rsx::evaluate_bone_offset(fp, scaled[fp.bone_component], offset))
+		{
+			return false;
+		}
+
+		m_scratch_bone_raw[i] = raw[fp.bone_component];
+
+		// Remix indexes boneTransforms[] directly, so the palette offsets have to be packed
+		// down to 0..count-1. Counts are small (one skeleton), so a linear scan is cheapest.
+		u32 dense = umax;
+
+		for (u32 s = 0; s < ::size32(m_scratch_bone_slots); ++s)
+		{
+			if (m_scratch_bone_slots[s] == offset)
+			{
+				dense = s;
+				break;
+			}
+		}
+
+		if (dense == umax)
+		{
+			if (m_scratch_bone_slots.size() >= REMIXAPI_INSTANCE_INFO_MAX_BONES_COUNT)
+			{
+				return false;
+			}
+
+			remix_rsx::slot_block slots{};
+
+			if (!remix_rsx::read_slot_block(fp.palette_base + offset, slots))
+			{
+				return false;
+			}
+
+			const remix_rsx::mat4 bone = remix_rsx::slots_to_matrix(slots, fp.palette_shape);
+
+			// A bone that is not a plain affine transform is not a bone; refusing it here is
+			// what keeps a mis-read palette from smearing geometry across the world.
+			if (!remix_rsx::mat4_is_finite(bone) || !remix_rsx::is_affine(bone, s_world_affine_tolerance))
+			{
+				return false;
+			}
+
+			dense = ::size32(m_scratch_bone_slots);
+			m_scratch_bone_slots.push_back(offset);
+			m_scratch_bone_transforms.push_back(remix_rsx::to_remix_transform(bone));
+		}
+
+		m_scratch_bone_indices[i] = dense;
+	}
+
+	if (m_scratch_bone_transforms.empty())
+	{
+		return false;
+	}
+
+	// One bone per vertex at weight 1: that is the shape the observed ucode presents (a single
+	// MUL + 3 MAD against one address register, no in_weight attribute). Anything else is not
+	// recognised and therefore never reaches here.
+	m_scratch_bone_weights.assign(vertex_count, 1.f);
+
+	m_stats.skin_bones_max = std::max(m_stats.skin_bones_max, static_cast<u64>(m_scratch_bone_transforms.size()));
+	return true;
+}
+
 void RemixGSRender::update_camera_candidate()
 {
 	const remix_rsx::vp_fingerprint& fp = *m_current_fingerprint;
@@ -516,7 +1317,7 @@ void RemixGSRender::update_camera_candidate()
 		rsx::method_registers.viewport_scale_z(),
 		rsx::method_registers.viewport_offset_z());
 
-	if (fp.archetype == remix_rsx::vp_archetype::layered)
+	if (fp.is_layered())
 	{
 		// The title already split its own transform: the outermost group is the projection,
 		// the one below it is the view (identity when there are only two groups).
@@ -628,8 +1429,43 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out) const
 	const remix_rsx::vp_fingerprint& fp = *m_current_fingerprint;
 	remix_rsx::mat4 world{};
 
-	if (m_active_camera.archetype == remix_rsx::vp_archetype::layered)
+	if (m_active_camera.archetype == remix_rsx::vp_archetype::layered
+		|| m_active_camera.archetype == remix_rsx::vp_archetype::skinned_layered)
 	{
+		if (fp.archetype == remix_rsx::vp_archetype::skinned_layered)
+		{
+			// The bone matrices already carry the vertex into the space the outer groups
+			// expect, so the instance transform is only what sits *below* the view: the
+			// groups the layered case would call the world. Two groups means the palette is
+			// already world-space and the instance transform is the identity.
+			const u32 world_groups = (fp.group_count >= 3) ? (fp.group_count - 2) : 0;
+			world = remix_rsx::mat4_identity();
+
+			for (u32 i = 0; i < world_groups; ++i)
+			{
+				remix_rsx::slot_block slots{};
+				if (!remix_rsx::read_slot_block(fp.group_base[i], slots))
+				{
+					return false;
+				}
+
+				world = remix_rsx::mat4_multiply(world, remix_rsx::slots_to_matrix(slots, fp.group_shape[i]));
+			}
+
+			if (remix_rsx::mat4 prescale{}; remix_rsx::build_prescale(fp, prescale))
+			{
+				world = remix_rsx::mat4_multiply(prescale, world);
+			}
+
+			if (!remix_rsx::mat4_is_finite(world) || !remix_rsx::is_affine(world, s_world_affine_tolerance))
+			{
+				return false;
+			}
+
+			out = remix_rsx::to_remix_transform(world);
+			return true;
+		}
+
 		if (fp.archetype == remix_rsx::vp_archetype::layered
 			&& fp.group_count == m_active_camera.group_count
 			&& fp.inner_is_input)
@@ -775,12 +1611,24 @@ void RemixGSRender::submit_subdraw()
 		return;
 	}
 
+	// One-run bisector: drop everything one program draws and see what disappears.
+	if (const u64 skip_hash = remix_rsx::skip_vp_hash(); skip_hash != 0 && skip_hash == m_current_vp_hash)
+	{
+		++m_stats.skip_vp;
+		return;
+	}
+
 	// --- screen-space classification ----------------------------------------------------
 	// When dumping, the skip is deferred until after the decode so that the 2D programs
 	// still get a dump line: their ATTR0 bounding box is the corroborating evidence.
 	const bool screen_space = !remix_rsx::keep_ui_enabled() && is_screen_space_draw();
 
-	if (screen_space && !remix_rsx::dump_enabled())
+	// The title's 2D draws are no longer thrown away: they are rasterized into the overlay
+	// buffer, which needs their positions, so the pre-decode early-out only applies when the
+	// compositor is unavailable.
+	const bool compositing = m_remix.fork_features() && !remix_rsx::compositor_disabled();
+
+	if (screen_space && !remix_rsx::dump_enabled() && !compositing)
 	{
 		++m_stats.skip_screen_space;
 		return;
@@ -793,41 +1641,13 @@ void RemixGSRender::submit_subdraw()
 	}
 
 	// --- locate the interleaved block that feeds ATTR0 ---------------------------------
-	const rsx::interleaved_range_info* block = nullptr;
-	for (const auto* candidate : m_vertex_layout.interleaved_blocks)
-	{
-		for (const auto& location : candidate->locations)
-		{
-			if (location.index == 0)
-			{
-				block = candidate;
-				break;
-			}
-		}
-
-		if (block)
-		{
-			break;
-		}
-	}
-
-	if (!block || block->attribute_stride == 0)
+	// Cheap gate only; the real mapping (and its memory validation) runs once the vertex
+	// range is known, through map_attribute().
+	if (const rsx::interleaved_range_info* block = find_attribute_block(0); !block || block->attribute_stride == 0)
 	{
 		++m_stats.skip_layout;
 		return;
 	}
-
-	const auto& attr0 = rsx::method_registers.vertex_arrays_info[0];
-	const u32 attr0_base = attr0.offset() & 0x7fffffff;
-
-	if (attr0_base < block->base_offset)
-	{
-		++m_stats.skip_layout;
-		return;
-	}
-
-	const u32 attr0_offset = attr0_base - block->base_offset;
-	const u32 stride = block->attribute_stride;
 
 	// --- build a u32 triangle list ------------------------------------------------------
 	m_scratch_indices.clear();
@@ -970,28 +1790,21 @@ void RemixGSRender::submit_subdraw()
 	}
 
 	// --- decode ATTR0 positions ---------------------------------------------------------
-	const rsx::vertex_base_type attr0_type = attr0.type();
-	const u32 attr0_size = attr0.size();
-	const u32 attr0_bytes = remix_rsx::attribute_byte_size(attr0_type, attr0_size);
-
-	if (attr0_bytes == 0)
-	{
-		++m_stats.skip_decode;
-		return;
-	}
-
 	const u32 first_vertex = index_base ? rsx::get_index_from_base(min_index, index_base) : min_index;
-	const u64 span_base = u64{block->real_offset_address} + (u64{first_vertex} * stride);
-	const u64 span_bytes = (u64{vertex_count - 1} * stride) + attr0_offset + attr0_bytes;
 
-	if ((span_base + span_bytes) > 0xFFFFFFFFull ||
-		!vm::check_addr(span_base, vm::page_readable, static_cast<u32>(span_bytes)))
+	attribute_view positions{};
+
+	switch (map_attribute(0, first_vertex, vertex_count, positions))
 	{
+	case attribute_status::ok:
+		break;
+	case attribute_status::memory:
 		++m_stats.skip_memory;
 		return;
+	default:
+		++m_stats.skip_layout;
+		return;
 	}
-
-	const u8* block_base = vm::_ptr<const u8>(static_cast<u32>(span_base));
 
 	m_scratch_vertices.clear();
 	m_scratch_vertices.resize(vertex_count);
@@ -1000,7 +1813,7 @@ void RemixGSRender::submit_subdraw()
 	{
 		f32 position[4] = {};
 
-		if (!remix_rsx::decode_position(block_base + (static_cast<usz>(i) * stride) + attr0_offset, attr0_type, attr0_size, position))
+		if (!remix_rsx::decode_position(positions.at(i), positions.type, positions.size, position))
 		{
 			++m_stats.skip_decode;
 			return;
@@ -1036,6 +1849,35 @@ void RemixGSRender::submit_subdraw()
 	if (screen_space)
 	{
 		++m_stats.skip_screen_space;
+
+		if (compositing)
+		{
+			composite_ui_draw(first_vertex, vertex_count);
+		}
+
+		return;
+	}
+
+	// --- skinning -----------------------------------------------------------------------
+	const remix_rsx::vp_fingerprint& fp = *m_current_fingerprint;
+	bool skinned = false;
+
+	if (fp.archetype == remix_rsx::vp_archetype::skinned_layered)
+	{
+		if (remix_rsx::noskin_enabled() || !m_remix.fork_features() || !build_skinning(first_vertex, vertex_count))
+		{
+			++m_stats.skin_skipped;
+			return;
+		}
+
+		skinned = true;
+	}
+	else if (fp.indexed_const && !fp.has_outer())
+	{
+		// An indexed-constant program the recogniser did not resolve. Submitting it means
+		// drawing it at identity, which is exactly what parked skinned meshes at the world
+		// origin in M2/M3. Skipped, and counted, instead.
+		++m_stats.skin_skipped;
 		return;
 	}
 
@@ -1100,6 +1942,23 @@ void RemixGSRender::submit_subdraw()
 		{
 			hash = rpcs3::hash64(hash, albedo_hash);
 		}
+
+		if (skinned)
+		{
+			// The rigging is part of the mesh's identity: the same geometry bound to a
+			// different skeleton must not share a handle. The bone *matrices* are deliberately
+			// not folded in - they change every animation frame, and folding them would churn
+			// the mesh cache exactly the way CPU baking would.
+			for (const f32 raw : m_scratch_bone_raw)
+			{
+				hash = rpcs3::hash64(hash, std::bit_cast<u32>(raw));
+			}
+
+			for (const u32 index : m_scratch_bone_indices)
+			{
+				hash = rpcs3::hash64(hash, index);
+			}
+		}
 	}
 
 	if (hash == 0)
@@ -1123,7 +1982,17 @@ void RemixGSRender::submit_subdraw()
 		surface.vertices_count = m_scratch_vertices.size();
 		surface.indices_values = m_scratch_indices.data();
 		surface.indices_count = m_scratch_indices.size();
-		surface.skinning_hasvalue = 0;
+		surface.skinning_hasvalue = skinned ? 1u : 0u;
+
+		if (skinned)
+		{
+			surface.skinning_value.bonesPerVertex = 1;
+			surface.skinning_value.blendWeights_values = m_scratch_bone_weights.data();
+			surface.skinning_value.blendWeights_count = ::size32(m_scratch_bone_weights);
+			surface.skinning_value.blendIndices_values = m_scratch_bone_indices.data();
+			surface.skinning_value.blendIndices_count = ::size32(m_scratch_bone_indices);
+		}
+
 		surface.material = material;
 
 		remixapi_MeshInfo mesh_info{};
@@ -1160,6 +2029,8 @@ void RemixGSRender::submit_subdraw()
 		++m_stats.world_fallback;
 	}
 
+	remixapi_InstanceInfoBoneTransformsEXT bone_transforms{};
+
 	remixapi_InstanceInfo instance{};
 	instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
 	instance.pNext = nullptr;
@@ -1167,6 +2038,17 @@ void RemixGSRender::submit_subdraw()
 	instance.mesh = it->second.handle;
 	instance.transform = transform;
 	instance.doubleSided = 1;
+
+	if (skinned)
+	{
+		// Read per draw, not per clause: a title that uploads a new palette between draw calls
+		// of one clause gets the pose it asked for.
+		bone_transforms.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BONE_TRANSFORMS_EXT;
+		bone_transforms.pNext = nullptr;
+		bone_transforms.boneTransforms_values = m_scratch_bone_transforms.data();
+		bone_transforms.boneTransforms_count = ::size32(m_scratch_bone_transforms);
+		instance.pNext = &bone_transforms;
+	}
 
 	const u32 status = remix_rsx::guarded_draw_instance(api.DrawInstance, &instance);
 	if (status != REMIXAPI_ERROR_CODE_SUCCESS)
@@ -1177,6 +2059,11 @@ void RemixGSRender::submit_subdraw()
 	}
 
 	++m_stats.draws_submitted;
+
+	if (skinned)
+	{
+		++m_stats.skin_submitted;
+	}
 }
 
 const remix_rsx::vp_fingerprint& RemixGSRender::fingerprint_for(u64 vp_hash)
@@ -1230,6 +2117,50 @@ void RemixGSRender::dump_vertex_program(u32 vertex_count, u32 index_count)
 			remix_rsx::shape_name(fp.group_shape[i]),
 			remix_rsx::format_matrix(g),
 			remix_rsx::classify_perspective(g));
+	}
+
+	if (fp.skinned)
+	{
+		// The line that settles the open question: which attribute carries the bone index,
+		// which component of it, and what is applied on the way to the address register.
+		fmt::append(groups, " | skin palette=c[%u+a] shape=%s attr=ATTR%u.%c resolved=%d ops=%u",
+			fp.palette_base,
+			remix_rsx::shape_name(fp.palette_shape),
+			fp.bone_attribute,
+			"xyzw"[fp.bone_component & 3],
+			fp.bone_resolved ? 1 : 0,
+			fp.bone_op_count);
+
+		for (u32 i = 0; i < fp.bone_op_count; ++i)
+		{
+			const remix_rsx::bone_index_op& op = fp.bone_ops[i];
+
+			switch (op.op)
+			{
+			case remix_rsx::bone_index_op::kind::floor:
+				groups += " floor";
+				break;
+			case remix_rsx::bone_index_op::kind::scale:
+				fmt::append(groups, " *c%u.%c", op.mul_slot, "xyzw"[op.mul_component & 3]);
+				break;
+			case remix_rsx::bone_index_op::kind::affine:
+				if (op.mul_slot == umax)
+				{
+					fmt::append(groups, " +c%u.%c", op.add_slot, "xyzw"[op.add_component & 3]);
+				}
+				else
+				{
+					fmt::append(groups, " *c%u.%c+c%u.%c", op.mul_slot, "xyzw"[op.mul_component & 3],
+						op.add_slot, "xyzw"[op.add_component & 3]);
+				}
+				break;
+			}
+		}
+
+		if (fp.skin_note[0])
+		{
+			fmt::append(groups, " (%s)", fp.skin_note);
+		}
 	}
 
 	if (fp.archetype == remix_rsx::vp_archetype::unknown)
@@ -1345,8 +2276,10 @@ void RemixGSRender::log_stats()
 	rsx_log.notice(
 		"Remix stats: frame=%llu draws=%llu submitted=%llu meshes_live=%llu created=%llu destroyed=%llu poisoned=%llu | "
 		"cam_resolved=%llu cam_fallback=%llu arch=%s world_applied=%llu world_fallback=%llu | "
-		"skip screen=%llu immediate=%llu inline=%llu volatile=%llu reg_attr0=%llu prim=%llu restart=%llu instanced=%llu layout=%llu mem=%llu decode=%llu poison=%llu | "
-		"tex_bound=%llu tex_none=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_rehashed=%llu mat_created=%llu",
+		"skip screen=%llu immediate=%llu inline=%llu volatile=%llu reg_attr0=%llu prim=%llu restart=%llu instanced=%llu layout=%llu mem=%llu decode=%llu poison=%llu vp=%llu | "
+		"skin_submitted=%llu skin_skipped=%llu skin_bones_max=%llu | "
+		"tex_bound=%llu tex_none=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_rehashed=%llu mat_created=%llu | "
+		"ui_draws=%llu ui_skipped=%llu ui_prims=%llu ui_frames=%llu",
 		m_frame_counter,
 		m_stats.draws_seen,
 		m_stats.draws_submitted,
@@ -1371,6 +2304,10 @@ void RemixGSRender::log_stats()
 		m_stats.skip_memory,
 		m_stats.skip_decode,
 		m_stats.skip_poisoned,
+		m_stats.skip_vp,
+		m_stats.skin_submitted,
+		m_stats.skin_skipped,
+		m_stats.skin_bones_max,
 		m_stats.tex_bound,
 		m_stats.tex_none,
 		static_cast<u64>(m_textures.live()),
@@ -1381,7 +2318,11 @@ void RemixGSRender::log_stats()
 		tex.unreadable,
 		tex.unsupported,
 		tex.rehashed,
-		tex.materials);
+		tex.materials,
+		m_stats.ui_draws,
+		m_stats.ui_skipped,
+		m_compositor.draws(),
+		m_compositor.frames());
 }
 
 #endif

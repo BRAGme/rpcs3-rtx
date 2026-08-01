@@ -58,6 +58,98 @@ namespace remix_rsx
 			default: return 0;
 			}
 		}
+
+		// The component decode shared by decode_position and decode_attribute_raw. Everything
+		// here is pre-scaling: 'biased' adds the SNORM16 half-unit the position path applies,
+		// and neither caller's w convention is decided here.
+		// 'decoded' is written for the components the format carries; the rest stay 0.
+		bool decode_components(const u8* src, rsx::vertex_base_type type, u32 size, bool biased, f32 (&decoded)[4], u32& out_components)
+		{
+			const u32 type_index = static_cast<u32>(type);
+
+			if (type_index == 0 || type_index > 7)
+			{
+				return false;
+			}
+
+			const u32 elem_size = s_elem_size[type_index];
+
+			// CMP32 packs all components into a single dword; the layout code forces size to 1.
+			const u32 components = (type == rsx::vertex_base_type::cmp) ? 1u : size;
+
+			if (components == 0 || components > 4)
+			{
+				return false;
+			}
+
+			u32 raw[4] = {};
+			for (u32 i = 0; i < components; ++i)
+			{
+				raw[i] = read_be(src + (i * elem_size), elem_size);
+			}
+
+			decoded[0] = 0.f;
+			decoded[1] = 0.f;
+			decoded[2] = 0.f;
+			decoded[3] = 0.f;
+
+			switch (type)
+			{
+			case rsx::vertex_base_type::s1:
+			case rsx::vertex_base_type::s32k:
+			{
+				// SNORM16 is biased by half a unit before the divide; SINT16 is not.
+				const f32 bias = (biased && type == rsx::vertex_base_type::s1) ? 0.5f : 0.f;
+				for (u32 i = 0; i < components; ++i)
+				{
+					decoded[i] = sext16(raw[i]) + bias;
+				}
+				break;
+			}
+			case rsx::vertex_base_type::f:
+			{
+				for (u32 i = 0; i < components; ++i)
+				{
+					decoded[i] = std::bit_cast<f32>(raw[i]);
+				}
+				break;
+			}
+			case rsx::vertex_base_type::sf:
+			{
+				for (u32 i = 0; i < components; ++i)
+				{
+					decoded[i] = half_to_float(static_cast<u16>(raw[i]));
+				}
+				break;
+			}
+			case rsx::vertex_base_type::ub:
+			case rsx::vertex_base_type::ub256:
+			{
+				for (u32 i = 0; i < components; ++i)
+				{
+					decoded[i] = static_cast<f32>(raw[i]);
+				}
+				break;
+			}
+			case rsx::vertex_base_type::cmp:
+			{
+				// X11Y11Z10, each field left-aligned into a 16-bit signed field before extension.
+				const u32 x = (raw[0] >> 0) & 0x7FFu;
+				const u32 y = (raw[0] >> 11) & 0x7FFu;
+				const u32 z = (raw[0] >> 22) & 0x3FFu;
+
+				decoded[0] = sext16((x << 5) & 0xFFFFu);
+				decoded[1] = sext16((y << 5) & 0xFFFFu);
+				decoded[2] = sext16((z << 6) & 0xFFFFu);
+				break;
+			}
+			default:
+				return false;
+			}
+
+			out_components = components;
+			return true;
+		}
 	}
 
 	bool is_supported_primitive(rsx::primitive_type prim)
@@ -118,81 +210,18 @@ namespace remix_rsx
 			return false;
 		}
 
-		const u32 elem_size = s_elem_size[type_index];
 		const f32 scale = s_scale[type_index];
 
-		// CMP32 packs all components into a single dword; the layout code forces size to 1.
-		const u32 components = (type == rsx::vertex_base_type::cmp) ? 1u : size;
-
-		if (components == 0 || components > 4)
-		{
-			return false;
-		}
-
-		u32 raw[4] = {};
-		for (u32 i = 0; i < components; ++i)
-		{
-			raw[i] = read_be(src + (i * elem_size), elem_size);
-		}
-
 		f32 decoded[4] = { 0.f, 0.f, 0.f, 0.f };
+		u32 components = 0;
 
-		switch (type)
+		if (!decode_components(src, type, size, true, decoded, components))
 		{
-		case rsx::vertex_base_type::s1:
-		case rsx::vertex_base_type::s32k:
-		{
-			// SNORM16 is biased by half a unit before the divide; SINT16 is not.
-			const f32 bias = (type == rsx::vertex_base_type::s1) ? 0.5f : 0.f;
-			for (u32 i = 0; i < components; ++i)
-			{
-				decoded[i] = sext16(raw[i]) + bias;
-			}
-			break;
-		}
-		case rsx::vertex_base_type::f:
-		{
-			for (u32 i = 0; i < components; ++i)
-			{
-				decoded[i] = std::bit_cast<f32>(raw[i]);
-			}
-			break;
-		}
-		case rsx::vertex_base_type::sf:
-		{
-			for (u32 i = 0; i < components; ++i)
-			{
-				decoded[i] = half_to_float(static_cast<u16>(raw[i]));
-			}
-			break;
-		}
-		case rsx::vertex_base_type::ub:
-		case rsx::vertex_base_type::ub256:
-		{
-			for (u32 i = 0; i < components; ++i)
-			{
-				decoded[i] = static_cast<f32>(raw[i]);
-			}
-			break;
-		}
-		case rsx::vertex_base_type::cmp:
-		{
-			// X11Y11Z10, each field left-aligned into a 16-bit signed field before extension.
-			const u32 x = (raw[0] >> 0) & 0x7FFu;
-			const u32 y = (raw[0] >> 11) & 0x7FFu;
-			const u32 z = (raw[0] >> 22) & 0x3FFu;
-
-			decoded[0] = sext16((x << 5) & 0xFFFFu);
-			decoded[1] = sext16((y << 5) & 0xFFFFu);
-			decoded[2] = sext16((z << 6) & 0xFFFFu);
-			decoded[3] = scale;
-			break;
-		}
-		default:
 			return false;
 		}
 
 		// The shader forces w to the scale so that narrow attributes divide down to 1.0.
+		// CMP32 lands here too: its component count is 1.
 		if (components < 4)
 		{
 			decoded[3] = scale;
@@ -201,6 +230,31 @@ namespace remix_rsx
 		for (u32 i = 0; i < 4; ++i)
 		{
 			out[i] = decoded[i] / scale;
+		}
+
+		return true;
+	}
+
+	bool decode_attribute_raw(const u8* src, rsx::vertex_base_type type, u32 size, f32 (&out)[4])
+	{
+		f32 decoded[4] = { 0.f, 0.f, 0.f, 0.f };
+		u32 components = 0;
+
+		if (!decode_components(src, type, size, false, decoded, components))
+		{
+			return false;
+		}
+
+		// No scale divide here: the caller wants the stored value. Only the absent w is
+		// given the conventional 1.0 so a 2-component texcoord is still a usable vector.
+		if (components < 4)
+		{
+			decoded[3] = 1.f;
+		}
+
+		for (u32 i = 0; i < 4; ++i)
+		{
+			out[i] = decoded[i];
 		}
 
 		return true;

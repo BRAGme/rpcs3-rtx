@@ -57,9 +57,33 @@ namespace remix_rsx
 	// Up to this many chained 4-slot groups are followed back from HPOS.
 	inline constexpr u32 max_transform_groups = 4;
 
+	// One step of the "vertex attribute -> address register" computation, stored innermost
+	// first. Every factor is a transform constant, so the whole chain is re-evaluated per draw
+	// from live register state rather than baked at scan time.
+	struct bone_index_op
+	{
+		enum class kind : u8
+		{
+			scale, // v = v * c[mul_slot][mul_component]
+			affine, // v = v * c[mul_slot][mul_component] + c[add_slot][add_component]
+			floor  // v = floor(v)
+		};
+
+		kind op = kind::floor;
+		u32 mul_slot = 0;
+		u32 add_slot = 0;
+		u8 mul_component = 0;
+		u8 add_component = 0;
+	};
+
+	// Longest attribute -> address-register chain that is followed. The one observed program
+	// needs three steps (MAD, FLR, MUL); the rest is headroom, not speculation.
+	inline constexpr u32 max_bone_index_ops = 6;
+
 	enum class vp_archetype
 	{
-		// Nothing usable found: indexed constants, SCA position write, unresolved temp chase.
+		// Nothing usable found: unresolved indexed constants, SCA position write,
+		// unresolved temp chase.
 		unknown,
 		// 0 or 1 distinct constants feed the position: a pre-transformed / 2D program.
 		screen_space,
@@ -69,6 +93,11 @@ namespace remix_rsx
 		//   clip = pos * G0 * G1 * ... * G(n-1)
 		//   world = G0 * ... * G(n-3),  view = G(n-2) (identity when n == 2),  proj = G(n-1)
 		layered,
+		// As 'layered', plus an innermost bone-palette group read through the address register:
+		//   clip = pos * c[palette_base + a ..] * G0 * ... * G(n-1)
+		// The palette group is NOT one of the G's: it is submitted to Remix as per-instance
+		// bone transforms, so the G's are exactly the world/view/projection stack again.
+		skinned_layered,
 	};
 
 	struct vp_fingerprint
@@ -92,15 +121,35 @@ namespace remix_rsx
 		u32 prescale_scale_component = 0;
 		u32 prescale_bias_slot = 0;
 
+		// Skinning. 'a' as computed below is already the bone's *slot* offset (bone * stride),
+		// because the ucode reads c[palette_base + a] .. c[palette_base + a + 3] with a single
+		// shared address register - so there is no separate stride to recover.
+		bool skinned = false;
+		u32 palette_base = 0;
+		chain_shape palette_shape = chain_shape::none;
+
+		// The attribute component that feeds the address register, and how.
+		u32 bone_attribute = 0;
+		u32 bone_component = 0;
+		bool bone_resolved = false;
+		u32 bone_op_count = 0;
+		bone_index_op bone_ops[max_bone_index_ops] = {};
+
 		// Diagnostics.
 		u32 distinct_consts = 0;
 		u32 chain_instructions = 0;
 		bool indexed_const = false;
 		const char* note = "";
+		const char* skin_note = "";
+
+		bool is_layered() const
+		{
+			return archetype == vp_archetype::layered || archetype == vp_archetype::skinned_layered;
+		}
 
 		bool has_outer() const
 		{
-			return archetype == vp_archetype::fused || archetype == vp_archetype::layered;
+			return archetype == vp_archetype::fused || is_layered();
 		}
 
 		u32 outer_base() const { return group_count ? group_base[group_count - 1] : 0; }
@@ -135,6 +184,11 @@ namespace remix_rsx
 
 	// The 'pos * s + b' step described by the fingerprint, as a row-vector affine matrix.
 	bool build_prescale(const vp_fingerprint& fp, mat4& out);
+
+	// Runs the recorded bone-index op chain over one vertex's attribute component and
+	// truncates like ARL does, yielding the palette slot offset 'a'. False when a constant is
+	// out of range or the result is not a usable non-negative offset.
+	bool evaluate_bone_offset(const vp_fingerprint& fp, f32 value, u32& out);
 
 	// Row-vector affine matrix to remixapi_Transform (column-vector, translation in column 3).
 	remixapi_Transform to_remix_transform(const mat4& m);
@@ -193,9 +247,15 @@ namespace remix_rsx
 	// RPCS3_REMIX_DUMP=1     one log line per unique vertex program.
 	// RPCS3_REMIX_KEEP_UI=1  disable the screen-space skip (bisection).
 	// RPCS3_REMIX_NOCAM=1    force the milestone-1 hardcoded camera + debug triangle.
+	// RPCS3_REMIX_NOSKIN=1   skip every skinned draw instead of submitting bone transforms.
 	bool dump_enabled();
 	bool keep_ui_enabled();
 	bool nocam_enabled();
+	bool noskin_enabled();
+
+	// RPCS3_REMIX_SKIPVP=<16 hex digits>: drop every draw of one vertex program. The one-run
+	// bisector for "which program draws that". 0 when unset.
+	u64 skip_vp_hash();
 
 	// Debug light knobs so a derived camera can be judged visually at all.
 	f32 debug_light_radius();

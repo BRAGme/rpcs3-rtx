@@ -73,6 +73,18 @@ namespace remix_rsx
 		return value;
 	}
 
+	bool ui_probe_enabled()
+	{
+		static const bool value = []
+		{
+			wchar_t buffer[16]{};
+			const DWORD written = GetEnvironmentVariableW(L"RPCS3_REMIX_UIPROBE", buffer, static_cast<DWORD>(std::size(buffer)));
+			return written > 0 && written < std::size(buffer) && ::wcstol(buffer, nullptr, 10) != 0;
+		}();
+
+		return value;
+	}
+
 	void compositor::begin_frame(u32 width, u32 height)
 	{
 		if (width == 0 || height == 0 || width > s_max_dimension || height > s_max_dimension)

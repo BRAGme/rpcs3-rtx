@@ -12,11 +12,6 @@ namespace remix_rsx
 {
 	struct texture_entry;
 
-	// NOT WIRED YET. This translation unit compiles and is registered in all three build
-	// systems, but nothing calls it: the two producers it exists for -- the title's own
-	// screen-space draws (M3 step 5) and rpcs3's compiled_resource overlay (M3 step 6) --
-	// were deferred to M4. Do not assume any of it has been exercised at runtime.
-	//
 	// CPU rasterizer for everything that must appear as flat 2D on top of the path-traced
 	// image: the title's own screen-space draws and rpcs3's native overlay. The whole buffer
 	// is handed to the fork's DrawScreenOverlay once per flip, which composites it with a
@@ -71,6 +66,10 @@ namespace remix_rsx
 
 	// RPCS3_REMIX_NOUI=1 disables the compositor entirely.
 	bool compositor_disabled();
+
+	// RPCS3_REMIX_UIPROBE=1 draws a fixed known pattern through DrawScreenOverlay instead of
+	// judging the call for the first time with real UI data flowing through it.
+	bool ui_probe_enabled();
 }
 
 #endif

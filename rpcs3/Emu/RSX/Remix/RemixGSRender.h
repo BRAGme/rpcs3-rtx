@@ -2,9 +2,12 @@
 #include "Emu/RSX/GSRender.h"
 
 #ifdef _WIN32
+#include "Emu/RSX/Overlays/overlay_controls.h"
+#include "Emu/RSX/Remix/RemixCompositor.h"
 #include "Emu/RSX/Remix/RemixRuntime.h"
 #include "Emu/RSX/Remix/RemixTextures.h"
 #include "Emu/RSX/Remix/RemixTransforms.h"
+#include "Emu/RSX/Remix/RemixVertexDecode.h"
 
 #include <unordered_map>
 #include <unordered_set>
@@ -22,6 +25,7 @@ public:
 	void on_init_thread() override;
 	void on_exit() override;
 	void flip(const rsx::display_flip_info_t& info) override;
+	void do_local_task(rsx::FIFO::state state) override;
 
 private:
 	void end() override;
@@ -58,6 +62,35 @@ private:
 		u64 world_fallback = 0;
 		u64 tex_bound = 0;
 		u64 tex_none = 0;
+		u64 ui_draws = 0;
+		u64 ui_skipped = 0;
+		u64 skin_submitted = 0;
+		u64 skin_skipped = 0;
+		u64 skin_bones_max = 0;
+		u64 skip_vp = 0;
+	};
+
+	// One vertex attribute located inside its interleaved block, with the guest span it
+	// spells out already validated. 'base' points at the block's first decoded vertex.
+	struct attribute_view
+	{
+		const u8* base = nullptr;
+		u32 stride = 0;
+		u32 offset = 0;
+		rsx::vertex_base_type type = rsx::vertex_base_type::f;
+		u32 size = 0;
+
+		const u8* at(u32 vertex) const { return base + (static_cast<usz>(vertex) * stride) + offset; }
+	};
+
+	// Why an attribute could not be mapped. Each reason maps onto its own skip counter so a
+	// "nothing decoded" result says which gate refused.
+	enum class attribute_status
+	{
+		ok,
+		absent, // not fed from a persistent interleaved block at all
+		layout, // block found but the offsets do not describe a readable stream
+		memory  // the span is not readable guest memory
 	};
 
 	// The frame's best camera guess. Latched at flip and used for the whole next frame so
@@ -109,6 +142,45 @@ private:
 	// Lowest referenced, enabled, 2D fragment texture unit for this draw, or -1.
 	int albedo_texture_unit() const;
 
+	// Locates one vertex attribute in the interleaved blocks and validates the guest span it
+	// would be read through. Unlike the old ATTR0-only code this searches *every* block: a
+	// bone index or a texcoord routinely lives in a different block than the position.
+	attribute_status map_attribute(u32 index, u32 first_vertex, u32 vertex_count, attribute_view& out) const;
+
+	// The interleaved block that carries 'index', or null. Cheap: no memory validation.
+	const rsx::interleaved_range_info* find_attribute_block(u32 index) const;
+
+	// Size of the overlay buffer for this frame: the render surface the title's own 2D draws
+	// are authored against. False when neither the surface nor the window has usable dims.
+	bool compositor_target(u32& width, u32& height) const;
+
+	// Hands the frame's overlay buffer to the fork's DrawScreenOverlay, once per flip.
+	void submit_compositor();
+
+	// Rasterizes one of the title's own screen-space draws into the overlay buffer. Called
+	// after the positions have been decoded, in submission order.
+	void composite_ui_draw(u32 first_vertex, u32 vertex_count);
+
+	// Walks rpcs3's own overlay views into the same compositor at flip: message dialogs, the
+	// home menu, the perf overlay. Mirrors GLPresent's dirty-drain + locked view walk.
+	void composite_native_overlay();
+
+	// Converts one overlay draw command's vertices into compositor primitives.
+	void composite_overlay_command(const rsx::overlays::compiled_resource::command& cmd,
+		f32 scale_x, f32 scale_y);
+
+	// RGBA8 overlay images converted to the compositor's BGRA8 once, keyed by source pointer.
+	const remix_rsx::texture_entry* overlay_image(const void* key, const u8* rgba, u32 width, u32 height);
+
+	// Fills the bone scratch buffers for a skinned draw: per-vertex palette offsets, their
+	// dense remap, and the matrices behind them. False means the draw must be skipped - never
+	// drawn at identity, which is what parked skinned meshes at the world origin before.
+	bool build_skinning(u32 first_vertex, u32 vertex_count);
+
+	// RPCS3_REMIX_UIPROBE=1: a fixed known pattern through the same path, so the fork call can
+	// be judged on its own before any real UI data is wired through it.
+	void draw_ui_probe();
+
 	// Per-draw object-to-world transform. False means "no transform available, use identity".
 	bool per_draw_transform(remixapi_Transform& out) const;
 
@@ -141,6 +213,10 @@ private:
 	std::unordered_set<u64> m_poisoned;
 
 	remix_rsx::texture_cache m_textures;
+	remix_rsx::compositor m_compositor;
+
+	// True once begin_frame() has run for the frame currently being built.
+	bool m_compositor_open = false;
 
 	std::unordered_map<u64, remix_rsx::vp_fingerprint> m_vp_fingerprints;
 	std::unordered_set<u64> m_vp_dumped;
@@ -160,6 +236,26 @@ private:
 	std::vector<u32> m_scratch_indices;
 	std::vector<u32> m_scratch_indices_alt;
 	std::vector<u8> m_scratch_index_bytes;
+
+	// Skinning scratch. 'slots' is the distinct set of palette offsets this draw touched;
+	// 'indices' is the per-vertex index into it, which is what Remix's blendIndices means.
+	std::vector<u32> m_scratch_bone_indices;
+	std::vector<f32> m_scratch_bone_weights;
+	std::vector<u32> m_scratch_bone_slots;
+	std::vector<f32> m_scratch_bone_raw;
+	std::vector<remixapi_Transform> m_scratch_bone_transforms;
+
+	// Screen-space positions in compositor pixels, one entry per decoded vertex.
+	std::vector<f32> m_scratch_ui_x;
+	std::vector<f32> m_scratch_ui_y;
+
+	// BGRA8 copies of rpcs3's own overlay images, keyed by the source data pointer. Cleared
+	// when the overlay manager reports the owning view dirty.
+	std::unordered_map<const void*, remix_rsx::texture_entry> m_overlay_images;
+
+	// rpcs3's own overlay icon set, loaded on the first native-overlay frame.
+	rsx::overlays::resource_config m_ui_resources;
+	bool m_ui_resources_loaded = false;
 
 	stat_counters m_stats{};
 	u64 m_frame_counter = 0;
