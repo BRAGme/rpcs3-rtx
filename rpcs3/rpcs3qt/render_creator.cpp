@@ -85,12 +85,18 @@ render_creator::render_creator()
 	Vulkan = render_info(vulkan_adapters, supports_vulkan, emu_settings_type::VulkanAdapter);
 	OpenGL = render_info();
 	NullRender = render_info();
+	Remix = render_info();
 
 #ifdef __APPLE__
 	OpenGL.supported = false;
 #endif
 
-	renderers = { &Vulkan, &OpenGL, &NullRender };
+#ifndef _WIN32
+	// The Remix runtime is a Windows d3d9.dll.
+	Remix.supported = false;
+#endif
+
+	renderers = { &Vulkan, &OpenGL, &NullRender, &Remix };
 }
 
 void render_creator::update_names(const QStringList& names)

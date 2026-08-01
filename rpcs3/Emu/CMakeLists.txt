@@ -578,6 +578,16 @@ target_sources(rpcs3_emu PRIVATE
     RSX/rsx_vertex_data.cpp
 )
 
+# RTX Remix backend: Win32 only (the runtime is a Windows d3d9.dll).
+if(WIN32)
+    target_sources(rpcs3_emu PRIVATE
+        RSX/Remix/RemixGSRender.cpp
+        RSX/Remix/RemixRuntime.cpp
+        RSX/Remix/RemixTransforms.cpp
+        RSX/Remix/RemixVertexDecode.cpp
+    )
+endif()
+
 if(NOT ANDROID AND NOT APPLE)
     target_sources(rpcs3_emu PRIVATE
         RSX/GL/GLCommonDecompiler.cpp

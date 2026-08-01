@@ -37,6 +37,9 @@
     <Filter Include="Emu\GPU\RSX\Null">
       <UniqueIdentifier>{4adca4fa-b90f-4662-9eb0-1d29cf3cd2eb}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Emu\GPU\RSX\Remix">
+      <UniqueIdentifier>{0d9c7a2e-6f31-4a54-9d1b-2a5b1c8f4e70}</UniqueIdentifier>
+    </Filter>
     <Filter Include="Emu\Audio\Null">
       <UniqueIdentifier>{1eae80f6-5aef-4049-81a0-bbfd7602f8f6}</UniqueIdentifier>
     </Filter>
@@ -251,6 +254,18 @@
     </ClCompile>
     <ClCompile Include="Emu\RSX\Null\NullGSRender.cpp">
       <Filter>Emu\GPU\RSX\Null</Filter>
+    </ClCompile>
+    <ClCompile Include="Emu\RSX\Remix\RemixGSRender.cpp">
+      <Filter>Emu\GPU\RSX\Remix</Filter>
+    </ClCompile>
+    <ClCompile Include="Emu\RSX\Remix\RemixRuntime.cpp">
+      <Filter>Emu\GPU\RSX\Remix</Filter>
+    </ClCompile>
+    <ClCompile Include="Emu\RSX\Remix\RemixTransforms.cpp">
+      <Filter>Emu\GPU\RSX\Remix</Filter>
+    </ClCompile>
+    <ClCompile Include="Emu\RSX\Remix\RemixVertexDecode.cpp">
+      <Filter>Emu\GPU\RSX\Remix</Filter>
     </ClCompile>
     <ClCompile Include="Emu\RSX\Common\surface_store.cpp">
       <Filter>Emu\GPU\RSX\Common</Filter>
@@ -1580,6 +1595,21 @@
     </ClInclude>
     <ClInclude Include="Emu\RSX\Null\NullGSRender.h">
       <Filter>Emu\GPU\RSX\Null</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\RSX\Remix\remix_c.h">
+      <Filter>Emu\GPU\RSX\Remix</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\RSX\Remix\RemixGSRender.h">
+      <Filter>Emu\GPU\RSX\Remix</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\RSX\Remix\RemixRuntime.h">
+      <Filter>Emu\GPU\RSX\Remix</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\RSX\Remix\RemixTransforms.h">
+      <Filter>Emu\GPU\RSX\Remix</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\RSX\Remix\RemixVertexDecode.h">
+      <Filter>Emu\GPU\RSX\Remix</Filter>
     </ClInclude>
     <ClInclude Include="Emu\RSX\Program\RSXFragmentProgram.h">
       <Filter>Emu\GPU\RSX\Program</Filter>

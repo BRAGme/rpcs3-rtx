@@ -57,6 +57,10 @@
 #include "Emu/RSX/Null/NullGSRender.h"
 #include "Emu/RSX/GL/GLGSRender.h"
 
+#ifdef _WIN32
+#include "Emu/RSX/Remix/RemixGSRender.h"
+#endif
+
 #if defined(HAVE_VULKAN)
 #include "Emu/RSX/VK/VKGSRender.h"
 #endif
@@ -613,6 +617,7 @@ std::unique_ptr<gs_frame> gui_application::get_gs_frame()
 	}
 	case video_renderer::null:
 	case video_renderer::vulkan:
+	case video_renderer::remix:
 	{
 		frame = new gs_frame(screen, frame_geometry, app_icon, m_gui_settings, m_start_games_fullscreen);
 		break;
@@ -700,6 +705,13 @@ void gui_application::InitializeCallbacks()
 		{
 #if defined(HAVE_VULKAN)
 			g_fxo->init<rsx::thread, named_thread<VKGSRender>>(ar);
+#endif
+			break;
+		}
+		case video_renderer::remix:
+		{
+#ifdef _WIN32
+			g_fxo->init<rsx::thread, named_thread<RemixGSRender>>(ar);
 #endif
 			break;
 		}

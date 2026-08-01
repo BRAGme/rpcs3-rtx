@@ -88,6 +88,14 @@ main_application::main_application()
 		Emu.SetDefaultRenderer(video_renderer::opengl);
 	}
 
+#ifdef _WIN32
+	// Without this, System.cpp silently downgrades the renderer back to the default at boot.
+	if (m_render_creator->Remix.supported)
+	{
+		supported_renderers.insert(video_renderer::remix);
+	}
+#endif
+
 	Emu.SetSupportedRenderers(supported_renderers);
 }
 
