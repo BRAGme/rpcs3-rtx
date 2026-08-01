@@ -503,6 +503,8 @@
     <ClCompile Include="Emu\RSX\Null\NullGSRender.cpp" />
     <ClCompile Include="Emu\RSX\Remix\RemixGSRender.cpp" />
     <ClCompile Include="Emu\RSX\Remix\RemixRuntime.cpp" />
+    <ClCompile Include="Emu\RSX\Remix\RemixCompositor.cpp" />
+    <ClCompile Include="Emu\RSX\Remix\RemixTextures.cpp" />
     <ClCompile Include="Emu\RSX\Remix\RemixTransforms.cpp" />
     <ClCompile Include="Emu\RSX\Remix\RemixVertexDecode.cpp" />
     <ClCompile Include="Emu\RSX\Overlays\overlays.cpp" />
@@ -1057,6 +1059,8 @@
     <ClInclude Include="Emu\RSX\Remix\remix_c.h" />
     <ClInclude Include="Emu\RSX\Remix\RemixGSRender.h" />
     <ClInclude Include="Emu\RSX\Remix\RemixRuntime.h" />
+    <ClInclude Include="Emu\RSX\Remix\RemixCompositor.h" />
+    <ClInclude Include="Emu\RSX\Remix\RemixTextures.h" />
     <ClInclude Include="Emu\RSX\Remix\RemixTransforms.h" />
     <ClInclude Include="Emu\RSX\Remix\RemixVertexDecode.h" />
     <ClInclude Include="Emu\RSX\Program\RSXFragmentProgram.h" />

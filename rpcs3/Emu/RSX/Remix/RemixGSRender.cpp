@@ -109,6 +109,8 @@ void RemixGSRender::on_exit()
 		{
 			remix_rsx::guarded_destroy_light(api.DestroyLight, m_debug_light);
 		}
+
+		m_textures.destroy_all(api);
 	}
 
 	m_debug_mesh = nullptr;
@@ -144,7 +146,9 @@ void RemixGSRender::flip(const rsx::display_flip_info_t& info)
 		m_split_attempts = 0;
 
 		++m_frame_counter;
+		m_textures.begin_frame();
 		reap_idle_meshes();
+		m_textures.reap(m_remix.api(), m_frame_counter);
 		log_stats();
 	}
 #endif
@@ -152,6 +156,14 @@ void RemixGSRender::flip(const rsx::display_flip_info_t& info)
 	// Always run the base flip: gs_frame::flip is what shows the window on the first frame
 	// and what drives the FPS readout in the title bar.
 	GSRender::flip(info);
+
+	// GSRender::flip only presents the window. rsx::thread::flip is what clears
+	// async_flip_requested (without it every later guest flip request is dropped), stamps
+	// last_host_flip_timestamp (the overlay refresh rate limit reads it) and clears the
+	// display interrupt so do_local_task runs every 64th cycle instead of every cycle.
+	// GL and VK both call it explicitly (GLPresent.cpp:518, VKPresent.cpp:966); GSRender::flip
+	// does not.
+	rsx::thread::flip(info);
 }
 
 void RemixGSRender::end()
@@ -353,6 +365,10 @@ void RemixGSRender::place_debug_light(const f32 (&position)[3])
 	sphere_light.position = { position[0], position[1], position[2] };
 	sphere_light.radius = remix_rsx::debug_light_radius();
 	sphere_light.shaping_hasvalue = 0;
+	// Zero-init leaves this at 0, but the runtime's own default is 1.0
+	// (rtx_lights.h kVolumetricRadianceScaleDefaultValue). At 0 the light contributes
+	// nothing volumetrically.
+	sphere_light.volumetricRadianceScale = 1.f;
 
 	const f32 radiance = remix_rsx::debug_light_radiance();
 
@@ -360,7 +376,11 @@ void RemixGSRender::place_debug_light(const f32 (&position)[3])
 	light_info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
 	light_info.pNext = &sphere_light;
 	light_info.hash = 0x3;
-	light_info.radiance = { radiance, radiance * 2.f, radiance };
+	// Neutral white. The 2x green came from NVIDIA's sample app ({100, 200, 100}); the runtime
+	// gives radiance no per-channel semantics, so it only tinted every judgement green.
+	// The default is deliberately not raised to compensate for the ~1.7x luma drop:
+	// RPCS3_REMIX_LIGHTRADIANCE covers it, and the right value is scene-scale dependent.
+	light_info.radiance = { radiance, radiance, radiance };
 
 	const u32 status = remix_rsx::guarded_create_light(api.CreateLight, &light_info, &m_debug_light);
 	if (status != REMIXAPI_ERROR_CODE_SUCCESS || !m_debug_light)
@@ -437,6 +457,39 @@ bool RemixGSRender::is_screen_space_draw() const
 	}
 
 	return remix_rsx::is_orthographic(outer) && !rsx::method_registers.depth_write_enabled();
+}
+
+int RemixGSRender::albedo_texture_unit() const
+{
+	// referenced_textures_mask comes from the fragment ucode disassembly that
+	// analyse_current_rsx_pipeline() already ran, so it costs nothing here. GL and VK iterate
+	// the same mask (GLDraw.cpp:301, VKDraw.cpp:286) rather than trusting enabled() alone.
+	u32 mask = current_fp_metadata.referenced_textures_mask;
+
+	for (u32 unit = 0; mask; mask >>= 1, ++unit)
+	{
+		if (!(mask & 1))
+		{
+			continue;
+		}
+
+		const auto& tex = rsx::method_registers.fragment_textures[unit];
+
+		if (!tex.enabled())
+		{
+			continue;
+		}
+
+		if (tex.get_extended_texture_dimension() != rsx::texture_dimension_extended::texture_dimension_2d)
+		{
+			// Cube / 3D albedo is out of scope for this milestone.
+			continue;
+		}
+
+		return static_cast<int>(unit);
+	}
+
+	return -1;
 }
 
 void RemixGSRender::update_camera_candidate()
@@ -986,6 +1039,42 @@ void RemixGSRender::submit_subdraw()
 		return;
 	}
 
+	// --- albedo material ----------------------------------------------------------------
+	// Resolved before the mesh hash because the material binds at CreateMesh time, so two
+	// draws that share geometry but not their texture must not share a mesh handle.
+	const auto& api = m_remix.api();
+
+	remixapi_MaterialHandle material = nullptr;
+	u64 albedo_hash = 0;
+
+	if (m_remix.fork_features())
+	{
+		if (const int unit = albedo_texture_unit(); unit >= 0)
+		{
+			const remix_rsx::texture_entry* entry = nullptr;
+			material = m_textures.bind(api, rsx::method_registers.fragment_textures[unit], m_frame_counter, &entry);
+
+			if (material && entry)
+			{
+				albedo_hash = entry->content_hash;
+				++m_stats.tex_bound;
+
+				if (remix_rsx::dump_enabled() && m_dumped_textures.insert(albedo_hash).second)
+				{
+					dump_texture(*entry, rsx::method_registers.fragment_textures[unit], static_cast<u32>(unit));
+				}
+			}
+			else
+			{
+				++m_stats.tex_none;
+			}
+		}
+		else
+		{
+			++m_stats.tex_none;
+		}
+	}
+
 	// --- content hash -> mesh handle ----------------------------------------------------
 	usz hash = rpcs3::fnv_seed;
 
@@ -1006,6 +1095,11 @@ void RemixGSRender::submit_subdraw()
 		{
 			hash = rpcs3::hash64(hash, m_current_vp_hash);
 		}
+
+		if (albedo_hash)
+		{
+			hash = rpcs3::hash64(hash, albedo_hash);
+		}
 	}
 
 	if (hash == 0)
@@ -1020,7 +1114,6 @@ void RemixGSRender::submit_subdraw()
 		return;
 	}
 
-	const auto& api = m_remix.api();
 	auto it = m_meshes.find(hash);
 
 	if (it == m_meshes.end())
@@ -1031,7 +1124,7 @@ void RemixGSRender::submit_subdraw()
 		surface.indices_values = m_scratch_indices.data();
 		surface.indices_count = m_scratch_indices.size();
 		surface.skinning_hasvalue = 0;
-		surface.material = nullptr;
+		surface.material = material;
 
 		remixapi_MeshInfo mesh_info{};
 		mesh_info.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
@@ -1187,6 +1280,31 @@ void RemixGSRender::dump_vertex_program(u32 vertex_count, u32 index_count)
 	}
 }
 
+void RemixGSRender::dump_texture(const remix_rsx::texture_entry& entry, const rsx::fragment_texture& tex, u32 unit)
+{
+	const std::string line = fmt::format(
+		"Remix tex=%016llX fmt=%02x %ux%u unit=%u mips=%u swizzled=%d pitch=%u loc=%u offset=0x%x wrap=%u,%u",
+		entry.content_hash,
+		u32{tex.format()} & ~(CELL_GCM_TEXTURE_LN | CELL_GCM_TEXTURE_UN),
+		entry.width,
+		entry.height,
+		unit,
+		u32{tex.get_exact_mipmap_count()},
+		(tex.format() & CELL_GCM_TEXTURE_LN) ? 0 : 1,
+		tex.pitch(),
+		u32{tex.location()},
+		tex.offset(),
+		u32{entry.wrap_u},
+		u32{entry.wrap_v});
+
+	rsx_log.notice("%s", line);
+
+	if (fs::file out{ fs::get_executable_dir() + "remix_dump.log", fs::write + fs::create + fs::append })
+	{
+		out.write(line + '\n');
+	}
+}
+
 void RemixGSRender::reap_idle_meshes()
 {
 	if (m_meshes.empty() || m_frame_counter < s_mesh_idle_frames)
@@ -1222,10 +1340,13 @@ void RemixGSRender::log_stats()
 		return;
 	}
 
+	const remix_rsx::texture_stats& tex = m_textures.stats();
+
 	rsx_log.notice(
 		"Remix stats: frame=%llu draws=%llu submitted=%llu meshes_live=%llu created=%llu destroyed=%llu poisoned=%llu | "
 		"cam_resolved=%llu cam_fallback=%llu arch=%s world_applied=%llu world_fallback=%llu | "
-		"skip screen=%llu immediate=%llu inline=%llu volatile=%llu reg_attr0=%llu prim=%llu restart=%llu instanced=%llu layout=%llu mem=%llu decode=%llu poison=%llu",
+		"skip screen=%llu immediate=%llu inline=%llu volatile=%llu reg_attr0=%llu prim=%llu restart=%llu instanced=%llu layout=%llu mem=%llu decode=%llu poison=%llu | "
+		"tex_bound=%llu tex_none=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_rehashed=%llu mat_created=%llu",
 		m_frame_counter,
 		m_stats.draws_seen,
 		m_stats.draws_submitted,
@@ -1249,7 +1370,18 @@ void RemixGSRender::log_stats()
 		m_stats.skip_layout,
 		m_stats.skip_memory,
 		m_stats.skip_decode,
-		m_stats.skip_poisoned);
+		m_stats.skip_poisoned,
+		m_stats.tex_bound,
+		m_stats.tex_none,
+		static_cast<u64>(m_textures.live()),
+		tex.created,
+		tex.destroyed,
+		tex.hits,
+		tex.deferred,
+		tex.unreadable,
+		tex.unsupported,
+		tex.rehashed,
+		tex.materials);
 }
 
 #endif

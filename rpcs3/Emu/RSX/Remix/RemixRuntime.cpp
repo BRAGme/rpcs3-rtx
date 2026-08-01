@@ -3,7 +3,27 @@
 
 #ifdef _WIN32
 
+#include "util/fnv_hash.hpp"
+
 #include <cstdlib>
+
+// ---------------------------------------------------------------------------------------------
+// Runtime provenance. The vendored header and the deployed runtime MUST come from the same
+// release tag, always in the same commit -- the API's version gate only compares the minor
+// number, so two builds of the same minor with a different interface layout would pass the
+// check and then misroute every slot after the first divergence.
+//
+//   Fork          : RemixProjGroup/dxvk-remix ("Remix Plus", maintainer Kim2091)
+//   Release tag   : remix-plus-1.5.1        (tag object f4173a9c8b94736363cb27c3bd228059780acbcf)
+//   Tagged commit : 8afa36fdecc60e8d3ec57b360e5fd14158b39aea
+//   API version   : 0.1000.0
+//   remix_c.h     : blob 3f4acf5f476bf96d71bdd09354ef0602b0a8e239, 54643 bytes
+//                   SHA-256 25296449789A483745E65E8A0110AACF134EA77E3AB608991DAA12A0FC9E7AE0
+//                   (byte-identical to public/include/remix/remix_c.h at that tag)
+//   Runtime asset : Remix_Plus_v1.5.1_x64_games_release.zip, deployed to <exe dir>\remix\
+//
+// Never update bin\remix\ without re-vendoring remix_c.h in the same commit.
+// ---------------------------------------------------------------------------------------------
 
 namespace remix_rsx
 {
@@ -55,6 +75,49 @@ namespace remix_rsx
 
 			return widen(fs::get_executable_dir() + "remix/d3d9.dll");
 		}
+
+		// Narrow a UTF-16 path for logging only.
+		std::string narrow(const std::wstring& src)
+		{
+			if (src.empty())
+			{
+				return {};
+			}
+
+			const int needed = WideCharToMultiByte(CP_UTF8, 0, src.c_str(), static_cast<int>(src.size()), nullptr, 0, nullptr, nullptr);
+			if (needed <= 0)
+			{
+				return {};
+			}
+
+			std::string result(static_cast<usz>(needed), '\0');
+			WideCharToMultiByte(CP_UTF8, 0, src.c_str(), static_cast<int>(src.size()), result.data(), needed, nullptr, nullptr);
+			return result;
+		}
+
+		// Identity of the DLL actually loaded, so a report can say which binary produced a run.
+		void log_dll_identity(const std::wstring& path)
+		{
+			const std::string narrow_path = narrow(path);
+
+			fs::file dll{narrow_path};
+			if (!dll)
+			{
+				rsx_log.warning("Remix: runtime DLL '%s' could not be opened for fingerprinting", narrow_path);
+				return;
+			}
+
+			const u64 size = dll.size();
+			const std::vector<u8> bytes = dll.to_vector<u8>();
+
+			usz hash = rpcs3::fnv_seed;
+			for (const u8 b : bytes)
+			{
+				hash = rpcs3::hash64(hash, b);
+			}
+
+			rsx_log.notice("Remix: runtime DLL '%s' size=%llu fnv1a=%016llx", narrow_path, size, static_cast<u64>(hash));
+		}
 	}
 
 	runtime::~runtime()
@@ -76,11 +139,20 @@ namespace remix_rsx
 			return false;
 		}
 
-		const remixapi_ErrorCode load_status = remixapi_lib_loadRemixDllAndInitialize(path.c_str(), &m_api, &m_dll);
+		log_dll_identity(path);
+
+		rsx_log.notice("Remix: header API version %u.%u.%u, sizeof(remixapi_Interface)=%llu (+%llu bytes slack)",
+			u32{REMIXAPI_VERSION_MAJOR}, u32{REMIXAPI_VERSION_MINOR}, u32{REMIXAPI_VERSION_PATCH},
+			static_cast<u64>(sizeof(remixapi_Interface)), static_cast<u64>(interface_slack_bytes));
+
+		const remixapi_ErrorCode load_status = remixapi_lib_loadRemixDllAndInitialize(path.c_str(), &m_storage.api, &m_dll);
 		if (load_status != REMIXAPI_ERROR_CODE_SUCCESS)
 		{
+			// INCOMPATIBLE_VERSION here is the header/runtime lockstep check doing its job:
+			// isVersionCompatible matches the minor exactly for 0.y.z, so both mismatch
+			// directions fail loudly instead of silently misrouting interface slots.
 			rsx_log.error("Remix: remixapi_lib_loadRemixDllAndInitialize failed (%s)", error_name(load_status));
-			m_api = {};
+			m_storage = {};
 			m_dll = nullptr;
 			return false;
 		}
@@ -93,27 +165,114 @@ namespace remix_rsx
 		startup_info.forceNoVkSwapchain = 0;
 		startup_info.editorModeEnabled = 0;
 
-		if (!m_api.Startup)
+		if (!m_storage.api.Startup)
 		{
 			rsx_log.error("Remix: runtime exposes no Startup entry point");
-			remixapi_lib_shutdownAndUnloadRemixDll(&m_api, m_dll);
-			m_api = {};
+			remixapi_lib_shutdownAndUnloadRemixDll(&m_storage.api, m_dll);
+			m_storage = {};
 			m_dll = nullptr;
 			return false;
 		}
 
-		const u32 startup_status = guarded_startup(m_api.Startup, &startup_info);
+		const u32 startup_status = guarded_startup(m_storage.api.Startup, &startup_info);
 		if (startup_status != REMIXAPI_ERROR_CODE_SUCCESS)
 		{
 			rsx_log.error("Remix: Startup failed (%s)", error_name(startup_status));
-			remixapi_lib_shutdownAndUnloadRemixDll(&m_api, m_dll);
-			m_api = {};
+			remixapi_lib_shutdownAndUnloadRemixDll(&m_storage.api, m_dll);
+			m_storage = {};
 			m_dll = nullptr;
 			return false;
 		}
 
 		m_ok = true;
+
+		// A stock (non-fork) runtime that somehow passed the version gate would leave these
+		// slots at the zeroed value the storage was constructed with, so a null check is a
+		// real detector and not just defensive noise.
+		m_fork_features = check_fork_slots() && probe_create_texture();
+
+		if (m_fork_features)
+		{
+			rsx_log.success("Remix: fork features available (CreateTexture/CreateMaterial/DrawScreenOverlay)");
+		}
+		else
+		{
+			rsx_log.error("Remix: fork features disabled -- running geometry-only (no textures, no UI compositor)");
+		}
+
 		rsx_log.success("Remix: runtime started on HWND 0x%x", reinterpret_cast<u64>(hwnd));
+		return true;
+	}
+
+	bool runtime::check_fork_slots()
+	{
+		struct slot
+		{
+			const char* name;
+			const void* fn;
+		};
+
+		const slot required[] =
+		{
+			{ "CreateTexture", reinterpret_cast<const void*>(m_storage.api.CreateTexture) },
+			{ "DestroyTexture", reinterpret_cast<const void*>(m_storage.api.DestroyTexture) },
+			{ "CreateMaterial", reinterpret_cast<const void*>(m_storage.api.CreateMaterial) },
+			{ "DestroyMaterial", reinterpret_cast<const void*>(m_storage.api.DestroyMaterial) },
+			{ "DrawScreenOverlay", reinterpret_cast<const void*>(m_storage.api.DrawScreenOverlay) },
+		};
+
+		bool all_present = true;
+
+		for (const slot& s : required)
+		{
+			if (!s.fn)
+			{
+				rsx_log.error("Remix: runtime does not expose %s -- not a Remix Plus runtime?", s.name);
+				all_present = false;
+			}
+		}
+
+		return all_present;
+	}
+
+	bool runtime::probe_create_texture()
+	{
+		// 2x2 RGBA8, distinctive content. If a slot were misrouted the call would land in an
+		// unrelated function; the SEH wrapper turns that into a loud degrade instead of a crash.
+		static constexpr u8 probe_pixels[16] =
+		{
+			0xFF, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF,
+			0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+		};
+
+		remixapi_TextureInfo info{};
+		info.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_INFO;
+		info.pNext = nullptr;
+		info.hash = 0x5250435333303031ull; // "RPCS3001"
+		info.width = 2;
+		info.height = 2;
+		info.depth = 1;
+		info.mipLevels = 1;
+		info.format = REMIXAPI_FORMAT_R8G8B8A8_UNORM;
+		info.data = probe_pixels;
+		info.dataSize = sizeof(probe_pixels);
+
+		remixapi_TextureHandle handle = nullptr;
+		const u32 status = guarded_create_texture(m_storage.api.CreateTexture, &info, &handle);
+
+		if (status != REMIXAPI_ERROR_CODE_SUCCESS)
+		{
+			rsx_log.error("Remix: CreateTexture probe failed (%s)", error_name(status));
+			return false;
+		}
+
+		rsx_log.notice("Remix: CreateTexture probe SUCCESS (handle %p)", handle);
+
+		if (handle)
+		{
+			guarded_destroy_texture(m_storage.api.DestroyTexture, handle);
+		}
+
 		return true;
 	}
 
@@ -121,15 +280,17 @@ namespace remix_rsx
 	{
 		if (!m_dll)
 		{
-			m_api = {};
+			m_storage = {};
 			m_ok = false;
+			m_fork_features = false;
 			return;
 		}
 
-		remixapi_lib_shutdownAndUnloadRemixDll(&m_api, m_dll);
-		m_api = {};
+		remixapi_lib_shutdownAndUnloadRemixDll(&m_storage.api, m_dll);
+		m_storage = {};
 		m_dll = nullptr;
 		m_ok = false;
+		m_fork_features = false;
 	}
 
 	u32 guarded_startup(PFN_remixapi_Startup fn, const remixapi_StartupInfo* info)
@@ -278,6 +439,108 @@ namespace remix_rsx
 		__try
 		{
 			return fn(info);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			return error_code_faulted;
+		}
+	}
+
+	u32 guarded_create_material(PFN_remixapi_CreateMaterial fn, const remixapi_MaterialInfo* info, remixapi_MaterialHandle* out_handle)
+	{
+		if (!fn)
+		{
+			return REMIXAPI_ERROR_CODE_NOT_INITIALIZED;
+		}
+
+		__try
+		{
+			return fn(info, out_handle);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			return error_code_faulted;
+		}
+	}
+
+	u32 guarded_destroy_material(PFN_remixapi_DestroyMaterial fn, remixapi_MaterialHandle handle)
+	{
+		if (!fn)
+		{
+			return REMIXAPI_ERROR_CODE_NOT_INITIALIZED;
+		}
+
+		__try
+		{
+			return fn(handle);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			return error_code_faulted;
+		}
+	}
+
+	u32 guarded_create_texture(PFN_remixapi_CreateTexture fn, const remixapi_TextureInfo* info, remixapi_TextureHandle* out_handle)
+	{
+		if (!fn)
+		{
+			return REMIXAPI_ERROR_CODE_NOT_INITIALIZED;
+		}
+
+		__try
+		{
+			return fn(info, out_handle);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			return error_code_faulted;
+		}
+	}
+
+	u32 guarded_destroy_texture(PFN_remixapi_DestroyTexture fn, remixapi_TextureHandle handle)
+	{
+		if (!fn)
+		{
+			return REMIXAPI_ERROR_CODE_NOT_INITIALIZED;
+		}
+
+		__try
+		{
+			return fn(handle);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			return error_code_faulted;
+		}
+	}
+
+	u32 guarded_draw_screen_overlay(PFN_remixapi_DrawScreenOverlay fn, const void* pixels, u32 width, u32 height, remixapi_Format format, f32 opacity)
+	{
+		if (!fn)
+		{
+			return REMIXAPI_ERROR_CODE_NOT_INITIALIZED;
+		}
+
+		__try
+		{
+			return fn(pixels, width, height, format, opacity);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			return error_code_faulted;
+		}
+	}
+
+	u32 guarded_set_config_variable(PFN_remixapi_SetConfigVariable fn, const char* key, const char* value)
+	{
+		if (!fn)
+		{
+			return REMIXAPI_ERROR_CODE_NOT_INITIALIZED;
+		}
+
+		__try
+		{
+			return fn(key, value);
 		}
 		__except (EXCEPTION_EXECUTE_HANDLER)
 		{

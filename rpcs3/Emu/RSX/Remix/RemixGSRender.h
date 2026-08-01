@@ -3,6 +3,7 @@
 
 #ifdef _WIN32
 #include "Emu/RSX/Remix/RemixRuntime.h"
+#include "Emu/RSX/Remix/RemixTextures.h"
 #include "Emu/RSX/Remix/RemixTransforms.h"
 
 #include <unordered_map>
@@ -55,6 +56,8 @@ private:
 		u64 cam_fallback = 0;
 		u64 world_applied = 0;
 		u64 world_fallback = 0;
+		u64 tex_bound = 0;
+		u64 tex_none = 0;
 	};
 
 	// The frame's best camera guess. Latched at flip and used for the whole next frame so
@@ -103,6 +106,9 @@ private:
 	// True when this draw is 2D / pre-projected and must not reach Remix.
 	bool is_screen_space_draw() const;
 
+	// Lowest referenced, enabled, 2D fragment texture unit for this draw, or -1.
+	int albedo_texture_unit() const;
+
 	// Per-draw object-to-world transform. False means "no transform available, use identity".
 	bool per_draw_transform(remixapi_Transform& out) const;
 
@@ -115,6 +121,10 @@ private:
 
 	// RPCS3_REMIX_DUMP=1: one line per unique vertex program, the permanent diagnostic.
 	void dump_vertex_program(u32 vertex_count, u32 index_count);
+
+	// RPCS3_REMIX_DUMP=1: one line per unique texture content hash. This is the line a
+	// modder reads to get the value they type into rtx.conf.
+	void dump_texture(const remix_rsx::texture_entry& entry, const rsx::fragment_texture& tex, u32 unit);
 
 	void reap_idle_meshes();
 	void log_stats();
@@ -130,8 +140,11 @@ private:
 	std::unordered_map<u64, mesh_entry> m_meshes;
 	std::unordered_set<u64> m_poisoned;
 
+	remix_rsx::texture_cache m_textures;
+
 	std::unordered_map<u64, remix_rsx::vp_fingerprint> m_vp_fingerprints;
 	std::unordered_set<u64> m_vp_dumped;
+	std::unordered_set<u64> m_dumped_textures;
 
 	// Identification of the draw clause currently being submitted. Set once in end(),
 	// because the vertex program cannot change between subdraws of one clause.

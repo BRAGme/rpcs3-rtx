@@ -261,6 +261,12 @@
     <ClCompile Include="Emu\RSX\Remix\RemixRuntime.cpp">
       <Filter>Emu\GPU\RSX\Remix</Filter>
     </ClCompile>
+    <ClCompile Include="Emu\RSX\Remix\RemixCompositor.cpp">
+      <Filter>Emu\GPU\RSX\Remix</Filter>
+    </ClCompile>
+    <ClCompile Include="Emu\RSX\Remix\RemixTextures.cpp">
+      <Filter>Emu\GPU\RSX\Remix</Filter>
+    </ClCompile>
     <ClCompile Include="Emu\RSX\Remix\RemixTransforms.cpp">
       <Filter>Emu\GPU\RSX\Remix</Filter>
     </ClCompile>
@@ -1603,6 +1609,12 @@
       <Filter>Emu\GPU\RSX\Remix</Filter>
     </ClInclude>
     <ClInclude Include="Emu\RSX\Remix\RemixRuntime.h">
+      <Filter>Emu\GPU\RSX\Remix</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\RSX\Remix\RemixCompositor.h">
+      <Filter>Emu\GPU\RSX\Remix</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\RSX\Remix\RemixTextures.h">
       <Filter>Emu\GPU\RSX\Remix</Filter>
     </ClInclude>
     <ClInclude Include="Emu\RSX\Remix\RemixTransforms.h">

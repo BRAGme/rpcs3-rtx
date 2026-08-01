@@ -581,8 +581,10 @@ target_sources(rpcs3_emu PRIVATE
 # RTX Remix backend: Win32 only (the runtime is a Windows d3d9.dll).
 if(WIN32)
     target_sources(rpcs3_emu PRIVATE
+        RSX/Remix/RemixCompositor.cpp
         RSX/Remix/RemixGSRender.cpp
         RSX/Remix/RemixRuntime.cpp
+        RSX/Remix/RemixTextures.cpp
         RSX/Remix/RemixTransforms.cpp
         RSX/Remix/RemixVertexDecode.cpp
     )
