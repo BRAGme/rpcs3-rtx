@@ -49,6 +49,11 @@ namespace remix_rsx
 		u64 draws() const { return m_draws; }
 		u64 frames() const { return m_frames; }
 
+		// Pixels the scalar rasterizer actually shaded. This is the compositor's real bill:
+		// draw counts say nothing when one full-screen blit outweighs a thousand glyphs.
+		u64 pixels() const { return m_pixels; }
+		void reset_pixels() { m_pixels = 0; }
+
 	private:
 		void blend(u32 x, u32 y, u32 src_bgra);
 
@@ -62,14 +67,25 @@ namespace remix_rsx
 
 		u64 m_draws = 0;
 		u64 m_frames = 0;
+		u64 m_pixels = 0;
 	};
 
 	// RPCS3_REMIX_NOUI=1 disables the compositor entirely.
 	bool compositor_disabled();
 
+	// RPCS3_REMIX_KEEPRT=1 restores the old behaviour of compositing the title's own
+	// render-target blits (its post-process chain) through the CPU rasterizer. Off by default:
+	// those draws are not UI, they cost a full-screen fill each, and they are what held Haze
+	// at 1.9 FPS. Provided so the change can be A/B'd in one run.
+	bool keep_render_target_blits();
+
 	// RPCS3_REMIX_UIPROBE=1 draws a fixed known pattern through DrawScreenOverlay instead of
 	// judging the call for the first time with real UI data flowing through it.
 	bool ui_probe_enabled();
+
+	// Ceiling on the compositor buffer's width in pixels; the height follows the window's
+	// aspect. RPCS3_REMIX_UIWIDTH overrides it, 0 removes the cap. Default 1920.
+	u32 compositor_max_width();
 }
 
 #endif

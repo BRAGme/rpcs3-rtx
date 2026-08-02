@@ -73,6 +73,18 @@ namespace remix_rsx
 		return value;
 	}
 
+	bool keep_render_target_blits()
+	{
+		static const bool value = []
+		{
+			wchar_t buffer[16]{};
+			const DWORD written = GetEnvironmentVariableW(L"RPCS3_REMIX_KEEPRT", buffer, static_cast<DWORD>(std::size(buffer)));
+			return written > 0 && written < std::size(buffer) && ::wcstol(buffer, nullptr, 10) != 0;
+		}();
+
+		return value;
+	}
+
 	bool ui_probe_enabled()
 	{
 		static const bool value = []
@@ -80,6 +92,28 @@ namespace remix_rsx
 			wchar_t buffer[16]{};
 			const DWORD written = GetEnvironmentVariableW(L"RPCS3_REMIX_UIPROBE", buffer, static_cast<DWORD>(std::size(buffer)));
 			return written > 0 && written < std::size(buffer) && ::wcstol(buffer, nullptr, 10) != 0;
+		}();
+
+		return value;
+	}
+
+	u32 compositor_max_width()
+	{
+		static const u32 value = []
+		{
+			wchar_t buffer[16]{};
+			const DWORD written = GetEnvironmentVariableW(L"RPCS3_REMIX_UIWIDTH", buffer, static_cast<DWORD>(std::size(buffer)));
+
+			if (written == 0 || written >= std::size(buffer))
+			{
+				// 1080p class. Everything this rasterizer draws is authored at the guest's own
+				// surface resolution (720p on both test titles) or, for rpcs3's overlays, a
+				// virtual 1280x720, so more pixels than this buy no detail at all.
+				return 1920u;
+			}
+
+			const long parsed = ::wcstol(buffer, nullptr, 10);
+			return (parsed >= 0) ? static_cast<u32>(parsed) : 1920u;
 		}();
 
 		return value;
@@ -129,6 +163,8 @@ namespace remix_rsx
 
 	void compositor::blend(u32 x, u32 y, u32 src_bgra)
 	{
+		++m_pixels;
+
 		const u32 alpha = (src_bgra >> 24) & 0xFF;
 
 		if (alpha == 0)

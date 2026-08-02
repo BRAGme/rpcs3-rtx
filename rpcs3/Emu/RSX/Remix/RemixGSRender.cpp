@@ -14,17 +14,35 @@
 #include "util/fnv_hash.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <numeric>
 #include <variant>
 
 namespace
 {
+	// Microsecond monotonic clock for the frame-time breakdown. Two reads per call site per
+	// frame, so the measurement itself is far below the resolution of what it measures.
+	inline u64 now_us()
+	{
+		return static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count());
+	}
+
+	// Ceiling on the tracked render-surface address set. A title rotates a handful of targets;
+	// this only stops a pathological guest from growing the set without bound.
+	constexpr usz s_max_tracked_surfaces = 256;
+
 	// Frames a mesh may go unreferenced before its handle is released.
 	constexpr u64 s_mesh_idle_frames = 300;
 
-	// How often the stats line is emitted, in flips.
+	// How often the stats line is emitted, in flips, and the wall-clock bound that also
+	// forces one so a stalled or sub-1-FPS renderer still reports.
 	constexpr u64 s_stats_interval_flips = 120;
+	constexpr u64 s_stats_interval_us = 2'000'000;
+
+	// How long flips may stop before end() says so.
+	constexpr u64 s_flip_stall_us = 2'000'000;
 
 	// Sanity ceiling on a single submitted mesh. Guards against a malformed draw clause
 	// turning into a multi-gigabyte allocation.
@@ -37,6 +55,87 @@ namespace
 
 	// Tolerance on the perspective row of a derived world transform.
 	constexpr f32 s_world_affine_tolerance = 0.02f;
+
+	// RPCS3_REMIX_UIDUMP=N logs the geometry of the first N textured UI draws: screen bbox and
+	// the raw (x,y,u,v) of the first triangle. A glyph batch whose per-quad UVs span the whole
+	// 0..1 atlas instead of one glyph cell is the "overlapping text" signature, and this is the
+	// only way to tell that apart from a positioning fault.
+	u32 ui_dump_limit()
+	{
+		static const u32 value = []() -> u32
+		{
+			wchar_t buffer[16]{};
+			const DWORD written = GetEnvironmentVariableW(L"RPCS3_REMIX_UIDUMP", buffer, static_cast<DWORD>(std::size(buffer)));
+
+			if (written == 0 || written >= std::size(buffer))
+			{
+				return 0;
+			}
+
+			const long parsed = ::wcstol(buffer, nullptr, 10);
+			return (parsed > 0) ? static_cast<u32>(parsed) : 0;
+		}();
+
+		return value;
+	}
+
+	// RPCS3_REMIX_UIDUMPVP=<hex vp hash> narrows the UI dump to one vertex program and makes it
+	// log every quad rather than the first triangle, and writes that draw's albedo texture out
+	// as a BMP once. Needed to tell "the glyph cell is right and the placement is wrong" from
+	// "the placement is right and the cell is wrong".
+	u64 ui_dump_vp()
+	{
+		static const u64 value = []() -> u64
+		{
+			wchar_t buffer[32]{};
+			const DWORD written = GetEnvironmentVariableW(L"RPCS3_REMIX_UIDUMPVP", buffer, static_cast<DWORD>(std::size(buffer)));
+
+			if (written == 0 || written >= std::size(buffer))
+			{
+				return 0;
+			}
+
+			return ::wcstoull(buffer, nullptr, 16);
+		}();
+
+		return value;
+	}
+
+	// 32-bit bottom-up BMP of a BGRA8 buffer. Debug only.
+	void write_bgra_bmp(const std::string& path, const u8* pixels, u32 width, u32 height)
+	{
+		fs::file out{ path, fs::rewrite };
+
+		if (!out || width == 0 || height == 0)
+		{
+			return;
+		}
+
+		const u32 image_bytes = width * height * 4;
+		const u32 file_bytes = 14 + 40 + image_bytes;
+
+		u8 header[54]{};
+		header[0] = 'B';
+		header[1] = 'M';
+		std::memcpy(header + 2, &file_bytes, 4);
+		const u32 offset = 54;
+		std::memcpy(header + 10, &offset, 4);
+		const u32 dib = 40;
+		std::memcpy(header + 14, &dib, 4);
+		std::memcpy(header + 18, &width, 4);
+		std::memcpy(header + 22, &height, 4);
+		const u16 planes = 1;
+		std::memcpy(header + 26, &planes, 2);
+		const u16 bpp = 32;
+		std::memcpy(header + 28, &bpp, 2);
+		std::memcpy(header + 34, &image_bytes, 4);
+		out.write(header, sizeof(header));
+
+		for (u32 y = height; y-- > 0;)
+		{
+			out.write(pixels + (usz{y} * width * 4), usz{width} * 4);
+		}
+	}
 
 	constexpr remixapi_Transform s_identity_transform =
 	{ {
@@ -133,6 +232,13 @@ void RemixGSRender::flip(const rsx::display_flip_info_t& info)
 #ifdef _WIN32
 	if (m_remix_ok)
 	{
+		const u64 flip_enter = now_us();
+
+		if (m_timing.window_start == 0)
+		{
+			m_timing.window_start = flip_enter;
+		}
+
 		submit_camera();
 
 		if (remix_rsx::ui_probe_enabled() && m_remix.fork_features() && !remix_rsx::compositor_disabled())
@@ -144,12 +250,19 @@ void RemixGSRender::flip(const rsx::display_flip_info_t& info)
 		// frame reaches the runtime in one call, before the present.
 		if (m_remix.fork_features() && !remix_rsx::compositor_disabled())
 		{
+			const u64 t0 = now_us();
 			composite_native_overlay();
+			m_timing.overlay += now_us() - t0;
 		}
 
+		const u64 t_submit = now_us();
 		submit_compositor();
+		m_timing.submit += now_us() - t_submit;
 
+		const u64 t_present = now_us();
 		const u32 status = remix_rsx::guarded_present(m_remix.api().Present, nullptr);
+		m_timing.present += now_us() - t_present;
+
 		if (status != REMIXAPI_ERROR_CODE_SUCCESS)
 		{
 			rsx_log.error("Remix: Present failed (%s)", remix_rsx::error_name(status));
@@ -165,6 +278,13 @@ void RemixGSRender::flip(const rsx::display_flip_info_t& info)
 		m_textures.begin_frame();
 		reap_idle_meshes();
 		m_textures.reap(m_remix.api(), m_frame_counter);
+
+		const u64 flip_exit = now_us();
+		m_timing.flip += flip_exit - flip_enter;
+		m_timing.window = flip_exit - m_timing.window_start;
+		++m_timing.frames;
+		m_last_flip_us = flip_exit;
+
 		log_stats();
 	}
 #endif
@@ -185,6 +305,36 @@ void RemixGSRender::flip(const rsx::display_flip_info_t& info)
 void RemixGSRender::do_local_task(rsx::FIFO::state state)
 {
 	rsx::thread::do_local_task(state);
+
+#ifdef _WIN32
+	// Stall heartbeat. This runs on every FIFO tick whether or not draws are arriving, so it
+	// reports even when the RSX thread is spinning on an empty ring - which end() cannot.
+	// 'state' is the FIFO's own verdict: empty means the guest has stopped submitting and the
+	// stall is upstream of this backend entirely.
+	if (m_remix_ok && m_last_flip_us && ((++m_end_calls) & 0x3FF) == 0)
+	{
+		if (const u64 now = now_us(); now - m_last_flip_us > s_flip_stall_us)
+		{
+			// 'ctrl' is the guest-visible FIFO ring control, inherited from GCM_context.
+			// get == put is the definition of "the guest has stopped submitting commands".
+			const RsxDmaControl* dma = ctrl;
+
+			rsx_log.error("Remix: no flip for %.1fs | fifo_state=%d in_begin_end=%d async_flip=0x%x "
+				"| draws=%llu meshes_live=%llu created=%llu | get=0x%x put=0x%x",
+				static_cast<f64>(now - m_last_flip_us) / 1e6,
+				static_cast<int>(state),
+				in_begin_end ? 1 : 0,
+				static_cast<u32>(async_flip_requested),
+				m_stats.draws_seen,
+				static_cast<u64>(m_meshes.size()),
+				m_stats.meshes_created,
+				dma ? static_cast<u32>(dma->get.load()) : 0u,
+				dma ? static_cast<u32>(dma->put.load()) : 0u);
+
+			m_last_flip_us = now;
+		}
+	}
+#endif
 
 	if (state == rsx::FIFO::state::lock_wait)
 	{
@@ -218,8 +368,46 @@ void RemixGSRender::end()
 		return;
 	}
 
+	// Heartbeat. If flips have stopped but draw clauses keep arriving, the RSX thread is alive
+	// and the stall is downstream of end(); if this never fires while the picture is frozen,
+	// the thread is stuck inside flip() or the guest stopped submitting altogether.
+	if (((++m_end_calls) & 0xFF) == 0 && m_last_flip_us)
+	{
+		if (const u64 now = now_us(); now - m_last_flip_us > s_flip_stall_us)
+		{
+			rsx_log.error("Remix: no flip for %.1fs, still receiving draws (draws=%llu meshes_live=%llu created=%llu tex_live=%llu)",
+				static_cast<f64>(now - m_last_flip_us) / 1e6,
+				m_stats.draws_seen,
+				static_cast<u64>(m_meshes.size()),
+				m_stats.meshes_created,
+				static_cast<u64>(m_textures.live()));
+
+			m_last_flip_us = now;
+		}
+	}
+
 	// Fills current_vp_metadata (referenced input mask) and the vertex program ucode.
 	analyse_current_rsx_pipeline();
+
+	// Remember every address the RSX has rendered into. A later screen-space draw that samples
+	// one of these is the title re-reading its own framebuffer - a post-process pass - not UI.
+	// See composite_ui_draw for why that distinction is the difference between 13 ms and 150 ms
+	// a frame. Recorded here because a blit samples a target that is no longer bound by then.
+	if (m_surface_addresses.size() < s_max_tracked_surfaces)
+	{
+		for (const u32 addr : get_color_surface_addresses())
+		{
+			if (addr)
+			{
+				m_surface_addresses.insert(addr);
+			}
+		}
+
+		if (const u32 z = get_zeta_surface_address())
+		{
+			m_surface_addresses.insert(z);
+		}
+	}
 
 	// The vertex program cannot change between subdraws of one clause, so identify it once.
 	m_current_vp_hash = current_vertex_program.data.empty()
@@ -257,7 +445,9 @@ void RemixGSRender::end()
 
 		if (m_vertex_layout.validate())
 		{
+			const u64 t0 = now_us();
 			submit_subdraw();
+			m_timing.draw += now_us() - t0;
 		}
 		else
 		{
@@ -614,9 +804,15 @@ RemixGSRender::attribute_status RemixGSRender::map_attribute(u32 index, u32 firs
 
 bool RemixGSRender::compositor_target(u32& width, u32& height) const
 {
-	// Measured, not assumed: DrawScreenOverlay composites the buffer 1:1 in output pixels and
-	// does not stretch it, so the buffer has to be the window's client size or the UI lands in
-	// the top-left corner at the wrong scale. The guest's own surface is only the fallback.
+	// DrawScreenOverlay does NOT require client-sized pixels. Read from the fork's own source:
+	// dispatchScreenOverlay (rtx_fork_overlay.cpp) dispatches over the *final output* extent
+	// and screen_overlay.comp.slang samples this buffer with normalised UVs -
+	// uv = (threadId + 0.5) / imageSize - through a LINEAR / CLAMP_TO_EDGE sampler. So any
+	// resolution is stretched to fill the output. The M4 note that it composites 1:1 and lands
+	// in the top-left corner was wrong; the only thing that has to match is the aspect ratio,
+	// because the stretch is independent per axis.
+	//
+	// The window is still what sets the aspect. The guest's own surface is only the fallback.
 	u32 w = m_frame ? static_cast<u32>(std::max(0, m_frame->client_width())) : 0;
 	u32 h = m_frame ? static_cast<u32>(std::max(0, m_frame->client_height())) : 0;
 
@@ -624,6 +820,16 @@ bool RemixGSRender::compositor_target(u32& width, u32& height) const
 	{
 		w = rsx::method_registers.surface_clip_width();
 		h = rsx::method_registers.surface_clip_height();
+	}
+
+	// A 1280x720 window at 192 DPI has a 2560x1440 client area, so the scalar CPU rasterizer
+	// was paying for 3.7 M pixels per full-screen layer to display a 720p image. Cap the width
+	// and let the height follow the aspect: 2560x1440 becomes 1920x1080, 1.8x fewer pixels,
+	// and the compute pass stretches it back with no visible change.
+	if (const u32 cap = remix_rsx::compositor_max_width(); cap != 0 && w > cap && h != 0)
+	{
+		h = std::max<u32>(1, static_cast<u32>((u64{h} * cap) / w));
+		w = cap;
 	}
 
 	width = w;
@@ -800,7 +1006,24 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 	if (const int unit = albedo_texture_unit(); unit >= 0)
 	{
 		const auto& tex = rsx::method_registers.fragment_textures[unit];
-		m_textures.bind(m_remix.api(), tex, m_frame_counter, &entry);
+
+		// A full-screen quad sampling something the RSX itself rendered into is a post-process
+		// pass (tone map, bloom, colour grade), not UI. Compositing it is wrong twice over:
+		// Remix already owns the final image, and with 'Write Color Buffers' off the guest copy
+		// of that surface holds stale bytes anyway. It is also what makes this path unusable -
+		// each one is a full compositor-buffer fill through the scalar rasterizer, ~20 ms at
+		// 1920x1083, and Haze issues three to seven of them per frame.
+		if (!remix_rsx::keep_render_target_blits() &&
+			m_surface_addresses.contains(rsx::get_address(tex.offset(), tex.location())))
+		{
+			++m_stats.ui_render_target;
+			return;
+		}
+
+		// refresh_pixels: this path rasterizes from the CPU copy, and a title that rewrites a
+		// font atlas under a stable descriptor otherwise keeps the page that was resident when
+		// the entry was created. Only the CPU copy is rebuilt, so no mesh key moves.
+		m_textures.bind(m_remix.api(), tex, m_frame_counter, &entry, true);
 
 		if (entry && entry->pixels.empty())
 		{
@@ -824,6 +1047,7 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 	// --- flat tint ----------------------------------------------------------------------
 	// Per-vertex interpolation is out of scope; vertex 0's colour is the whole draw's tint.
 	u32 tint = 0xFFFFFFFFu;
+	bool have_colour = false;
 
 	if (attribute_view colours{}; map_attribute(3, first_vertex, vertex_count, colours) == attribute_status::ok)
 	{
@@ -831,6 +1055,7 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 
 		if (remix_rsx::decode_position(colours.at(0), colours.type, colours.size, rgba))
 		{
+			have_colour = true;
 			const auto channel = [](f32 v)
 			{
 				return static_cast<u32>(std::clamp(v, 0.f, 1.f) * 255.f + 0.5f);
@@ -841,7 +1066,47 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 		}
 	}
 
+	// Neither an albedo texture nor a vertex colour: the draw's colour lives somewhere this
+	// compositor cannot read (a vertex/fragment program constant). Filling it with the default
+	// white tint at alpha 1 paints an opaque slab over everything behind it, which is exactly
+	// the symptom M4 shipped. Refusing and counting is the honest fallback.
+	// Note the texture only counts when texcoords were resolved too: draw_triangle is handed
+	// 'have_uv ? entry : nullptr', so a texture without UVs rasterizes as flat tint just the
+	// same.
+	if (!(entry && have_uv) && !have_colour)
+	{
+		++m_stats.ui_no_colour;
+		return;
+	}
+
 	const bool clamp_uv = entry && (entry->wrap_u == 0 || entry->wrap_v == 0);
+
+	// Diagnostic: remember the draw covering the most screen area this stats window, with the
+	// albedo unit and pixel count it resolved. A large draw with unit=-1 / pixels=0 is a draw
+	// the rasterizer fills with flat tint, which is the white-slab signature.
+	{
+		f32 sx_lo = +3.4e38f, sx_hi = -3.4e38f, sy_lo = +3.4e38f, sy_hi = -3.4e38f;
+
+		for (u32 i = 0; i < vertex_count; ++i)
+		{
+			sx_lo = std::min(sx_lo, m_scratch_ui_x[i]);
+			sx_hi = std::max(sx_hi, m_scratch_ui_x[i]);
+			sy_lo = std::min(sy_lo, m_scratch_ui_y[i]);
+			sy_hi = std::max(sy_hi, m_scratch_ui_y[i]);
+		}
+
+		if (const f32 area = (sx_hi - sx_lo) * (sy_hi - sy_lo); area > m_ui_biggest.area)
+		{
+			m_ui_biggest.area = area;
+			m_ui_biggest.vp_hash = m_current_vp_hash;
+			m_ui_biggest.unit = albedo_texture_unit();
+			m_ui_biggest.pixels = entry ? entry->pixels.size() : 0;
+			m_ui_biggest.verts = vertex_count;
+			m_ui_biggest.inputs = u32{current_vp_metadata.referenced_inputs_mask};
+			m_ui_biggest.tint = tint;
+			m_ui_biggest.have_uv = have_uv;
+		}
+	}
 
 	for (usz t = 0; (t + 2) < m_scratch_indices.size(); t += 3)
 	{
@@ -872,6 +1137,112 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 				u[c] = uv[0] * uv_scale[0];
 				v[c] = uv[1] * uv_scale[1];
 			}
+		}
+
+		if (t == 0 && entry && have_uv && ui_dump_vp() != 0 && m_current_vp_hash == ui_dump_vp() &&
+			m_ui_dumped < ui_dump_limit())
+		{
+			++m_ui_dumped;
+
+			if (m_ui_dumped == 1)
+			{
+				write_bgra_bmp(fs::get_executable_dir() + "remix_atlas.bmp",
+					entry->pixels.data(), entry->width, entry->height);
+
+				// Which unit the fragment program actually samples is an assumption
+				// (albedo_texture_unit takes the lowest referenced+enabled 2D unit). List every
+				// unit so a mismatch between the sampled atlas and the authored UVs is visible.
+				std::string units = fmt::format("Remix ui-units: chosen=%d fp_mask=0x%x",
+					albedo_texture_unit(), u32{current_fp_metadata.referenced_textures_mask});
+
+				for (u32 unit = 0; unit < 16; ++unit)
+				{
+					const auto& t = rsx::method_registers.fragment_textures[unit];
+
+					if (!t.enabled())
+					{
+						continue;
+					}
+
+					fmt::append(units, " | u%u %ux%u fmt=%02x mips=%u dim=%u ref=%d", unit,
+						u32{t.width()}, u32{t.height()},
+						u32{t.format()} & ~(CELL_GCM_TEXTURE_LN | CELL_GCM_TEXTURE_UN),
+						u32{t.get_exact_mipmap_count()},
+						static_cast<u32>(t.get_extended_texture_dimension()),
+						(current_fp_metadata.referenced_textures_mask >> unit) & 1);
+				}
+
+				rsx_log.notice("%s", units);
+			}
+
+			// Every quad, in vertex order: two triangles per quad, so vertices 4n..4n+3.
+			std::string line = fmt::format("Remix ui-quads[%u]: vp=%016llx tex=%ux%u verts=%u",
+				m_ui_dumped, m_current_vp_hash, entry->width, entry->height, vertex_count);
+
+			for (u32 i = 0; i < vertex_count; ++i)
+			{
+				f32 uvq[4]{};
+
+				if (!remix_rsx::decode_position(uvs.at(i), uvs.type, uvs.size, uvq))
+				{
+					break;
+				}
+
+				fmt::append(line, " [%u](%.1f,%.1f,%.4f,%.4f)", i,
+					m_scratch_ui_x[i], m_scratch_ui_y[i], uvq[0] * uv_scale[0], uvq[1] * uv_scale[1]);
+			}
+
+			rsx_log.notice("%s", line);
+		}
+
+		if (t == 0 && entry && have_uv && ui_dump_vp() == 0 && m_ui_dumped < ui_dump_limit())
+		{
+			++m_ui_dumped;
+
+			f32 u_lo = +3.4e38f, u_hi = -3.4e38f, v_lo = +3.4e38f, v_hi = -3.4e38f;
+
+			for (u32 i = 0; i < vertex_count; ++i)
+			{
+				f32 uv[4]{};
+
+				if (!remix_rsx::decode_position(uvs.at(i), uvs.type, uvs.size, uv))
+				{
+					break;
+				}
+
+				u_lo = std::min(u_lo, uv[0] * uv_scale[0]);
+				u_hi = std::max(u_hi, uv[0] * uv_scale[0]);
+				v_lo = std::min(v_lo, uv[1] * uv_scale[1]);
+				v_hi = std::max(v_hi, uv[1] * uv_scale[1]);
+			}
+
+			f32 x_lo = +3.4e38f, x_hi = -3.4e38f, y_lo = +3.4e38f, y_hi = -3.4e38f;
+
+			for (u32 i = 0; i < vertex_count; ++i)
+			{
+				x_lo = std::min(x_lo, m_scratch_ui_x[i]);
+				x_hi = std::max(x_hi, m_scratch_ui_x[i]);
+				y_lo = std::min(y_lo, m_scratch_ui_y[i]);
+				y_hi = std::max(y_hi, m_scratch_ui_y[i]);
+			}
+
+			rsx_log.notice(
+				"Remix ui-dump[%u]: vp=%016llx verts=%u tris=%llu tex=%ux%u uvtype=%u/%u uvscale=%.5f,%.5f "
+				"box=[%.1f,%.1f]..[%.1f,%.1f] uvbox=[%.4f,%.4f]..[%.4f,%.4f] "
+				"t0=(%.1f,%.1f,%.4f,%.4f)(%.1f,%.1f,%.4f,%.4f)(%.1f,%.1f,%.4f,%.4f) tint=%08X",
+				m_ui_dumped,
+				m_current_vp_hash,
+				vertex_count,
+				static_cast<u64>(m_scratch_indices.size() / 3),
+				entry->width, entry->height,
+				static_cast<u32>(uvs.type), u32{uvs.size},
+				uv_scale[0], uv_scale[1],
+				x_lo, y_lo, x_hi, y_hi,
+				u_lo, v_lo, u_hi, v_hi,
+				x[0], y[0], u[0], v[0],
+				x[1], y[1], u[1], v[1],
+				x[2], y[2], u[2], v[2],
+				tint);
 		}
 
 		m_compositor.draw_triangle(x, y, u, v, have_uv ? entry : nullptr, tint, clamp_uv);
@@ -1852,7 +2223,9 @@ void RemixGSRender::submit_subdraw()
 
 		if (compositing)
 		{
+			const u64 t0 = now_us();
 			composite_ui_draw(first_vertex, vertex_count);
+			m_timing.ui += now_us() - t0;
 		}
 
 		return;
@@ -2266,7 +2639,10 @@ void RemixGSRender::reap_idle_meshes()
 
 void RemixGSRender::log_stats()
 {
-	if ((m_frame_counter % s_stats_interval_flips) != 0)
+	// Flip count OR wall clock, whichever comes first. A fixed 120-flip interval reports once
+	// a minute at 2 FPS and never at all if flips stop, which is exactly the regime that needs
+	// watching, so the time bound is what makes this instrument usable during a stall.
+	if (m_timing.frames < s_stats_interval_flips && m_timing.window < s_stats_interval_us)
 	{
 		return;
 	}
@@ -2278,8 +2654,8 @@ void RemixGSRender::log_stats()
 		"cam_resolved=%llu cam_fallback=%llu arch=%s world_applied=%llu world_fallback=%llu | "
 		"skip screen=%llu immediate=%llu inline=%llu volatile=%llu reg_attr0=%llu prim=%llu restart=%llu instanced=%llu layout=%llu mem=%llu decode=%llu poison=%llu vp=%llu | "
 		"skin_submitted=%llu skin_skipped=%llu skin_bones_max=%llu | "
-		"tex_bound=%llu tex_none=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_rehashed=%llu mat_created=%llu | "
-		"ui_draws=%llu ui_skipped=%llu ui_prims=%llu ui_frames=%llu",
+		"tex_bound=%llu tex_none=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_rehashed=%llu tex_refreshed=%llu mat_created=%llu | "
+		"ui_draws=%llu ui_skipped=%llu ui_no_colour=%llu ui_rt=%llu ui_prims=%llu ui_frames=%llu",
 		m_frame_counter,
 		m_stats.draws_seen,
 		m_stats.draws_submitted,
@@ -2318,11 +2694,54 @@ void RemixGSRender::log_stats()
 		tex.unreadable,
 		tex.unsupported,
 		tex.rehashed,
+		tex.refreshed,
 		tex.materials,
 		m_stats.ui_draws,
 		m_stats.ui_skipped,
+		m_stats.ui_no_colour,
+		m_stats.ui_render_target,
 		m_compositor.draws(),
 		m_compositor.frames());
+
+	// Where the RSX thread's wall clock actually went, per frame, over this window. 'other' is
+	// window - flip: everything outside flip(), which is FIFO decode plus any guest stall.
+	// 'ui' is measured inside 'draw', not alongside it.
+	{
+		const f64 n = static_cast<f64>(std::max<u64>(1, m_timing.frames));
+		const auto ms = [n](u64 us) { return static_cast<f64>(us) / 1000.0 / n; };
+
+		rsx_log.notice(
+			"Remix timing: frames=%llu frame_ms=%.2f | flip=%.2f (overlay=%.2f submit=%.2f present=%.2f) | draw=%.2f (ui=%.2f) | other=%.2f | ui_px/frame=%.0f",
+			m_timing.frames,
+			ms(m_timing.window),
+			ms(m_timing.flip),
+			ms(m_timing.overlay),
+			ms(m_timing.submit),
+			ms(m_timing.present),
+			ms(m_timing.draw),
+			ms(m_timing.ui),
+			ms(m_timing.window > m_timing.flip ? m_timing.window - m_timing.flip : 0),
+			static_cast<f64>(m_compositor.pixels()) / n);
+
+		m_timing = {};
+		m_compositor.reset_pixels();
+	}
+
+	if (m_ui_biggest.area > 0.f)
+	{
+		rsx_log.notice(
+			"Remix ui-biggest: vp=%016llx area=%.0fpx verts=%u inputs=0x%x unit=%d pixels=%llu uv=%d tint=%08X",
+			m_ui_biggest.vp_hash,
+			m_ui_biggest.area,
+			m_ui_biggest.verts,
+			m_ui_biggest.inputs,
+			m_ui_biggest.unit,
+			static_cast<u64>(m_ui_biggest.pixels),
+			m_ui_biggest.have_uv ? 1 : 0,
+			m_ui_biggest.tint);
+
+		m_ui_biggest = {};
+	}
 }
 
 #endif

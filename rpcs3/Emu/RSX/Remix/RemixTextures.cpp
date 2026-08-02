@@ -233,7 +233,8 @@ namespace remix_rsx
 	remixapi_MaterialHandle texture_cache::bind(const remixapi_Interface& api,
 		const rsx::fragment_texture& tex,
 		u64 frame,
-		const texture_entry** out_entry)
+		const texture_entry** out_entry,
+		bool refresh_pixels)
 	{
 		if (out_entry)
 		{
@@ -302,6 +303,48 @@ namespace remix_rsx
 			if (!stale)
 			{
 				++m_stats.hits;
+
+				// The CPU copy is what the compositor rasterizes from, and a title that
+				// rewrites a font atlas in place under a stable descriptor leaves it holding
+				// the page that happened to be resident on first sight. Measured on Haze
+				// BLUS30094: the 512x512 B8 glyph sheet the menu samples is rewritten, and
+				// without this the menu renders as overlapping glyph rows because the UVs
+				// address a page the cached bytes no longer contain.
+				//
+				// Full hash rather than the strided sample: a font page swap changes a small
+				// fraction of the bytes and the sample misses it. 512x512 B8 is 256 KiB, which
+				// is far below what the scalar rasterizer downstream already costs.
+				if (refresh_pixels && texture_rehash_mode() == 0 && !entry.pixels.empty())
+				{
+					const u32 address = rsx::get_address(desc.offset, desc.location);
+					const u32 length = static_cast<u32>(std::min<usz>(rsx::get_texture_size(tex), 0x4000000));
+
+					if (length && vm::check_addr(address, vm::page_readable, length))
+					{
+						if (const u64 full = fnv_bytes(vm::_ptr<const u8>(address), length, rpcs3::fnv_seed);
+							full != entry.content_refresh)
+						{
+							// decode() rewrites content_hash and fingerprint as well as the
+							// pixels. content_hash is folded into the mesh key
+							// (RemixGSRender albedo_hash), so letting it move here would
+							// re-key every mesh that shares this texture - the very churn
+							// that made the global rehash policy unusable. Restore both; the
+							// Remix texture/material handles are untouched either way, so the
+							// GPU side stays exactly as it was.
+							const u64 keep_hash = entry.content_hash;
+							const u64 keep_fingerprint = entry.fingerprint;
+
+							if (decode(tex, entry))
+							{
+								++m_stats.refreshed;
+							}
+
+							entry.content_hash = keep_hash;
+							entry.fingerprint = keep_fingerprint;
+							entry.content_refresh = full;
+						}
+					}
+				}
 
 				if (out_entry)
 				{
@@ -464,7 +507,13 @@ namespace remix_rsx
 						continue;
 					}
 
-					// bcdec writes 0xAABBGGRR words, i.e. RGBA byte order.
+					// rpcs3's bcdec fork writes 0xAARRGGBB words (3rdparty/bcdec/bcdec.hpp
+					// bcdec__color_block: refColors[n] = 0xFF000000 | (r << 16) | (g << 8) | b),
+					// which on a little-endian host is already B,G,R,A in memory - the same
+					// order this cache hands to the compositor and to CreateTexture. The stale
+					// "0xAABBGGRR" comment is upstream bcdec's; rpcs3 swapped r and b in its
+					// copy so that its own BGRA8 backends need no fixup. Re-swapping here was
+					// the R/B inversion that made yellow read as cyan.
 					u8 block[4 * 4 * 4];
 
 					switch (gcm_format)
@@ -495,10 +544,8 @@ namespace remix_rsx
 							const u8* texel = block + (y * 16) + (x * 4);
 							u8* dst = out.pixels.data() + ((usz{dst_y} * width + dst_x) * 4);
 
-							dst[0] = texel[2]; // B
-							dst[1] = texel[1]; // G
-							dst[2] = texel[0]; // R
-							dst[3] = texel[3]; // A
+							// Already B,G,R,A - straight copy.
+							std::memcpy(dst, texel, 4);
 						}
 					}
 				}

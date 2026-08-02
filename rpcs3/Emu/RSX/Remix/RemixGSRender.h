@@ -64,10 +64,45 @@ private:
 		u64 tex_none = 0;
 		u64 ui_draws = 0;
 		u64 ui_skipped = 0;
+		u64 ui_no_colour = 0;
+		u64 ui_render_target = 0;
 		u64 skin_submitted = 0;
 		u64 skin_skipped = 0;
 		u64 skin_bones_max = 0;
 		u64 skip_vp = 0;
+	};
+
+	// Wall-clock breakdown of the RSX thread's frame, in microseconds, accumulated over one
+	// stats window. A frame-time collapse in which no CPU thread is busy is a *wait*, not
+	// work, and only a per-call clock says which call is doing the waiting. 'window' is the
+	// real elapsed time the frames covered, so 'window - flip' is everything the RSX thread
+	// did outside flip() (FIFO decode, draw submission, guest stalls).
+	struct frame_timing
+	{
+		u64 window_start = 0;
+		u64 window = 0;
+		u64 frames = 0;
+		u64 flip = 0;
+		u64 overlay = 0;  // composite_native_overlay: CPU rasterize of rpcs3's own UI
+		u64 submit = 0;   // submit_compositor -> DrawScreenOverlay
+		u64 present = 0;  // guarded_present
+		u64 ui = 0;       // composite_ui_draw, summed over the frame
+		u64 draw = 0;     // submit_subdraw, summed over the frame
+	};
+
+	// Diagnostic only: the widest-covering UI draw seen in the current stats window. The
+	// white-slab symptom is "a large 2D draw resolved no albedo unit", so the unit, the pixel
+	// count behind it and the attribute mask that fed it are exactly what names the cause.
+	struct ui_biggest_draw
+	{
+		f32 area = 0.f;
+		u64 vp_hash = 0;
+		int unit = -1;
+		usz pixels = 0;
+		u32 verts = 0;
+		u32 inputs = 0;
+		u32 tint = 0;
+		bool have_uv = false;
 	};
 
 	// One vertex attribute located inside its interleaved block, with the guest span it
@@ -212,11 +247,22 @@ private:
 	std::unordered_map<u64, mesh_entry> m_meshes;
 	std::unordered_set<u64> m_poisoned;
 
+	// Guest addresses the RSX has bound as a colour or depth surface. A screen-space draw
+	// sampling one of these is the title compositing its own framebuffer, which the Remix
+	// path already produces; see composite_ui_draw.
+	std::unordered_set<u32> m_surface_addresses;
+
 	remix_rsx::texture_cache m_textures;
 	remix_rsx::compositor m_compositor;
 
 	// True once begin_frame() has run for the frame currently being built.
 	bool m_compositor_open = false;
+
+	// Diagnostic accumulator, reset every time it is logged.
+	ui_biggest_draw m_ui_biggest{};
+
+	// How many RPCS3_REMIX_UIDUMP lines have been emitted so far.
+	u32 m_ui_dumped = 0;
 
 	std::unordered_map<u64, remix_rsx::vp_fingerprint> m_vp_fingerprints;
 	std::unordered_set<u64> m_vp_dumped;
@@ -258,6 +304,13 @@ private:
 	bool m_ui_resources_loaded = false;
 
 	stat_counters m_stats{};
+	frame_timing m_timing{};
 	u64 m_frame_counter = 0;
+
+	// Flip heartbeat. When the picture stops moving, "blocked inside Present", "grinding
+	// through draws without ever reaching flip" and "the guest stopped asking to flip" are
+	// indistinguishable from outside the process; end() checks these to tell them apart.
+	u64 m_last_flip_us = 0;
+	u64 m_end_calls = 0;
 #endif
 };

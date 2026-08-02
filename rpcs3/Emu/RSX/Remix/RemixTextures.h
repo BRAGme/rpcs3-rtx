@@ -53,6 +53,12 @@ namespace remix_rsx
 		// in place (animated water/fire) is noticed without rehashing megabytes.
 		u64 fingerprint = 0;
 
+		// Full hash of the guest range as of the last CPU-pixel refresh (bind's
+		// 'refresh_pixels' path). Separate from 'fingerprint' so the two staleness policies
+		// never overwrite each other, and separate from 'content_hash' because that one is
+		// folded into the mesh key and must not move when only the CPU copy is rebuilt.
+		u64 content_refresh = 0;
+
 		u32 width = 0;
 		u32 height = 0;
 
@@ -76,6 +82,7 @@ namespace remix_rsx
 		u64 unreadable = 0;
 		u64 unsupported = 0;
 		u64 rehashed = 0;
+		u64 refreshed = 0;
 		u64 materials = 0;
 	};
 
@@ -93,10 +100,19 @@ namespace remix_rsx
 		// Resolves the bound unit to a material. Returns nullptr when the draw should be
 		// submitted without one (unreadable, unsupported, over budget or disabled).
 		// 'out_entry' is set on success and stays valid until the next reap.
+		//
+		// 'refresh_pixels' re-checks the guest bytes on a cache hit and re-decodes the CPU
+		// copy in place when they changed, leaving the Remix texture/material handles alone.
+		// The UI compositor needs this: titles rewrite a font atlas under a stable descriptor,
+		// and the global RPCS3_REMIX_TEXREHASH policy cannot be turned on to catch it because
+		// it rebuilds the handles, which changes the albedo hash folded into the mesh key and
+		// explodes 3D mesh churn (see texture_rehash_mode's note). Refreshing only the CPU
+		// pixels has no effect on any mesh key.
 		remixapi_MaterialHandle bind(const remixapi_Interface& api,
 			const rsx::fragment_texture& tex,
 			u64 frame,
-			const texture_entry** out_entry);
+			const texture_entry** out_entry,
+			bool refresh_pixels = false);
 
 		void reap(const remixapi_Interface& api, u64 frame);
 		void destroy_all(const remixapi_Interface& api);
