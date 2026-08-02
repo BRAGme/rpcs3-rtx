@@ -27,6 +27,14 @@ public:
 	void flip(const rsx::display_flip_info_t& info) override;
 	void do_local_task(rsx::FIFO::state state) override;
 
+	// Guest-thread entry point (rsx::g_access_violation_handler, called from the host fault
+	// handler in Utilities/Thread.cpp). MUST be implemented: rsx::reports::ZCULL_control marks the
+	// occlusion-report page PROT_NONE while a query is in flight, and the only thing that ever
+	// unmarks it is this callback. Without it the guest re-faults on that page forever, and because
+	// the fault path sets cpu_flag::temp the spinning thread can never acknowledge cpu_flag::suspend,
+	// which wedges lv2's g_pending and freezes the whole emulated machine.
+	bool on_access_violation(u32 address, bool is_writing) override;
+
 private:
 	void end() override;
 
@@ -312,5 +320,8 @@ private:
 	// indistinguishable from outside the process; end() checks these to tell them apart.
 	u64 m_last_flip_us = 0;
 	u64 m_end_calls = 0;
+
+	// How many guest-thread forensics dumps the stall path has already emitted.
+	u32 m_stall_dumps = 0;
 #endif
 };

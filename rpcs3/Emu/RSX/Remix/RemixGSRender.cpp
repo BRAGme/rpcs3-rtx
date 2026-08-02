@@ -1,9 +1,15 @@
 #include "stdafx.h"
 #include "RemixGSRender.h"
+#include "Emu/RSX/Host/MM.h"
 
 #ifdef _WIN32
 
+#include "Emu/Cell/PPUThread.h"
+#include "Emu/Cell/SPUThread.h"
+#include "Emu/Cell/lv2/sys_sync.h"
+#include "Emu/IdManager.h"
 #include "Emu/Memory/vm.h"
+#include "Emu/Memory/vm_locking.h"
 #include "Emu/RSX/Common/BufferUtils.h"
 #include "Emu/RSX/Program/ProgramStateCache.h"
 #include "Emu/RSX/Remix/RemixVertexDecode.h"
@@ -11,7 +17,10 @@
 #include "Emu/RSX/Overlays/overlays.h"
 #include "Emu/RSX/rsx_methods.h"
 #include "Emu/RSX/rsx_utils.h"
+#include "Utilities/stack_trace.h"
 #include "util/fnv_hash.hpp"
+#include "util/sysinfo.hpp"
+#include "util/tsc.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -43,6 +52,253 @@ namespace
 
 	// How long flips may stop before end() says so.
 	constexpr u64 s_flip_stall_us = 2'000'000;
+
+	// Stall forensics. The stall's defining fact is that the *guest* stopped writing to the
+	// command ring while the RSX thread kept running, so the only thing that can name the cause
+	// is the guest side: which PPU/SPU threads exist, what address each is sitting on, and which
+	// cpu_flags they carry. A thread frozen with cpu_flag::pause set means a global suspend is in
+	// progress and stuck; a thread advancing its PC means the guest is spinning in its own code.
+	// Two samples a fixed interval apart separate those two cases without another run.
+	constexpr u32 s_stall_dumps_max = 3;
+	constexpr u64 s_stall_dump_gap_ms = 250;
+
+	// RSX-thread work log. The stall dump itself runs on the RSX thread, so by definition the RSX
+	// thread is not inside a Remix call when it prints - what matters is whether a long call
+	// happened at the moment the guest parked, which is ~2 s earlier. This keeps the last few
+	// RSX-thread operations that took longer than a frame's worth of time, with wall-clock stamps,
+	// so that moment can be read off the dump.
+	constexpr usz s_rsx_op_log_size = 16;
+	constexpr u64 s_rsx_op_log_threshold_us = 4000;
+
+	struct rsx_op_event
+	{
+		const char* name;
+		u64 start_us;
+		u64 dur_us;
+	};
+
+	rsx_op_event s_rsx_op_log[s_rsx_op_log_size]{};
+	usz s_rsx_op_log_pos = 0;
+
+	// Scoped timer, RSX thread only (no synchronisation - single producer).
+	struct rsx_op_scope
+	{
+		const char* name;
+		u64 start;
+
+		explicit rsx_op_scope(const char* n)
+			: name(n), start(now_us())
+		{
+		}
+
+		~rsx_op_scope()
+		{
+			const u64 dur = now_us() - start;
+
+			if (dur >= s_rsx_op_log_threshold_us)
+			{
+				s_rsx_op_log[s_rsx_op_log_pos++ % s_rsx_op_log_size] = { name, start, dur };
+			}
+		}
+	};
+
+	// Host-side backtrace of one guest thread's OS thread. The guest-side dump can only say "this
+	// thread's cia is not moving"; it cannot say whether the OS thread is spinning in recompiled
+	// guest code, parked in an lv2 wait, or blocked on a host lock inside the emulator. That
+	// distinction is the whole question, and only the native stack answers it.
+	//
+	// The target is suspended for exactly as long as it takes to copy its CONTEXT, then resumed.
+	// Symbolisation (which allocates and takes DbgHelp's global lock) happens after the resume, so
+	// a suspended thread can never be holding a lock this function then waits on.
+	std::vector<std::string> native_backtrace(u64 native_id)
+	{
+		if (!native_id)
+		{
+			return {};
+		}
+
+		const HANDLE h = ::OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+			FALSE, static_cast<DWORD>(native_id));
+
+		if (!h)
+		{
+			return { fmt::format("<OpenThread failed, err=%u>", ::GetLastError()) };
+		}
+
+		CONTEXT ctx{};
+		ctx.ContextFlags = CONTEXT_FULL;
+
+		const bool suspended = ::SuspendThread(h) != static_cast<DWORD>(-1);
+		const bool got = suspended && ::GetThreadContext(h, &ctx);
+
+		if (suspended)
+		{
+			::ResumeThread(h);
+		}
+
+		::CloseHandle(h);
+
+		if (!got)
+		{
+			return { "<GetThreadContext failed>" };
+		}
+
+		return utils::get_backtrace_symbols(utils::get_backtrace(24, &ctx));
+	}
+
+	void dump_guest_threads(const char* tag)
+	{
+		struct sample
+		{
+			u32 id;
+			std::string name;
+			u32 pc;
+			std::string flags;
+			const char* func;
+			const char* last_func;
+			bool ack;
+			u64 checks;   // cpu_dbg::check_counter
+			u64 cycles;   // host thread cycle counter
+			u64 native;   // host thread id
+		};
+
+		auto collect = [](std::vector<sample>& ppus, std::vector<sample>& spus)
+		{
+			idm::select<named_thread<ppu_thread>>([&](u32 id, named_thread<ppu_thread>& ppu)
+			{
+				ppus.push_back({ id, ppu.get_name(), ppu.cia,
+					fmt::format("%s%s", +ppu.state, ppu.ack_suspend ? " ACK_SUSPEND" : ""),
+					ppu.current_function, ppu.last_function, ppu.ack_suspend,
+					cpu_dbg::check_counter(id),
+					thread_ctrl::get_cycles(ppu),
+					thread_ctrl::get_native_id(ppu) });
+			}, idm::unlocked);
+
+			idm::select<named_thread<spu_thread>>([&](u32 id, named_thread<spu_thread>& spu)
+			{
+				spus.push_back({ id, spu.get_name(), spu.pc, fmt::format("%s", +spu.state), spu.current_func,
+					nullptr, false, cpu_dbg::check_counter(id), thread_ctrl::get_cycles(spu),
+					thread_ctrl::get_native_id(spu) });
+			}, idm::unlocked);
+		};
+
+		std::vector<sample> ppu_a, spu_a, ppu_b, spu_b;
+		const u64 sctr_a = cpu_thread::g_suspend_counter;
+		collect(ppu_a, spu_a);
+		std::this_thread::sleep_for(std::chrono::milliseconds(s_stall_dump_gap_ms));
+		const u64 sctr_b = cpu_thread::g_suspend_counter;
+		collect(ppu_b, spu_b);
+
+		rsx_log.error("Remix stall/%s: suspend_counter %llu -> %llu (phase %llu) | ppu=%llu spu=%llu "
+			"| vm_range_bits=%llx/%llx | ppu_slots=%u | lv2_pending=%u sched_ready=%d lv2_mutex_free=%d",
+			tag, sctr_a, sctr_b, sctr_b & 3, static_cast<u64>(ppu_b.size()), static_cast<u64>(spu_b.size()),
+			vm::g_range_lock_bits[0].load(), vm::g_range_lock_bits[1].load(),
+			static_cast<u32>(g_cfg.core.ppu_threads),
+			lv2_obj::get_pending_count(),
+			lv2_obj::is_scheduler_ready() ? 1 : 0,
+			[]
+			{
+				if (!lv2_obj::g_mutex.try_lock_shared())
+				{
+					return 0;
+				}
+
+				lv2_obj::g_mutex.unlock_shared();
+				return 1;
+			}());
+
+		// lv2's own view of who is runnable. Every guest thread carrying cpu_flag::suspend while
+		// this list is empty or all-suspended means the scheduler, not the title, is what stopped.
+		for (u32 slot = 0; slot < static_cast<u32>(g_cfg.core.ppu_threads); slot++)
+		{
+			const ppu_thread* running = lv2_obj::get_running_ppu(slot);
+
+			rsx_log.error("Remix stall/%s:   lv2_run[%u] = %s flags=%s", tag, slot,
+				running ? running->get_name() : std::string("<none>"),
+				running ? fmt::format("%s", +running->state) : std::string("-"));
+		}
+
+		auto report = [tag](const char* kind, const std::vector<sample>& a, const std::vector<sample>& b)
+		{
+			for (usz i = 0; i < b.size(); i++)
+			{
+				const bool paired = i < a.size() && a[i].id == b[i].id;
+				const u32 before = paired ? a[i].pc : b[i].pc;
+
+				// checks/cycles deltas are the liveness verdict: checks==0 with cycles>0 means the
+				// OS thread is running but never re-entering check_state(); both 0 means it is
+				// genuinely parked and the native stack below says on what.
+				rsx_log.error("Remix stall/%s:   %s[0x%x] '%s' pc=0x%x->0x%x %s flags=%s checks=+%llu cycles=+%llu cur_fn=%s last_fn=%s",
+					tag, kind, b[i].id, b[i].name, before, b[i].pc,
+					before == b[i].pc ? "FROZEN" : "moving",
+					b[i].flags,
+					paired ? b[i].checks - a[i].checks : 0,
+					paired ? b[i].cycles - a[i].cycles : 0,
+					b[i].func ? b[i].func : "-",
+					b[i].last_func ? b[i].last_func : "-");
+			}
+		};
+
+		report("ppu", ppu_a, ppu_b);
+		report("spu", spu_a, spu_b);
+
+		// RSX-thread operations that overran, newest last, with how long ago they ended. If a
+		// long Remix call is what the guest tripped over, one of these lands on the moment the
+		// guest stopped feeding the ring.
+		{
+			const u64 now = now_us();
+			const usz count = std::min(s_rsx_op_log_pos, s_rsx_op_log_size);
+
+			for (usz i = 0; i < count; i++)
+			{
+				const auto& e = s_rsx_op_log[(s_rsx_op_log_pos - count + i) % s_rsx_op_log_size];
+
+				rsx_log.error("Remix stall/%s:   rsx_op '%s' took %.1f ms, ended %.1f s ago",
+					tag, e.name ? e.name : "-",
+					static_cast<double>(e.dur_us) / 1000.0,
+					static_cast<double>(now - (e.start_us + e.dur_us)) / 1e6);
+			}
+		}
+
+		// Every g_pending transition still in the ring, newest last. The charge that was never
+		// repaid is the last '+' with no matching '-' for the same thread id.
+		{
+			const auto events = lv2_obj::get_pending_log();
+			const u64 tsc_now = utils::get_tsc();
+			const u64 tsc_hz = std::max<u64>(1, utils::get_tsc_freq());
+
+			for (const auto& e : events)
+			{
+				rsx_log.error("Remix stall/%s:   pending%c site=%c thr=0x%x flags=0x%x -> %u (%.3f ms ago)",
+					tag, e.delta, e.site, e.id, e.flags, e.value,
+					static_cast<double>(tsc_now - e.tsc) * 1000.0 / static_cast<double>(tsc_hz));
+			}
+		}
+
+		// Native stack of every PPU thread that owes an acknowledgement, plus of the two threads
+		// lv2 believes are runnable. Bounded so a wide dump cannot stall the RSX thread for long.
+		u32 walked = 0;
+
+		for (const auto& s : ppu_b)
+		{
+			if (!s.ack || walked >= 3)
+			{
+				continue;
+			}
+
+			walked++;
+
+			const auto frames = native_backtrace(s.native);
+
+			rsx_log.error("Remix stall/%s:   native stack of %s (tid=%llu), %llu frames:",
+				tag, s.name, s.native, static_cast<u64>(frames.size()));
+
+			for (usz i = 0; i < frames.size(); i++)
+			{
+				rsx_log.error("Remix stall/%s:     #%02u %s", tag, static_cast<u32>(i), frames[i]);
+			}
+		}
+	}
 
 	// Sanity ceiling on a single submitted mesh. Guards against a malformed draw clause
 	// turning into a multi-gigabyte allocation.
@@ -186,6 +442,35 @@ void RemixGSRender::on_init_thread()
 #endif
 }
 
+// Counted on the guest thread that faulted, so it cannot live in the RSX-thread-only stat block.
+static atomic_t<u64> g_remix_av_seen{0};
+static atomic_t<u64> g_remix_av_handled{0};
+
+bool RemixGSRender::on_access_violation(u32 address, bool is_writing)
+{
+	// Mirrors VKGSRender::on_access_violation minus the texture cache, which this backend does not
+	// have. The Remix backend never write-protects guest memory itself, so every fault that reaches
+	// here belongs to the ZCULL report pages that rsx::reports::ZCULL_control locked down in
+	// on_report_enqueued(). Returning false (the rsx::thread default this class used to inherit)
+	// leaves the page PROT_NONE and the faulting guest thread spins on it forever.
+	rsx::mm_flush(address);
+
+	const u64 seen = g_remix_av_seen++;
+	const bool handled = zcull_ctrl && zcull_ctrl->on_access_violation(address);
+
+	if (handled)
+	{
+		g_remix_av_handled++;
+	}
+
+	if (seen < 8)
+	{
+		rsx_log.notice("Remix: guest access violation at 0x%x (writing=%d) handled=%d", address, is_writing ? 1 : 0, handled ? 1 : 0);
+	}
+
+	return handled;
+}
+
 void RemixGSRender::on_exit()
 {
 #ifdef _WIN32
@@ -232,6 +517,7 @@ void RemixGSRender::flip(const rsx::display_flip_info_t& info)
 #ifdef _WIN32
 	if (m_remix_ok)
 	{
+		const rsx_op_scope _flip_scope("flip");
 		const u64 flip_enter = now_us();
 
 		if (m_timing.window_start == 0)
@@ -260,7 +546,11 @@ void RemixGSRender::flip(const rsx::display_flip_info_t& info)
 		m_timing.submit += now_us() - t_submit;
 
 		const u64 t_present = now_us();
-		const u32 status = remix_rsx::guarded_present(m_remix.api().Present, nullptr);
+		u32 status = REMIXAPI_ERROR_CODE_SUCCESS;
+		{
+			const rsx_op_scope _present_scope("Present");
+			status = remix_rsx::guarded_present(m_remix.api().Present, nullptr);
+		}
 		m_timing.present += now_us() - t_present;
 
 		if (status != REMIXAPI_ERROR_CODE_SUCCESS)
@@ -331,7 +621,27 @@ void RemixGSRender::do_local_task(rsx::FIFO::state state)
 				dma ? static_cast<u32>(dma->get.load()) : 0u,
 				dma ? static_cast<u32>(dma->put.load()) : 0u);
 
-			m_last_flip_us = now;
+			rsx_log.error("Remix stall/rsx: flip_status=%u vsync=%d vblank=%llu int_flip=%llu "
+				"guest_flip_ts=%llu host_flip_ts=%llu ext_lock=%u sync_req=%d eng_mask=0x%x",
+				flip_status,
+				requested_vsync.load() ? 1 : 0,
+				vblank_count.load(),
+				int_flip_index,
+				last_guest_flip_timestamp,
+				last_host_flip_timestamp,
+				external_interrupt_lock.load(),
+				sync_point_request.load() ? 1 : 0,
+				static_cast<u32>(m_eng_interrupt_mask.load()));
+
+			// The guest side is the only thing that can name this. Bounded so a long stall does
+			// not turn the log into a wall of dumps.
+			if (m_stall_dumps < s_stall_dumps_max)
+			{
+				++m_stall_dumps;
+				dump_guest_threads("t");
+			}
+
+			m_last_flip_us = now_us();
 		}
 	}
 #endif
@@ -385,6 +695,8 @@ void RemixGSRender::end()
 			m_last_flip_us = now;
 		}
 	}
+
+	const rsx_op_scope _end_scope("end");
 
 	// Fills current_vp_metadata (referenced input mask) and the vertex program ucode.
 	analyse_current_rsx_pipeline();
@@ -2611,19 +2923,64 @@ void RemixGSRender::dump_texture(const remix_rsx::texture_entry& entry, const rs
 
 void RemixGSRender::reap_idle_meshes()
 {
-	if (m_meshes.empty() || m_frame_counter < s_mesh_idle_frames)
+	if (m_meshes.empty())
 	{
 		return;
 	}
 
-	const u64 cutoff = m_frame_counter - s_mesh_idle_frames;
 	const auto& api = m_remix.api();
 
-	for (auto it = m_meshes.begin(); it != m_meshes.end();)
+	if (m_frame_counter >= s_mesh_idle_frames)
 	{
-		if (it->second.last_used_frame > cutoff)
+		const u64 cutoff = m_frame_counter - s_mesh_idle_frames;
+
+		for (auto it = m_meshes.begin(); it != m_meshes.end();)
 		{
-			++it;
+			if (it->second.last_used_frame > cutoff)
+			{
+				++it;
+				continue;
+			}
+
+			if (it->second.handle)
+			{
+				remix_rsx::guarded_destroy_mesh(api.DestroyMesh, it->second.handle);
+				++m_stats.meshes_destroyed;
+			}
+
+			it = m_meshes.erase(it);
+		}
+	}
+
+	// RPCS3_REMIX_MESHCAP=N: hard ceiling with LRU eviction. The idle rule above is a *frame*
+	// rule, so a title that mints a new mesh every frame grows the cache without bound for 300
+	// frames - and grows it forever once flips stop, because the frame counter stops with them.
+	// Off by default; this exists to A/B whether unbounded CreateMesh pressure is what stalls
+	// the guest, and it is the fix if it is.
+	const usz cap = remix_rsx::mesh_cap();
+
+	if (!cap || m_meshes.size() <= cap)
+	{
+		return;
+	}
+
+	std::vector<std::pair<u64, u64>> by_age; // last_used_frame, hash
+	by_age.reserve(m_meshes.size());
+
+	for (const auto& [hash, entry] : m_meshes)
+	{
+		by_age.emplace_back(entry.last_used_frame, hash);
+	}
+
+	const usz excess = m_meshes.size() - cap;
+	std::partial_sort(by_age.begin(), by_age.begin() + excess, by_age.end());
+
+	for (usz i = 0; i < excess; i++)
+	{
+		auto it = m_meshes.find(by_age[i].second);
+
+		if (it == m_meshes.end())
+		{
 			continue;
 		}
 
@@ -2633,7 +2990,7 @@ void RemixGSRender::reap_idle_meshes()
 			++m_stats.meshes_destroyed;
 		}
 
-		it = m_meshes.erase(it);
+		m_meshes.erase(it);
 	}
 }
 
@@ -2655,7 +3012,8 @@ void RemixGSRender::log_stats()
 		"skip screen=%llu immediate=%llu inline=%llu volatile=%llu reg_attr0=%llu prim=%llu restart=%llu instanced=%llu layout=%llu mem=%llu decode=%llu poison=%llu vp=%llu | "
 		"skin_submitted=%llu skin_skipped=%llu skin_bones_max=%llu | "
 		"tex_bound=%llu tex_none=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_rehashed=%llu tex_refreshed=%llu mat_created=%llu | "
-		"ui_draws=%llu ui_skipped=%llu ui_no_colour=%llu ui_rt=%llu ui_prims=%llu ui_frames=%llu",
+		"ui_draws=%llu ui_skipped=%llu ui_no_colour=%llu ui_rt=%llu ui_prims=%llu ui_frames=%llu | "
+		"zcull_av=%llu zcull_av_handled=%llu",
 		m_frame_counter,
 		m_stats.draws_seen,
 		m_stats.draws_submitted,
@@ -2701,7 +3059,12 @@ void RemixGSRender::log_stats()
 		m_stats.ui_no_colour,
 		m_stats.ui_render_target,
 		m_compositor.draws(),
-		m_compositor.frames());
+		m_compositor.frames(),
+		// ZCULL occlusion-report page faults taken by guest threads. Non-zero means the title polls
+		// cellGcmGetReport while a query is in flight; every one of these that is NOT handled wedges
+		// the faulting PPU thread forever (see on_access_violation).
+		g_remix_av_seen.load(),
+		g_remix_av_handled.load());
 
 	// Where the RSX thread's wall clock actually went, per frame, over this window. 'other' is
 	// window - flip: everything outside flip(), which is FIFO decode plus any guest stall.

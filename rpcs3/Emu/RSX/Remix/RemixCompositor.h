@@ -79,6 +79,10 @@ namespace remix_rsx
 	// at 1.9 FPS. Provided so the change can be A/B'd in one run.
 	bool keep_render_target_blits();
 
+	// RPCS3_REMIX_MESHCAP=N caps the live mesh-handle cache at N with LRU eviction. 0 (default)
+	// leaves it unbounded, which is what the idle-frame rule alone gives.
+	usz mesh_cap();
+
 	// RPCS3_REMIX_UIPROBE=1 draws a fixed known pattern through DrawScreenOverlay instead of
 	// judging the call for the first time with real UI data flowing through it.
 	bool ui_probe_enabled();

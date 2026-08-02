@@ -49,6 +49,26 @@ constexpr bool is_paused(bs_t<cpu_flag> state)
 	return !!(state & (cpu_flag::suspend + cpu_flag::dbg_global_pause + cpu_flag::dbg_pause)) && !is_stopped(state);
 }
 
+// Diagnostic only (Remix stall forensics): per-thread count of check_state() entries. Sampling it
+// twice separates "this thread is executing but not observing its flags" from "this thread's host
+// thread is parked somewhere that never returns to check_state()".
+//
+// This deliberately lives OUTSIDE cpu_thread. The PPU LLVM object cache on disk
+// (bin/cache/<title>/ppu-*/v8-kusa-*.obj.gz) bakes in ppu_thread member offsets and its key does
+// not cover the emulator's own struct layout, so adding any member to cpu_thread silently
+// mismatches every cached module and the guest misbehaves immediately after boot.
+namespace cpu_dbg
+{
+	// [thread class][low id bits]. PPU and SPU ids are dense in their low bits, so no PPU/SPU
+	// thread of interest ever shares a slot with another.
+	extern u64 g_check_state_counts[4][64];
+
+	inline u64& check_counter(u32 id)
+	{
+		return g_check_state_counts[(id >> 24) & 3][id & 63];
+	}
+}
+
 class cpu_thread
 {
 public:

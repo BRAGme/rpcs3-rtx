@@ -1301,6 +1301,24 @@ static atomic_t<u64> s_max_allowed_yield_tsc = 0;
 static u64 s_last_yield_tsc = 0;
 atomic_t<u32> g_lv2_preempts_taken = 0;
 
+// Diagnostics (Remix stall forensics): ring of the last g_pending transitions. Every write happens
+// under lv2_obj::g_mutex (all three sites are inside awake_unlocked/sleep_unlocked), so no extra
+// synchronisation is needed for the producers; the reader takes a snapshot and tolerates a torn
+// tail. Fixed size, no allocation after startup.
+namespace
+{
+	constexpr usz s_pending_log_size = 64;
+
+	lv2_obj::pending_event s_pending_log[s_pending_log_size]{};
+	atomic_t<u64> s_pending_log_pos = 0;
+
+	void log_pending_event(u32 id, u32 flags, u32 value, char site, char delta)
+	{
+		const u64 slot = s_pending_log_pos++;
+		s_pending_log[slot % s_pending_log_size] = { utils::get_tsc(), id, flags, value, site, delta };
+	}
+}
+
 namespace cpu_counter
 {
 	void remove(cpu_thread*) noexcept;
@@ -1493,6 +1511,7 @@ bool lv2_obj::sleep_unlocked(cpu_thread& thread, u64 timeout, u64 current_time)
 		{
 			ppu->ack_suspend = false;
 			g_pending--;
+			log_pending_event(ppu->id, static_cast<u32>(+ppu->state), g_pending, 'S', '-');
 		}
 
 		if (std::exchange(ppu->cancel_sleep, 0) == 2)
@@ -1766,6 +1785,7 @@ bool lv2_obj::awake_unlocked(cpu_thread* cpu, s32 prio)
 			ppu_log.trace("suspend(): %s", target->id);
 			target->ack_suspend = true;
 			g_pending++;
+			log_pending_event(target->id, static_cast<u32>(+target->state), g_pending, 'C', '+');
 			ensure(!target->state.test_and_set(cpu_flag::suspend));
 
 			if (is_paused(target->state - cpu_flag::suspend))
@@ -1783,6 +1803,7 @@ bool lv2_obj::awake_unlocked(cpu_thread* cpu, s32 prio)
 		if (std::exchange(current_ppu->ack_suspend, false))
 		{
 			ensure(g_pending)--;
+			log_pending_event(current_ppu->id, static_cast<u32>(+current_ppu->state), g_pending, 'A', '-');
 		}
 	}
 
@@ -2209,6 +2230,27 @@ void lv2_obj::prepare_for_sleep(cpu_thread& cpu)
 {
 	vm::temporary_unlock(cpu);
 	cpu_counter::remove(&cpu);
+}
+
+u32 lv2_obj::get_pending_count()
+{
+	return g_pending;
+}
+
+std::vector<lv2_obj::pending_event> lv2_obj::get_pending_log()
+{
+	const u64 pos = s_pending_log_pos;
+	const u64 first = pos > s_pending_log_size ? pos - s_pending_log_size : 0;
+
+	std::vector<pending_event> out;
+	out.reserve(pos - first);
+
+	for (u64 i = first; i < pos; i++)
+	{
+		out.push_back(s_pending_log[i % s_pending_log_size]);
+	}
+
+	return out;
 }
 
 ppu_thread* lv2_obj::get_running_ppu(u32 index)

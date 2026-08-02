@@ -827,8 +827,15 @@ void cpu_thread::cpu_wait(bs_t<cpu_flag> old)
 
 static atomic_t<u32> s_dummy_atomic = 0;
 
+namespace cpu_dbg
+{
+	u64 g_check_state_counts[4][64]{};
+}
+
 bool cpu_thread::check_state() noexcept
 {
+	cpu_dbg::check_counter(id)++;
+
 	bool cpu_sleep_called = false;
 	bool cpu_memory_checked = false;
 	bool cpu_can_stop = true;

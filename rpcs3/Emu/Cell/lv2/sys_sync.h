@@ -502,6 +502,26 @@ public:
 	// Proirity tags
 	static atomic_t<u64> g_priority_order_tag;
 
+	// Diagnostics: the scheduler's pending-suspend-acknowledgement counter and its ready flag.
+	// schedule_all() refuses to wake ANY thread while the counter is non-zero, so a leaked count
+	// is indistinguishable from a hung guest unless it can be read from outside.
+	static u32 get_pending_count();
+
+	// Diagnostics: the last few g_pending transitions, newest last. Each entry names the thread
+	// whose ack_suspend changed, the flags it carried at that instant and which site did it, so a
+	// leaked count can be traced back to the exact charge that was never repaid.
+	struct pending_event
+	{
+		u64 tsc;
+		u32 id;
+		u32 flags;
+		u32 value;   // g_pending after the change
+		char site;   // 'C' charge (awake suspend loop), 'A' repay in awake, 'S' repay in sleep
+		char delta;  // '+' or '-'
+	};
+
+	static std::vector<pending_event> get_pending_log();
+
 private:
 	// Pending list of threads to run
 	static thread_local std::vector<class cpu_thread*> g_to_awake;

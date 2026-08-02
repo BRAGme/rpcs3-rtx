@@ -85,6 +85,25 @@ namespace remix_rsx
 		return value;
 	}
 
+	usz mesh_cap()
+	{
+		static const usz value = []() -> usz
+		{
+			wchar_t buffer[16]{};
+			const DWORD written = GetEnvironmentVariableW(L"RPCS3_REMIX_MESHCAP", buffer, static_cast<DWORD>(std::size(buffer)));
+
+			if (written == 0 || written >= std::size(buffer))
+			{
+				return 0;
+			}
+
+			const long parsed = ::wcstol(buffer, nullptr, 10);
+			return parsed > 0 ? static_cast<usz>(parsed) : 0;
+		}();
+
+		return value;
+	}
+
 	bool ui_probe_enabled()
 	{
 		static const bool value = []
