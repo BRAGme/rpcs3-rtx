@@ -496,11 +496,17 @@ void RemixGSRender::on_exit()
 			remix_rsx::guarded_destroy_light(api.DestroyLight, m_debug_light);
 		}
 
+		if (m_sun_light)
+		{
+			remix_rsx::guarded_destroy_light(api.DestroyLight, m_sun_light);
+		}
+
 		m_textures.destroy_all(api);
 	}
 
 	m_debug_mesh = nullptr;
 	m_debug_light = nullptr;
+	m_sun_light = nullptr;
 	m_meshes.clear();
 	m_poisoned.clear();
 	m_remix_ok = false;
@@ -914,7 +920,11 @@ void RemixGSRender::place_debug_light(const f32 (&position)[3])
 	// nothing volumetrically.
 	sphere_light.volumetricRadianceScale = 1.f;
 
-	const f32 radiance = remix_rsx::debug_light_radiance();
+	// RPCS3_REMIX_CAMLIGHT is both the on-switch and the radiance for the camera fill. Unset it
+	// and this stays exactly the stage-A debug light create_debug_scene has always placed at the
+	// origin for the no-camera fallback scene.
+	const f32 camlight = remix_rsx::camera_light_radiance();
+	const f32 radiance = (camlight > 0.f) ? camlight : remix_rsx::debug_light_radiance();
 
 	remixapi_LightInfo light_info{};
 	light_info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
@@ -932,6 +942,96 @@ void RemixGSRender::place_debug_light(const f32 (&position)[3])
 		rsx_log.error("Remix: CreateLight failed (%s)", remix_rsx::error_name(status));
 		m_debug_light = nullptr;
 	}
+}
+
+bool RemixGSRender::ensure_sun_light()
+{
+	if (m_sun_light)
+	{
+		return true;
+	}
+
+	if (m_sun_failed || remix_rsx::nosun_enabled())
+	{
+		return false;
+	}
+
+	const auto& api = m_remix.api();
+
+	f32 direction[3]{};
+	remix_rsx::sun_direction(direction);
+
+	remixapi_LightInfoDistantEXT distant{};
+	distant.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_DISTANT_EXT;
+	distant.pNext = nullptr;
+	distant.direction = { direction[0], direction[1], direction[2] };
+	distant.angularDiameterDegrees = remix_rsx::sun_angular_diameter();
+	// Same reasoning as the sphere light: zero-init leaves this at 0, where the light
+	// contributes nothing volumetrically, while the runtime's own default is 1.0.
+	distant.volumetricRadianceScale = 1.f;
+
+	const f32 radiance = remix_rsx::sun_radiance();
+
+	remixapi_LightInfo light_info{};
+	light_info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
+	light_info.pNext = &distant;
+	light_info.hash = 0x4;
+	light_info.radiance = { radiance, radiance, radiance };
+
+	const u32 status = remix_rsx::guarded_create_light(api.CreateLight, &light_info, &m_sun_light);
+
+	if (status != REMIXAPI_ERROR_CODE_SUCCESS || !m_sun_light)
+	{
+		rsx_log.error("Remix: CreateLight(distant sun) failed (%s)", remix_rsx::error_name(status));
+		m_sun_light = nullptr;
+		m_sun_failed = true;
+		return false;
+	}
+
+	rsx_log.notice("Remix: default sun dir=[%.4g %.4g %.4g] radiance=%.4g angle=%.4g deg",
+		static_cast<f64>(direction[0]), static_cast<f64>(direction[1]), static_cast<f64>(direction[2]),
+		static_cast<f64>(radiance), static_cast<f64>(remix_rsx::sun_angular_diameter()));
+
+	return true;
+}
+
+u32 RemixGSRender::classify_draw(u64 albedo_hash)
+{
+	if (!albedo_hash || !remix_rsx::any_category_listed())
+	{
+		return 0;
+	}
+
+	u32 flags = 0;
+
+	if (remix_rsx::hash_in_category(remix_rsx::draw_category::sky, albedo_hash))
+	{
+		// SKY both selects the sky camera and hides the instance from the world pass, which is
+		// exactly what a sun card drawing through buildings needs.
+		flags |= REMIXAPI_INSTANCE_CATEGORY_BIT_SKY;
+		++m_stats.cat_sky;
+	}
+
+	if (remix_rsx::hash_in_category(remix_rsx::draw_category::hide, albedo_hash))
+	{
+		// HIDDEN, not IGNORE: IGNORE is a no-op on the API draw path.
+		flags |= REMIXAPI_INSTANCE_CATEGORY_BIT_HIDDEN;
+		++m_stats.cat_hidden;
+	}
+
+	if (remix_rsx::hash_in_category(remix_rsx::draw_category::particle, albedo_hash))
+	{
+		flags |= REMIXAPI_INSTANCE_CATEGORY_BIT_PARTICLE;
+		++m_stats.cat_particle;
+	}
+
+	if (remix_rsx::hash_in_category(remix_rsx::draw_category::decal, albedo_hash))
+	{
+		flags |= REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_STATIC;
+		++m_stats.cat_decal;
+	}
+
+	return flags;
 }
 
 void RemixGSRender::submit_camera()
@@ -960,13 +1060,24 @@ void RemixGSRender::submit_camera()
 		rsx_log.error("Remix: SetupCamera failed (%s)", remix_rsx::error_name(status));
 	}
 
-	// Park the debug light on the camera so the derived pose can be judged visually.
-	// The title's own lights are out of scope for this milestone.
-	place_debug_light(m_active_camera.position);
-
-	if (m_debug_light)
+	// The scene's readable light: one distant sun, created once, drawn every frame.
+	if (ensure_sun_light())
 	{
-		remix_rsx::guarded_draw_light_instance(api.DrawLightInstance, m_debug_light);
+		remix_rsx::guarded_draw_light_instance(api.DrawLightInstance, m_sun_light);
+	}
+
+	// The camera sphere is now an optional fill, off by default. It is what blew out
+	// everything near the player and crushed everything far from them; RPCS3_REMIX_CAMLIGHT
+	// brings it back for anyone who wants it, and it still costs a destroy+create per frame
+	// because it moves with the camera.
+	if (remix_rsx::camera_light_radiance() > 0.f)
+	{
+		place_debug_light(m_active_camera.position);
+
+		if (m_debug_light)
+		{
+			remix_rsx::guarded_draw_light_instance(api.DrawLightInstance, m_debug_light);
+		}
 	}
 }
 
@@ -1911,7 +2022,14 @@ bool RemixGSRender::build_skinning(u32 first_vertex, u32 vertex_count)
 
 		u32 offset = 0;
 
-		if (!remix_rsx::evaluate_bone_offset(fp, scaled[fp.bone_component], offset))
+		// RPCS3_REMIX_SKINRAW=1 feeds the stored value instead of the scaled one, which is the
+		// M4 deviation D1 decision under test: a ub bone index that the ucode does not rescale
+		// reads 0..255 raw but 0..1 scaled.
+		const f32 index_value = remix_rsx::skinraw_enabled()
+			? raw[fp.bone_component]
+			: scaled[fp.bone_component];
+
+		if (!remix_rsx::evaluate_bone_offset(fp, index_value, offset))
 		{
 			return false;
 		}
@@ -1965,6 +2083,21 @@ bool RemixGSRender::build_skinning(u32 first_vertex, u32 vertex_count)
 	if (m_scratch_bone_transforms.empty())
 	{
 		return false;
+	}
+
+	// --- bisect knobs -------------------------------------------------------------------
+	// Both are deliberately applied after the real decode, so the mesh, the weights and the
+	// palette read are exactly what an unknobbed run produces and only the one link under
+	// test changes.
+	if (const u32 forced = remix_rsx::skinbone_index(); forced != umax)
+	{
+		const u32 clamped = std::min<u32>(forced, ::size32(m_scratch_bone_transforms) - 1);
+		std::fill(m_scratch_bone_indices.begin(), m_scratch_bone_indices.end(), clamped);
+	}
+
+	if (remix_rsx::skinid_enabled())
+	{
+		std::fill(m_scratch_bone_transforms.begin(), m_scratch_bone_transforms.end(), s_identity_transform);
 	}
 
 	// One bone per vertex at weight 1: that is the shape the observed ucode presents (a single
@@ -2526,7 +2659,7 @@ void RemixGSRender::submit_subdraw()
 
 	if (remix_rsx::dump_enabled())
 	{
-		dump_vertex_program(vertex_count, ::size32(m_scratch_indices));
+		dump_vertex_program(first_vertex, vertex_count, ::size32(m_scratch_indices));
 	}
 
 	if (screen_space)
@@ -2547,6 +2680,14 @@ void RemixGSRender::submit_subdraw()
 	const remix_rsx::vp_fingerprint& fp = *m_current_fingerprint;
 	bool skinned = false;
 
+	if (fp.skin_unrecognised)
+	{
+		// A rig the recogniser detected but cannot prove it understands. Nothing is drawn: an
+		// absent character is a shippable result, a character torn across the map is not.
+		++m_stats.skin_unrecognised;
+		return;
+	}
+
 	if (fp.archetype == remix_rsx::vp_archetype::skinned_layered)
 	{
 		if (remix_rsx::noskin_enabled() || !m_remix.fork_features() || !build_skinning(first_vertex, vertex_count))
@@ -2557,12 +2698,18 @@ void RemixGSRender::submit_subdraw()
 
 		skinned = true;
 	}
-	else if (fp.indexed_const && !fp.has_outer())
+	else if (fp.indexed_const)
 	{
-		// An indexed-constant program the recogniser did not resolve. Submitting it means
-		// drawing it at identity, which is exactly what parked skinned meshes at the world
-		// origin in M2/M3. Skipped, and counted, instead.
-		++m_stats.skin_skipped;
+		// The program reads a constant palette through an address register and the recogniser
+		// did not turn it into bone transforms - whether or not it managed to match an outer
+		// group. Submitting it draws the mesh with the palette simply not applied: the bind
+		// pose, in the wrong place, or a character torn across the map. That is the symptom
+		// this milestone exists to remove, so the draw is refused and counted.
+		//
+		// Note the '!fp.has_outer()' this replaces: once the outer group matches (which it now
+		// does for Haze, see the ADD-operand fix in match_mad_chain), 'has_outer()' is true and
+		// the old condition let exactly these draws through.
+		++m_stats.skin_unrecognised;
 		return;
 	}
 
@@ -2719,7 +2866,7 @@ void RemixGSRender::submit_subdraw()
 	remixapi_InstanceInfo instance{};
 	instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
 	instance.pNext = nullptr;
-	instance.categoryFlags = 0;
+	instance.categoryFlags = classify_draw(albedo_hash);
 	instance.mesh = it->second.handle;
 	instance.transform = transform;
 	instance.doubleSided = 1;
@@ -2763,7 +2910,143 @@ const remix_rsx::vp_fingerprint& RemixGSRender::fingerprint_for(u64 vp_hash)
 	return it->second;
 }
 
-void RemixGSRender::dump_vertex_program(u32 vertex_count, u32 index_count)
+std::string RemixGSRender::describe_skinning(u32 first_vertex, u32 vertex_count)
+{
+	const remix_rsx::vp_fingerprint& fp = *m_current_fingerprint;
+
+	std::string out = " | skinval";
+
+	attribute_view bones{};
+	const attribute_status status = map_attribute(fp.bone_attribute, first_vertex, vertex_count, bones);
+
+	if (status != attribute_status::ok)
+	{
+		const char* reason = "absent";
+
+		switch (status)
+		{
+		case attribute_status::layout: reason = "layout"; break;
+		case attribute_status::memory: reason = "memory"; break;
+		default: break;
+		}
+
+		fmt::append(out, " attr=ATTR%u UNMAPPED(%s)", fp.bone_attribute, reason);
+		return out;
+	}
+
+	fmt::append(out, " attr=ATTR%u.%c type=%u size=%u stride=%u off=%u first_vertex=%u verts=%u",
+		fp.bone_attribute,
+		"xyzw"[fp.bone_component & 3],
+		static_cast<u32>(bones.type),
+		bones.size,
+		bones.stride,
+		bones.offset,
+		first_vertex,
+		vertex_count);
+
+	// Decoded per vertex exactly the way build_skinning does it, with both candidate values
+	// carried side by side so the raw-vs-scaled question (M4 D1) is answered by reading the
+	// line rather than by another run.
+	std::vector<u32> slots;
+	u32 decode_failed = 0;
+	u32 scaled_failed = 0;
+	u32 raw_failed = 0;
+	std::string samples;
+
+	for (u32 i = 0; i < vertex_count; ++i)
+	{
+		f32 scaled[4] = {};
+		f32 raw[4] = {};
+
+		if (!remix_rsx::decode_position(bones.at(i), bones.type, bones.size, scaled) ||
+			!remix_rsx::decode_attribute_raw(bones.at(i), bones.type, bones.size, raw))
+		{
+			++decode_failed;
+			continue;
+		}
+
+		u32 scaled_offset = 0;
+		u32 raw_offset = 0;
+		const bool scaled_ok = remix_rsx::evaluate_bone_offset(fp, scaled[fp.bone_component], scaled_offset);
+		const bool raw_ok = remix_rsx::evaluate_bone_offset(fp, raw[fp.bone_component], raw_offset);
+
+		if (!scaled_ok) { ++scaled_failed; }
+		if (!raw_ok) { ++raw_failed; }
+
+		u32 dense = umax;
+
+		if (scaled_ok)
+		{
+			for (u32 s = 0; s < ::size32(slots); ++s)
+			{
+				if (slots[s] == scaled_offset)
+				{
+					dense = s;
+					break;
+				}
+			}
+
+			if (dense == umax && slots.size() < REMIXAPI_INSTANCE_INFO_MAX_BONES_COUNT)
+			{
+				dense = ::size32(slots);
+				slots.push_back(scaled_offset);
+			}
+		}
+
+		if (i < 8)
+		{
+			fmt::append(samples, " v%u[raw=%.6g->%s%u scaled=%.6g->%s%u dense=%d]",
+				i,
+				static_cast<f64>(raw[fp.bone_component]),
+				raw_ok ? "" : "!",
+				raw_offset,
+				static_cast<f64>(scaled[fp.bone_component]),
+				scaled_ok ? "" : "!",
+				scaled_offset,
+				(dense == umax) ? -1 : static_cast<int>(dense));
+		}
+	}
+
+	fmt::append(out, " distinct=%u decode_fail=%u scaled_fail=%u raw_fail=%u%s",
+		::size32(slots), decode_failed, scaled_failed, raw_failed, samples);
+
+	// The palette itself. A bind pose is affine with plausible translations; a transpose puts
+	// the translation in the perspective row, which is exactly what this prints.
+	if (!slots.empty())
+	{
+		remix_rsx::slot_block block{};
+
+		if (remix_rsx::read_slot_block(fp.palette_base + slots[0], block))
+		{
+			const remix_rsx::mat4 bone = remix_rsx::slots_to_matrix(block, fp.palette_shape);
+			fmt::append(out, " | bone0 c[%u] slots=%s mat=%s affine=%d",
+				fp.palette_base + slots[0],
+				remix_rsx::format_slots(block),
+				remix_rsx::format_matrix(bone),
+				remix_rsx::is_affine(bone, s_world_affine_tolerance) ? 1 : 0);
+		}
+		else
+		{
+			fmt::append(out, " | bone0 c[%u] UNREADABLE", fp.palette_base + slots[0]);
+		}
+	}
+
+	// The instance transform this draw would be submitted with: the suspect for a character
+	// standing in the wrong place (per_draw_transform's skinned branch).
+	remixapi_Transform world{};
+	const bool have_world = per_draw_transform(world);
+
+	fmt::append(out, " | world applied=%d groups=%u [%.5g %.5g %.5g %.5g | %.5g %.5g %.5g %.5g | %.5g %.5g %.5g %.5g]",
+		have_world ? 1 : 0,
+		fp.group_count,
+		static_cast<f64>(world.matrix[0][0]), static_cast<f64>(world.matrix[0][1]), static_cast<f64>(world.matrix[0][2]), static_cast<f64>(world.matrix[0][3]),
+		static_cast<f64>(world.matrix[1][0]), static_cast<f64>(world.matrix[1][1]), static_cast<f64>(world.matrix[1][2]), static_cast<f64>(world.matrix[1][3]),
+		static_cast<f64>(world.matrix[2][0]), static_cast<f64>(world.matrix[2][1]), static_cast<f64>(world.matrix[2][2]), static_cast<f64>(world.matrix[2][3]));
+
+	return out;
+}
+
+void RemixGSRender::dump_vertex_program(u32 first_vertex, u32 vertex_count, u32 index_count)
 {
 	const u64 vp_hash = m_current_vp_hash;
 	const remix_rsx::vp_fingerprint& fp = *m_current_fingerprint;
@@ -2808,13 +3091,17 @@ void RemixGSRender::dump_vertex_program(u32 vertex_count, u32 index_count)
 	{
 		// The line that settles the open question: which attribute carries the bone index,
 		// which component of it, and what is applied on the way to the address register.
-		fmt::append(groups, " | skin palette=c[%u+a] shape=%s attr=ATTR%u.%c resolved=%d ops=%u",
+		fmt::append(groups, " | skin palette=c[%u+a] shape=%s attr=ATTR%u.%c resolved=%d ops=%u arl=%u idx=%u foreign=%u unrecognised=%d",
 			fp.palette_base,
 			remix_rsx::shape_name(fp.palette_shape),
 			fp.bone_attribute,
 			"xyzw"[fp.bone_component & 3],
 			fp.bone_resolved ? 1 : 0,
-			fp.bone_op_count);
+			fp.bone_op_count,
+			fp.arl_count,
+			fp.indexed_reads,
+			fp.foreign_indexed_reads,
+			fp.skin_unrecognised ? 1 : 0);
 
 		for (u32 i = 0; i < fp.bone_op_count; ++i)
 		{
@@ -2846,12 +3133,20 @@ void RemixGSRender::dump_vertex_program(u32 vertex_count, u32 index_count)
 		{
 			fmt::append(groups, " (%s)", fp.skin_note);
 		}
+
+		if (fp.archetype == remix_rsx::vp_archetype::skinned_layered)
+		{
+			groups += describe_skinning(first_vertex, vertex_count);
+		}
 	}
 
-	if (fp.archetype == remix_rsx::vp_archetype::unknown)
+	// The ucode is the only thing that can say why identification failed - and, for a program
+	// that indexes constants, whether the rig blends several bones per vertex at all. Those get
+	// a longer slice: the palette read sits below the outer matrix, past the default cut.
+	if (fp.archetype == remix_rsx::vp_archetype::unknown || fp.skinned || fp.indexed_const)
 	{
-		// The ucode is the only thing that can say why identification failed.
-		fmt::append(groups, " slice:%s", remix_rsx::describe_position_slice(current_vertex_program));
+		fmt::append(groups, " slice:%s",
+			remix_rsx::describe_position_slice(current_vertex_program, fp.indexed_const ? 96 : 32));
 	}
 
 	const std::string line = fmt::format(
@@ -3010,7 +3305,8 @@ void RemixGSRender::log_stats()
 		"Remix stats: frame=%llu draws=%llu submitted=%llu meshes_live=%llu created=%llu destroyed=%llu poisoned=%llu | "
 		"cam_resolved=%llu cam_fallback=%llu arch=%s world_applied=%llu world_fallback=%llu | "
 		"skip screen=%llu immediate=%llu inline=%llu volatile=%llu reg_attr0=%llu prim=%llu restart=%llu instanced=%llu layout=%llu mem=%llu decode=%llu poison=%llu vp=%llu | "
-		"skin_submitted=%llu skin_skipped=%llu skin_bones_max=%llu | "
+		"skin_submitted=%llu skin_skipped=%llu skin_unrecognised=%llu skin_bones_max=%llu | "
+		"cat_sky=%llu cat_hidden=%llu cat_particle=%llu cat_decal=%llu | "
 		"tex_bound=%llu tex_none=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_rehashed=%llu tex_refreshed=%llu mat_created=%llu | "
 		"ui_draws=%llu ui_skipped=%llu ui_no_colour=%llu ui_rt=%llu ui_prims=%llu ui_frames=%llu | "
 		"zcull_av=%llu zcull_av_handled=%llu",
@@ -3041,7 +3337,12 @@ void RemixGSRender::log_stats()
 		m_stats.skip_vp,
 		m_stats.skin_submitted,
 		m_stats.skin_skipped,
+		m_stats.skin_unrecognised,
 		m_stats.skin_bones_max,
+		m_stats.cat_sky,
+		m_stats.cat_hidden,
+		m_stats.cat_particle,
+		m_stats.cat_decal,
 		m_stats.tex_bound,
 		m_stats.tex_none,
 		static_cast<u64>(m_textures.live()),

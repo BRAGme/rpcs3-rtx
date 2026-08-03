@@ -7,6 +7,7 @@
 #include "Emu/RSX/rsx_methods.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstdlib>
@@ -465,11 +466,18 @@ namespace remix_rsx
 				}
 
 				// Find the constant operand and, for the scaled forms, the position operand.
+				// MUL/MAD multiply src0 by src1 and (MAD) accumulate src2, so their two operands
+				// are 0 and 1. ADD consumes src0 and src2 - there is no src1 - so its constant is
+				// as likely to sit in src2 as in src0, and Haze's world programs write exactly
+				// that: 'ADD o0, r3, c[3]'. Scanning only slots 0 and 1 missed the translation
+				// step of every one of them and threw the whole matrix away.
 				u32 const_slot = umax;
 				u32 scale_slot = umax;
 				const u32 mask = vec_source_mask(opcode);
+				const bool is_add = (opcode == RSX_VEC_OPCODE_ADD);
+				const u32 operand_slots[2] = { 0u, is_add ? 2u : 1u };
 
-				for (u32 s = 0; s < 2; ++s)
+				for (const u32 s : operand_slots)
 				{
 					if (!(mask & (1u << s)))
 					{
@@ -540,13 +548,16 @@ namespace remix_rsx
 					break;
 				}
 
-				// Follow the accumulator into the previous step.
-				if (in.src[2].reg_type != RSX_VP_REGISTER_TYPE_TEMP)
+				// Follow the accumulator into the previous step. It is whichever consumed slot
+				// the constant did not take: src2 for MAD, and for ADD the other of {0, 2}.
+				const u32 accumulator_slot = is_add ? ((const_slot == 0) ? 2u : 0u) : 2u;
+
+				if (in.src[accumulator_slot].reg_type != RSX_VP_REGISTER_TYPE_TEMP)
 				{
 					return false;
 				}
 
-				const u32 prev = prog.last_temp_writer(in.src[2].tmp_src, cursor);
+				const u32 prev = prog.last_temp_writer(in.src[accumulator_slot].tmp_src, cursor);
 				if (prev == umax)
 				{
 					return false;
@@ -604,6 +615,66 @@ namespace remix_rsx
 			out.addr_reg = (addr_reg == umax) ? 0 : addr_reg;
 			out.addr_swz = (addr_swz == umax) ? 0 : addr_swz;
 			return true;
+		}
+
+		// True when this instruction actually consumes a constant, so d3.index_const means
+		// something. The bit is only interpreted for RSX_VP_REGISTER_TYPE_CONSTANT sources
+		// (VertexProgramDecompiler.cpp:128-132); on any other instruction it is noise.
+		bool reads_constant(const decoded_instr& in)
+		{
+			const u32 mask = (in.d1.vec_opcode != RSX_VEC_OPCODE_NOP) ? vec_source_mask(in.d1.vec_opcode) : 0;
+
+			for (u32 s = 0; s < 3; ++s)
+			{
+				// SCA reads src2 (the decompiler's GetSRC(2) path).
+				const bool consumed = (mask & (1u << s)) != 0
+					|| (s == 2 && in.d1.sca_opcode != RSX_SCA_OPCODE_NOP);
+
+				if (consumed && in.src[s].reg_type == RSX_VP_REGISTER_TYPE_CONSTANT)
+				{
+					return true;
+				}
+			}
+
+			return false;
+		}
+
+		// Whole-ucode audit of the indexing the program does. A rig this code can express
+		// (bonesPerVertex = 1) loads one address register once and reads its palette through
+		// that one register+component; every other shape is a blend rig, and submitting one of
+		// its bones as if it were the only bone is what tears a character apart.
+		struct index_audit
+		{
+			u32 arl_count = 0;
+			u32 indexed_reads = 0;
+			u32 foreign_reads = 0; // indexed reads through some other address register/component
+		};
+
+		index_audit audit_indexing(const program_walker& prog, u32 addr_reg, u32 addr_swz)
+		{
+			index_audit out{};
+
+			for (u32 i = 0; i < static_cast<u32>(prog.size()); ++i)
+			{
+				const decoded_instr& in = prog[i];
+
+				if (in.d1.vec_opcode == RSX_VEC_OPCODE_ARL)
+				{
+					++out.arl_count;
+				}
+
+				if (in.d3.index_const && reads_constant(in))
+				{
+					++out.indexed_reads;
+
+					if (u32{in.d0.addr_reg_sel_1} != addr_reg || u32{in.d0.addr_swz} != addr_swz)
+					{
+						++out.foreign_reads;
+					}
+				}
+			}
+
+			return out;
 		}
 
 		// Follows the address register back to the vertex attribute that produced it, recording
@@ -1125,6 +1196,95 @@ namespace remix_rsx
 			return (std::isfinite(parsed) && parsed > 0.f) ? parsed : fallback;
 		}
 
+		// Unsigned integer knob. Unlike env_float the fallback covers "unset" only, so 0 stays a
+		// usable value (RPCS3_REMIX_SKINBONE=0 means bone 0, not "off").
+		u32 env_u32(const wchar_t* name, u32 fallback)
+		{
+			wchar_t buffer[32]{};
+			const DWORD written = GetEnvironmentVariableW(name, buffer, static_cast<DWORD>(std::size(buffer)));
+
+			if (written == 0 || written >= std::size(buffer))
+			{
+				return fallback;
+			}
+
+			wchar_t* end = nullptr;
+			const unsigned long parsed = ::wcstoul(buffer, &end, 10);
+
+			if (end == buffer || parsed > 0xFFFFFFFEul)
+			{
+				return fallback;
+			}
+
+			return static_cast<u32>(parsed);
+		}
+
+		// "aabbccdd11223344,556677..." -> the hashes, parsed once. Separators are comma, space
+		// or semicolon so a value pasted out of the dev menu or the dump line works as typed.
+		std::vector<u64> parse_hash_list(const wchar_t* name)
+		{
+			std::vector<u64> out;
+
+			// Enough for ~200 hashes; a longer list is a conf-file problem, not a knob problem.
+			std::vector<wchar_t> buffer(4096, L'\0');
+			const DWORD written = GetEnvironmentVariableW(name, buffer.data(), static_cast<DWORD>(buffer.size()));
+
+			if (written == 0 || written >= buffer.size())
+			{
+				return out;
+			}
+
+			const wchar_t* cursor = buffer.data();
+
+			while (*cursor)
+			{
+				while (*cursor == L',' || *cursor == L' ' || *cursor == L';' || *cursor == L'\t')
+				{
+					++cursor;
+				}
+
+				if (!*cursor)
+				{
+					break;
+				}
+
+				wchar_t* end = nullptr;
+				const u64 value = ::_wcstoui64(cursor, &end, 16);
+
+				if (end == cursor)
+				{
+					// Not a hex digit: skip the token rather than spinning on it.
+					while (*cursor && *cursor != L',' && *cursor != L' ' && *cursor != L';')
+					{
+						++cursor;
+					}
+
+					continue;
+				}
+
+				if (value)
+				{
+					out.push_back(value);
+				}
+
+				cursor = end;
+			}
+
+			return out;
+		}
+
+		const std::vector<u64>* category_lists()
+		{
+			static const std::vector<u64> lists[4] = {
+				parse_hash_list(L"RPCS3_REMIX_CAT_SKY"),
+				parse_hash_list(L"RPCS3_REMIX_CAT_HIDE"),
+				parse_hash_list(L"RPCS3_REMIX_CAT_PARTICLE"),
+				parse_hash_list(L"RPCS3_REMIX_CAT_DECAL"),
+			};
+
+			return lists;
+		}
+
 		f32 vec_length(const f32 (&v)[3])
 		{
 			return std::sqrt((v[0] * v[0]) + (v[1] * v[1]) + (v[2] * v[2]));
@@ -1530,6 +1690,29 @@ namespace remix_rsx
 				result.skinned = true;
 				result.palette_base = chain.base;
 				result.palette_shape = chain.shape;
+
+				// Hardening: prove the whole program only ever indexes this one palette through
+				// this one address register component before anything is submitted. A second ARL
+				// (an address register reloaded between palette reads) or a read through another
+				// register/component means more than one bone contributes to a vertex, which this
+				// path cannot express. Refuse, count, draw nothing.
+				{
+					const index_audit audit = audit_indexing(prog, chain.addr_reg, chain.addr_swz);
+
+					result.arl_count = audit.arl_count;
+					result.indexed_reads = audit.indexed_reads;
+					result.foreign_indexed_reads = audit.foreign_reads;
+
+					if (audit.arl_count > 1 || audit.foreign_reads != 0)
+					{
+						result.skin_unrecognised = true;
+						result.skin_note = (audit.arl_count > 1)
+							? "more than one ARL: address register is reloaded, so the rig blends"
+							: "palette read through a second address register component";
+						result.note = "skinned rig not provably single-bone";
+						return result;
+					}
+				}
 
 				if (resolve_bone_index(prog, chain.addr_reg, chain.addr_swz, chain.first_instruction, result))
 				{
@@ -2234,6 +2417,24 @@ namespace remix_rsx
 		return value;
 	}
 
+	bool skinid_enabled()
+	{
+		static const bool value = env_flag(L"RPCS3_REMIX_SKINID");
+		return value;
+	}
+
+	u32 skinbone_index()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_SKINBONE", umax);
+		return value;
+	}
+
+	bool skinraw_enabled()
+	{
+		static const bool value = env_flag(L"RPCS3_REMIX_SKINRAW");
+		return value;
+	}
+
 	u64 skip_vp_hash()
 	{
 		static const u64 value = []() -> u64
@@ -2261,6 +2462,125 @@ namespace remix_rsx
 	f32 debug_light_radiance()
 	{
 		static const f32 value = env_float(L"RPCS3_REMIX_LIGHTRADIANCE", 100.f);
+		return value;
+	}
+
+	bool hash_in_category(draw_category which, u64 hash)
+	{
+		if (!hash)
+		{
+			return false;
+		}
+
+		const std::vector<u64>& list = category_lists()[static_cast<u32>(which) & 3];
+		return std::find(list.begin(), list.end(), hash) != list.end();
+	}
+
+	bool any_category_listed()
+	{
+		static const bool value = []() -> bool
+		{
+			const std::vector<u64>* lists = category_lists();
+
+			for (u32 i = 0; i < 4; ++i)
+			{
+				if (!lists[i].empty())
+				{
+					return true;
+				}
+			}
+
+			return false;
+		}();
+
+		return value;
+	}
+
+	void sun_direction(f32 (&out)[3])
+	{
+		static const std::array<f32, 3> value = []() -> std::array<f32, 3>
+		{
+			// Down and slightly across: a plausible mid-morning sun in a Y-up world, which is
+			// what every title seen so far uses. Tuned by knob, not guessed at again in code.
+			std::array<f32, 3> result = { -0.35f, -0.9f, -0.25f };
+
+			wchar_t buffer[128]{};
+			const DWORD written = GetEnvironmentVariableW(L"RPCS3_REMIX_SUNDIR", buffer, static_cast<DWORD>(std::size(buffer)));
+
+			if (written != 0 && written < std::size(buffer))
+			{
+				f32 parsed[3]{};
+				u32 count = 0;
+				const wchar_t* cursor = buffer;
+
+				while (count < 3 && *cursor)
+				{
+					wchar_t* end = nullptr;
+					const double v = ::wcstod(cursor, &end);
+
+					if (end == cursor)
+					{
+						break;
+					}
+
+					parsed[count++] = static_cast<f32>(v);
+					cursor = end;
+
+					while (*cursor == L',' || *cursor == L' ' || *cursor == L';')
+					{
+						++cursor;
+					}
+				}
+
+				if (count == 3)
+				{
+					f32 v[3] = { parsed[0], parsed[1], parsed[2] };
+
+					if (normalize3(v))
+					{
+						result = { v[0], v[1], v[2] };
+						return result;
+					}
+				}
+			}
+
+			f32 v[3] = { result[0], result[1], result[2] };
+			normalize3(v);
+			return { v[0], v[1], v[2] };
+		}();
+
+		out[0] = value[0];
+		out[1] = value[1];
+		out[2] = value[2];
+	}
+
+	f32 sun_radiance()
+	{
+		// The shader divides a distant light's radiance by sin^2(halfAngle) and samples the
+		// cone uniformly, so the irradiance it delivers works out at about pi * radiance
+		// regardless of the angular diameter (distant_light.slangh:99-101). Single digits are
+		// therefore the useful range, not the sphere light's 100.
+		static const f32 value = env_float(L"RPCS3_REMIX_SUNRADIANCE", 3.f);
+		return value;
+	}
+
+	f32 sun_angular_diameter()
+	{
+		static const f32 value = env_float(L"RPCS3_REMIX_SUNANGLE", 0.5f);
+		return value;
+	}
+
+	f32 camera_light_radiance()
+	{
+		// 0 = off. env_float rejects non-positive values, so an explicit 0 lands on the
+		// fallback, which is also 0.
+		static const f32 value = env_float(L"RPCS3_REMIX_CAMLIGHT", 0.f);
+		return value;
+	}
+
+	bool nosun_enabled()
+	{
+		static const bool value = env_flag(L"RPCS3_REMIX_NOSUN");
 		return value;
 	}
 }

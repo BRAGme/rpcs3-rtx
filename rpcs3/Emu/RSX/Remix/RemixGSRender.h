@@ -9,6 +9,7 @@
 #include "Emu/RSX/Remix/RemixTransforms.h"
 #include "Emu/RSX/Remix/RemixVertexDecode.h"
 
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -77,7 +78,15 @@ private:
 		u64 skin_submitted = 0;
 		u64 skin_skipped = 0;
 		u64 skin_bones_max = 0;
+		// A program whose ucode carries skinning the recogniser cannot prove it understands
+		// (a blend rig partially matched as single-bone). Refused, never mis-skinned: a missing
+		// character is an acceptable result, an exploded one is not.
+		u64 skin_unrecognised = 0;
 		u64 skip_vp = 0;
+		u64 cat_sky = 0;
+		u64 cat_hidden = 0;
+		u64 cat_particle = 0;
+		u64 cat_decal = 0;
 	};
 
 	// Wall-clock breakdown of the RSX thread's frame, in microseconds, accumulated over one
@@ -179,6 +188,16 @@ private:
 	// visually at all. Extracting the title's own lights is out of scope for this milestone.
 	void place_debug_light(const f32 (&position)[3]);
 
+	// The scene's default readable light: one distant sun, created once and drawn every frame.
+	// RSX has no fixed-function light state to read - PS3 titles light in fragment-program
+	// constants with per-title semantics - so there is nothing engine-agnostic to extract.
+	// False when the light could not be created; the caller then just has no sun.
+	bool ensure_sun_light();
+
+	// Remix instance categories for one draw, from the albedo hash lists. Replaces the
+	// hardcoded categoryFlags = 0: the rtx.*Textures conf lists never reach an API draw.
+	u32 classify_draw(u64 albedo_hash);
+
 	// True when this draw is 2D / pre-projected and must not reach Remix.
 	bool is_screen_space_draw() const;
 
@@ -235,7 +254,13 @@ private:
 	const remix_rsx::vp_fingerprint& fingerprint_for(u64 vp_hash);
 
 	// RPCS3_REMIX_DUMP=1: one line per unique vertex program, the permanent diagnostic.
-	void dump_vertex_program(u32 vertex_count, u32 index_count);
+	void dump_vertex_program(u32 first_vertex, u32 vertex_count, u32 index_count);
+
+	// The '| skinval' half of that line: the decoded bone attribute, the offsets and dense
+	// indices the first few vertices produce, the palette matrix behind dense bone 0 and the
+	// world transform the draw would be submitted with. Read once per skinned program, so the
+	// skinning diagnosis is read off a log line instead of guessed.
+	std::string describe_skinning(u32 first_vertex, u32 vertex_count);
 
 	// RPCS3_REMIX_DUMP=1: one line per unique texture content hash. This is the line a
 	// modder reads to get the value they type into rtx.conf.
@@ -249,6 +274,11 @@ private:
 
 	remixapi_MeshHandle m_debug_mesh = nullptr;
 	remixapi_LightHandle m_debug_light = nullptr;
+
+	// The default sun. Created once, not destroyed and recreated every frame the way the
+	// camera sphere is: its parameters come from knobs that cannot change mid-run.
+	remixapi_LightHandle m_sun_light = nullptr;
+	bool m_sun_failed = false;
 
 	rsx::vertex_input_layout m_vertex_layout{};
 

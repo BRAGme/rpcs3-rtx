@@ -135,7 +135,17 @@ namespace remix_rsx
 		u32 bone_op_count = 0;
 		bone_index_op bone_ops[max_bone_index_ops] = {};
 
+		// The ucode carries skinning this recogniser cannot prove it understands: a second ARL,
+		// or an indexed constant read through an address register/component other than the one
+		// matched palette's. That is a blend rig being seen as single-bone, which is what
+		// explodes a character. The draw is refused and counted, never drawn with one of its
+		// bones - a missing character is an acceptable result, an exploded one is not.
+		bool skin_unrecognised = false;
+
 		// Diagnostics.
+		u32 arl_count = 0;
+		u32 indexed_reads = 0;
+		u32 foreign_indexed_reads = 0;
 		u32 distinct_consts = 0;
 		u32 chain_instructions = 0;
 		bool indexed_const = false;
@@ -253,6 +263,20 @@ namespace remix_rsx
 	bool nocam_enabled();
 	bool noskin_enabled();
 
+	// Skinning bisect knobs. Each one isolates one link of the chain
+	// attribute -> index -> palette slot -> matrix -> submitted pose, so a single run answers
+	// one question instead of the whole thing being guessed at.
+	// RPCS3_REMIX_SKINID=1      submit identity bone transforms, mesh/indices/weights unchanged.
+	//                           Geometry rigid and correctly placed => the matrices are the fault.
+	// RPCS3_REMIX_SKINBONE=<n>  clamp every dense bone index to n. Mesh rigid => the palette read
+	//                           is fine and the index decode is the fault. umax when unset, so 0
+	//                           stays a usable value.
+	// RPCS3_REMIX_SKINRAW=1     feed the raw (un-scaled) attribute value to evaluate_bone_offset
+	//                           instead of the scaled one - M4 deviation D1 under test.
+	bool skinid_enabled();
+	u32 skinbone_index();
+	bool skinraw_enabled();
+
 	// RPCS3_REMIX_SKIPVP=<16 hex digits>: drop every draw of one vertex program. The one-run
 	// bisector for "which program draws that". 0 when unset.
 	u64 skip_vp_hash();
@@ -260,6 +284,46 @@ namespace remix_rsx
 	// Debug light knobs so a derived camera can be judged visually at all.
 	f32 debug_light_radius();
 	f32 debug_light_radiance();
+
+	// ---------------------------------------------------------------------------------------
+	// Instance categories
+	// ---------------------------------------------------------------------------------------
+	// Comma-separated 16-hex albedo *content* hashes - the same values the 'Remix tex=' dump
+	// line and the Remix dev menu display. Setting categoryFlags at submit time is the only
+	// mechanism that reaches a submitExternalDraw-path draw: the rtx.*Textures conf lists are
+	// matched on the D3D9 path only, which is why tagging a texture in the dev menu did
+	// nothing for this backend.
+	//   RPCS3_REMIX_CAT_SKY      -> SKY          (selects the sky camera AND hides the instance)
+	//   RPCS3_REMIX_CAT_HIDE     -> HIDDEN       (IGNORE is a no-op for API draws; do not use it)
+	//   RPCS3_REMIX_CAT_PARTICLE -> PARTICLE
+	//   RPCS3_REMIX_CAT_DECAL    -> DECAL_STATIC
+	enum class draw_category
+	{
+		sky,
+		hide,
+		particle,
+		decal
+	};
+
+	bool hash_in_category(draw_category which, u64 hash);
+
+	// True when any list has at least one entry, so the per-draw lookup can be skipped whole.
+	bool any_category_listed();
+
+	// ---------------------------------------------------------------------------------------
+	// Default lighting
+	// ---------------------------------------------------------------------------------------
+	// The camera-parked debug sphere blows out everything near it and crushes everything far,
+	// so the readable default is a distant sun; the sphere stays as an optional fill, off by
+	// default. Direction is in the recovered world space and is normalised in code.
+	//   RPCS3_REMIX_SUNDIR="x,y,z"  RPCS3_REMIX_SUNRADIANCE=<f>  RPCS3_REMIX_SUNANGLE=<degrees>
+	//   RPCS3_REMIX_CAMLIGHT=<radiance>  (0 = off)
+	//   RPCS3_REMIX_NOSUN=1  no default sun at all
+	void sun_direction(f32 (&out)[3]);
+	f32 sun_radiance();
+	f32 sun_angular_diameter();
+	f32 camera_light_radiance();
+	bool nosun_enabled();
 }
 
 #endif
