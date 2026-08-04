@@ -1163,6 +1163,142 @@ int RemixGSRender::albedo_texture_unit() const
 	return -1;
 }
 
+void RemixGSRender::apply_texcoords(u32 unit, const remix_rsx::texture_entry& entry,
+	const rsx::fragment_texture& tex, u32 first_vertex, u32 vertex_count)
+{
+	// Every world vertex used to leave here with texcoord (0,0). A mesh whose UVs are all the
+	// same point samples one texel of its albedo across every pixel of every triangle, so the
+	// material is applied but the picture is a flat colour - which is what Haze showed while
+	// the counters said tex_bound=5.7M and mat_created=6715. The texture path was never the
+	// defect; the coordinates were missing.
+	//
+	// RSX feeds texture unit n from vertex attribute 8+n (ATTR8 == in_tc0), the same mapping
+	// composite_ui_draw uses on the 2D path. That mapping is a convention, not a guarantee -
+	// the fragment program's TEXn input is fed by whatever the vertex program writes to o[9+n] -
+	// so a fallback scan and an override knob are provided rather than assuming it holds.
+	if (remix_rsx::texcoords_disabled())
+	{
+		return;
+	}
+
+	attribute_view uvs{};
+	u32 chosen = 0xFFFFFFFFu;
+
+	const auto try_attribute = [&](u32 index)
+	{
+		if (index < 8 || index > 15 || chosen != 0xFFFFFFFFu)
+		{
+			return;
+		}
+
+		if (map_attribute(index, first_vertex, vertex_count, uvs) == attribute_status::ok)
+		{
+			chosen = index;
+		}
+	};
+
+	if (const u32 forced = remix_rsx::texcoord_attribute(); forced != 0)
+	{
+		try_attribute(forced);
+	}
+	else
+	{
+		try_attribute(8 + unit);
+
+		// A program that samples unit 1 from in_tc0 (a lightmap or detail map sharing the
+		// diffuse UVs) is common enough to be worth a second look before giving up.
+		for (u32 index = 8; index <= 15; ++index)
+		{
+			try_attribute(index);
+		}
+	}
+
+	if (chosen == 0xFFFFFFFFu)
+	{
+		++m_stats.uv_none;
+		return;
+	}
+
+	f32 uv_scale[2] = { 1.f, 1.f };
+
+	if (tex.format() & CELL_GCM_TEXTURE_UN)
+	{
+		// Unnormalised coordinates are in texels, exactly as on the UI path.
+		uv_scale[0] = entry.width ? (1.f / static_cast<f32>(entry.width)) : 1.f;
+		uv_scale[1] = entry.height ? (1.f / static_cast<f32>(entry.height)) : 1.f;
+	}
+	else if (uvs.type == rsx::vertex_base_type::s32k)
+	{
+		// S32K is the one texcoord format the vertex fetch does not normalise - rpcs3's
+		// scaling_table gives it 1.0, so decode_position hands back the stored 16-bit integer
+		// and the divisor lives in a vertex-program constant. Submitted raw, a 0..32767 UV
+		// minifies the texture by four orders of magnitude, and every pixel of the surface
+		// averages to one flat colour: the grey tree trunks and white slabs in tx1_u1/u2.
+		//
+		// The divisor is 4096 (12.4 fixed point). Read off the title's own data rather than
+		// assumed: of the thirteen S32K programs in the tx1 census, four span a maximum of
+		// exactly 4095 / 4109 / 4028 - i.e. one full tile of a 4096 unit, with the small
+		// overshoot a wrap - and the rest run to ~30000-32600, which is that same unit tiled
+		// seven or eight times across a wall. The alternative reading (unit 32768) would give
+		// those four programs a sixteenth of their 128x128 and 512x512 textures, which no
+		// content pipeline produces. RPCS3_REMIX_UVINTSCALE=<n> overrides it in one variable.
+		const f32 divisor = static_cast<f32>(remix_rsx::texcoord_int_scale());
+
+		if (divisor > 0.f)
+		{
+			uv_scale[0] = 1.f / divisor;
+			uv_scale[1] = 1.f / divisor;
+		}
+	}
+
+	for (u32 i = 0; i < vertex_count; ++i)
+	{
+		f32 uv[4]{};
+
+		if (!remix_rsx::decode_position(uvs.at(i), uvs.type, uvs.size, uv))
+		{
+			// decode_position only rejects on the type/size pair, which is constant across the
+			// view, so this fires on i == 0 or never - no half-written UV set escapes.
+			++m_stats.uv_none;
+			return;
+		}
+
+		m_scratch_vertices[i].texcoord[0] = uv[0] * uv_scale[0];
+		m_scratch_vertices[i].texcoord[1] = uv[1] * uv_scale[1];
+	}
+
+	++m_stats.uv_applied;
+
+	if (chosen != (8 + unit))
+	{
+		++m_stats.uv_fallback;
+	}
+
+	// One line per (program, unit, attribute), once: if the picture comes back textured but
+	// wrong, the UV range and the attribute that produced it are the first two things to read.
+	if (remix_rsx::dump_enabled())
+	{
+		const u64 census_key = m_current_vp_hash ^ (u64{unit} << 56) ^ (u64{chosen} << 48);
+
+		if (m_uv_census_seen.insert(census_key).second)
+		{
+			f32 u_lo = +3.4e38f, u_hi = -3.4e38f, v_lo = +3.4e38f, v_hi = -3.4e38f;
+
+			for (u32 i = 0; i < vertex_count; ++i)
+			{
+				u_lo = std::min(u_lo, m_scratch_vertices[i].texcoord[0]);
+				u_hi = std::max(u_hi, m_scratch_vertices[i].texcoord[0]);
+				v_lo = std::min(v_lo, m_scratch_vertices[i].texcoord[1]);
+				v_hi = std::max(v_hi, m_scratch_vertices[i].texcoord[1]);
+			}
+
+			rsx_log.notice("Remix uv: vp=%016llx unit=%u attr=%u type=%u size=%u u=[%.3f..%.3f] v=[%.3f..%.3f] tex=%ux%u",
+				m_current_vp_hash, unit, chosen, static_cast<u32>(uvs.type), uvs.size,
+				u_lo, u_hi, v_lo, v_hi, entry.width, entry.height);
+		}
+	}
+}
+
 bool RemixGSRender::samples_bound_surface() const
 {
 	// Every referenced 2D unit is tested, not just albedo_texture_unit()'s: that one returns the
@@ -2739,6 +2875,32 @@ void RemixGSRender::submit_subdraw()
 	{
 		++m_stats.skip_screen_space;
 
+		// One line per program, once. The first-person weapon/arms are absent from every
+		// capture and this is the largest refusal bucket that could plausibly hold them: a
+		// viewmodel is drawn with its own near-plane projection, which is exactly what the
+		// orthographic test can mistake for UI. A viewmodel reads as a few hundred to a few
+		// thousand vertices in a bounding box a metre or two across; real UI reads as a handful
+		// of vertices on a unit quad. The bbox is what tells them apart.
+		if (remix_rsx::dump_enabled() && m_screen_census_seen.insert(m_current_vp_hash).second)
+		{
+			f32 lo[3] = { +3.4e38f, +3.4e38f, +3.4e38f };
+			f32 hi[3] = { -3.4e38f, -3.4e38f, -3.4e38f };
+
+			for (const remixapi_HardcodedVertex& v : m_scratch_vertices)
+			{
+				for (u32 c = 0; c < 3; ++c)
+				{
+					lo[c] = std::min(lo[c], v.position[c]);
+					hi[c] = std::max(hi[c], v.position[c]);
+				}
+			}
+
+			rsx_log.notice("Remix: screen-space refusal vp=%016llx vtx=%u idx=%llu bbox=[%.4g %.4g %.4g]..[%.4g %.4g %.4g] depth_write=%d",
+				m_current_vp_hash, vertex_count, static_cast<u64>(m_scratch_indices.size()),
+				lo[0], lo[1], lo[2], hi[0], hi[1], hi[2],
+				rsx::method_registers.depth_write_enabled() ? 1 : 0);
+		}
+
 		if (compositing)
 		{
 			const u64 t0 = now_us();
@@ -2817,8 +2979,19 @@ void RemixGSRender::submit_subdraw()
 
 		skinned = true;
 	}
-	else if (fp.indexed_const)
+	else if (fp.indexed_const && !remix_rsx::draw_indexed_const())
 	{
+		// One line per program, once, at notice level - the same census shape the render-target
+		// gate uses. Without it this counter is a single number covering however many programs
+		// happen to land in it, and the first Haze run after the geometry fix had it at 2.6 M
+		// draws against 5.6 M submitted, i.e. it was silently eating a third of the scene.
+		if (m_indexed_census_seen.insert(m_current_vp_hash).second)
+		{
+			rsx_log.notice("Remix: indexed-const refusal vp=%016llx vtx=%u idx=%llu arch=%s",
+				m_current_vp_hash, vertex_count, static_cast<u64>(m_scratch_indices.size()),
+				remix_rsx::archetype_name(fp.archetype));
+		}
+
 		// The program reads a constant palette through an address register and the recogniser
 		// did not turn it into bone transforms - whether or not it managed to match an outer
 		// group. Submitting it draws the mesh with the palette simply not applied: the bind
@@ -2845,16 +3018,21 @@ void RemixGSRender::submit_subdraw()
 		if (const int unit = albedo_texture_unit(); unit >= 0)
 		{
 			const remix_rsx::texture_entry* entry = nullptr;
-			material = m_textures.bind(api, rsx::method_registers.fragment_textures[unit], m_frame_counter, &entry);
+			const rsx::fragment_texture& tex = rsx::method_registers.fragment_textures[unit];
+			material = m_textures.bind(api, tex, m_frame_counter, &entry);
 
 			if (material && entry)
 			{
 				albedo_hash = entry->content_hash;
 				++m_stats.tex_bound;
 
+				// Must happen before the mesh hash below: the texcoords live inside
+				// m_scratch_vertices, which is what the hash is taken over.
+				apply_texcoords(static_cast<u32>(unit), *entry, tex, first_vertex, vertex_count);
+
 				if (remix_rsx::dump_enabled() && m_dumped_textures.insert(albedo_hash).second)
 				{
-					dump_texture(*entry, rsx::method_registers.fragment_textures[unit], static_cast<u32>(unit));
+					dump_texture(*entry, tex, static_cast<u32>(unit));
 				}
 			}
 			else
@@ -3352,7 +3530,7 @@ void RemixGSRender::dump_vertex_program(u32 first_vertex, u32 vertex_count, u32 
 void RemixGSRender::dump_texture(const remix_rsx::texture_entry& entry, const rsx::fragment_texture& tex, u32 unit)
 {
 	const std::string line = fmt::format(
-		"Remix tex=%016llX fmt=%02x %ux%u unit=%u mips=%u swizzled=%d pitch=%u loc=%u offset=0x%x wrap=%u,%u",
+		"Remix tex=%016llX fmt=%02x %ux%u unit=%u mips=%u swizzled=%d pitch=%u loc=%u offset=0x%x wrap=%u,%u alpha=%u/%u",
 		entry.content_hash,
 		u32{tex.format()} & ~(CELL_GCM_TEXTURE_LN | CELL_GCM_TEXTURE_UN),
 		entry.width,
@@ -3364,7 +3542,9 @@ void RemixGSRender::dump_texture(const remix_rsx::texture_entry& entry, const rs
 		u32{tex.location()},
 		tex.offset(),
 		u32{entry.wrap_u},
-		u32{entry.wrap_v});
+		u32{entry.wrap_v},
+		u32{entry.alpha_func},
+		u32{entry.alpha_ref});
 
 	rsx_log.notice("%s", line);
 
@@ -3465,7 +3645,7 @@ void RemixGSRender::log_stats()
 		"skip screen=%llu immediate=%llu inline=%llu volatile=%llu reg_attr0=%llu prim=%llu restart=%llu instanced=%llu layout=%llu mem=%llu decode=%llu poison=%llu vp=%llu rt=%llu rt_kept=%llu notinput=%llu wdiv=%llu | "
 		"skin_submitted=%llu skin_skipped=%llu skin_unrecognised=%llu skin_bones_max=%llu | "
 		"cat_sky=%llu cat_hidden=%llu cat_particle=%llu cat_decal=%llu | "
-		"tex_bound=%llu tex_none=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_rehashed=%llu tex_refreshed=%llu mat_created=%llu | "
+		"tex_bound=%llu tex_none=%llu uv_applied=%llu uv_none=%llu uv_fallback=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_rehashed=%llu tex_refreshed=%llu mat_created=%llu | "
 		"ui_draws=%llu ui_skipped=%llu ui_no_colour=%llu ui_rt=%llu ui_prims=%llu ui_frames=%llu | "
 		"zcull_av=%llu zcull_av_handled=%llu",
 		m_frame_counter,
@@ -3508,6 +3688,9 @@ void RemixGSRender::log_stats()
 		m_stats.cat_decal,
 		m_stats.tex_bound,
 		m_stats.tex_none,
+		m_stats.uv_applied,
+		m_stats.uv_none,
+		m_stats.uv_fallback,
 		static_cast<u64>(m_textures.live()),
 		tex.created,
 		tex.destroyed,

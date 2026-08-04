@@ -35,6 +35,13 @@ namespace remix_rsx
 		u8 cubemap = 0;
 		u8 dimension = 0;
 
+		// The draw's alpha test, as a VkCompareOp (RSX comparison_function - 0x200) plus the
+		// 0-255 reference. Part of the key because the material carries the alpha state and the
+		// material is what this cache hands out: one texture used by an opaque wall draw and by
+		// an alpha-cutout foliage card needs two materials, not one. 7 == ALWAYS == no test.
+		u8 alpha_func = 7;
+		u8 alpha_ref = 0;
+
 		bool operator==(const texture_descriptor&) const = default;
 		u64 key() const;
 	};
@@ -65,6 +72,10 @@ namespace remix_rsx
 		// Remix wrap-mode enumerants derived from the RSX sampler state.
 		u8 wrap_u = 1;
 		u8 wrap_v = 1;
+
+		// Alpha test carried over from the descriptor, applied to the material at upload time.
+		u8 alpha_func = 7;
+		u8 alpha_ref = 0;
 
 		// Decoded BGRA8, kept so the UI compositor can sample it CPU-side.
 		std::vector<u8> pixels;

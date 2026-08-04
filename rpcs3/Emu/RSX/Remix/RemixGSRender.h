@@ -88,6 +88,13 @@ private:
 		u64 wdiv_draws = 0;
 		u64 tex_bound = 0;
 		u64 tex_none = 0;
+		// Of the tex_bound population, how many left with real texcoords rather than the
+		// (0,0) every vertex used to carry. uv_applied far below tex_bound means the albedo is
+		// there and the coordinates are not, which renders as one flat colour per draw.
+		u64 uv_applied = 0;
+		u64 uv_none = 0;
+		// Resolved from an attribute other than 8+unit, i.e. the convention did not hold.
+		u64 uv_fallback = 0;
 		u64 ui_draws = 0;
 		u64 ui_skipped = 0;
 		u64 ui_no_colour = 0;
@@ -225,6 +232,12 @@ private:
 	// bound as a colour or depth surface: the title reading back its own framebuffer.
 	bool samples_bound_surface() const;
 
+	// Fills m_scratch_vertices' texcoords from the vertex attribute that feeds the albedo unit.
+	// Must run before the mesh content hash is taken: the texcoords are part of the vertex data
+	// the hash covers, and two draws that share positions but not UVs are different meshes.
+	void apply_texcoords(u32 unit, const remix_rsx::texture_entry& entry,
+		const rsx::fragment_texture& tex, u32 first_vertex, u32 vertex_count);
+
 	// Locates one vertex attribute in the interleaved blocks and validates the guest span it
 	// would be read through. Unlike the old ATTR0-only code this searches *every* block: a
 	// bone index or a texcoord routinely lives in a different block than the position.
@@ -319,6 +332,16 @@ private:
 	// Vertex programs already reported by the render-target feedback gate, so its census is one
 	// line per program instead of one per draw.
 	std::unordered_set<u64> m_rt_feedback_seen;
+
+	// (vertex program, albedo unit, texcoord attribute) triples already reported by the UV
+	// census, so a dump run gets one line per combination instead of one per draw.
+	std::unordered_set<u64> m_uv_census_seen;
+
+	// Vertex programs already reported by the indexed-constant refusal census.
+	std::unordered_set<u64> m_indexed_census_seen;
+
+	// Vertex programs already reported by the screen-space refusal census.
+	std::unordered_set<u64> m_screen_census_seen;
 
 	remix_rsx::texture_cache m_textures;
 	remix_rsx::compositor m_compositor;

@@ -8,6 +8,8 @@
 #include "Emu/RSX/Common/io_buffer.h"
 #include "Emu/RSX/RSXTexture.h"
 #include "Emu/RSX/RSXThread.h"
+#include "Emu/RSX/rsx_methods.h"
+#include "Emu/RSX/Remix/RemixTransforms.h"
 #include "Emu/RSX/gcm_enums.h"
 #include "Emu/RSX/Remix/RemixRuntime.h"
 #include "util/fnv_hash.hpp"
@@ -222,6 +224,7 @@ namespace remix_rsx
 		hash = rpcs3::hash64(hash, u64{location} | (u64{format} << 8) | (u64{pitch} << 16));
 		hash = rpcs3::hash64(hash, u64{width} | (u64{height} << 16) | (u64{depth} << 32) | (u64{mipmaps} << 48));
 		hash = rpcs3::hash64(hash, u64{border} | (u64{wrap_s} << 8) | (u64{wrap_t} << 16) | (u64{cubemap} << 24) | (u64{dimension} << 32));
+		hash = rpcs3::hash64(hash, u64{alpha_func} | (u64{alpha_ref} << 8));
 		return hash ? hash : 1;
 	}
 
@@ -260,6 +263,29 @@ namespace remix_rsx
 		desc.wrap_t = static_cast<u8>(tex.wrap_t());
 		desc.cubemap = tex.cubemap() ? 1 : 0;
 		desc.dimension = static_cast<u8>(tex.dimension());
+
+		// Alpha-cutout foliage was rendering as a solid quad because M3 shipped every material
+		// with alphaTestType 7 (ALWAYS, i.e. no test) and useDrawCallAlphaState 1 - and the
+		// latter tells the runtime to read the alpha state from a remixapi_InstanceInfoBlendEXT
+		// this backend never chains, so the state was neither the title's nor the material's.
+		// Take it from the RSX registers, where it actually lives.
+		if (!alpha_state_disabled() && rsx::method_registers.alpha_test_enabled())
+		{
+			// RSX comparison_function is CELL_GCM_NEVER..CELL_GCM_ALWAYS = 0x200..0x207, and
+			// VkCompareOp (which is what the runtime's alphaTestType is) is 0..7 in the same
+			// order, so the mapping is a subtraction. Anything outside the range falls back to
+			// ALWAYS rather than guessing.
+			const u32 func = static_cast<u32>(rsx::method_registers.alpha_func());
+
+			if (func >= 0x200 && func <= 0x207)
+			{
+				desc.alpha_func = static_cast<u8>(func - 0x200);
+			}
+
+			// alpha_ref() is normalised 0..1 regardless of the surface's colour depth;
+			// alphaReferenceValue is a uint8_t.
+			desc.alpha_ref = static_cast<u8>(std::clamp(rsx::method_registers.alpha_ref(), 0.f, 1.f) * 255.f + 0.5f);
+		}
 
 		if (desc.width == 0 || desc.height == 0)
 		{
@@ -381,6 +407,8 @@ namespace remix_rsx
 		entry.last_used_frame = frame;
 		entry.wrap_u = to_remix_wrap(tex.wrap_s());
 		entry.wrap_v = to_remix_wrap(tex.wrap_t());
+		entry.alpha_func = desc.alpha_func;
+		entry.alpha_ref = desc.alpha_ref;
 
 		if (!decode(tex, entry))
 		{
@@ -662,12 +690,15 @@ namespace remix_rsx
 		opaque.alphaIsThinFilmThickness = 0;
 		opaque.heightTexture = nullptr;
 		opaque.displaceIn = 0.f;
-		opaque.useDrawCallAlphaState = 1;
+		// 0, not 1: 1 means "read the alpha state from remixapi_InstanceInfoBlendEXT", which
+		// this backend does not chain onto its instances, so with 1 the two fields below were
+		// dead and every material was unconditionally opaque.
+		opaque.useDrawCallAlphaState = 0;
 		opaque.blendType_hasvalue = 0;
 		opaque.blendType_value = 0;
 		opaque.invertedBlend = 0;
-		opaque.alphaTestType = 7;
-		opaque.alphaReferenceValue = 0;
+		opaque.alphaTestType = static_cast<int>(entry.alpha_func);
+		opaque.alphaReferenceValue = entry.alpha_ref;
 		opaque.displaceOut = 0.f;
 
 		remixapi_MaterialInfo material{};

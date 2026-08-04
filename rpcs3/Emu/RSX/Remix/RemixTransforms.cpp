@@ -1131,41 +1131,93 @@ namespace remix_rsx
 		}
 
 		// Bounded backward slice from HPOS, only to count constants and spot indexed addressing.
+		//
+		// The walk is order-aware: a register read by the instruction at index i can only have
+		// been written by an instruction at index < i, because RSX vertex programs are
+		// straight-line code. Collecting every writer in the program regardless of position -
+		// which is what this did up to e9a7956 - drags the *later* half of the program into the
+		// position slice. That is not a theoretical concern: all three of Haze's indexed
+		// programs (af06f6d32ec048ee, ea1fc49cc2ef7afc, df46f03b1b7ab8a4) write HPOS and then
+		// read c27[a]/c29[a] into a temp several instructions afterwards, so the unordered walk
+		// reported indexed addressing in the position chain for programs whose position never
+		// touches an indexed constant, and submit_subdraw refused them as unrecognised rigs.
+		// RPCS3_REMIX_LOOSESLICE=1 restores the old behaviour.
 		void slice_position(const program_walker& prog, u32& out_distinct_consts, u32& out_instructions, bool& out_indexed, std::vector<u32>* out_indices = nullptr)
 		{
-			std::vector<walk_target> pending;
-			std::vector<walk_target> seen_targets;
+			// 'before' is the exclusive instruction bound a write has to precede to reach this
+			// read. Two reads of the same register at different points in the program are
+			// genuinely different targets, so it takes part in the visited test.
+			struct slice_target
+			{
+				walk_target reg;
+				u32 before = 0;
+
+				bool operator==(const slice_target& other) const
+				{
+					return reg == other.reg && before == other.before;
+				}
+			};
+
+			const bool ordered = !loose_slice_enabled();
+			const u32 program_size = static_cast<u32>(prog.size());
+
+			// The visited set is now (register, bound) rather than register alone, so a linear
+			// scan of it is quadratic in a way the old one was not. A dense bitmap keeps the
+			// walk linear in the number of distinct targets: 2 spaces x 64 registers x one slot
+			// per instruction boundary.
+			constexpr u32 register_space = 64;
+			const u32 bound_slots = program_size + 1;
+			std::vector<u8> visited(usz{2} * register_space * bound_slots, 0);
+
+			const auto mark_visited = [&](const slice_target& t) -> bool
+			{
+				if (t.reg.index >= register_space || t.before > program_size)
+				{
+					// Out of the bitmap's range. Cannot loop forever regardless: 'before'
+					// strictly decreases along every edge in ordered mode, and the walk budget
+					// below is the backstop for the loose one.
+					return false;
+				}
+
+				const usz slot = ((usz{t.reg.is_output ? 1u : 0u} * register_space) + t.reg.index) * bound_slots + t.before;
+
+				if (visited[slot])
+				{
+					return true;
+				}
+
+				visited[slot] = 1;
+				return false;
+			};
+
+			std::vector<slice_target> pending;
 			std::vector<u8> seen_instr(prog.size(), 0);
 			std::vector<u32> consts;
 
-			pending.push_back(walk_target{ true, 0 });
+			pending.push_back(slice_target{ walk_target{ true, 0 }, program_size });
 
 			u32 instructions = 0;
 			bool indexed = false;
 
-			while (!pending.empty())
+			// One walk per distinct (register, bound) plus slack. Never reached in practice;
+			// it exists so a malformed ucode cannot wedge the RSX thread.
+			u32 budget = 4 * static_cast<u32>(visited.size()) + 1024;
+
+			while (!pending.empty() && budget-- != 0)
 			{
-				const walk_target target = pending.back();
+				const slice_target entry = pending.back();
 				pending.pop_back();
 
-				bool already = false;
-				for (const auto& t : seen_targets)
-				{
-					if (t == target)
-					{
-						already = true;
-						break;
-					}
-				}
+				const walk_target target = entry.reg;
 
-				if (already)
+				if (mark_visited(entry))
 				{
 					continue;
 				}
 
-				seen_targets.push_back(target);
+				const u32 limit = ordered ? std::min(entry.before, program_size) : program_size;
 
-				for (u32 i = 0; i < static_cast<u32>(prog.size()); ++i)
+				for (u32 i = 0; i < limit; ++i)
 				{
 					const decoded_instr& in = prog[i];
 
@@ -1228,7 +1280,10 @@ namespace remix_rsx
 							break;
 						}
 						case RSX_VP_REGISTER_TYPE_TEMP:
-							pending.push_back(walk_target{ false, in.src[s].tmp_src });
+							// In loose mode the bound is not used, so collapse it to keep the
+							// visited set keyed on the register alone - exactly the pre-e9a7956
+							// walk, at the pre-e9a7956 cost.
+							pending.push_back(slice_target{ walk_target{ false, in.src[s].tmp_src }, ordered ? i : program_size });
 							break;
 						default:
 							break;
@@ -2559,6 +2614,42 @@ namespace remix_rsx
 	bool strict_input_enabled()
 	{
 		static const bool value = env_flag(L"RPCS3_REMIX_STRICTINPUT");
+		return value;
+	}
+
+	bool texcoords_disabled()
+	{
+		static const bool value = env_flag(L"RPCS3_REMIX_NOUV");
+		return value;
+	}
+
+	u32 texcoord_attribute()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_UVATTR", 0);
+		return value;
+	}
+
+	u32 texcoord_int_scale()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_UVINTSCALE", 4096);
+		return value;
+	}
+
+	bool loose_slice_enabled()
+	{
+		static const bool value = env_flag(L"RPCS3_REMIX_LOOSESLICE");
+		return value;
+	}
+
+	bool draw_indexed_const()
+	{
+		static const bool value = env_flag(L"RPCS3_REMIX_DRAWINDEXED");
+		return value;
+	}
+
+	bool alpha_state_disabled()
+	{
+		static const bool value = env_flag(L"RPCS3_REMIX_NOALPHA");
 		return value;
 	}
 

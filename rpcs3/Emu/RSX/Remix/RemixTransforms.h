@@ -297,6 +297,40 @@ namespace remix_rsx
 	// run that says whether they are the cause. Diagnostic only - off by default.
 	bool strict_input_enabled();
 
+	// RPCS3_REMIX_NOUV=1: submit world geometry with texcoord (0,0) on every vertex - the
+	// behaviour up to and including e9a7956, where a bound albedo material produced one flat
+	// colour per draw because every pixel sampled the same texel. The bisect knob for the UV
+	// fetch.
+	bool texcoords_disabled();
+
+	// RPCS3_REMIX_UVATTR=<n>: force the vertex attribute the albedo texcoords are read from
+	// (8..15, i.e. in_tc0..in_tc7) instead of the 8+unit convention with its fallback scan.
+	// 0 (default) leaves the automatic choice in place.
+	u32 texcoord_attribute();
+
+	// RPCS3_REMIX_UVINTSCALE=<n>: divisor for S32K (raw 16-bit integer) texcoords, whose real
+	// divisor is a vertex-program constant this backend does not read. Default 4096, inferred
+	// from Haze's own UV ranges - see apply_texcoords. 0 submits them raw.
+	u32 texcoord_int_scale();
+
+	// RPCS3_REMIX_LOOSESLICE=1: let the backward slice from HPOS collect writers that sit *after*
+	// the instruction whose operand is being traced - the behaviour up to and including e9a7956.
+	// RSX vertex programs are straight-line code, so a write at a later instruction cannot reach
+	// an earlier read; collecting them anyway made three of Haze's programs report indexed
+	// addressing in the position chain when their indexed reads land after the HPOS write. The
+	// bisect knob for the ordering constraint.
+	bool loose_slice_enabled();
+
+	// RPCS3_REMIX_DRAWINDEXED=1: submit draws whose position chain really does read a constant
+	// through an address register instead of refusing them. Diagnostic - the refusal exists
+	// because such a draw renders in its bind pose or torn across the map.
+	bool draw_indexed_const();
+
+	// RPCS3_REMIX_NOALPHA=1: create materials with the alpha state M3 shipped (alphaTestType 7 /
+	// always-pass, useDrawCallAlphaState 1) instead of the title's own alpha test. The bisect
+	// knob for cutout foliage.
+	bool alpha_state_disabled();
+
 	// Skinning bisect knobs. Each one isolates one link of the chain
 	// attribute -> index -> palette slot -> matrix -> submitted pose, so a single run answers
 	// one question instead of the whole thing being guessed at.
