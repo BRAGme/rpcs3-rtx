@@ -969,6 +969,117 @@ namespace remix_rsx
 			return false;
 		}
 
+		struct wdivide_result
+		{
+			bool found = false;
+			u32 attribute = 0;
+		};
+
+		// 'temp.xyz = attribute.xyz * RCP(attribute.w)': a per-vertex divide applied before the
+		// first matrix.
+		//
+		// Haze stores positions as four 16-bit integers in which w is that vertex's own divisor,
+		// and undoes the packing in the ucode. This backend submits the *stored* attribute, so
+		// unless the divide is reproduced on the CPU every vertex is left displaced along its own
+		// ray by its own factor - a mesh blown apart from the inside, which is exactly the
+		// symptom. Unlike match_prescale's constant scale it cannot be folded into the world
+		// matrix, because the factor differs per vertex; the divide has to happen at decode time.
+		bool match_wdivide(const program_walker& prog, u32 temp, u32 before, wdivide_result& out)
+		{
+			const u32 writer = prog.last_temp_writer(temp, before);
+
+			if (writer == umax)
+			{
+				return false;
+			}
+
+			const decoded_instr& in = prog[writer];
+
+			if (in.d1.vec_opcode != RSX_VEC_OPCODE_MUL || (vec_writemask(in) & 0x7) != 0x7 || in.d3.index_const)
+			{
+				return false;
+			}
+
+			u32 attribute_slot = umax;
+			u32 scalar_slot = umax;
+
+			for (u32 s = 0; s < 2; ++s)
+			{
+				if (in.src[s].reg_type == RSX_VP_REGISTER_TYPE_INPUT)
+				{
+					attribute_slot = s;
+				}
+				else if (in.src[s].reg_type == RSX_VP_REGISTER_TYPE_TEMP)
+				{
+					scalar_slot = s;
+				}
+			}
+
+			if (attribute_slot == umax || scalar_slot == umax)
+			{
+				return false;
+			}
+
+			// The attribute has to be read straight: any other swizzle means the operand is not
+			// this vertex's position in its own axis order.
+			const SRC& attr = in.src[attribute_slot];
+
+			if (attr.swz_x != 0 || attr.swz_y != 1 || attr.swz_z != 2)
+			{
+				return false;
+			}
+
+			u32 component = 0;
+			if (!is_broadcast_swizzle(in.src[scalar_slot], component))
+			{
+				return false;
+			}
+
+			const u32 attribute = u32{in.d1.input_src};
+			const u32 scalar_temp = u32{in.src[scalar_slot].tmp_src};
+
+			// The scalar must be the reciprocal of the *same* attribute's w, taken from the last
+			// write of that one component. A VEC write landing there first means the value is
+			// something else and the match is off.
+			for (u32 i = writer; i-- > 0;)
+			{
+				const decoded_instr& prev = prog[i];
+
+				if (vec_writes_temp(prev, scalar_temp) && (vec_writemask(prev) & (1u << component)))
+				{
+					return false;
+				}
+
+				if (!sca_writes_temp(prev, scalar_temp) || !(sca_writemask(prev) & (1u << component)))
+				{
+					continue;
+				}
+
+				if (prev.d1.sca_opcode != RSX_SCA_OPCODE_RCP || prev.d3.index_const)
+				{
+					return false;
+				}
+
+				// The SCA half reads src2.
+				const SRC& divisor = prev.src[2];
+				u32 divisor_component = 0;
+
+				if (divisor.reg_type != RSX_VP_REGISTER_TYPE_INPUT
+					|| u32{prev.d1.input_src} != attribute
+					|| !is_broadcast_swizzle(divisor, divisor_component)
+					|| divisor_component != 3)
+				{
+					return false;
+				}
+
+				out.found = true;
+				out.attribute = attribute;
+				return true;
+			}
+
+			return false;
+		}
+
 		chain_result find_chain(const program_walker& prog, const walk_target& target, u32 before, u32 depth = 0, bool allow_indexed = false)
 		{
 			chain_result result{};
@@ -1763,6 +1874,16 @@ namespace remix_rsx
 				break;
 			}
 
+			// ...or with a per-vertex divisor carried in the attribute's own w. Only ATTR0 is
+			// accepted: it is the one attribute this backend submits as the position, so a divide
+			// on any other input would describe a vector we never send.
+			if (wdivide_result wdivide{}; match_wdivide(prog, source.index, chain.first_instruction, wdivide) && wdivide.attribute == 0)
+			{
+				result.has_wdivide = true;
+				reached_input = true;
+				break;
+			}
+
 			target = walk_target{ false, source.index };
 			before = chain.first_instruction;
 		}
@@ -2420,6 +2541,12 @@ namespace remix_rsx
 	bool draw_without_world()
 	{
 		static const bool value = env_flag(L"RPCS3_REMIX_DRAWNOWORLD");
+		return value;
+	}
+
+	bool nowdivide_enabled()
+	{
+		static const bool value = env_flag(L"RPCS3_REMIX_NOWDIV");
 		return value;
 	}
 

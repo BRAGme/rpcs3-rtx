@@ -2672,6 +2672,17 @@ void RemixGSRender::submit_subdraw()
 	m_scratch_vertices.clear();
 	m_scratch_vertices.resize(vertex_count);
 
+	// The ucode may undo a per-vertex packing before its first matrix: 'pos.xyz * RCP(pos.w)'.
+	// The divisor differs per vertex, so it cannot be folded into the world transform - it has to
+	// be applied here, to the same value the vertex fetch would have handed the shader. Without
+	// it every vertex sits displaced along its own ray and the mesh is blown apart from inside.
+	const bool w_divide = m_current_fingerprint->has_wdivide && !remix_rsx::nowdivide_enabled();
+
+	if (w_divide)
+	{
+		++m_stats.wdiv_draws;
+	}
+
 	for (u32 i = 0; i < vertex_count; ++i)
 	{
 		f32 position[4] = {};
@@ -2680,6 +2691,21 @@ void RemixGSRender::submit_subdraw()
 		{
 			++m_stats.skip_decode;
 			return;
+		}
+
+		if (w_divide)
+		{
+			// A zero divisor is what the RSX would turn into an infinity; leaving the vertex
+			// alone keeps one bad value from poisoning the whole mesh's bounds.
+			const f32 w = position[3];
+
+			if (std::isfinite(w) && std::abs(w) > 1e-8f)
+			{
+				const f32 inv = 1.f / w;
+				position[0] *= inv;
+				position[1] *= inv;
+				position[2] *= inv;
+			}
 		}
 
 		remixapi_HardcodedVertex& v = m_scratch_vertices[i];
@@ -3248,13 +3274,37 @@ void RemixGSRender::dump_vertex_program(u32 first_vertex, u32 vertex_count, u32 
 		}
 	}
 
+	// ATTR0's stored shape. A four-component position is the precondition for the per-vertex
+	// divide, so this is the line that says whether has_wdivide could ever have been right.
+	if (attribute_view attr0{}; map_attribute(0, first_vertex, vertex_count, attr0) == attribute_status::ok)
+	{
+		fmt::append(groups, " | attr0 type=%u size=%u stride=%u wdiv=%d",
+			static_cast<u32>(attr0.type), attr0.size, attr0.stride, fp.has_wdivide ? 1 : 0);
+
+		f32 w_lo = +3.4e38f;
+		f32 w_hi = -3.4e38f;
+
+		for (u32 i = 0; i < vertex_count; ++i)
+		{
+			f32 decoded[4] = {};
+
+			if (remix_rsx::decode_position(attr0.at(i), attr0.type, attr0.size, decoded))
+			{
+				w_lo = std::min(w_lo, decoded[3]);
+				w_hi = std::max(w_hi, decoded[3]);
+			}
+		}
+
+		fmt::append(groups, " w=[%.6g..%.6g]", static_cast<f64>(w_lo), static_cast<f64>(w_hi));
+	}
+
 	// The ucode is the only thing that can say why identification failed - and, for a program
 	// that indexes constants, whether the rig blends several bones per vertex at all. Those get
 	// a longer slice: the palette read sits below the outer matrix, past the default cut.
-	if (fp.archetype == remix_rsx::vp_archetype::unknown || fp.skinned || fp.indexed_const)
+	if (fp.archetype == remix_rsx::vp_archetype::unknown || fp.skinned || fp.indexed_const || !fp.inner_is_input)
 	{
 		fmt::append(groups, " slice:%s",
-			remix_rsx::describe_position_slice(current_vertex_program, fp.indexed_const ? 96 : 32));
+			remix_rsx::describe_position_slice(current_vertex_program, (fp.indexed_const || !fp.inner_is_input) ? 96 : 32));
 	}
 
 	const std::string line = fmt::format(
@@ -3412,7 +3462,7 @@ void RemixGSRender::log_stats()
 	rsx_log.notice(
 		"Remix stats: frame=%llu draws=%llu submitted=%llu meshes_live=%llu created=%llu destroyed=%llu poisoned=%llu | "
 		"cam_resolved=%llu cam_fallback=%llu arch=%s world_applied=%llu world_fallback=%llu world_refused=%llu | "
-		"skip screen=%llu immediate=%llu inline=%llu volatile=%llu reg_attr0=%llu prim=%llu restart=%llu instanced=%llu layout=%llu mem=%llu decode=%llu poison=%llu vp=%llu rt=%llu rt_kept=%llu notinput=%llu | "
+		"skip screen=%llu immediate=%llu inline=%llu volatile=%llu reg_attr0=%llu prim=%llu restart=%llu instanced=%llu layout=%llu mem=%llu decode=%llu poison=%llu vp=%llu rt=%llu rt_kept=%llu notinput=%llu wdiv=%llu | "
 		"skin_submitted=%llu skin_skipped=%llu skin_unrecognised=%llu skin_bones_max=%llu | "
 		"cat_sky=%llu cat_hidden=%llu cat_particle=%llu cat_decal=%llu | "
 		"tex_bound=%llu tex_none=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_rehashed=%llu tex_refreshed=%llu mat_created=%llu | "
@@ -3447,6 +3497,7 @@ void RemixGSRender::log_stats()
 		m_stats.skip_render_target,
 		m_stats.rt_feedback_kept,
 		m_stats.skip_not_input,
+		m_stats.wdiv_draws,
 		m_stats.skin_submitted,
 		m_stats.skin_skipped,
 		m_stats.skin_unrecognised,

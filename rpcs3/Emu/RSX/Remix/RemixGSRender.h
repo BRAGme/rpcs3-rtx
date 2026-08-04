@@ -83,6 +83,9 @@ private:
 		// RPCS3_REMIX_STRICTINPUT only: draws refused because their matrix chain never reached
 		// the vertex attribute.
 		u64 skip_not_input = 0;
+		// Draws whose positions were divided by ATTR0.w at decode time, undoing the packing the
+		// ucode undoes. RPCS3_REMIX_NOWDIV=1 drives this to 0.
+		u64 wdiv_draws = 0;
 		u64 tex_bound = 0;
 		u64 tex_none = 0;
 		u64 ui_draws = 0;

@@ -121,6 +121,13 @@ namespace remix_rsx
 		u32 prescale_scale_component = 0;
 		u32 prescale_bias_slot = 0;
 
+		// The program divides the position by the attribute's own w before the first matrix
+		// ('pos.xyz * RCP(pos.w)'). The divisor is per vertex, so unlike has_prescale it cannot
+		// be folded into the world transform - the submitted vertex has to be divided at decode
+		// time or the mesh is blown apart from the inside. Always ATTR0; the matcher refuses any
+		// other input because ATTR0 is the only attribute submitted as a position.
+		bool has_wdivide = false;
+
 		// Skinning. 'a' as computed below is already the bone's *slot* offset (bone * stride),
 		// because the ucode reads c[palette_base + a] .. c[palette_base + a + 3] with a single
 		// shared address register - so there is no separate stride to recover.
@@ -270,6 +277,11 @@ namespace remix_rsx
 	// gate - the worst case is a missing object, never an exploding one. Kept as a knob so the
 	// change is bisectable against every capture taken before it.
 	bool draw_without_world();
+
+	// RPCS3_REMIX_NOWDIV=1: submit the stored ATTR0.xyz even for programs whose ucode divides the
+	// position by ATTR0.w - the behaviour up to and including 4b8e925. The bisect knob for the
+	// per-vertex divide: with it set, the affected meshes go back to being blown apart.
+	bool nowdivide_enabled();
 
 	// RPCS3_REMIX_RTVERTS=<n>: vertex ceiling for the 3D render-target-feedback gate. A draw that
 	// samples a bound colour/depth surface is only treated as a post-process pass when it is also
