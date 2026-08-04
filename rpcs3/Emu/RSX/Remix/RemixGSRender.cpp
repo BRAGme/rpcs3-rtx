@@ -42,6 +42,13 @@ namespace
 	// this only stops a pathological guest from growing the set without bound.
 	constexpr usz s_max_tracked_surfaces = 256;
 
+	// Sampling a render target does NOT by itself make a 3D draw a post-process pass: shadow
+	// maps, reflection probes and environment maps are all render targets that real world
+	// geometry legitimately samples, and refusing those would delete the level. A post-process
+	// pass is additionally a *quad*, so the feedback gate also requires a small vertex count.
+	// Tunable with RPCS3_REMIX_RTVERTS; 0 disables the shape test (refuse on the address alone).
+	constexpr u32 s_rt_feedback_max_vertices = 32;
+
 	// Frames a mesh may go unreferenced before its handle is released.
 	constexpr u64 s_mesh_idle_frames = 300;
 
@@ -726,6 +733,15 @@ void RemixGSRender::end()
 			m_surface_addresses.insert(z);
 		}
 	}
+	else if (!m_surface_cap_logged)
+	{
+		// Past the cap the set stops learning, so a surface bound later is never recognised as
+		// one and its feedback draws are submitted as geometry. Say so once rather than let the
+		// gates fail silently.
+		m_surface_cap_logged = true;
+		rsx_log.warning("Remix: surface-address set hit its cap of %llu; later render targets will not be recognised",
+			static_cast<u64>(s_max_tracked_surfaces));
+	}
 
 	// The vertex program cannot change between subdraws of one clause, so identify it once.
 	m_current_vp_hash = current_vertex_program.data.empty()
@@ -1145,6 +1161,37 @@ int RemixGSRender::albedo_texture_unit() const
 	}
 
 	return -1;
+}
+
+bool RemixGSRender::samples_bound_surface() const
+{
+	// Every referenced 2D unit is tested, not just albedo_texture_unit()'s: that one returns the
+	// *lowest* referenced unit, and a post-process pass routinely samples the framebuffer on a
+	// higher unit with a gradient or a LUT on unit 0. Testing only the lowest would let exactly
+	// those through.
+	u32 mask = current_fp_metadata.referenced_textures_mask;
+
+	for (u32 unit = 0; mask; mask >>= 1, ++unit)
+	{
+		if (!(mask & 1))
+		{
+			continue;
+		}
+
+		const auto& tex = rsx::method_registers.fragment_textures[unit];
+
+		if (!tex.enabled() || tex.get_extended_texture_dimension() != rsx::texture_dimension_extended::texture_dimension_2d)
+		{
+			continue;
+		}
+
+		if (m_surface_addresses.contains(rsx::get_address(tex.offset(), tex.location())))
+		{
+			return true;
+		}
+	}
+
+	return false;
 }
 
 const rsx::interleaved_range_info* RemixGSRender::find_attribute_block(u32 index) const
@@ -2676,9 +2723,55 @@ void RemixGSRender::submit_subdraw()
 		return;
 	}
 
+	// --- render-target feedback ---------------------------------------------------------
+	// A 3D draw whose albedo samples a surface the RSX itself rendered into is the title
+	// re-reading its own framebuffer - a post-process pass (tone map, bloom, colour grade) -
+	// not world geometry. composite_ui_draw refuses exactly this on the 2D path; the ones that
+	// happen to carry a matrix chain are classified 3D and land here instead, where submitting
+	// them puts a screen-covering slab into the scene. Wrong twice over, for the same two
+	// reasons the UI path gives: Remix already owns the final image, and with 'Write Color
+	// Buffers' off the guest copy of that surface holds stale bytes anyway.
+	//
+	// Refused rather than submitted with categoryFlags HIDDEN, matching the UI path: a hidden
+	// instance still costs a mesh, a material, a hash and a BLAS update every frame to produce
+	// nothing, and HIDDEN is a fork-only bit while this hazard exists on every runtime.
+	//
+	// Placed after the decode so that a dump run still gets a 'Remix vp=' line for these
+	// programs - the ATTR0 bounding box is the corroborating evidence that it was full-screen.
+	if (!remix_rsx::keep_render_target_blits() && samples_bound_surface())
+	{
+		const u32 vertex_ceiling = remix_rsx::rt_feedback_max_vertices();
+		const bool is_quad = (vertex_ceiling == 0) || (vertex_count <= vertex_ceiling);
+
+		// One line per program, once, so the census of what this gate touches is readable from a
+		// normal run: without it a large 'rt=' count cannot be told apart from a gate that is
+		// eating the level.
+		if (m_rt_feedback_seen.insert(m_current_vp_hash).second)
+		{
+			rsx_log.notice("Remix: rt-feedback vp=%016llx vtx=%u idx=%llu refused=%d",
+				m_current_vp_hash, vertex_count, static_cast<u64>(m_scratch_indices.size()), is_quad ? 1 : 0);
+		}
+
+		if (is_quad)
+		{
+			++m_stats.skip_render_target;
+			return;
+		}
+
+		++m_stats.rt_feedback_kept;
+	}
+
 	// --- skinning -----------------------------------------------------------------------
 	const remix_rsx::vp_fingerprint& fp = *m_current_fingerprint;
 	bool skinned = false;
+
+	if (remix_rsx::strict_input_enabled() && fp.has_outer() && !fp.inner_is_input)
+	{
+		// Diagnostic bisect: drop the population whose matrix chain never reached the vertex
+		// attribute, so a capture says whether the residual exploded geometry comes from them.
+		++m_stats.skip_not_input;
+		return;
+	}
 
 	if (fp.skin_unrecognised)
 	{
@@ -2859,6 +2952,21 @@ void RemixGSRender::submit_subdraw()
 	else
 	{
 		++m_stats.world_fallback;
+
+		// No resolved world transform means the mesh is submitted in raw model space at the
+		// world origin - and every unresolved draw lands on the same spot, which is precisely
+		// the "vertex explosion" the ADD-src2 fix removed for the 71 % it could resolve. The
+		// residue is the ~20 programs still classified unknown(no matrix chain into HPOS).
+		// Same rule as the skinning gate: a missing object is shippable, an exploding one is
+		// not. RPCS3_REMIX_DRAWNOWORLD=1 restores the old behaviour for bisection.
+		//
+		// NOCAM is exempt: per_draw_transform returns false unconditionally there because that
+		// mode *is* the all-identity milestone-1 path, and refusing would empty the scene.
+		if (!remix_rsx::draw_without_world() && !remix_rsx::nocam_enabled())
+		{
+			++m_stats.world_refused;
+			return;
+		}
 	}
 
 	remixapi_InstanceInfoBoneTransformsEXT bone_transforms{};
@@ -3303,8 +3411,8 @@ void RemixGSRender::log_stats()
 
 	rsx_log.notice(
 		"Remix stats: frame=%llu draws=%llu submitted=%llu meshes_live=%llu created=%llu destroyed=%llu poisoned=%llu | "
-		"cam_resolved=%llu cam_fallback=%llu arch=%s world_applied=%llu world_fallback=%llu | "
-		"skip screen=%llu immediate=%llu inline=%llu volatile=%llu reg_attr0=%llu prim=%llu restart=%llu instanced=%llu layout=%llu mem=%llu decode=%llu poison=%llu vp=%llu | "
+		"cam_resolved=%llu cam_fallback=%llu arch=%s world_applied=%llu world_fallback=%llu world_refused=%llu | "
+		"skip screen=%llu immediate=%llu inline=%llu volatile=%llu reg_attr0=%llu prim=%llu restart=%llu instanced=%llu layout=%llu mem=%llu decode=%llu poison=%llu vp=%llu rt=%llu rt_kept=%llu notinput=%llu | "
 		"skin_submitted=%llu skin_skipped=%llu skin_unrecognised=%llu skin_bones_max=%llu | "
 		"cat_sky=%llu cat_hidden=%llu cat_particle=%llu cat_decal=%llu | "
 		"tex_bound=%llu tex_none=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_rehashed=%llu tex_refreshed=%llu mat_created=%llu | "
@@ -3322,6 +3430,7 @@ void RemixGSRender::log_stats()
 		remix_rsx::archetype_name(m_active_camera.archetype),
 		m_stats.world_applied,
 		m_stats.world_fallback,
+		m_stats.world_refused,
 		m_stats.skip_screen_space,
 		m_stats.skip_immediate,
 		m_stats.skip_inline_array,
@@ -3335,6 +3444,9 @@ void RemixGSRender::log_stats()
 		m_stats.skip_decode,
 		m_stats.skip_poisoned,
 		m_stats.skip_vp,
+		m_stats.skip_render_target,
+		m_stats.rt_feedback_kept,
+		m_stats.skip_not_input,
 		m_stats.skin_submitted,
 		m_stats.skin_skipped,
 		m_stats.skin_unrecognised,

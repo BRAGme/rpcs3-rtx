@@ -263,6 +263,28 @@ namespace remix_rsx
 	bool nocam_enabled();
 	bool noskin_enabled();
 
+	// RPCS3_REMIX_DRAWNOWORLD=1: submit a draw whose world transform could not be resolved at
+	// the identity anyway - the behaviour up to and including 41d9adc. Off by default because
+	// identity means "raw model-space vertices at the world origin", i.e. every unresolved draw
+	// piled on top of every other one: the vertex explosion. Same principle as the skinning
+	// gate - the worst case is a missing object, never an exploding one. Kept as a knob so the
+	// change is bisectable against every capture taken before it.
+	bool draw_without_world();
+
+	// RPCS3_REMIX_RTVERTS=<n>: vertex ceiling for the 3D render-target-feedback gate. A draw that
+	// samples a bound colour/depth surface is only treated as a post-process pass when it is also
+	// small enough to be a full-screen quad - otherwise shadow-mapped and probe-lit world
+	// geometry, which legitimately samples render targets, would be deleted. 0 disables the shape
+	// test and refuses on the address alone. Default 32.
+	u32 rt_feedback_max_vertices();
+
+	// RPCS3_REMIX_STRICTINPUT=1: refuse any draw whose position chain never reached the vertex
+	// attribute (the 'fused(innermost operand is not an attribute)' population). Those groups are
+	// given a world transform even though the space their innermost operand lives in was never
+	// proven, so if geometry is still exploding after the no-world refusal, this knob is the one
+	// run that says whether they are the cause. Diagnostic only - off by default.
+	bool strict_input_enabled();
+
 	// Skinning bisect knobs. Each one isolates one link of the chain
 	// attribute -> index -> palette slot -> matrix -> submitted pose, so a single run answers
 	// one question instead of the whole thing being guessed at.

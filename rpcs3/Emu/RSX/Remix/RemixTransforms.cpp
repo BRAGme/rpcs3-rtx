@@ -2417,6 +2417,24 @@ namespace remix_rsx
 		return value;
 	}
 
+	bool draw_without_world()
+	{
+		static const bool value = env_flag(L"RPCS3_REMIX_DRAWNOWORLD");
+		return value;
+	}
+
+	u32 rt_feedback_max_vertices()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_RTVERTS", 32);
+		return value;
+	}
+
+	bool strict_input_enabled()
+	{
+		static const bool value = env_flag(L"RPCS3_REMIX_STRICTINPUT");
+		return value;
+	}
+
 	bool skinid_enabled()
 	{
 		static const bool value = env_flag(L"RPCS3_REMIX_SKINID");

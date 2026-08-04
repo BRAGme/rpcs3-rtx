@@ -69,6 +69,20 @@ private:
 		u64 cam_fallback = 0;
 		u64 world_applied = 0;
 		u64 world_fallback = 0;
+		// Of the world_fallback population, how many were refused rather than drawn at the
+		// identity. Counted separately so world_fallback stays comparable across every run
+		// taken before the refusal existed. RPCS3_REMIX_DRAWNOWORLD=1 drives this back to 0.
+		u64 world_refused = 0;
+		// A 3D draw whose albedo samples a surface the RSX itself rendered into: a post-process
+		// pass classified as world geometry. The 3D twin of ui_render_target.
+		u64 skip_render_target = 0;
+		// Sampled a bound surface but was too big to be a post-process quad - a shadow-mapped or
+		// probe-lit world draw. Kept. The pair (skip_render_target, rt_feedback_kept) is what
+		// says whether the shape test is doing anything.
+		u64 rt_feedback_kept = 0;
+		// RPCS3_REMIX_STRICTINPUT only: draws refused because their matrix chain never reached
+		// the vertex attribute.
+		u64 skip_not_input = 0;
 		u64 tex_bound = 0;
 		u64 tex_none = 0;
 		u64 ui_draws = 0;
@@ -204,6 +218,10 @@ private:
 	// Lowest referenced, enabled, 2D fragment texture unit for this draw, or -1.
 	int albedo_texture_unit() const;
 
+	// True when any referenced, enabled 2D fragment texture unit samples an address the RSX has
+	// bound as a colour or depth surface: the title reading back its own framebuffer.
+	bool samples_bound_surface() const;
+
 	// Locates one vertex attribute in the interleaved blocks and validates the guest span it
 	// would be read through. Unlike the old ATTR0-only code this searches *every* block: a
 	// bone index or a texcoord routinely lives in a different block than the position.
@@ -285,10 +303,19 @@ private:
 	std::unordered_map<u64, mesh_entry> m_meshes;
 	std::unordered_set<u64> m_poisoned;
 
-	// Guest addresses the RSX has bound as a colour or depth surface. A screen-space draw
-	// sampling one of these is the title compositing its own framebuffer, which the Remix
-	// path already produces; see composite_ui_draw.
+	// Guest addresses the RSX has bound as a colour or depth surface. A draw sampling one of
+	// these is the title reading back its own framebuffer, which the Remix path already
+	// produces; see composite_ui_draw (2D) and submit_subdraw (3D).
 	std::unordered_set<u32> m_surface_addresses;
+
+	// The set stops growing at s_max_tracked_surfaces. A title that binds more distinct
+	// surfaces than that would leave the later ones untracked, and both feedback gates would
+	// silently start missing. Logged once so a miss is diagnosable instead of invisible.
+	bool m_surface_cap_logged = false;
+
+	// Vertex programs already reported by the render-target feedback gate, so its census is one
+	// line per program instead of one per draw.
+	std::unordered_set<u64> m_rt_feedback_seen;
 
 	remix_rsx::texture_cache m_textures;
 	remix_rsx::compositor m_compositor;
