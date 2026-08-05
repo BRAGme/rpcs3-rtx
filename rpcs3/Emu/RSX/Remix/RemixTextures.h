@@ -7,6 +7,7 @@
 #include "Emu/RSX/Remix/remix_c.h"
 
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace rsx
@@ -95,6 +96,11 @@ namespace remix_rsx
 		u64 rehashed = 0;
 		u64 refreshed = 0;
 		u64 materials = 0;
+		// Of the 'unsupported' population, how many were a descriptor already tombstoned by an
+		// earlier failure rather than a fresh refusal. 'unsupported' counts per draw, so a
+		// handful of bad descriptors inflate it without bound and it cannot be read as "how
+		// many textures does this title bind that we cannot decode". This split can.
+		u64 tombstone_hits = 0;
 	};
 
 	// Per-draw albedo texture cache. Owns every remixapi texture and material it creates.
@@ -131,11 +137,26 @@ namespace remix_rsx
 		usz live() const { return m_entries.size(); }
 		const texture_stats& stats() const { return m_stats; }
 
+		// True once this frame's CreateTexture budget is spent. A caller walking several texture
+		// units for an albedo must stop here: with budget left, a bind() that returns null was
+		// refused for a permanent reason (format, dimensions, unreadable) and the next unit is
+		// worth trying, but out of budget *every* unit returns null, so continuing would bind
+		// whatever unit happens to be cached already - a normal map instead of the diffuse map,
+		// this frame only. That is a wrong texture that flickers, which is worse than the white
+		// the retry exists to remove.
+		bool over_budget() const { return m_budget_left == 0; }
+
 	private:
 		bool decode(const rsx::fragment_texture& tex, texture_entry& out);
 		bool upload(const remixapi_Interface& api, texture_entry& entry);
 
+		// One notice per distinct (format, dimensions, reason) a decode refuses. Without it
+		// 'tex_unsupported' is a single number that names neither the format nor the count of
+		// distinct offenders, and "many surfaces stay white" cannot be attributed.
+		void note_refusal(const char* reason, u32 gcm_format, u32 width, u32 height);
+
 		std::unordered_map<u64, texture_entry> m_entries;
+		std::unordered_set<u64> m_refusals_seen;
 		texture_stats m_stats{};
 		u32 m_budget_left = 0;
 

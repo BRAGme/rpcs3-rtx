@@ -88,6 +88,12 @@ private:
 		u64 wdiv_draws = 0;
 		u64 tex_bound = 0;
 		u64 tex_none = 0;
+		// Of the tex_none population, how many had no referenced, enabled 2D fragment texture
+		// unit at all - i.e. the draw is not textured by the title, so no budget, format or
+		// decode change can ever give it a material. Separating this from "the cache refused"
+		// is what says whether a white surface is our bug or the title's own vertex-coloured
+		// geometry (Haze's sky dome, vp=fc0fac8afccec49a, is the latter).
+		u64 tex_no_unit = 0;
 		// Of the tex_bound population, how many left with real texcoords rather than the
 		// (0,0) every vertex used to carry. uv_applied far below tex_bound means the albedo is
 		// there and the coordinates are not, which renders as one flat colour per draw.
@@ -95,6 +101,10 @@ private:
 		u64 uv_none = 0;
 		// Resolved from an attribute other than 8+unit, i.e. the convention did not hold.
 		u64 uv_fallback = 0;
+		// Untextured draws that left with the title's own ATTR3 colour instead of flat white.
+		u64 vcol_applied = 0;
+		// Times a referenced texture unit yielded no material and the next one was tried.
+		u64 tex_unit_retry = 0;
 		u64 ui_draws = 0;
 		u64 ui_skipped = 0;
 		u64 ui_no_colour = 0;
@@ -225,8 +235,10 @@ private:
 	// True when this draw is 2D / pre-projected and must not reach Remix.
 	bool is_screen_space_draw() const;
 
-	// Lowest referenced, enabled, 2D fragment texture unit for this draw, or -1.
-	int albedo_texture_unit() const;
+	// Lowest referenced, enabled, 2D fragment texture unit at or above 'skip_below', or -1.
+	// The caller retries with skip_below = failed_unit + 1 when the cache refuses a unit, so a
+	// normal map bound below the diffuse map does not cost the draw its albedo.
+	int albedo_texture_unit(u32 skip_below = 0) const;
 
 	// True when any referenced, enabled 2D fragment texture unit samples an address the RSX has
 	// bound as a colour or depth surface: the title reading back its own framebuffer.
@@ -237,6 +249,11 @@ private:
 	// the hash covers, and two draws that share positions but not UVs are different meshes.
 	void apply_texcoords(u32 unit, const remix_rsx::texture_entry& entry,
 		const rsx::fragment_texture& tex, u32 first_vertex, u32 vertex_count);
+
+	// Fills m_scratch_vertices' colours from ATTR3 for draws that resolved no material, so
+	// vertex-coloured geometry stops reaching Remix as flat white. Like apply_texcoords it must
+	// run before the mesh content hash, which covers the colour.
+	void apply_vertex_colour(u32 first_vertex, u32 vertex_count);
 
 	// Locates one vertex attribute in the interleaved blocks and validates the guest span it
 	// would be read through. Unlike the old ATTR0-only code this searches *every* block: a
@@ -342,6 +359,13 @@ private:
 
 	// Vertex programs already reported by the screen-space refusal census.
 	std::unordered_set<u64> m_screen_census_seen;
+
+	// CreateMesh calls attributed to the vertex program that issued them, reset every stats
+	// window. A title that skins on the SPU rewrites its vertex bytes every frame, so the
+	// content-hashed mesh cache mints a fresh handle per frame per animated draw - and this map
+	// is what says whether the churn is concentrated in a few animated programs (fixable by
+	// bounding them) or spread across the whole scene (not).
+	std::unordered_map<u64, u64> m_mesh_creates_by_vp;
 
 	remix_rsx::texture_cache m_textures;
 	remix_rsx::compositor m_compositor;

@@ -233,6 +233,21 @@ namespace remix_rsx
 		m_budget_left = texture_budget();
 	}
 
+	void texture_cache::note_refusal(const char* reason, u32 gcm_format, u32 width, u32 height)
+	{
+		u64 key = rpcs3::fnv_seed;
+		key = rpcs3::hash64(key, u64{gcm_format});
+		key = rpcs3::hash64(key, u64{width} | (u64{height} << 32));
+		key = rpcs3::hash64(key, reinterpret_cast<u64>(reason));
+
+		if (!m_refusals_seen.insert(key).second)
+		{
+			return;
+		}
+
+		rsx_log.notice("Remix texrefuse: %s fmt=%02x %ux%u", reason, gcm_format, width, height);
+	}
+
 	remixapi_MaterialHandle texture_cache::bind(const remixapi_Interface& api,
 		const rsx::fragment_texture& tex,
 		u64 frame,
@@ -290,6 +305,7 @@ namespace remix_rsx
 		if (desc.width == 0 || desc.height == 0)
 		{
 			++m_stats.unsupported;
+			note_refusal("zero-dims", desc.format, desc.width, desc.height);
 			return nullptr;
 		}
 
@@ -304,6 +320,7 @@ namespace remix_rsx
 			if (entry.unsupported)
 			{
 				++m_stats.unsupported;
+				++m_stats.tombstone_hits;
 				return nullptr;
 			}
 
@@ -451,6 +468,7 @@ namespace remix_rsx
 		if (total_size == 0 || total_size > 0x4000000)
 		{
 			++m_stats.unsupported;
+			note_refusal("size", gcm_format, tex.width(), tex.height());
 			return false;
 		}
 
@@ -458,6 +476,7 @@ namespace remix_rsx
 		{
 			// Render-target-sourced or unmapped: guest RAM is not authoritative here.
 			++m_stats.unreadable;
+			note_refusal("unreadable", gcm_format, tex.width(), tex.height());
 			return false;
 		}
 
@@ -469,6 +488,7 @@ namespace remix_rsx
 		if (!direct && !expand && !is_bc && !is_b8)
 		{
 			++m_stats.unsupported;
+			note_refusal("format", gcm_format, tex.width(), tex.height());
 			return false;
 		}
 
@@ -488,6 +508,7 @@ namespace remix_rsx
 		if (!mip0 || mip0->data.empty())
 		{
 			++m_stats.unreadable;
+			note_refusal("no-mip0", gcm_format, tex.width(), tex.height());
 			return false;
 		}
 
@@ -497,6 +518,7 @@ namespace remix_rsx
 		if (width == 0 || height == 0 || (usz{width} * height * 4) > s_max_decoded_bytes)
 		{
 			++m_stats.unsupported;
+			note_refusal("decoded-dims", gcm_format, width, height);
 			return false;
 		}
 

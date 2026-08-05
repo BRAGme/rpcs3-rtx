@@ -1130,16 +1130,24 @@ bool RemixGSRender::is_screen_space_draw() const
 	return remix_rsx::is_orthographic(outer) && !rsx::method_registers.depth_write_enabled();
 }
 
-int RemixGSRender::albedo_texture_unit() const
+int RemixGSRender::albedo_texture_unit(u32 skip_below) const
 {
 	// referenced_textures_mask comes from the fragment ucode disassembly that
 	// analyse_current_rsx_pipeline() already ran, so it costs nothing here. GL and VK iterate
 	// the same mask (GLDraw.cpp:301, VKDraw.cpp:286) rather than trusting enabled() alone.
+	//
+	// 'skip_below' lets the caller walk past a unit the cache could not turn into a material.
+	// The lowest referenced unit is a guess at "the diffuse map", not a fact: Haze binds a
+	// 2048x2048 COMPRESSED_HILO8 normal map on a lower unit than the diffuse map it pairs it
+	// with, and taking the lowest unit unconditionally meant every one of those draws resolved
+	// a format this cache cannot decode and submitted flat white with a perfectly good diffuse
+	// texture sitting one unit up. That single descriptor accounted for 123,057 of the 123,059
+	// 'unsupported' draws in the p0 run - 40% of every untextured draw in the frame.
 	u32 mask = current_fp_metadata.referenced_textures_mask;
 
 	for (u32 unit = 0; mask; mask >>= 1, ++unit)
 	{
-		if (!(mask & 1))
+		if (!(mask & 1) || unit < skip_below)
 		{
 			continue;
 		}
@@ -1297,6 +1305,56 @@ void RemixGSRender::apply_texcoords(u32 unit, const remix_rsx::texture_entry& en
 				u_lo, u_hi, v_lo, v_hi, entry.width, entry.height);
 		}
 	}
+}
+
+void RemixGSRender::apply_vertex_colour(u32 first_vertex, u32 vertex_count)
+{
+	// Every vertex leaves the decode loop with color = 0xFFFFFFFF, so a draw that resolves no
+	// albedo material reaches Remix as pure white. Some of those draws are not untextured by
+	// accident - they are *vertex-coloured by design*, and Haze's sky dome (vp=fc0fac8afccec49a,
+	// inputs=0x9 = position + ATTR3 only, no texcoord attribute at all) is the clearest case.
+	//
+	// Deliberately applied only when no material bound. A textured draw's ATTR3 modulates its
+	// albedo in the title's own fragment program with per-title semantics this backend does not
+	// read, so tinting one would be a guess; leaving white is the safe identity. An untextured
+	// draw has nothing to lose - the alternative is the flat white it already shows.
+	if (remix_rsx::vertex_colour_disabled())
+	{
+		return;
+	}
+
+	// ATTR3 is RSX's diffuse colour register.
+	attribute_view colours{};
+
+	if (map_attribute(3, first_vertex, vertex_count, colours) != attribute_status::ok)
+	{
+		return;
+	}
+
+	const auto channel = [](f32 v) -> u32
+	{
+		return static_cast<u32>(std::clamp(v, 0.f, 1.f) * 255.f + 0.5f);
+	};
+
+	for (u32 i = 0; i < vertex_count; ++i)
+	{
+		f32 rgba[4]{};
+
+		// decode_position divides by the type's scale, so 'ub' (the usual colour storage)
+		// arrives as 0..1 and float attributes arrive unchanged - which is the normalisation
+		// a colour wants in both cases.
+		if (!remix_rsx::decode_position(colours.at(i), colours.type, colours.size, rgba))
+		{
+			return;
+		}
+
+		m_scratch_vertices[i].color = channel(rgba[0])
+			| (channel(rgba[1]) << 8)
+			| (channel(rgba[2]) << 16)
+			| (channel(colours.size >= 4 ? rgba[3] : 1.f) << 24);
+	}
+
+	++m_stats.vcol_applied;
 }
 
 bool RemixGSRender::samples_bound_surface() const
@@ -3015,7 +3073,12 @@ void RemixGSRender::submit_subdraw()
 
 	if (m_remix.fork_features())
 	{
-		if (const int unit = albedo_texture_unit(); unit >= 0)
+		// Walk the referenced 2D units in order and keep the first that yields a material.
+		// A refusal on the lowest unit is not a refusal for the draw: see albedo_texture_unit.
+		int unit = albedo_texture_unit();
+		const bool had_unit = (unit >= 0);
+
+		while (unit >= 0)
 		{
 			const remix_rsx::texture_entry* entry = nullptr;
 			const rsx::fragment_texture& tex = rsx::method_registers.fragment_textures[unit];
@@ -3034,15 +3097,68 @@ void RemixGSRender::submit_subdraw()
 				{
 					dump_texture(*entry, tex, static_cast<u32>(unit));
 				}
+
+				break;
 			}
-			else
+
+			if (m_textures.over_budget())
 			{
-				++m_stats.tex_none;
+				// Out of budget every unit returns null; walking on would bind a cached wrong
+				// unit rather than this draw's diffuse map. Leave it untextured for this frame.
+				break;
 			}
+
+			++m_stats.tex_unit_retry;
+			unit = albedo_texture_unit(static_cast<u32>(unit) + 1);
 		}
-		else
+
+		if (!material)
 		{
 			++m_stats.tex_none;
+
+			if (!had_unit)
+			{
+				++m_stats.tex_no_unit;
+			}
+		}
+	}
+
+	// An untextured draw is the only one whose colour this backend can improve on: white is
+	// what it shows today. Before the mesh hash, which covers the colour.
+	if (!material)
+	{
+		apply_vertex_colour(first_vertex, vertex_count);
+	}
+
+	// --- sky dome -----------------------------------------------------------------------
+	// A draw that binds no texture, writes no depth and spans thousands of units is the title's
+	// sky. Haze's is vp=fc0fac8afccec49a: 82 vertices, bbox [-5000 0 -5000]..[5000 398 5000],
+	// depth_write=0, inputs=0x9 (position + diffuse colour, no texcoord at all). Because it is
+	// vertex-coloured rather than textured, albedo_texture_unit() returns -1 and it reached Remix
+	// with a null material - i.e. as an opaque *white* shell, drawn with a translation-free
+	// camera-locked matrix, which is exactly the "white untextured dome surrounding me" report.
+	// Tagged SKY it renders as the sky instead of as world geometry enclosing the player.
+	bool is_sky = false;
+
+	if (!material && remix_rsx::sky_min_extent() > 0.f && !rsx::method_registers.depth_write_enabled())
+	{
+		f32 lo[3] = { +3.4e38f, +3.4e38f, +3.4e38f };
+		f32 hi[3] = { -3.4e38f, -3.4e38f, -3.4e38f };
+
+		for (const remixapi_HardcodedVertex& v : m_scratch_vertices)
+		{
+			for (u32 c = 0; c < 3; ++c)
+			{
+				lo[c] = std::min(lo[c], v.position[c]);
+				hi[c] = std::max(hi[c], v.position[c]);
+			}
+		}
+
+		const f32 extent = std::max({ hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2] });
+
+		if (std::isfinite(extent) && extent >= remix_rsx::sky_min_extent())
+		{
+			is_sky = true;
 		}
 	}
 
@@ -3142,6 +3258,7 @@ void RemixGSRender::submit_subdraw()
 		}
 
 		++m_stats.meshes_created;
+		++m_mesh_creates_by_vp[m_current_vp_hash];
 		it = m_meshes.emplace(hash, mesh_entry{ handle, m_frame_counter }).first;
 	}
 
@@ -3179,9 +3296,15 @@ void RemixGSRender::submit_subdraw()
 	instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
 	instance.pNext = nullptr;
 	instance.categoryFlags = classify_draw(albedo_hash);
+
+	if (is_sky)
+	{
+		instance.categoryFlags |= REMIXAPI_INSTANCE_CATEGORY_BIT_SKY;
+		++m_stats.cat_sky;
+	}
 	instance.mesh = it->second.handle;
 	instance.transform = transform;
-	instance.doubleSided = 1;
+	instance.doubleSided = (remix_rsx::cull_from_rsx() && rsx::method_registers.cull_face_enabled()) ? 0u : 1u;
 
 	if (skinned)
 	{
@@ -3645,7 +3768,7 @@ void RemixGSRender::log_stats()
 		"skip screen=%llu immediate=%llu inline=%llu volatile=%llu reg_attr0=%llu prim=%llu restart=%llu instanced=%llu layout=%llu mem=%llu decode=%llu poison=%llu vp=%llu rt=%llu rt_kept=%llu notinput=%llu wdiv=%llu | "
 		"skin_submitted=%llu skin_skipped=%llu skin_unrecognised=%llu skin_bones_max=%llu | "
 		"cat_sky=%llu cat_hidden=%llu cat_particle=%llu cat_decal=%llu | "
-		"tex_bound=%llu tex_none=%llu uv_applied=%llu uv_none=%llu uv_fallback=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_rehashed=%llu tex_refreshed=%llu mat_created=%llu | "
+		"tex_bound=%llu tex_none=%llu tex_no_unit=%llu tex_unit_retry=%llu uv_applied=%llu uv_none=%llu uv_fallback=%llu vcol_applied=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_tombstone=%llu tex_rehashed=%llu tex_refreshed=%llu mat_created=%llu | "
 		"ui_draws=%llu ui_skipped=%llu ui_no_colour=%llu ui_rt=%llu ui_prims=%llu ui_frames=%llu | "
 		"zcull_av=%llu zcull_av_handled=%llu",
 		m_frame_counter,
@@ -3688,9 +3811,12 @@ void RemixGSRender::log_stats()
 		m_stats.cat_decal,
 		m_stats.tex_bound,
 		m_stats.tex_none,
+		m_stats.tex_no_unit,
+		m_stats.tex_unit_retry,
 		m_stats.uv_applied,
 		m_stats.uv_none,
 		m_stats.uv_fallback,
+		m_stats.vcol_applied,
 		static_cast<u64>(m_textures.live()),
 		tex.created,
 		tex.destroyed,
@@ -3698,6 +3824,7 @@ void RemixGSRender::log_stats()
 		tex.deferred,
 		tex.unreadable,
 		tex.unsupported,
+		tex.tombstone_hits,
 		tex.rehashed,
 		tex.refreshed,
 		tex.materials,
@@ -3732,6 +3859,36 @@ void RemixGSRender::log_stats()
 			ms(m_timing.ui),
 			ms(m_timing.window > m_timing.flip ? m_timing.window - m_timing.flip : 0),
 			static_cast<f64>(m_compositor.pixels()) / n);
+
+		// Which programs minted the window's mesh handles. Printed per frame so the number is
+		// directly comparable against the ~350 sub-draws a frame submits: a program at 30
+		// creates/frame is producing a brand-new BLAS for every one of its draws, every frame.
+		if (!m_mesh_creates_by_vp.empty())
+		{
+			std::vector<std::pair<u64, u64>> by_count; // creates, vp
+			by_count.reserve(m_mesh_creates_by_vp.size());
+
+			for (const auto& [vp, count] : m_mesh_creates_by_vp)
+			{
+				by_count.emplace_back(count, vp);
+			}
+
+			std::sort(by_count.begin(), by_count.end(),
+				[](const auto& a, const auto& b) { return a.first > b.first; });
+
+			std::string top;
+
+			for (usz i = 0; i < by_count.size() && i < 8; ++i)
+			{
+				fmt::append(top, " %016llx=%.1f", by_count[i].second,
+					static_cast<f64>(by_count[i].first) / n);
+			}
+
+			rsx_log.notice("Remix meshchurn: programs=%llu creates/frame:%s",
+				static_cast<u64>(m_mesh_creates_by_vp.size()), top);
+
+			m_mesh_creates_by_vp.clear();
+		}
 
 		m_timing = {};
 		m_compositor.reset_pixels();

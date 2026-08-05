@@ -2689,6 +2689,24 @@ namespace remix_rsx
 		return value;
 	}
 
+	bool cull_from_rsx()
+	{
+		static const bool value = env_flag(L"RPCS3_REMIX_CULL");
+		return value;
+	}
+
+	bool vertex_colour_disabled()
+	{
+		static const bool value = env_flag(L"RPCS3_REMIX_NOVCOL");
+		return value;
+	}
+
+	f32 sky_min_extent()
+	{
+		static const f32 value = env_float(L"RPCS3_REMIX_SKYEXTENT", 2000.f);
+		return value;
+	}
+
 	f32 debug_light_radius()
 	{
 		static const f32 value = env_float(L"RPCS3_REMIX_LIGHTRADIUS", 0.1f);

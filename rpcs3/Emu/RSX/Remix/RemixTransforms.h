@@ -349,6 +349,25 @@ namespace remix_rsx
 	// bisector for "which program draws that". 0 when unset.
 	u64 skip_vp_hash();
 
+	// RPCS3_REMIX_CULL=1: submit doubleSided=0 for draws whose RSX cull state is enabled instead
+	// of forcing every instance double-sided. 23 of the 67 programs in the Haze census cull, and
+	// a double-sided triangle costs the path tracer intersection work on both faces. Off by
+	// default because a wrong winding anywhere in the strip/fan/quad expansion turns a
+	// single-sided surface invisible, and a missing wall is worse than a slow one - turn it on
+	// with a capture to hand.
+	bool cull_from_rsx();
+
+	// RPCS3_REMIX_NOVCOL=1: leave every submitted vertex colour at 0xFFFFFFFF instead of reading
+	// ATTR3 for draws that resolved no material. The bisect knob for vertex-coloured geometry.
+	bool vertex_colour_disabled();
+
+	// RPCS3_REMIX_SKYEXTENT=<units>: a draw that binds no texture, writes no depth and spans at
+	// least this much in its widest axis is the title's sky dome, and is tagged SKY. Haze draws
+	// its sky as an 82-vertex, 10,000-unit vertex-coloured dome with depth writes off
+	// (vp=fc0fac8afccec49a); with no material it reached Remix as an opaque white shell enclosing
+	// the camera. 0 disables the detection. Default 2000.
+	f32 sky_min_extent();
+
 	// Debug light knobs so a derived camera can be judged visually at all.
 	f32 debug_light_radius();
 	f32 debug_light_radiance();
