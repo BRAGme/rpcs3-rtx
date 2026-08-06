@@ -732,6 +732,8 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 			tr("Caps how many new textures are uploaded each frame. Anything over budget draws untextured until a later frame lets it through, which looks like textures fading in after a camera turn. 0 removes the cap."));
 		add_int(emu_settings_type::RemixTextureRehash, tr("Texture rehash mode (restart)"),
 			tr("0 keys textures by descriptor only. Higher values re-hash sampled content so textures a game rewrites in place stay fresh, at the cost of heavy mesh churn."));
+		add_check(emu_settings_type::RemixFlipTexcoordV, tr("Flip texcoord V (restart)"),
+			tr("Submits 1-v instead of v for every texture coordinate. Per title, and off by default: v = 0 is the top row of a texture on RSX exactly as it is in D3D, so turning this on for a game whose coordinates are already right will invert every surface. Turn it on only when a game's textures render vertically mirrored - upside-down on-screen text that still reads left to right is the tell."));
 
 		begin_group(tr("Geometry"), remix_right);
 		add_check(emu_settings_type::RemixNoWDivide, tr("Disable vertex W divide (restart)"),

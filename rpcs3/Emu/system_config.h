@@ -222,6 +222,7 @@ struct cfg_root : cfg::node
 			cfg::uint<0, 4096> texture_budget{ this, "Texture Uploads Per Frame", 8, true };// RPCS3_REMIX_TEXBUDGET, 0 = unlimited
 			cfg::uint<0, 2> texture_rehash{ this, "Texture Rehash Mode", 0 };               // RPCS3_REMIX_TEXREHASH, >0 costs heavy mesh churn
 			cfg::_bool texture_linear{ this, "Force Linear Textures", false };              // RPCS3_REMIX_TEXLINEAR
+			cfg::_bool flip_texcoord_v{ this, "Flip Texcoord V", false };                   // RPCS3_REMIX_UVFLIPV, per-title
 
 			// Camera
 			cfg::uint<0, 100000> camera_hold{ this, "Camera Hold Frames", 300, true };      // RPCS3_REMIX_CAMHOLD, 0 = drop instantly

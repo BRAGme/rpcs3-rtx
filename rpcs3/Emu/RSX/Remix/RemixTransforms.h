@@ -57,6 +57,9 @@ namespace remix_rsx
 	// Up to this many chained 4-slot groups are followed back from HPOS.
 	inline constexpr u32 max_transform_groups = 4;
 
+	// vp_fingerprint::texcoord_input entry for "the ucode does not say".
+	inline constexpr u8 s_no_texcoord_input = 0xff;
+
 	// One step of the "vertex attribute -> address register" computation, stored innermost
 	// first. Every factor is a transform constant, so the whole chain is re-evaluated per draw
 	// from live register state rather than baked at scan time.
@@ -121,6 +124,28 @@ namespace remix_rsx
 		u32 prescale_scale_component = 0;
 		u32 prescale_bias_slot = 0;
 
+		// The same decompression written as separate instructions instead of one MAD, and with a
+		// scale that may differ per axis. Resistance 2 (NPEA00431) writes it both ways:
+		//   ca526d308f1650bb  0:MUL>r0.xyz(I0.xyzx,C0.xyzx,...)c17i0        pos * c17.xyz
+		//   c87769e09c995db9  0:ADD>r0.xyz(C0.xyzx,I0.xyzw,I0.xyzx)c18i0    pos + c18.xyz
+		// match_prescale only recognises the fused 'MAD attr, scalar_temp, c[K]' form with a
+		// broadcast scalar, so both of these came back has_prescale = 0 and the raw quantised
+		// attribute was submitted against a matrix that expects the decoded one - the vertex
+		// explosion. Same rebuild rule as has_prescale: every operand is a transform constant, so
+		// the affine step is evaluated per draw and prepended to the world transform.
+		bool has_const_affine = false;
+		bool affine_has_scale = false;
+		bool affine_has_bias = false;
+		u32 affine_scale_slot = 0;
+		u8 affine_scale_component[3] = { 0, 1, 2 };
+		u32 affine_bias_slot = 0;
+
+		// Which input attribute the ucode moves into each texcoord output's xy, read from the
+		// program instead of inferred from the attribute's size and type. Index n is TEX<n>, i.e.
+		// output register o[7+n] (rpcs3's own output table, VKVertexProgram.cpp:292-299).
+		// s_no_texcoord_input when the write could not be reduced to one attribute read straight.
+		u8 texcoord_input[8] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+
 		// The program divides the position by the attribute's own w before the first matrix
 		// ('pos.xyz * RCP(pos.w)'). The divisor is per vertex, so unlike has_prescale it cannot
 		// be folded into the world transform - the submitted vertex has to be divided at decode
@@ -183,6 +208,17 @@ namespace remix_rsx
 	// Compact disassembly of the instructions that feed HPOS. This is the diagnostic that
 	// says why a program came back 'unknown'.
 	std::string describe_position_slice(const RSXVertexProgram& vp, u32 max_instructions = 32);
+
+	// The same disassembly for any vertex-program output register. TEX0..TEX7 are o7..o14 (the
+	// mapping rpcs3's own backends use, VKVertexProgram.cpp:292-299).
+	//
+	// This is the instrument for the class of defect match_wdivide belongs to. The backend submits
+	// the raw vertex attribute and never runs the ucode, so every operation the program applies on
+	// the way to an output is silently dropped: for the position that was the w dequantisation
+	// divide (e9a7956), and for a texcoord it would be any scale/bias - including a negated V,
+	// which is what R2's vertically mirrored textures look like. Reading the slice is how that
+	// stops being a guess.
+	std::string describe_output_slice(const RSXVertexProgram& vp, u32 output_index, u32 max_instructions = 32);
 
 	// ---------------------------------------------------------------------------------------
 	// Slot -> matrix conversion
@@ -317,6 +353,78 @@ namespace remix_rsx
 	// apply_texcoords rejected the forced index on the same bound the scan uses. 0 stays refused -
 	// that is the position attribute.
 	u32 texcoord_attribute();
+
+	// RPCS3_REMIX_UVUCODE=0: ignore vp_fingerprint::texcoord_input and pick the texcoord attribute
+	// with the size/type heuristic alone - the behaviour that shipped up to and including fdada2e,
+	// where the scan walked {8..15} then {1,2,4,5,6,7}, accepted the first 2-component stream and
+	// took the lowest index. That heuristic guesses at something the ucode states outright, and it
+	// guesses wrong. Replaying resolve_output_input over Resistance 2's (NPEA00431) 70 TEX0-writing
+	// programs resolves 67 of them, picking attribute 1 for 54, attribute 3 for 11 (among them
+	// a3af6e3d5f0ac8e6, 92e7472e1c0f58cd, ccfc2dd606adf833, 731962646a64e3a4, 1438eb79c0843fea,
+	// 7a4a57869f9c4a1f, c0aeb056121c7061 and 8496b26338eb1e01, all 'MOV>o7.xy(I0.xyxx,...)c0i3')
+	// and attribute 2 for 2. The widened scan excludes attribute 3 outright as RSX's diffuse colour
+	// register, so those 13 programs got attribute 1 - a different UV set - or nothing at all. On by
+	// default; the bisect knob for reading the attribute out of the program.
+	bool texcoord_from_ucode();
+
+	// RPCS3_REMIX_POSAFFINE=0: ignore vp_fingerprint::has_const_affine and stop refusing draws whose
+	// recognised position decode could not be rebuilt - the behaviour up to and including fdada2e,
+	// where a program that decodes 'pos = attr * c[S] (+ c[B])' outside a single MAD had the decode
+	// silently dropped and submitted its raw quantised attribute. Resistance 2 measured
+	// prescale=0(c0.0,c0) and wdiv=0 on every one of its 70 dumped programs while replaying this
+	// matcher over their position slices resolves eight, four of which are archetype 'fused' with
+	// group_count 1 - i.e. draws that really do reach Remix: ca526d308f1650bb, 2fbe115e8fbc3371,
+	// ab9725268da2ac85 and ab9725260da32c85, all 'MUL>r0.xyz(I0.xyzx,C0.xyzx,...)c17i0', a per-axis
+	// scale by c17.xyz. Their attr0 is type=5 size=4 (S32K x4) with w=[-16511..-16384], so the raw
+	// attribute they were submitted with is quantised integers: geometry at the wrong scale and
+	// offset, which is the reported vertex explosion. On by default.
+	bool position_affine_enabled();
+
+	// RPCS3_REMIX_UVWIDE=0: restrict the automatic texcoord scan to attributes 8..15 - the
+	// behaviour that shipped up to and including fdada2e, where a title that does not follow the
+	// 8+unit convention had no automatic path at all. On by default: Resistance 2 (NPEA00431)
+	// references no attribute above 4 in any of its 33 census programs and measured
+	// uv_absent == uv_none == tex_bound == 722623, i.e. every textured draw in the run failed with
+	// "the attribute was never placed" - a total failure the 8..15 scan can never fix. The widened
+	// pass adds referenced attributes 1, 2, 4, 5, 6, 7 (never 0/position, never 3/colour, never the
+	// skinning attribute) and takes only 2-component streams whose values decode finite; the full
+	// eligibility argument is in resolve_texcoord_attribute. The bisect knob for that scan.
+	bool texcoord_wide_scan();
+
+	// RPCS3_REMIX_UVFLIPV=1: submit 1-v instead of v for every texcoord, on both the 3D and the
+	// 2D path. Off by default, and it must stay off by default: v = 0 means row 0 of the decoded
+	// texture on RSX exactly as it does in D3D9, so a global flip would invert every title whose
+	// coordinates are already right.
+	//
+	// This is a per-title knob for a per-title defect. Resistance 2 (NPEA00431) is the first title
+	// whose UVs this backend ever applied (they arrived with the widened ATTR1 scan that shipped
+	// after fdada2e) and it samples every texture vertically mirrored - its on-screen text reads
+	// left to right with every glyph upside down, which is a V inversion and not a mirrored quad.
+	// The upload and the V convention are both excluded as the cause by Haze (BLUS30094): its menu
+	// text renders correctly through composite_ui_draw, which reads the title's own texcoord
+	// attribute, decodes it with the same decode_position, and samples the same texture_entry
+	// pixel buffer that reaches Remix's CreateTexture, with v = 0 bound to the top row
+	// (RemixCompositor.cpp:41-45). See commit 2414498, "Menu text now reads correctly".
+	//
+	// What is left is the title's own ucode: we submit the raw vertex attribute and never run the
+	// vertex program, so any scale/bias it applies between reading the texcoord attribute and
+	// writing it to o[7+n] is lost - the same class of trap as the position w dequantisation that
+	// match_wdivide replicates (e9a7956). Which instruction R2 uses has not been read yet; the
+	// texcoord slice added to the dump alongside this knob is what will name it, and a knob is
+	// what makes the picture usable in the meantime.
+	bool texcoord_flip_v();
+
+	// The one place the flip is spelled out, so the 3D and 2D paths cannot disagree about it.
+	// Applied after the unnormalise / S32K scaling, i.e. in normalised texture space: mirroring
+	// about v = 0.5 there is the correct inverse under both REPEAT and CLAMP, and it keeps a
+	// tiled coordinate tiling (v in 0..8 becomes -7..1, the same rows in the opposite order).
+	//
+	// 'flip' is passed in rather than read here because both callers run this per vertex and
+	// texcoord_flip_v() reads a config atomic; the callers hoist it out of their loops.
+	inline f32 apply_v_flip(f32 v, bool flip)
+	{
+		return flip ? (1.f - v) : v;
+	}
 
 	// RPCS3_REMIX_UVINTSCALE=<n>: divisor for S32K (raw 16-bit integer) texcoords, whose real
 	// divisor is a vertex-program constant this backend does not read. Default 4096, inferred

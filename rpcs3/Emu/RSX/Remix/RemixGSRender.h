@@ -97,6 +97,12 @@ private:
 		// Draws whose positions were divided by ATTR0.w at decode time, undoing the packing the
 		// ucode undoes. RPCS3_REMIX_NOWDIV=1 drives this to 0.
 		u64 wdiv_draws = 0;
+		// Draws refused because the program's recognised 'pos = attr * s + b' decode could not be
+		// rebuilt from live constants (slot out of range, zero or non-finite scale). Drawing them
+		// anyway means raw quantised positions against a matrix expecting decoded ones - the vertex
+		// explosion. Non-zero with world_applied unchanged means the matcher is recognising a decode
+		// whose constants are not where it thinks; RPCS3_REMIX_POSAFFINE=0 drives it to 0.
+		u64 pos_decode_refused = 0;
 		u64 tex_bound = 0;
 		u64 tex_none = 0;
 		// Of the tex_none population, how many had no referenced, enabled 2D fragment texture
@@ -123,6 +129,22 @@ private:
 		u64 uv_memory = 0;
 		// Resolved from an attribute other than 8+unit, i.e. the convention did not hold.
 		u64 uv_fallback = 0;
+		// The uv_applied population split by how the attribute was chosen: read out of the program's
+		// own TEX<unit> write, or inferred by the size/type heuristic that is now the fallback. The
+		// two always sum to uv_applied. R2 (NPEA00431) is the case that forced the split: replaying
+		// the resolver over its 70 TEX0-writing programs resolves 67 of them and picks attribute 1
+		// for 54, attribute 3 for 11 and attribute 2 for 2 - i.e. 13 programs whose UVs the
+		// size/type heuristic could never have got right, since it excludes attribute 3 outright as
+		// RSX's colour register. A high uv_applied alone cannot say whether those draws are correct.
+		u64 uv_ucode = 0;
+		u64 uv_heuristic = 0;
+		// Times the widened low-attribute scan mapped a 2-component stream and then threw it away
+		// because a sampled vertex did not decode to a finite pair. Counted separately from the
+		// uv_* statuses above because this refusal deliberately leaves 'best' at 'absent' (see
+		// resolve_texcoord_attribute), so without it a draw refused here is indistinguishable in
+		// the stats from a draw whose title feeds no texcoord attribute at all. Not a subset of
+		// uv_none: the scan may refuse attribute 1 here and still resolve a later one.
+		u64 uv_nonfinite = 0;
 		// Untextured draws that left with the title's own ATTR3 colour instead of flat white.
 		u64 vcol_applied = 0;
 		// Times a referenced texture unit yielded no material and the next one was tried.
@@ -266,6 +288,22 @@ private:
 	// bound as a colour or depth surface: the title reading back its own framebuffer.
 	bool samples_bound_surface() const;
 
+	// "no attribute resolved", the return of resolve_texcoord_attribute on failure. Not 0: that is
+	// a legal attribute index (the position), just never a texcoord one.
+	static constexpr u32 no_attribute = 0xFFFFFFFFu;
+
+	// Picks the vertex attribute carrying the texcoord set that feeds fragment texture 'unit', and
+	// maps it. Shared by the 3D path (apply_texcoords) and the 2D one (composite_ui_draw) so both
+	// see the same attribute: the compositor used to hardcode 8+unit with no fallback, which meant
+	// a menu quad whose UVs sit elsewhere resolved a texture it could not coordinate and died in
+	// the ui_no_colour refusal. Returns the chosen index or no_attribute, and reports through
+	// 'best' the closest any scanned attribute got, for report_uv_failure's census.
+	// Not const: the widened scan's finite-value gate is a refusal like any other and counts itself.
+	// 'from_ucode', when given, reports whether the pick came from the program's own TEX<unit> write
+	// or from the size/type heuristic that is now only the fallback.
+	u32 resolve_texcoord_attribute(u32 unit, u32 first_vertex, u32 vertex_count,
+		attribute_view& out, attribute_status& best, bool* from_ucode = nullptr);
+
 	// One line per vertex program whose texcoord scan found nothing, once. Names the two masks
 	// that decide what analyse_inputs_interleaved even placed, and the declared layout of every
 	// attribute the program references - which is what says whether a title's UVs are somewhere
@@ -323,7 +361,9 @@ private:
 	void draw_ui_probe();
 
 	// Per-draw object-to-world transform. False means "no transform available, use identity".
-	bool per_draw_transform(remixapi_Transform& out) const;
+	// Not const: a program whose position decode is recognised but not rebuildable is refused here
+	// rather than drawn raw, and that refusal counts itself (pos_decode_refused).
+	bool per_draw_transform(remixapi_Transform& out);
 
 	// Stage B: one subdraw of the current draw clause.
 	void submit_subdraw();

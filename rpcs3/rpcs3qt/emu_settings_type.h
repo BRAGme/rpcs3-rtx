@@ -124,6 +124,7 @@ enum class emu_settings_type
 	RemixNoTextures,
 	RemixTextureBudget,
 	RemixTextureRehash,
+	RemixFlipTexcoordV,
 	RemixCameraHold,
 	RemixNoWDivide,
 	RemixStrictInput,

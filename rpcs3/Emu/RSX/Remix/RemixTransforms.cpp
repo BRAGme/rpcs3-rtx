@@ -970,6 +970,315 @@ namespace remix_rsx
 			return false;
 		}
 
+		struct const_affine_result
+		{
+			bool found = false;
+			bool has_scale = false;
+			bool has_bias = false;
+			u32 scale_slot = 0;
+			u8 scale_component[3] = { 0, 1, 2 };
+			u32 bias_slot = 0;
+		};
+
+		// The xyz source swizzle is the identity, i.e. the operand really is this vertex's own
+		// position in its own axis order rather than some permutation of it.
+		bool is_identity_xyz_swizzle(const SRC& s)
+		{
+			return s.swz_x == 0 && s.swz_y == 1 && s.swz_z == 2;
+		}
+
+		// 'temp.xyz = attribute0.xyz * c[S].<swz> + c[B].xyz', written as separate MUL and ADD
+		// instructions rather than the single MAD match_prescale looks for, and with a scale that
+		// may be a different component per axis.
+		//
+		// Resistance 2 decodes its quantised positions this way. Two shapes appear in its dump
+		// (C:\...\r2_dump3.log, 70 programs):
+		//   ca526d308f1650bb  0:MUL>r0.xyz(I0.xyzx,C0.xyzx,I0.xyzw)c17i0   pos * c17.xyz
+		//   67c4f95549157dbb  1:MUL>r1.xyz(I0.xyzx,C0.wwww,I0.xyzw)c18i0   pos * c18.w
+		// and both leave 'r0.w = c[K].z' between the decode and the matrix, which is why this walks
+		// the writer list the way match_prescale does instead of looking only at the last write.
+		//
+		// Everything it cannot prove is a single scale-and-bias on ATTR0 is refused: a partial xyz
+		// write, a scalar that is not a transform constant, an indexed constant, a scalar half
+		// touching xyz, an operand that is not read straight. R2's own indexed-palette programs
+		// (fcbc61ec596e7e34, 0a8f3a6c16e60433) apply their bias *after* the palette matrix, so the
+		// backward walk hits a DP4 on the way and refuses them here, which is correct - their
+		// position is not attr * s + b at all.
+		bool match_const_affine(const program_walker& prog, u32 temp, u32 before, const_affine_result& out)
+		{
+			out = const_affine_result{};
+
+			// A scalar-half write into xyz is a term this walk never sees, so it has to be
+			// excluded for every temp the chase visits, not just the one it starts on.
+			const auto sca_touches_xyz = [&](u32 reg, u32 bound)
+			{
+				for (u32 i = 0; i < bound && i < static_cast<u32>(prog.size()); ++i)
+				{
+					if (sca_writes_temp(prog[i], reg) && (sca_writemask(prog[i]) & 0x7))
+					{
+						return true;
+					}
+				}
+
+				return false;
+			};
+
+			if (sca_touches_xyz(temp, before))
+			{
+				return false;
+			}
+
+			std::vector<u32> writers;
+			prog.collect_vec_writers(walk_target{ false, temp }, writers, before);
+
+			u32 cursor = before;
+
+			// One MUL and one ADD is the whole grammar; the bound is hop count, not instructions.
+			for (u32 hop = 0; hop < 4; ++hop)
+			{
+				u32 chosen = umax;
+
+				for (auto it = writers.rbegin(); it != writers.rend(); ++it)
+				{
+					if (*it >= cursor)
+					{
+						continue;
+					}
+
+					const u32 mask = vec_writemask(prog[*it]) & 0x7;
+
+					if (mask == 0)
+					{
+						// A w-only write (the 'r0.w = c[K].z' that completes the homogeneous
+						// vector) does not touch the position and cannot hide a term.
+						continue;
+					}
+
+					if (mask != 0x7)
+					{
+						// A partial xyz write means one axis is produced somewhere this walk is
+						// not looking. Refuse rather than fold two thirds of a decode.
+						return false;
+					}
+
+					chosen = *it;
+					break;
+				}
+
+				if (chosen == umax)
+				{
+					return false;
+				}
+
+				const decoded_instr& in = prog[chosen];
+
+				if (in.d3.index_const)
+				{
+					return false;
+				}
+
+				switch (in.d1.vec_opcode)
+				{
+				case RSX_VEC_OPCODE_ADD:
+				{
+					// ADD is '$0 + $2' - vec_source_mask(ADD) is 0b101 and there is no src1. A
+					// scan written as 's = 0..1' silently misses every real case (41d9adc).
+					constexpr u32 add_slots[2] = { 0, 2 };
+
+					u32 const_slot = umax;
+					u32 other_slot = umax;
+
+					for (const u32 s : add_slots)
+					{
+						if (in.src[s].reg_type == RSX_VP_REGISTER_TYPE_CONSTANT)
+						{
+							const_slot = (const_slot == umax) ? s : umax;
+						}
+						else
+						{
+							other_slot = s;
+						}
+					}
+
+					if (const_slot == umax || other_slot == umax || out.has_bias)
+					{
+						return false;
+					}
+
+					if (!is_identity_xyz_swizzle(in.src[const_slot]) || !is_identity_xyz_swizzle(in.src[other_slot]))
+					{
+						return false;
+					}
+
+					out.has_bias = true;
+					out.bias_slot = in.d1.const_src;
+
+					if (in.src[other_slot].reg_type == RSX_VP_REGISTER_TYPE_INPUT)
+					{
+						// Terminal: 'attr + c[B]', no scale.
+						out.found = (u32{in.d1.input_src} == 0);
+						return out.found;
+					}
+
+					if (in.src[other_slot].reg_type != RSX_VP_REGISTER_TYPE_TEMP)
+					{
+						return false;
+					}
+
+					if (sca_touches_xyz(in.src[other_slot].tmp_src, chosen))
+					{
+						return false;
+					}
+
+					prog.collect_vec_writers(walk_target{ false, in.src[other_slot].tmp_src }, writers, chosen);
+					cursor = chosen;
+					break;
+				}
+				case RSX_VEC_OPCODE_MUL:
+				{
+					// MUL is '$0 * $1'.
+					u32 input_slot = umax;
+					u32 const_slot = umax;
+
+					for (u32 s = 0; s < 2; ++s)
+					{
+						if (in.src[s].reg_type == RSX_VP_REGISTER_TYPE_INPUT)
+						{
+							input_slot = s;
+						}
+						else if (in.src[s].reg_type == RSX_VP_REGISTER_TYPE_CONSTANT)
+						{
+							const_slot = s;
+						}
+					}
+
+					if (input_slot == umax || const_slot == umax || out.has_scale)
+					{
+						return false;
+					}
+
+					// ATTR0 only, and read straight: it is the one attribute this backend submits
+					// as a position, so a decode on any other input describes a vector we never
+					// send. The same rule match_wdivide states.
+					if (u32{in.d1.input_src} != 0 || !is_identity_xyz_swizzle(in.src[input_slot]))
+					{
+						return false;
+					}
+
+					const SRC& factor = in.src[const_slot];
+
+					out.has_scale = true;
+					out.scale_slot = in.d1.const_src;
+					out.scale_component[0] = static_cast<u8>(factor.swz_x);
+					out.scale_component[1] = static_cast<u8>(factor.swz_y);
+					out.scale_component[2] = static_cast<u8>(factor.swz_z);
+					out.found = true;
+					return true;
+				}
+				default:
+					return false;
+				}
+			}
+
+			return false;
+		}
+
+		// Which input attribute the ucode writes into output register 'output' xy. This is the
+		// texcoord half of the match_wdivide lesson: the backend submits the raw attribute and
+		// never runs the program, so guessing which attribute is the texcoord from its size and
+		// type is guessing at something 'MOV>o7.xy(I0.xyxx,...)c0i<N>' states outright - and R2
+		// disagrees with the guess on 13 of its 70 TEX0-writing programs: replaying this matcher
+		// over that dump resolves 67 of the 70 and picks attribute 1 for 54, attribute 3 for 11 and
+		// attribute 2 for 2, and the size/type scan excludes attribute 3 outright as RSX's colour
+		// register.
+		//
+		// Refuses anything that is not a straight read of one attribute: a write assembled from
+		// temps or constants (ab9725268da2ac85 writes o7 from a temp), a texture matrix applied to
+		// the position (ef8f10966ce1500b writes 'DP4>o7.y(I0.xyzw,C0.xyzw,...)c2i0' - attribute 0,
+		// which is the position, not a texcoord), a swizzle that is not the identity, an indexed
+		// constant, a scalar-half write, or two writers that disagree.
+		bool resolve_output_input(const program_walker& prog, u32 output, u32& out_attribute)
+		{
+			bool found = false;
+			u32 attribute = 0;
+
+			for (u32 i = 0; i < static_cast<u32>(prog.size()); ++i)
+			{
+				const decoded_instr& in = prog[i];
+
+				if (sca_writes_output(in, output) && (sca_writemask(in) & 0x3))
+				{
+					return false;
+				}
+
+				if (!vec_writes_output(in, output))
+				{
+					continue;
+				}
+
+				const u32 mask = vec_writemask(in) & 0x3;
+
+				if (mask == 0)
+				{
+					// Writes only z/w. R2 packs a second coordinate set, a fog factor or a
+					// scroll term there ('MOV>o7.zw(T0.xxxy,...)'); only xy is the 2D texcoord.
+					continue;
+				}
+
+				if (in.d3.index_const)
+				{
+					return false;
+				}
+
+				const u32 sources = vec_source_mask(in.d1.vec_opcode);
+				u32 input_slot = umax;
+
+				// ADD's mask is 0b101 - src0 and src2, no src1. Walking 0..1 misses it (41d9adc).
+				for (u32 s = 0; s < 3; ++s)
+				{
+					if ((sources & (1u << s)) && in.src[s].reg_type == RSX_VP_REGISTER_TYPE_INPUT)
+					{
+						input_slot = s;
+					}
+				}
+
+				if (input_slot == umax)
+				{
+					return false;
+				}
+
+				// One input register index per instruction, so the operand's components have to
+				// line up with the ones being written for the attribute to mean what it says.
+				const SRC& src = in.src[input_slot];
+
+				if (((mask & 1) && src.swz_x != 0) || ((mask & 2) && src.swz_y != 1))
+				{
+					return false;
+				}
+
+				const u32 index = u32{in.d1.input_src};
+
+				if (found && index != attribute)
+				{
+					return false;
+				}
+
+				found = true;
+				attribute = index;
+			}
+
+			// Attribute 0 is the position. A program that texture-maps from it is doing texgen,
+			// which this backend does not evaluate; the heuristic scan is a better answer than a
+			// stream of vertex positions handed to a sampler.
+			if (!found || attribute == 0 || attribute > 15)
+			{
+				return false;
+			}
+
+			out_attribute = attribute;
+			return true;
+		}
+
 		struct wdivide_result
 		{
 			bool found = false;
@@ -1143,7 +1452,12 @@ namespace remix_rsx
 		// reported indexed addressing in the position chain for programs whose position never
 		// touches an indexed constant, and submit_subdraw refused them as unrecognised rigs.
 		// RPCS3_REMIX_LOOSESLICE=1 restores the old behaviour.
-		void slice_position(const program_walker& prog, u32& out_distinct_consts, u32& out_instructions, bool& out_indexed, std::vector<u32>* out_indices = nullptr)
+		// 'output_index' is the vertex-program output register the backward slice starts from.
+		// 0 is HPOS, which is the only one the matcher itself cares about; the texcoord outputs
+		// (TEX0..TEX7 are o7..o14, per rpcs3's own output table in VKVertexProgram.cpp:292-299)
+		// are sliced by the diagnostics, to read what a title does to a texcoord attribute between
+		// loading it and writing it out.
+		void slice_position(const program_walker& prog, u32 output_index, u32& out_distinct_consts, u32& out_instructions, bool& out_indexed, std::vector<u32>* out_indices = nullptr)
 		{
 			// 'before' is the exclusive instruction bound a write has to precede to reach this
 			// read. Two reads of the same register at different points in the program are
@@ -1195,7 +1509,7 @@ namespace remix_rsx
 			std::vector<u8> seen_instr(prog.size(), 0);
 			std::vector<u32> consts;
 
-			pending.push_back(slice_target{ walk_target{ true, 0 }, program_size });
+			pending.push_back(slice_target{ walk_target{ true, output_index }, program_size });
 
 			u32 instructions = 0;
 			bool indexed = false;
@@ -1878,7 +2192,18 @@ namespace remix_rsx
 
 		const program_walker prog(vp);
 
-		slice_position(prog, result.distinct_consts, result.chain_instructions, result.indexed_const);
+		// Read the texcoord attributes out of the ucode before any early return: a screen_space or
+		// unknown program still draws through composite_ui_draw, which resolves texcoords the same
+		// way. Once per program, not per draw - the fingerprint is cached by program hash.
+		for (u32 unit = 0; unit < 8; ++unit)
+		{
+			if (u32 attribute = 0; resolve_output_input(prog, 7 + unit, attribute))
+			{
+				result.texcoord_input[unit] = static_cast<u8>(attribute);
+			}
+		}
+
+		slice_position(prog, 0, result.distinct_consts, result.chain_instructions, result.indexed_const);
 
 		if (result.chain_instructions == 0)
 		{
@@ -1997,6 +2322,23 @@ namespace remix_rsx
 			if (wdivide_result wdivide{}; match_wdivide(prog, source.index, chain.first_instruction, wdivide) && wdivide.attribute == 0)
 			{
 				result.has_wdivide = true;
+				reached_input = true;
+				break;
+			}
+
+			// ...or with the same constant scale and bias spelled out as separate instructions,
+			// which is how Resistance 2 writes it. Tried last so a program that matches either of
+			// the older, tighter shapes keeps matching it.
+			if (const_affine_result affine{}; match_const_affine(prog, source.index, chain.first_instruction, affine))
+			{
+				result.has_const_affine = true;
+				result.affine_has_scale = affine.has_scale;
+				result.affine_has_bias = affine.has_bias;
+				result.affine_scale_slot = affine.scale_slot;
+				result.affine_scale_component[0] = affine.scale_component[0];
+				result.affine_scale_component[1] = affine.scale_component[1];
+				result.affine_scale_component[2] = affine.scale_component[2];
+				result.affine_bias_slot = affine.bias_slot;
 				reached_input = true;
 				break;
 			}
@@ -2151,6 +2493,11 @@ namespace remix_rsx
 
 	std::string describe_position_slice(const RSXVertexProgram& vp, u32 max_instructions)
 	{
+		return describe_output_slice(vp, 0, max_instructions);
+	}
+
+	std::string describe_output_slice(const RSXVertexProgram& vp, u32 output_index, u32 max_instructions)
+	{
 		if (vp.data.size() < 4)
 		{
 			return "<empty>";
@@ -2162,7 +2509,12 @@ namespace remix_rsx
 		u32 instructions = 0;
 		bool indexed = false;
 		std::vector<u32> indices;
-		slice_position(prog, consts, instructions, indexed, &indices);
+		slice_position(prog, output_index, consts, instructions, indexed, &indices);
+
+		if (instructions == 0)
+		{
+			return " <not written>";
+		}
 
 		std::string out;
 		u32 emitted = 0;
@@ -2307,6 +2659,60 @@ namespace remix_rsx
 
 	bool build_prescale(const vp_fingerprint& fp, mat4& out)
 	{
+		if (fp.has_const_affine && position_affine_enabled())
+		{
+			// Per-axis scale, so a diagonal rather than the uniform one below. Both halves are
+			// optional: R2's ca526d308f1650bb scales and does not bias, its c87769e09c995db9
+			// biases and does not scale.
+			out = mat4_identity();
+
+			if (fp.affine_has_scale)
+			{
+				f32 slot[4]{};
+
+				if (!read_slot(fp.affine_scale_slot, slot))
+				{
+					return false;
+				}
+
+				for (u32 i = 0; i < 3; ++i)
+				{
+					const f32 s = slot[fp.affine_scale_component[i] & 3];
+
+					// A zero or non-finite axis collapses the mesh into a plane or deletes it.
+					// Refuse the whole decode rather than submit two thirds of it.
+					if (!std::isfinite(s) || std::abs(s) < 1e-12f)
+					{
+						return false;
+					}
+
+					out.m[i][i] = s;
+				}
+			}
+
+			if (fp.affine_has_bias)
+			{
+				f32 slot[4]{};
+
+				if (!read_slot(fp.affine_bias_slot, slot))
+				{
+					return false;
+				}
+
+				for (u32 i = 0; i < 3; ++i)
+				{
+					if (!std::isfinite(slot[i]))
+					{
+						return false;
+					}
+
+					out.m[3][i] = slot[i];
+				}
+			}
+
+			return fp.affine_has_scale || fp.affine_has_bias;
+		}
+
 		if (!fp.has_prescale)
 		{
 			return false;
@@ -2697,6 +3103,34 @@ namespace remix_rsx
 	{
 		static const u32 value = env_u32(L"RPCS3_REMIX_UVATTR", 0);
 		return value;
+	}
+
+	bool texcoord_from_ucode()
+	{
+		// env_u32 rather than env_flag: the useful setting is the *off* one, and env_flag cannot
+		// tell "set to 0" from "not set at all".
+		static const u32 value = env_u32(L"RPCS3_REMIX_UVUCODE", 1);
+		return value != 0;
+	}
+
+	bool position_affine_enabled()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_POSAFFINE", 1);
+		return value != 0;
+	}
+
+	bool texcoord_wide_scan()
+	{
+		// env_u32 rather than env_flag: the useful setting here is the *off* one, and env_flag
+		// cannot tell "set to 0" from "not set at all".
+		static const u32 value = env_u32(L"RPCS3_REMIX_UVWIDE", 1);
+		return value != 0;
+	}
+
+	bool texcoord_flip_v()
+	{
+		static const bool env = env_flag(L"RPCS3_REMIX_UVFLIPV");
+		return env || g_cfg.video.remix.flip_texcoord_v;
 	}
 
 	u32 texcoord_int_scale()

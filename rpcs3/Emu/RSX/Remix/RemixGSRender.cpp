@@ -1271,34 +1271,25 @@ void RemixGSRender::report_uv_failure(attribute_status best)
 	}
 }
 
-void RemixGSRender::apply_texcoords(u32 unit, const remix_rsx::texture_entry& entry,
-	const rsx::fragment_texture& tex, u32 first_vertex, u32 vertex_count)
+u32 RemixGSRender::resolve_texcoord_attribute(u32 unit, u32 first_vertex, u32 vertex_count,
+	attribute_view& out, attribute_status& best, bool* from_ucode)
 {
-	// Every world vertex used to leave here with texcoord (0,0). A mesh whose UVs are all the
-	// same point samples one texel of its albedo across every pixel of every triangle, so the
-	// material is applied but the picture is a flat colour - which is what Haze showed while
-	// the counters said tex_bound=5.7M and mat_created=6715. The texture path was never the
-	// defect; the coordinates were missing.
-	//
-	// RSX feeds texture unit n from vertex attribute 8+n (ATTR8 == in_tc0), the same mapping
-	// composite_ui_draw uses on the 2D path. That mapping is a convention, not a guarantee -
-	// the fragment program's TEXn input is fed by whatever the vertex program writes to o[9+n] -
-	// so a fallback scan and an override knob are provided rather than assuming it holds.
-	if (remix_rsx::texcoords_disabled())
-	{
-		return;
-	}
+	out = attribute_view{};
 
-	attribute_view uvs{};
-	u32 chosen = 0xFFFFFFFFu;
+	if (from_ucode)
+	{
+		*from_ucode = false;
+	}
 
 	// The best status any scanned attribute reached, ordered by how close it got to a usable
 	// stream: absent (not fed from a persistent block at all) < layout (block found, offsets do
 	// not describe a readable stream) < memory (stream described, span unreadable). Recorded
-	// because R2 measured uv_none == tex_bound == 2450329 - a total failure, where the aggregate
+	// because R2 measured uv_none == tex_bound == 722623 - a total failure, where the aggregate
 	// counter alone cannot say whether the title feeds no texcoord attribute or feeds one this
 	// code mis-locates.
-	attribute_status best_status = attribute_status::absent;
+	best = attribute_status::absent;
+
+	u32 chosen = no_attribute;
 
 	const auto rank = [](attribute_status s) -> u32
 	{
@@ -1313,47 +1304,223 @@ void RemixGSRender::apply_texcoords(u32 unit, const remix_rsx::texture_entry& en
 		return 0;
 	};
 
+	// "Finite" is the cheap proof that a widened candidate really is coordinates rather than some
+	// packed field reinterpreted as two halves. Sampled, not exhaustive: this runs per draw, and
+	// eight points spread across the range catch a garbage stream without paying a second full
+	// decode pass on top of the one the caller is about to run.
+	const auto decodes_finite = [&](const attribute_view& view) -> bool
+	{
+		const u32 step = std::max<u32>(1, vertex_count / 8);
+
+		for (u32 i = 0; i < vertex_count; i += step)
+		{
+			f32 uv[4]{};
+
+			if (!remix_rsx::decode_position(view.at(i), view.type, view.size, uv) ||
+				!std::isfinite(uv[0]) || !std::isfinite(uv[1]))
+			{
+				return false;
+			}
+		}
+
+		return true;
+	};
+
 	// 'forced' relaxes the lower bound to 1: RPCS3_REMIX_UVATTR exists to test a title that does
 	// not follow the 8+unit convention, and until now it could not express "the UVs are on a low
 	// attribute" at all because the bound was the same 8 the automatic scan uses. 0 stays refused -
-	// that is the position attribute, never a texcoord.
-	const auto try_attribute = [&](u32 index, bool forced)
+	// that is the position attribute, never a texcoord. 'widened' additionally demands the stream
+	// decode finite, which the 8..15 convention does not need: those attributes are texcoords by
+	// declaration, a low attribute is only a texcoord by inference.
+	const auto try_attribute = [&](u32 index, bool forced, bool widened)
 	{
-		if (index < (forced ? 1u : 8u) || index > 15 || chosen != 0xFFFFFFFFu)
+		if (index < (forced ? 1u : 8u) || index > 15 || chosen != no_attribute)
 		{
 			return;
 		}
 
-		const attribute_status status = map_attribute(index, first_vertex, vertex_count, uvs);
+		attribute_view view{};
+		const attribute_status status = map_attribute(index, first_vertex, vertex_count, view);
 
-		if (rank(status) > rank(best_status))
+		if (status == attribute_status::ok && widened && !decodes_finite(view))
 		{
-			best_status = status;
+			// Not ranked into 'best': a stream that does not decode as coordinates is not a
+			// failed texcoord attribute, and reporting it as one would tell report_uv_failure's
+			// census that a usable attribute was found when none was.
+			//
+			// Counted, because 'best' staying at 'absent' is exactly what makes this refusal
+			// invisible, and it is the only one of the widened scan's gates that can refuse an
+			// attribute the layout census prints as eligible. R2's post-widening capture left
+			// three programs in the uv-fail census whose a1 reads place1/type3/size2/blk20 -
+			// persistent, half x2, block found - which map_attribute cannot report as 'absent'
+			// (RemixGSRender.cpp:1676-1687 returns absent only for a non-persistent placement or
+			// a missing block, and reports 'layout'/'memory' for everything after that). This
+			// gate is the sole remaining path to best=absent on those three, and this counter is
+			// what says whether it fires once per program or on every draw of them.
+			++m_stats.uv_nonfinite;
+			return;
+		}
+
+		if (rank(status) > rank(best))
+		{
+			best = status;
 		}
 
 		if (status == attribute_status::ok)
 		{
+			out = view;
 			chosen = index;
 		}
 	};
 
 	if (const u32 forced = remix_rsx::texcoord_attribute(); forced != 0)
 	{
-		try_attribute(forced, true);
+		try_attribute(forced, true, false);
+		return chosen;
 	}
-	else
-	{
-		try_attribute(8 + unit, false);
 
-		// A program that samples unit 1 from in_tc0 (a lightmap or detail map sharing the
-		// diffuse UVs) is common enough to be worth a second look before giving up.
-		for (u32 index = 8; index <= 15; ++index)
+	// The ucode states which attribute feeds TEX<unit>. Everything below this point infers it from
+	// the attribute's declared size and type, which is guessing at something the program spells out:
+	// 'MOV>o7.xy(I0.xyxx,I0.xyzw,I0.xyzw)c0i1' is "TEX0.xy = attribute 1, no scale, no bias".
+	//
+	// The heuristic is not merely redundant, it is wrong on real programs. Of Resistance 2's 70
+	// dumped TEX0 writers, eight read attribute 3 - a3af6e3d5f0ac8e6, 92e7472e1c0f58cd,
+	// ccfc2dd606adf833, 731962646a64e3a4, 1438eb79c0843fea, 7a4a57869f9c4a1f, c0aeb056121c7061 and
+	// 8496b26338eb1e01, all 'MOV>o7.xy(...)c0i3' - and the widened scan excludes attribute 3
+	// outright because it is RSX's diffuse colour register on every other title. Those programs got
+	// attribute 1 (a different UV set) or nothing at all.
+	//
+	// The scan below stays as the fallback, because the ucode does not always answer: a program that
+	// assembles TEX0 from temps (ab9725268da2ac85: 'MUL>o7.xyzw(T0.xxxy,C0.xyzw,...)c20i0') or
+	// texture-matrixes the position into it (ef8f10966ce1500b: 'DP4>o7.y(I0.xyzw,C0.xyzw,...)c2i0',
+	// attribute 0) leaves texcoord_input at s_no_texcoord_input. RPCS3_REMIX_UVUCODE=0 skips this.
+	if (const remix_rsx::vp_fingerprint* fp = m_current_fingerprint;
+		fp && unit < 8 && remix_rsx::texcoord_from_ucode())
+	{
+		if (const u8 declared = fp->texcoord_input[unit]; declared != remix_rsx::s_no_texcoord_input)
 		{
-			try_attribute(index, false);
+			// 'widened' so the same finite-value proof the low-attribute scan demands applies here:
+			// the ucode names the attribute, it does not promise the stream behind it is readable.
+			try_attribute(declared, true, true);
+
+			if (chosen != no_attribute)
+			{
+				if (from_ucode)
+				{
+					*from_ucode = true;
+				}
+
+				return chosen;
+			}
 		}
 	}
 
-	if (chosen == 0xFFFFFFFFu)
+	try_attribute(8 + unit, false, false);
+
+	// A program that samples unit 1 from in_tc0 (a lightmap or detail map sharing the
+	// diffuse UVs) is common enough to be worth a second look before giving up.
+	for (u32 index = 8; index <= 15; ++index)
+	{
+		try_attribute(index, false, false);
+	}
+
+	if (chosen != no_attribute || !remix_rsx::texcoord_wide_scan())
+	{
+		return chosen;
+	}
+
+	// ATTR8 == in_tc0 is a convention, not a rule, and Resistance 2 does not follow it. Its run
+	// measured uv_absent == uv_none == tex_bound == 722623 with uv_layout = uv_memory = 0: every
+	// textured draw failed with "the attribute was never placed", not with a decode fault. All 33
+	// of its census programs reference only attributes 0..4 (ref= 0x3, 0x7, 0xf, 0x13, 0x17, 0x1b,
+	// 0x1f - the highest bit set is bit 4), so the 8..15 pass above cannot hit even once. The UVs
+	// are on ATTR1: type3/size2 (half x2), interleaved at the position's own stride, in 31 of
+	// those 33 programs.
+	//
+	// Which attributes are eligible is the whole safety argument, because a wrong pick is worse
+	// than no pick - it scrambles the texture *and* moves the mesh content hash:
+	//   0                  never. The position, submitted as the vertex position.
+	//   3                  never. RSX's diffuse colour register, which apply_vertex_colour reads.
+	//   fp.bone_attribute  never. It feeds the address register, not a sampler.
+	//   not referenced     never. analyse_inputs_interleaved only places attributes present in
+	//                      'input_mask & referenced_inputs_mask' (RSXDrawCommands.cpp:19), so an
+	//                      unreferenced index cannot be a real stream anyway.
+	//   size != 2          never. A texcoord is two components. R2's own a2/a3 are type6/size1
+	//                      packed normals and tangents and its a4 colour is type7/size4; demanding
+	//                      exactly two components is what keeps those out of the UV slot.
+	//
+	// Known-unhandled, deliberately: two of the 33 programs (9baa914c45f319dc, c46bfca2424f1c41)
+	// carry a1=type3/size4, which reads as two UV sets packed into one half4. Admitting size 4
+	// here would also admit half4/float4 tangents, blend weights and secondary colours in every
+	// other title, on the strength of two programs whose share of the draws was never measured.
+	// RPCS3_REMIX_UVATTR=1 pins ATTR1 for the run that would measure it.
+	//
+	// The lowest qualifying index wins, so the pick is stable run to run: the submitted mesh is
+	// content-hashed over its texcoords, and a choice that moved would mint a fresh mesh handle
+	// every time it did.
+	static constexpr u32 wide_scan[] = { 1, 2, 4, 5, 6, 7 };
+
+	// Null-checked rather than dereferenced like its neighbours: this is the one texcoord path the
+	// 2D compositor also calls, and it must not depend on the clause fingerprint being set.
+	const remix_rsx::vp_fingerprint* fp = m_current_fingerprint;
+	const u32 referenced = u32{current_vp_metadata.referenced_inputs_mask};
+
+	for (const u32 index : wide_scan)
+	{
+		if (!(referenced & (1u << index)))
+		{
+			continue;
+		}
+
+		if (fp && fp->bone_resolved && index == fp->bone_attribute)
+		{
+			continue;
+		}
+
+		if (u32{rsx::method_registers.vertex_arrays_info[index].size()} != 2)
+		{
+			continue;
+		}
+
+		try_attribute(index, true, true);
+
+		if (chosen != no_attribute)
+		{
+			break;
+		}
+	}
+
+	return chosen;
+}
+
+void RemixGSRender::apply_texcoords(u32 unit, const remix_rsx::texture_entry& entry,
+	const rsx::fragment_texture& tex, u32 first_vertex, u32 vertex_count)
+{
+	// Every world vertex used to leave here with texcoord (0,0). A mesh whose UVs are all the
+	// same point samples one texel of its albedo across every pixel of every triangle, so the
+	// material is applied but the picture is a flat colour - which is what Haze showed while
+	// the counters said tex_bound=5.7M and mat_created=6715. The texture path was never the
+	// defect; the coordinates were missing.
+	//
+	// RSX feeds texture unit n from vertex attribute 8+n (ATTR8 == in_tc0). That mapping is a
+	// convention, not a guarantee - the fragment program's TEXn input is fed by whatever the vertex
+	// program writes to o[7+n] (TEX0..TEX7 are o7..o14, per rpcs3's own output table in
+	// VKVertexProgram.cpp:292-299; an earlier revision of this comment said o[9+n], which was
+	// wrong) - so resolve_texcoord_attribute owns the choice: the convention, a
+	// sweep of 8..15, a widened low-attribute scan, and an override knob. composite_ui_draw calls
+	// the same helper, so the 2D and 3D paths cannot disagree about where a title's UVs live.
+	if (remix_rsx::texcoords_disabled())
+	{
+		return;
+	}
+
+	attribute_view uvs{};
+	attribute_status best_status = attribute_status::absent;
+
+	bool uv_from_ucode = false;
+	const u32 chosen = resolve_texcoord_attribute(unit, first_vertex, vertex_count, uvs, best_status, &uv_from_ucode);
+
+	if (chosen == no_attribute)
 	{
 		++m_stats.uv_none;
 
@@ -1400,6 +1567,8 @@ void RemixGSRender::apply_texcoords(u32 unit, const remix_rsx::texture_entry& en
 		}
 	}
 
+	const bool flip_v = remix_rsx::texcoord_flip_v();
+
 	for (u32 i = 0; i < vertex_count; ++i)
 	{
 		f32 uv[4]{};
@@ -1413,14 +1582,32 @@ void RemixGSRender::apply_texcoords(u32 unit, const remix_rsx::texture_entry& en
 		}
 
 		m_scratch_vertices[i].texcoord[0] = uv[0] * uv_scale[0];
-		m_scratch_vertices[i].texcoord[1] = uv[1] * uv_scale[1];
+		m_scratch_vertices[i].texcoord[1] = remix_rsx::apply_v_flip(uv[1] * uv_scale[1], flip_v);
 	}
 
 	++m_stats.uv_applied;
 
+	// Every pick the 8+unit convention did not make, whether it came from the 8..15 sweep or the
+	// widened low-attribute scan - which is what says the convention is not what carried the run.
+	// No separate counter for the widened path: on a title like R2 that references nothing above
+	// attribute 4, uv_fallback == uv_applied already means the widened scan did all of the work,
+	// and uv_applied == 0 with uv_absent == tex_bound means it did none.
 	if (chosen != (8 + unit))
 	{
 		++m_stats.uv_fallback;
+	}
+
+	// Which of the two mechanisms actually carried the run. uv_ucode == uv_applied means the
+	// programs answered for every textured draw and the heuristic below it is dead weight;
+	// uv_heuristic staying large means a whole population still writes TEX0 in a shape
+	// resolve_output_input refuses, and the tc0 slices in the dump name it.
+	if (uv_from_ucode)
+	{
+		++m_stats.uv_ucode;
+	}
+	else
+	{
+		++m_stats.uv_heuristic;
 	}
 
 	// One line per (program, unit, attribute), once: if the picture comes back textured but
@@ -1837,8 +2024,16 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 
 		if (entry)
 		{
-			// The texcoord set follows the texture unit: ATTR8 is in_tc0.
-			have_uv = map_attribute(8 + static_cast<u32>(unit), first_vertex, vertex_count, uvs) == attribute_status::ok;
+			// The same resolution the 3D path runs, not the bare 8+unit lookup this used to do.
+			// ATTR8 == in_tc0 is a convention, and a title that does not follow it lost every 2D
+			// draw here twice over: no UVs meant the texture did not count towards the colour gate
+			// below, so the quad was refused outright. R2 (NPEA00431) carries its texcoords on
+			// ATTR1 in 31 of its 33 census programs and measured ui_draws=0 / ui_no_colour=122580
+			// over 3968 frames - the whole live-rendered main menu, refused.
+			attribute_status uv_status = attribute_status::absent;
+
+			have_uv = resolve_texcoord_attribute(static_cast<u32>(unit), first_vertex, vertex_count,
+				uvs, uv_status) != no_attribute;
 
 			if (tex.format() & CELL_GCM_TEXTURE_UN)
 			{
@@ -1885,6 +2080,7 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 	}
 
 	const bool clamp_uv = entry && (entry->wrap_u == 0 || entry->wrap_v == 0);
+	const bool flip_v = remix_rsx::texcoord_flip_v();
 
 	// Diagnostic: remember the draw covering the most screen area this stats window, with the
 	// albedo unit and pixel count it resolved. A large draw with unit=-1 / pixels=0 is a draw
@@ -1940,7 +2136,7 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 				}
 
 				u[c] = uv[0] * uv_scale[0];
-				v[c] = uv[1] * uv_scale[1];
+				v[c] = remix_rsx::apply_v_flip(uv[1] * uv_scale[1], flip_v);
 			}
 		}
 
@@ -2622,7 +2818,7 @@ void RemixGSRender::update_camera_candidate()
 	}
 }
 
-bool RemixGSRender::per_draw_transform(remixapi_Transform& out) const
+bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 {
 	out = s_identity_transform;
 
@@ -2633,6 +2829,23 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out) const
 
 	const remix_rsx::vp_fingerprint& fp = *m_current_fingerprint;
 	remix_rsx::mat4 world{};
+
+	// The vertices submitted to Remix are the raw attribute values, so any decode the program
+	// applies before its first matrix is part of this transform. A program whose decode was
+	// recognised but whose constants cannot be read back is refused, not drawn raw: raw quantised
+	// positions against a matrix that expects decoded ones is the vertex explosion, and the whole
+	// point of recognising the decode is knowing that the raw values are wrong.
+	// RPCS3_REMIX_POSAFFINE=0 restores drawing them.
+	const bool decodes_position = fp.has_prescale || fp.has_const_affine;
+
+	if (decodes_position && remix_rsx::position_affine_enabled())
+	{
+		if (remix_rsx::mat4 probe{}; !remix_rsx::build_prescale(fp, probe))
+		{
+			++m_stats.pos_decode_refused;
+			return false;
+		}
+	}
 
 	if (m_active_camera.archetype == remix_rsx::vp_archetype::layered
 		|| m_active_camera.archetype == remix_rsx::vp_archetype::skinned_layered)
@@ -2739,6 +2952,16 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out) const
 			rsx::method_registers.viewport_offset_z());
 
 		world = remix_rsx::mat4_multiply(fused, m_active_camera.reference_inverse);
+
+		// The layered branches above have prepended the decode since e9a7956; this one never did,
+		// so every title whose active camera is archetype 'fused' - which is R2's, on every frame
+		// the log records arch=fused - had its quantised positions submitted undecoded even when the
+		// matcher had already recognised the decode. clip = (attr*S + B) * M and we submit attr, so
+		// the instance transform has to be S,B * M * reference_inverse, in that order.
+		if (remix_rsx::mat4 prescale{}; remix_rsx::build_prescale(fp, prescale))
+		{
+			world = remix_rsx::mat4_multiply(prescale, world);
+		}
 	}
 	else
 	{
@@ -3756,6 +3979,79 @@ void RemixGSRender::dump_vertex_program(u32 first_vertex, u32 vertex_count, u32 
 			remix_rsx::describe_position_slice(current_vertex_program, (fp.indexed_const || !fp.inner_is_input) ? 96 : 32));
 	}
 
+	// The texcoord half of the same argument. We submit the raw texcoord attribute and never run
+	// the ucode, so a program that scales, biases or negates it on the way to TEX0 has that
+	// operation dropped - the position's w-divide trap (e9a7956) applied to UVs. R2 renders every
+	// texture vertically mirrored on the first build that ever applied UVs at all, and the flip
+	// is not in the upload or the V convention (both are exercised correctly by Haze's menu text
+	// through composite_ui_draw, commit 2414498), which leaves the ucode. This slice is what names
+	// the instruction; RPCS3_REMIX_UVFLIPV is the stopgap until it does.
+	//
+	// Only TEX0 and only for programs that write it: a per-unit sweep would multiply the dump for
+	// a question about the diffuse coordinates.
+	if (const std::string tc0 = remix_rsx::describe_output_slice(current_vertex_program, 7, 32);
+		tc0 != " <not written>")
+	{
+		fmt::append(groups, " tc0:%s", tc0);
+	}
+
+	// What the two ucode readers made of this program: the attribute each texcoord output takes its
+	// xy from (-1 = the write could not be reduced to one attribute read straight), and the constant
+	// scale/bias the position decode resolved to. Printed next to the slices they were derived from
+	// so a wrong pick is one line to diagnose rather than a rebuild.
+	{
+		std::string tc_inputs;
+
+		for (u32 unit = 0; unit < 8; ++unit)
+		{
+			if (fp.texcoord_input[unit] != remix_rsx::s_no_texcoord_input)
+			{
+				fmt::append(tc_inputs, " tc%u<-a%u", unit, u32{fp.texcoord_input[unit]});
+			}
+		}
+
+		if (!tc_inputs.empty())
+		{
+			fmt::append(groups, " uvsrc:%s", tc_inputs);
+		}
+	}
+
+	if (fp.has_const_affine)
+	{
+		fmt::append(groups, " affine=");
+
+		if (fp.affine_has_scale)
+		{
+			fmt::append(groups, "*c%u.%c%c%c", fp.affine_scale_slot,
+				"xyzw"[fp.affine_scale_component[0] & 3],
+				"xyzw"[fp.affine_scale_component[1] & 3],
+				"xyzw"[fp.affine_scale_component[2] & 3]);
+		}
+
+		if (fp.affine_has_bias)
+		{
+			fmt::append(groups, "+c%u.xyz", fp.affine_bias_slot);
+		}
+
+		if (remix_rsx::mat4 built{}; remix_rsx::build_prescale(fp, built))
+		{
+			fmt::append(groups, "=%s", remix_rsx::format_matrix(built));
+		}
+		else
+		{
+			groups += "=<unbuildable>";
+		}
+	}
+
+	// The Y half of the viewport transform, alongside the Z half fold_viewport_z already folds.
+	// Nothing under Emu\RSX\Remix reads these two registers, and RSX viewport scale Y is commonly
+	// negative for a top-left window origin - which is the last live candidate for the reported
+	// whole-image vertical flip. Logged, not acted on: a global Y flip applied on a guess would
+	// invert every title whose orientation is already right, exactly as the global V flip did.
+	fmt::append(groups, " vp_scale_y=%.6g vp_offset_y=%.6g",
+		static_cast<f64>(rsx::method_registers.viewport_scale_y()),
+		static_cast<f64>(rsx::method_registers.viewport_offset_y()));
+
 	const std::string line = fmt::format(
 		"Remix dump vp=%016llx arch=%s(%s) groups=%u input=%d prescale=%d(c%u.%u,c%u) consts=%u slice=%u ucode=%u inputs=0x%x | "
 		"vtx=%u idx=%u prim=%u bbox=[%.4g %.4g %.4g]..[%.4g %.4g %.4g] | "
@@ -3913,10 +4209,10 @@ void RemixGSRender::log_stats()
 	rsx_log.notice(
 		"Remix stats: frame=%llu draws=%llu submitted=%llu meshes_live=%llu created=%llu destroyed=%llu poisoned=%llu | "
 		"cam_resolved=%llu cam_fallback=%llu cam_held=%llu split_attempted=%llu split_failed=%llu arch=%s world_applied=%llu world_fallback=%llu world_refused=%llu | "
-		"skip screen=%llu immediate=%llu inline=%llu volatile=%llu reg_attr0=%llu prim=%llu restart=%llu instanced=%llu layout=%llu mem=%llu decode=%llu poison=%llu vp=%llu rt=%llu rt_kept=%llu notinput=%llu wdiv=%llu | "
+		"skip screen=%llu immediate=%llu inline=%llu volatile=%llu reg_attr0=%llu prim=%llu restart=%llu instanced=%llu layout=%llu mem=%llu decode=%llu poison=%llu vp=%llu rt=%llu rt_kept=%llu notinput=%llu wdiv=%llu posdecode_refused=%llu | "
 		"skin_submitted=%llu skin_skipped=%llu skin_unrecognised=%llu skin_bones_max=%llu | "
 		"cat_sky=%llu cat_hidden=%llu cat_particle=%llu cat_decal=%llu | "
-		"tex_bound=%llu tex_none=%llu tex_no_unit=%llu tex_unit_retry=%llu uv_applied=%llu uv_none=%llu uv_absent=%llu uv_layout=%llu uv_memory=%llu uv_fallback=%llu vcol_applied=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_tombstone=%llu tex_rehashed=%llu tex_refreshed=%llu mat_created=%llu | "
+		"tex_bound=%llu tex_none=%llu tex_no_unit=%llu tex_unit_retry=%llu uv_applied=%llu uv_none=%llu uv_absent=%llu uv_layout=%llu uv_memory=%llu uv_fallback=%llu uv_ucode=%llu uv_heuristic=%llu uv_nonfinite=%llu vcol_applied=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_tombstone=%llu tex_rehashed=%llu tex_refreshed=%llu mat_created=%llu | "
 		"ui_draws=%llu ui_skipped=%llu ui_no_colour=%llu ui_rt=%llu ui_prims=%llu ui_frames=%llu | "
 		"zcull_av=%llu zcull_av_handled=%llu",
 		m_frame_counter,
@@ -3952,6 +4248,7 @@ void RemixGSRender::log_stats()
 		m_stats.rt_feedback_kept,
 		m_stats.skip_not_input,
 		m_stats.wdiv_draws,
+		m_stats.pos_decode_refused,
 		m_stats.skin_submitted,
 		m_stats.skin_skipped,
 		m_stats.skin_unrecognised,
@@ -3970,6 +4267,9 @@ void RemixGSRender::log_stats()
 		m_stats.uv_layout,
 		m_stats.uv_memory,
 		m_stats.uv_fallback,
+		m_stats.uv_ucode,
+		m_stats.uv_heuristic,
+		m_stats.uv_nonfinite,
 		m_stats.vcol_applied,
 		static_cast<u64>(m_textures.live()),
 		tex.created,
