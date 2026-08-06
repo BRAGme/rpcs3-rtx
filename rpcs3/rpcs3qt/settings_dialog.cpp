@@ -12,6 +12,14 @@
 #include <QTimer>
 #include <QScreen>
 #include <QStyleFactory>
+#include <QCheckBox>
+#include <QDoubleSpinBox>
+#include <QFormLayout>
+#include <QGroupBox>
+#include <QLabel>
+#include <QLineEdit>
+#include <QScrollArea>
+#include <QVBoxLayout>
 
 #include "gui_settings.h"
 #include "qt_utils.h"
@@ -640,6 +648,133 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 
 	m_emu_settings->EnhanceCheckBox(ui->asyncTextureStreaming, emu_settings_type::VulkanAsyncTextureUploads);
 	SubscribeTooltip(ui->asyncTextureStreaming, tooltips.settings.async_texture_streaming);
+
+	// RTX Remix
+	//
+	// Built in code rather than in the .ui because these settings track a backend that is still
+	// moving, and every one of them also exists as an RPCS3_REMIX_* environment variable that wins
+	// when set. Settings not marked "restart" are re-read per frame.
+	{
+		QWidget* remix_page = new QWidget(this);
+		QVBoxLayout* remix_layout = new QVBoxLayout(remix_page);
+
+		QGroupBox* current_group = nullptr;
+		QFormLayout* current_form = nullptr;
+
+		const auto begin_group = [&](const QString& title)
+		{
+			current_group = new QGroupBox(title, remix_page);
+			current_form  = new QFormLayout(current_group);
+			remix_layout->addWidget(current_group);
+		};
+
+		const auto add_check = [&](emu_settings_type type, const QString& label, const QString& tip)
+		{
+			QCheckBox* box = new QCheckBox(label, current_group);
+			m_emu_settings->EnhanceCheckBox(box, type);
+			box->setToolTip(tip);
+			current_form->addRow(box);
+		};
+
+		const auto add_double = [&](emu_settings_type type, const QString& label, const QString& tip)
+		{
+			QDoubleSpinBox* spin = new QDoubleSpinBox(current_group);
+			spin->setDecimals(4);
+			m_emu_settings->EnhanceDoubleSpinBox(spin, type);
+			spin->setToolTip(tip);
+			current_form->addRow(label, spin);
+		};
+
+		const auto add_int = [&](emu_settings_type type, const QString& label, const QString& tip)
+		{
+			QSpinBox* spin = new QSpinBox(current_group);
+			m_emu_settings->EnhanceSpinBox(spin, type);
+			spin->setToolTip(tip);
+			current_form->addRow(label, spin);
+		};
+
+		const auto add_text = [&](emu_settings_type type, const QString& label, const QString& tip)
+		{
+			QLineEdit* edit = new QLineEdit(current_group);
+			m_emu_settings->EnhanceLineEdit(edit, type);
+			edit->setToolTip(tip);
+			current_form->addRow(label, edit);
+		};
+
+		begin_group(tr("Lighting"));
+		add_check(emu_settings_type::RemixNoSun, tr("Disable default sun"),
+			tr("Turns off the backend's own distant light. The game's own lights are not extracted, so with this off and no camera fill the scene may be unlit."));
+		add_text(emu_settings_type::RemixSunDirection, tr("Sun direction"),
+			tr("Direction the sun points, as three comma-separated components. Does not need to be normalised."));
+		add_double(emu_settings_type::RemixSunRadiance, tr("Sun radiance"),
+			tr("Brightness of the distant sun. Delivered irradiance is roughly pi times this regardless of angular diameter, so single digits are the useful range."));
+		add_double(emu_settings_type::RemixSunAngle, tr("Sun angular diameter"),
+			tr("Angular size of the sun in degrees. Larger values give softer shadows."));
+		add_double(emu_settings_type::RemixCameraLight, tr("Camera fill light"),
+			tr("A sphere light attached to the camera. 0 disables it. A distant sun cannot light interiors, so a small fill is usually what makes them readable; the measured useful range is roughly 8 to 40."));
+		add_double(emu_settings_type::RemixDebugLightRadiance, tr("Fallback light radiance"),
+			tr("Radiance of the fallback light used before a camera has been resolved."));
+		add_double(emu_settings_type::RemixDebugLightRadius, tr("Fallback light radius"),
+			tr("Radius of that fallback light."));
+
+		begin_group(tr("Textures"));
+		add_check(emu_settings_type::RemixNoTextures, tr("Disable textures (restart)"),
+			tr("Submits every mesh without a material. Diagnostic only."));
+		add_int(emu_settings_type::RemixTextureBudget, tr("Texture uploads per frame"),
+			tr("Caps how many new textures are uploaded each frame. Anything over budget draws untextured until a later frame lets it through, which looks like textures fading in after a camera turn. 0 removes the cap."));
+		add_int(emu_settings_type::RemixTextureRehash, tr("Texture rehash mode (restart)"),
+			tr("0 keys textures by descriptor only. Higher values re-hash sampled content so textures a game rewrites in place stay fresh, at the cost of heavy mesh churn."));
+
+		begin_group(tr("Geometry"));
+		add_check(emu_settings_type::RemixNoWDivide, tr("Disable vertex W divide (restart)"),
+			tr("Stops dividing positions by the dequantisation scale some titles carry in the position attribute's W. Leaving this on will explode quantised meshes."));
+		add_check(emu_settings_type::RemixStrictInput, tr("Strict position input (restart)"),
+			tr("Refuses draws whose position chain does not reach a vertex attribute. Removes some misplaced geometry, but also removes real geometry."));
+		add_check(emu_settings_type::RemixDrawWithoutWorld, tr("Draw untransformed meshes (restart)"),
+			tr("Submits meshes with no resolved world transform at the origin instead of skipping them. Diagnostic only; this is what piles geometry at the world origin."));
+		add_check(emu_settings_type::RemixCullFromRSX, tr("Use RSX backface culling (restart)"),
+			tr("Follows the game's own cull state instead of submitting everything double-sided."));
+		add_check(emu_settings_type::RemixNoVertexColour, tr("Ignore vertex colours (restart)"),
+			tr("Submits every vertex as white."));
+		add_check(emu_settings_type::RemixNoAlphaTest, tr("Ignore alpha test (restart)"),
+			tr("Makes every material opaque. Alpha-cutout foliage will render as solid cards."));
+		add_int(emu_settings_type::RemixRenderTargetVerts, tr("Post-process quad vertex limit (restart)"),
+			tr("A draw sampling a render target is treated as a post-process blit and refused when it has no more vertices than this. Shadow maps and probes are also render targets, so the limit is what separates them."));
+		add_double(emu_settings_type::RemixSkyExtent, tr("Sky detection extent"),
+			tr("World extent above which a draw is considered sky."));
+		add_int(emu_settings_type::RemixMeshCap, tr("Live mesh cap (restart)"),
+			tr("Upper bound on simultaneously live meshes. 0 is uncapped."));
+		add_double(emu_settings_type::RemixFarPlane, tr("Far plane"),
+			tr("Far plane submitted with the camera."));
+
+		begin_group(tr("Instance categories"));
+		QLabel* cat_note = new QLabel(tr("Comma-separated 16-hex-digit texture hashes. Remix's own rtx.*Textures lists cannot categorise draws from this backend, so they are set here instead."), current_group);
+		cat_note->setWordWrap(true);
+		current_form->addRow(cat_note);
+		add_text(emu_settings_type::RemixCategorySky, tr("Sky"), tr("Drawn as sky."));
+		add_text(emu_settings_type::RemixCategoryHide, tr("Hidden"), tr("Excluded from the scene entirely."));
+		add_text(emu_settings_type::RemixCategoryParticle, tr("Particle"), tr("Treated as particles."));
+		add_text(emu_settings_type::RemixCategoryDecal, tr("Decal"), tr("Treated as static decals."));
+
+		begin_group(tr("Interface"));
+		add_check(emu_settings_type::RemixNoUI, tr("Disable game UI compositor (restart)"),
+			tr("Stops rasterising the game's own 2D draws. Menus, HUD and text will be invisible."));
+		add_int(emu_settings_type::RemixUIWidth, tr("UI compositor width (restart)"),
+			tr("Width of the CPU-rasterised overlay buffer. The overlay is stretched to the output, so this trades UI sharpness against CPU cost. 0 uses the window size."));
+
+		begin_group(tr("Diagnostics"));
+		add_check(emu_settings_type::RemixDump, tr("Log draw diagnostics (restart)"),
+			tr("Writes one line per unique vertex program and texture to remix_dump.log next to the executable."));
+
+		remix_layout->addStretch();
+
+		QScrollArea* remix_scroll = new QScrollArea(this);
+		remix_scroll->setWidget(remix_page);
+		remix_scroll->setWidgetResizable(true);
+		remix_scroll->setFrameShape(QFrame::NoFrame);
+
+		ui->tab_widget_settings->addTab(remix_scroll, tr("RTX Remix"));
+	}
 
 	// Radio buttons
 

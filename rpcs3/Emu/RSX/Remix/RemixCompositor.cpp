@@ -5,6 +5,7 @@
 
 #include "Emu/RSX/Remix/RemixRuntime.h"
 #include "Emu/RSX/Remix/RemixTextures.h"
+#include "Emu/system_config.h"
 
 #include <algorithm>
 #include <cmath>
@@ -63,14 +64,14 @@ namespace remix_rsx
 
 	bool compositor_disabled()
 	{
-		static const bool value = []
+		static const bool env = []
 		{
 			wchar_t buffer[16]{};
 			const DWORD written = GetEnvironmentVariableW(L"RPCS3_REMIX_NOUI", buffer, static_cast<DWORD>(std::size(buffer)));
 			return written > 0 && written < std::size(buffer) && ::wcstol(buffer, nullptr, 10) != 0;
 		}();
 
-		return value;
+		return env || g_cfg.video.remix.no_ui;
 	}
 
 	bool keep_render_target_blits()
@@ -87,7 +88,7 @@ namespace remix_rsx
 
 	usz mesh_cap()
 	{
-		static const usz value = []() -> usz
+		static const usz env = []() -> usz
 		{
 			wchar_t buffer[16]{};
 			const DWORD written = GetEnvironmentVariableW(L"RPCS3_REMIX_MESHCAP", buffer, static_cast<DWORD>(std::size(buffer)));
@@ -101,7 +102,7 @@ namespace remix_rsx
 			return parsed > 0 ? static_cast<usz>(parsed) : 0;
 		}();
 
-		return value;
+		return env ? env : static_cast<usz>(g_cfg.video.remix.mesh_cap);
 	}
 
 	bool ui_probe_enabled()
@@ -118,7 +119,8 @@ namespace remix_rsx
 
 	u32 compositor_max_width()
 	{
-		static const u32 value = []
+		// 0xFFFFFFFF means "unset": fall through to the config.
+		static const u32 env = []() -> u32
 		{
 			wchar_t buffer[16]{};
 			const DWORD written = GetEnvironmentVariableW(L"RPCS3_REMIX_UIWIDTH", buffer, static_cast<DWORD>(std::size(buffer)));
@@ -128,14 +130,14 @@ namespace remix_rsx
 				// 1080p class. Everything this rasterizer draws is authored at the guest's own
 				// surface resolution (720p on both test titles) or, for rpcs3's overlays, a
 				// virtual 1280x720, so more pixels than this buy no detail at all.
-				return 1920u;
+				return 0xFFFFFFFFu;
 			}
 
 			const long parsed = ::wcstol(buffer, nullptr, 10);
-			return (parsed >= 0) ? static_cast<u32>(parsed) : 1920u;
+			return (parsed >= 0) ? static_cast<u32>(parsed) : 0xFFFFFFFFu;
 		}();
 
-		return value;
+		return env != 0xFFFFFFFFu ? env : g_cfg.video.remix.ui_width;
 	}
 
 	void compositor::begin_frame(u32 width, u32 height)

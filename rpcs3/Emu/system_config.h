@@ -195,6 +195,61 @@ struct cfg_root : cfg::node
 
 		} vk{ this };
 
+		// RTX Remix backend. Every entry here is also readable as an environment variable of the
+		// same name prefixed RPCS3_REMIX_ (see Emu/RSX/Remix/RemixTransforms.cpp), and the
+		// environment wins when set, so existing test scripts keep working unchanged.
+		// Entries marked dynamic are re-read per frame; the rest are latched at boot.
+		struct node_remix : cfg::node
+		{
+			node_remix(cfg::node* _this) : cfg::node(_this, "Remix") {}
+
+			// Runtime
+			cfg::string dll_path{ this, "Runtime DLL" };                                   // RPCS3_REMIX_DLL, empty = <exe>\remix\d3d9.dll
+			cfg::_float<1, 10000000> far_plane{ this, "Far Plane", 1000, true };            // RPCS3_REMIX_FARPLANE
+
+			// Lighting. The default sun cannot light interiors at any radiance; a small camera
+			// fill is what makes them readable. Measured useful range for the fill is 8..40.
+			cfg::_bool no_sun{ this, "Disable Default Sun", false, true };                  // RPCS3_REMIX_NOSUN
+			cfg::string sun_direction{ this, "Sun Direction", "-0.3509,-0.9023,-0.2506" };  // RPCS3_REMIX_SUNDIR
+			cfg::_float<0, 10000> sun_radiance{ this, "Sun Radiance", 3, true };            // RPCS3_REMIX_SUNRADIANCE
+			cfg::_float<0, 180> sun_angular_diameter{ this, "Sun Angular Diameter", 0.5, true }; // RPCS3_REMIX_SUNANGLE
+			cfg::_float<0, 10000> camera_light{ this, "Camera Fill Light", 0, true };       // RPCS3_REMIX_CAMLIGHT, 0 = off
+			cfg::_float<0, 10000> debug_light_radiance{ this, "Debug Light Radiance", 100, true }; // RPCS3_REMIX_LIGHTRADIANCE
+			cfg::_float<0, 1000> debug_light_radius{ this, "Debug Light Radius", 0.1, true };      // RPCS3_REMIX_LIGHTRADIUS
+
+			// Textures
+			cfg::_bool no_textures{ this, "Disable Textures", false };                      // RPCS3_REMIX_NOTEX
+			cfg::uint<0, 4096> texture_budget{ this, "Texture Uploads Per Frame", 8, true };// RPCS3_REMIX_TEXBUDGET, 0 = unlimited
+			cfg::uint<0, 2> texture_rehash{ this, "Texture Rehash Mode", 0 };               // RPCS3_REMIX_TEXREHASH, >0 costs heavy mesh churn
+			cfg::_bool texture_linear{ this, "Force Linear Textures", false };              // RPCS3_REMIX_TEXLINEAR
+
+			// Geometry classification
+			cfg::_bool no_w_divide{ this, "Disable Vertex W Divide", false };               // RPCS3_REMIX_NOWDIV
+			cfg::_bool strict_input{ this, "Strict Position Input", false };                // RPCS3_REMIX_STRICTINPUT
+			cfg::_bool draw_without_world{ this, "Draw Untransformed Meshes", false };      // RPCS3_REMIX_DRAWNOWORLD
+			cfg::_bool cull_from_rsx{ this, "Use RSX Backface Culling", false };            // RPCS3_REMIX_CULL
+			cfg::_bool no_vertex_colour{ this, "Ignore Vertex Colours", false };            // RPCS3_REMIX_NOVCOL
+			cfg::_bool no_alpha_test{ this, "Ignore Alpha Test", false };                   // RPCS3_REMIX_NOALPHA
+			cfg::uint<0, 65536> render_target_verts{ this, "Post-process Quad Vertex Limit", 32 }; // RPCS3_REMIX_RTVERTS
+			cfg::_float<0, 1000000> sky_extent{ this, "Sky Detection Extent", 2000, true }; // RPCS3_REMIX_SKYEXTENT
+			cfg::uint<0, 1000000> mesh_cap{ this, "Live Mesh Cap", 0 };                     // RPCS3_REMIX_MESHCAP, 0 = uncapped
+
+			// Instance categories. Comma-separated 16-hex-digit albedo content hashes.
+			// Remix's own rtx.*Textures conf lists cannot categorise API-submitted draws.
+			cfg::string category_sky{ this, "Sky Textures", "", true };                     // RPCS3_REMIX_CAT_SKY
+			cfg::string category_hide{ this, "Hidden Textures", "", true };                 // RPCS3_REMIX_CAT_HIDE
+			cfg::string category_particle{ this, "Particle Textures", "", true };           // RPCS3_REMIX_CAT_PARTICLE
+			cfg::string category_decal{ this, "Decal Textures", "", true };                 // RPCS3_REMIX_CAT_DECAL
+
+			// 2D compositor
+			cfg::_bool no_ui{ this, "Disable Game UI Compositor", false };                  // RPCS3_REMIX_NOUI
+			cfg::uint<0, 7680> ui_width{ this, "UI Compositor Width", 1920 };               // RPCS3_REMIX_UIWIDTH, 0 = window size
+
+			// Diagnostics
+			cfg::_bool dump{ this, "Log Draw Diagnostics", false };                         // RPCS3_REMIX_DUMP
+
+		} remix{ this };
+
 		struct node_perf_overlay : cfg::node
 		{
 			node_perf_overlay(cfg::node* _this) : cfg::node(_this, "Performance Overlay") {}

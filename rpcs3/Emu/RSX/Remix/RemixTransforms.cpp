@@ -5,6 +5,7 @@
 
 #include "Emu/RSX/Program/RSXVertexProgram.h"
 #include "Emu/RSX/rsx_methods.h"
+#include "Emu/system_config.h"
 
 #include <algorithm>
 #include <array>
@@ -1439,14 +1440,75 @@ namespace remix_rsx
 			return out;
 		}
 
+		// Same grammar as the environment parser above, for the config strings.
+		void append_hash_list(std::vector<u64>& out, const std::string& text)
+		{
+			const char* cursor = text.c_str();
+
+			while (*cursor)
+			{
+				while (*cursor == ',' || *cursor == ' ' || *cursor == ';' || *cursor == '\t')
+				{
+					++cursor;
+				}
+
+				if (!*cursor)
+				{
+					break;
+				}
+
+				char* end = nullptr;
+				const u64 value = ::_strtoui64(cursor, &end, 16);
+
+				if (end == cursor)
+				{
+					while (*cursor && *cursor != ',' && *cursor != ' ' && *cursor != ';')
+					{
+						++cursor;
+					}
+
+					continue;
+				}
+
+				if (value)
+				{
+					out.push_back(value);
+				}
+
+				cursor = end;
+			}
+		}
+
+		// The environment entries are parsed once; the config strings are re-parsed whenever they
+		// change, so editing a category list in the settings dialog takes effect without a restart.
 		const std::vector<u64>* category_lists()
 		{
-			static const std::vector<u64> lists[4] = {
+			static const std::vector<u64> from_env[4] = {
 				parse_hash_list(L"RPCS3_REMIX_CAT_SKY"),
 				parse_hash_list(L"RPCS3_REMIX_CAT_HIDE"),
 				parse_hash_list(L"RPCS3_REMIX_CAT_PARTICLE"),
 				parse_hash_list(L"RPCS3_REMIX_CAT_DECAL"),
 			};
+
+			static std::vector<u64> lists[4];
+			static std::string cached[4];
+
+			const std::string current[4] = {
+				g_cfg.video.remix.category_sky.to_string(),
+				g_cfg.video.remix.category_hide.to_string(),
+				g_cfg.video.remix.category_particle.to_string(),
+				g_cfg.video.remix.category_decal.to_string(),
+			};
+
+			for (u32 i = 0; i < 4; ++i)
+			{
+				if (cached[i] != current[i] || (lists[i].empty() && !from_env[i].empty()))
+				{
+					cached[i] = current[i];
+					lists[i]  = from_env[i];
+					append_hash_list(lists[i], cached[i]);
+				}
+			}
 
 			return lists;
 		}
@@ -2571,8 +2633,8 @@ namespace remix_rsx
 
 	bool dump_enabled()
 	{
-		static const bool value = env_flag(L"RPCS3_REMIX_DUMP");
-		return value;
+		static const bool env = env_flag(L"RPCS3_REMIX_DUMP");
+		return env || g_cfg.video.remix.dump;
 	}
 
 	bool keep_ui_enabled()
@@ -2595,26 +2657,26 @@ namespace remix_rsx
 
 	bool draw_without_world()
 	{
-		static const bool value = env_flag(L"RPCS3_REMIX_DRAWNOWORLD");
-		return value;
+		static const bool env = env_flag(L"RPCS3_REMIX_DRAWNOWORLD");
+		return env || g_cfg.video.remix.draw_without_world;
 	}
 
 	bool nowdivide_enabled()
 	{
-		static const bool value = env_flag(L"RPCS3_REMIX_NOWDIV");
-		return value;
+		static const bool env = env_flag(L"RPCS3_REMIX_NOWDIV");
+		return env || g_cfg.video.remix.no_w_divide;
 	}
 
 	u32 rt_feedback_max_vertices()
 	{
-		static const u32 value = env_u32(L"RPCS3_REMIX_RTVERTS", 32);
-		return value;
+		static const u32 env = env_u32(L"RPCS3_REMIX_RTVERTS", 0);
+		return env ? env : g_cfg.video.remix.render_target_verts;
 	}
 
 	bool strict_input_enabled()
 	{
-		static const bool value = env_flag(L"RPCS3_REMIX_STRICTINPUT");
-		return value;
+		static const bool env = env_flag(L"RPCS3_REMIX_STRICTINPUT");
+		return env || g_cfg.video.remix.strict_input;
 	}
 
 	bool texcoords_disabled()
@@ -2649,8 +2711,8 @@ namespace remix_rsx
 
 	bool alpha_state_disabled()
 	{
-		static const bool value = env_flag(L"RPCS3_REMIX_NOALPHA");
-		return value;
+		static const bool env = env_flag(L"RPCS3_REMIX_NOALPHA");
+		return env || g_cfg.video.remix.no_alpha_test;
 	}
 
 	bool skinid_enabled()
@@ -2691,32 +2753,35 @@ namespace remix_rsx
 
 	bool cull_from_rsx()
 	{
-		static const bool value = env_flag(L"RPCS3_REMIX_CULL");
-		return value;
+		static const bool env = env_flag(L"RPCS3_REMIX_CULL");
+		return env || g_cfg.video.remix.cull_from_rsx;
 	}
 
 	bool vertex_colour_disabled()
 	{
-		static const bool value = env_flag(L"RPCS3_REMIX_NOVCOL");
-		return value;
+		static const bool env = env_flag(L"RPCS3_REMIX_NOVCOL");
+		return env || g_cfg.video.remix.no_vertex_colour;
 	}
 
+	// The environment variable is latched once and wins when set; otherwise the value is read
+	// live from the emulator config, so these take effect without a restart. A negative sentinel
+	// distinguishes "unset" from a legitimate zero, which several of these accept.
 	f32 sky_min_extent()
 	{
-		static const f32 value = env_float(L"RPCS3_REMIX_SKYEXTENT", 2000.f);
-		return value;
+		static const f32 env = env_float(L"RPCS3_REMIX_SKYEXTENT", -1.f);
+		return env >= 0.f ? env : g_cfg.video.remix.sky_extent;
 	}
 
 	f32 debug_light_radius()
 	{
-		static const f32 value = env_float(L"RPCS3_REMIX_LIGHTRADIUS", 0.1f);
-		return value;
+		static const f32 env = env_float(L"RPCS3_REMIX_LIGHTRADIUS", -1.f);
+		return env >= 0.f ? env : g_cfg.video.remix.debug_light_radius;
 	}
 
 	f32 debug_light_radiance()
 	{
-		static const f32 value = env_float(L"RPCS3_REMIX_LIGHTRADIANCE", 100.f);
-		return value;
+		static const f32 env = env_float(L"RPCS3_REMIX_LIGHTRADIANCE", -1.f);
+		return env >= 0.f ? env : g_cfg.video.remix.debug_light_radiance;
 	}
 
 	bool hash_in_category(draw_category which, u64 hash)
@@ -2732,7 +2797,9 @@ namespace remix_rsx
 
 	bool any_category_listed()
 	{
-		static const bool value = []() -> bool
+		// Not cached: the lists are editable at runtime from the settings dialog, and latching
+		// this would leave categorisation permanently off for anyone who starts with empty lists.
+		const bool value = []() -> bool
 		{
 			const std::vector<u64>* lists = category_lists();
 
@@ -2814,28 +2881,30 @@ namespace remix_rsx
 		// cone uniformly, so the irradiance it delivers works out at about pi * radiance
 		// regardless of the angular diameter (distant_light.slangh:99-101). Single digits are
 		// therefore the useful range, not the sphere light's 100.
-		static const f32 value = env_float(L"RPCS3_REMIX_SUNRADIANCE", 3.f);
-		return value;
+		static const f32 env = env_float(L"RPCS3_REMIX_SUNRADIANCE", -1.f);
+		return env >= 0.f ? env : g_cfg.video.remix.sun_radiance;
 	}
 
 	f32 sun_angular_diameter()
 	{
-		static const f32 value = env_float(L"RPCS3_REMIX_SUNANGLE", 0.5f);
-		return value;
+		static const f32 env = env_float(L"RPCS3_REMIX_SUNANGLE", -1.f);
+		return env >= 0.f ? env : g_cfg.video.remix.sun_angular_diameter;
 	}
 
 	f32 camera_light_radiance()
 	{
-		// 0 = off. env_float rejects non-positive values, so an explicit 0 lands on the
-		// fallback, which is also 0.
-		static const f32 value = env_float(L"RPCS3_REMIX_CAMLIGHT", 0.f);
-		return value;
+		// 0 = off. env_float rejects non-positive values, so an explicit 0 from the environment
+		// cannot be distinguished from unset; the config is what to use for turning it off.
+		static const f32 env = env_float(L"RPCS3_REMIX_CAMLIGHT", -1.f);
+		return env >= 0.f ? env : g_cfg.video.remix.camera_light;
 	}
 
 	bool nosun_enabled()
 	{
-		static const bool value = env_flag(L"RPCS3_REMIX_NOSUN");
-		return value;
+		// The environment can force this on but not off, so the config is the way to re-enable
+		// the sun once a script has disabled it.
+		static const bool env = env_flag(L"RPCS3_REMIX_NOSUN");
+		return env || g_cfg.video.remix.no_sun;
 	}
 }
 

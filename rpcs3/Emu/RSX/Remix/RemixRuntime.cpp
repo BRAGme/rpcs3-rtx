@@ -4,6 +4,7 @@
 #ifdef _WIN32
 
 #include "util/fnv_hash.hpp"
+#include "Emu/system_config.h"
 
 #include <cstdlib>
 
@@ -577,21 +578,21 @@ namespace remix_rsx
 
 	f32 hardcoded_far_plane()
 	{
-		static const f32 value = []() -> f32
+		static const f32 env = []() -> f32
 		{
-			if (const std::wstring env = read_env(L"RPCS3_REMIX_FARPLANE"); !env.empty())
+			if (const std::wstring text = read_env(L"RPCS3_REMIX_FARPLANE"); !text.empty())
 			{
-				const f32 parsed = static_cast<f32>(::_wtof(env.c_str()));
+				const f32 parsed = static_cast<f32>(::_wtof(text.c_str()));
 				if (parsed > 1.f)
 				{
 					return parsed;
 				}
 			}
 
-			return 1000.f;
+			return 0.f;
 		}();
 
-		return value;
+		return env > 1.f ? env : g_cfg.video.remix.far_plane;
 	}
 }
 

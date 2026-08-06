@@ -12,6 +12,7 @@
 #include "Emu/RSX/Remix/RemixTransforms.h"
 #include "Emu/RSX/gcm_enums.h"
 #include "Emu/RSX/Remix/RemixRuntime.h"
+#include "Emu/system_config.h"
 #include "util/fnv_hash.hpp"
 
 #include "3rdparty/bcdec/bcdec.hpp"
@@ -190,20 +191,24 @@ namespace remix_rsx
 
 	bool textures_disabled()
 	{
-		static const bool value = read_env_u32(L"RPCS3_REMIX_NOTEX", 0) != 0;
-		return value;
+		static const bool env = read_env_u32(L"RPCS3_REMIX_NOTEX", 0) != 0;
+		return env || g_cfg.video.remix.no_textures;
 	}
 
 	u32 texture_budget()
 	{
-		static const u32 value = std::max<u32>(1, read_env_u32(L"RPCS3_REMIX_TEXBUDGET", 8));
-		return value;
+		// Read live so it can be tuned without a restart. A camera turn exposes many new
+		// materials at once, and anything over budget submits with a null material for that
+		// frame, which renders untextured until a later frame lets it through. 0 = unlimited.
+		static const u32 env = read_env_u32(L"RPCS3_REMIX_TEXBUDGET", 0);
+		const u32 value = env ? env : g_cfg.video.remix.texture_budget;
+		return value ? value : umax;
 	}
 
 	bool textures_linear()
 	{
-		static const bool value = read_env_u32(L"RPCS3_REMIX_TEXLINEAR", 0) != 0;
-		return value;
+		static const bool env = read_env_u32(L"RPCS3_REMIX_TEXLINEAR", 0) != 0;
+		return env || g_cfg.video.remix.texture_linear;
 	}
 
 	u32 texture_rehash_mode()
@@ -213,8 +218,8 @@ namespace remix_rsx
 		// because the albedo hash is folded into the mesh key that dragged mesh churn from
 		// 5,881 creates / 887 live (mode 0) to 188,427 creates / 31,793 live (mode 1).
 		// Animated textures go stale instead; RPCS3_REMIX_TEXREHASH=1 or 2 buys them back.
-		static const u32 value = std::min<u32>(2, read_env_u32(L"RPCS3_REMIX_TEXREHASH", 0));
-		return value;
+		static const u32 env = std::min<u32>(2, read_env_u32(L"RPCS3_REMIX_TEXREHASH", 0));
+		return env ? env : std::min<u32>(2, g_cfg.video.remix.texture_rehash);
 	}
 
 	u64 texture_descriptor::key() const
