@@ -270,6 +270,13 @@ namespace remix_rsx
 	bool nocam_enabled();
 	bool noskin_enabled();
 
+	// RPCS3_REMIX_CAMHOLD=<frames>: how many consecutive flips the last resolved camera is kept
+	// when a frame produces no candidate of its own. 0 restores the unconditional per-frame latch
+	// that shipped up to and including 4d62620, where a single candidate-less frame dropped the
+	// camera and the backend submitted its origin fallback instead - the "camera gets lost when I
+	// look at the sun" symptom, measured at 33.9% of R2's frames. Default 300 (~5 s at 60 fps).
+	u32 camera_hold_frames();
+
 	// RPCS3_REMIX_DRAWNOWORLD=1: submit a draw whose world transform could not be resolved at
 	// the identity anyway - the behaviour up to and including 41d9adc. Off by default because
 	// identity means "raw model-space vertices at the world origin", i.e. every unresolved draw
@@ -303,9 +310,12 @@ namespace remix_rsx
 	// fetch.
 	bool texcoords_disabled();
 
-	// RPCS3_REMIX_UVATTR=<n>: force the vertex attribute the albedo texcoords are read from
-	// (8..15, i.e. in_tc0..in_tc7) instead of the 8+unit convention with its fallback scan.
-	// 0 (default) leaves the automatic choice in place.
+	// RPCS3_REMIX_UVATTR=<n>: force the vertex attribute the albedo texcoords are read from,
+	// instead of the 8+unit convention with its fallback scan. 0 (default) leaves the automatic
+	// choice in place. Accepts 1..15 when forced, not just the 8..15 the automatic scan walks:
+	// a title whose texcoords sit on a low attribute could not be tested at all before, because
+	// apply_texcoords rejected the forced index on the same bound the scan uses. 0 stays refused -
+	// that is the position attribute.
 	u32 texcoord_attribute();
 
 	// RPCS3_REMIX_UVINTSCALE=<n>: divisor for S32K (raw 16-bit integer) texcoords, whose real

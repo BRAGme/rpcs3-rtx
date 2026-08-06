@@ -2655,6 +2655,14 @@ namespace remix_rsx
 		return value;
 	}
 
+	u32 camera_hold_frames()
+	{
+		// umax is the "unset" sentinel, not a fallback value: 0 is a legitimate setting here (it
+		// restores the old per-frame latch), so it cannot double as "environment not set".
+		static const u32 env = env_u32(L"RPCS3_REMIX_CAMHOLD", umax);
+		return env != umax ? env : g_cfg.video.remix.camera_hold;
+	}
+
 	bool draw_without_world()
 	{
 		static const bool env = env_flag(L"RPCS3_REMIX_DRAWNOWORLD");

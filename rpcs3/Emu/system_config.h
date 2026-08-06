@@ -223,6 +223,9 @@ struct cfg_root : cfg::node
 			cfg::uint<0, 2> texture_rehash{ this, "Texture Rehash Mode", 0 };               // RPCS3_REMIX_TEXREHASH, >0 costs heavy mesh churn
 			cfg::_bool texture_linear{ this, "Force Linear Textures", false };              // RPCS3_REMIX_TEXLINEAR
 
+			// Camera
+			cfg::uint<0, 100000> camera_hold{ this, "Camera Hold Frames", 300, true };      // RPCS3_REMIX_CAMHOLD, 0 = drop instantly
+
 			// Geometry classification
 			cfg::_bool no_w_divide{ this, "Disable Vertex W Divide", false };               // RPCS3_REMIX_NOWDIV
 			cfg::_bool strict_input{ this, "Strict Position Input", false };                // RPCS3_REMIX_STRICTINPUT

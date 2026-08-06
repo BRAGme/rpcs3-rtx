@@ -16,9 +16,9 @@
 #include <QDoubleSpinBox>
 #include <QFormLayout>
 #include <QGroupBox>
+#include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
-#include <QScrollArea>
 #include <QVBoxLayout>
 
 #include "gui_settings.h"
@@ -655,17 +655,25 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 	// moving, and every one of them also exists as an RPCS3_REMIX_* environment variable that wins
 	// when set. Settings not marked "restart" are re-read per frame.
 	{
+		// Two columns, as every other tab in this dialog is (see coreTab in settings_dialog.ui).
+		// The page deliberately has no QScrollArea of its own: settings_dialog.ui already wraps
+		// the whole tab widget in one, and two nested vertical scrollbars leaves the inner one's
+		// bottom terminus clipped off the dialog whenever the outer engages.
 		QWidget* remix_page = new QWidget(this);
-		QVBoxLayout* remix_layout = new QVBoxLayout(remix_page);
+		QHBoxLayout* remix_layout = new QHBoxLayout(remix_page);
+		QVBoxLayout* remix_left = new QVBoxLayout();
+		QVBoxLayout* remix_right = new QVBoxLayout();
+		remix_layout->addLayout(remix_left);
+		remix_layout->addLayout(remix_right);
 
 		QGroupBox* current_group = nullptr;
 		QFormLayout* current_form = nullptr;
 
-		const auto begin_group = [&](const QString& title)
+		const auto begin_group = [&](const QString& title, QVBoxLayout* column)
 		{
 			current_group = new QGroupBox(title, remix_page);
 			current_form  = new QFormLayout(current_group);
-			remix_layout->addWidget(current_group);
+			column->addWidget(current_group);
 		};
 
 		const auto add_check = [&](emu_settings_type type, const QString& label, const QString& tip)
@@ -701,7 +709,7 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 			current_form->addRow(label, edit);
 		};
 
-		begin_group(tr("Lighting"));
+		begin_group(tr("Lighting"), remix_left);
 		add_check(emu_settings_type::RemixNoSun, tr("Disable default sun"),
 			tr("Turns off the backend's own distant light. The game's own lights are not extracted, so with this off and no camera fill the scene may be unlit."));
 		add_text(emu_settings_type::RemixSunDirection, tr("Sun direction"),
@@ -717,7 +725,7 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 		add_double(emu_settings_type::RemixDebugLightRadius, tr("Fallback light radius"),
 			tr("Radius of that fallback light."));
 
-		begin_group(tr("Textures"));
+		begin_group(tr("Textures"), remix_left);
 		add_check(emu_settings_type::RemixNoTextures, tr("Disable textures (restart)"),
 			tr("Submits every mesh without a material. Diagnostic only."));
 		add_int(emu_settings_type::RemixTextureBudget, tr("Texture uploads per frame"),
@@ -725,7 +733,7 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 		add_int(emu_settings_type::RemixTextureRehash, tr("Texture rehash mode (restart)"),
 			tr("0 keys textures by descriptor only. Higher values re-hash sampled content so textures a game rewrites in place stay fresh, at the cost of heavy mesh churn."));
 
-		begin_group(tr("Geometry"));
+		begin_group(tr("Geometry"), remix_right);
 		add_check(emu_settings_type::RemixNoWDivide, tr("Disable vertex W divide (restart)"),
 			tr("Stops dividing positions by the dequantisation scale some titles carry in the position attribute's W. Leaving this on will explode quantised meshes."));
 		add_check(emu_settings_type::RemixStrictInput, tr("Strict position input (restart)"),
@@ -747,7 +755,11 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 		add_double(emu_settings_type::RemixFarPlane, tr("Far plane"),
 			tr("Far plane submitted with the camera."));
 
-		begin_group(tr("Instance categories"));
+		begin_group(tr("Camera"), remix_right);
+		add_int(emu_settings_type::RemixCameraHold, tr("Camera hold frames"),
+			tr("How many frames the last resolved camera is kept when a frame resolves none of its own. Without a hold, a single frame with no perspective world draw - looking at the sky, for instance - drops the camera and the scene is rendered from the world origin. 0 restores that behaviour."));
+
+		begin_group(tr("Instance categories"), remix_right);
 		QLabel* cat_note = new QLabel(tr("Comma-separated 16-hex-digit texture hashes. Remix's own rtx.*Textures lists cannot categorise draws from this backend, so they are set here instead."), current_group);
 		cat_note->setWordWrap(true);
 		current_form->addRow(cat_note);
@@ -756,24 +768,22 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 		add_text(emu_settings_type::RemixCategoryParticle, tr("Particle"), tr("Treated as particles."));
 		add_text(emu_settings_type::RemixCategoryDecal, tr("Decal"), tr("Treated as static decals."));
 
-		begin_group(tr("Interface"));
+		begin_group(tr("Interface"), remix_right);
 		add_check(emu_settings_type::RemixNoUI, tr("Disable game UI compositor (restart)"),
 			tr("Stops rasterising the game's own 2D draws. Menus, HUD and text will be invisible."));
 		add_int(emu_settings_type::RemixUIWidth, tr("UI compositor width (restart)"),
 			tr("Width of the CPU-rasterised overlay buffer. The overlay is stretched to the output, so this trades UI sharpness against CPU cost. 0 uses the window size."));
 
-		begin_group(tr("Diagnostics"));
+		begin_group(tr("Diagnostics"), remix_left);
 		add_check(emu_settings_type::RemixDump, tr("Log draw diagnostics (restart)"),
 			tr("Writes one line per unique vertex program and texture to remix_dump.log next to the executable."));
 
-		remix_layout->addStretch();
+		// Each column ends in a stretch, as coreTab's do, so the groups sit at the top of their
+		// column instead of being spread down it.
+		remix_left->addStretch();
+		remix_right->addStretch();
 
-		QScrollArea* remix_scroll = new QScrollArea(this);
-		remix_scroll->setWidget(remix_page);
-		remix_scroll->setWidgetResizable(true);
-		remix_scroll->setFrameShape(QFrame::NoFrame);
-
-		ui->tab_widget_settings->addTab(remix_scroll, tr("RTX Remix"));
+		ui->tab_widget_settings->addTab(remix_page, tr("RTX Remix"));
 	}
 
 	// Radio buttons
@@ -2806,7 +2816,11 @@ void settings_dialog::open()
 {
 	QDialog::open();
 
-	ui->tab_widget_settings->setCurrentIndex(m_tab_index);
+	// Tabs added in code (the RTX Remix page) land after the ones from the .ui, and two of those
+	// are removed conditionally, so their index is not fixed. An out-of-range request means
+	// "the last tab" rather than silently leaving the dialog on tab 0.
+	const int tab_count = ui->tab_widget_settings->count();
+	ui->tab_widget_settings->setCurrentIndex(m_tab_index >= tab_count ? tab_count - 1 : m_tab_index);
 
 	// Open a dialog if your config file contained invalid entries
 	QTimer::singleShot(10, [this]

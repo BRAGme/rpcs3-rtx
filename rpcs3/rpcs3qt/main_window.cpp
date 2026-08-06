@@ -3061,6 +3061,16 @@ void main_window::CreateConnects()
 	connect(ui->confEmuAct,    &QAction::triggered, this, [open_settings]() { open_settings(7); });
 	connect(ui->confGuiAct,    &QAction::triggered, this, [open_settings]() { open_settings(8); });
 
+	// The RTX Remix page is added to the settings dialog in code rather than in its .ui, so it has
+	// no matching action there either. Insert one after GUI, and ask for an index past the end --
+	// settings_dialog reads that as "the last tab", which is where the page lands however many of
+	// the conditional tabs were removed.
+	{
+		QAction* remix_act = new QAction(tr("RTX Remix"), this);
+		ui->menuConfiguration->insertAction(ui->confGuiAct, remix_act);
+		connect(remix_act, &QAction::triggered, this, [open_settings]() { open_settings(0x7fffffff); });
+	}
+
 	connect(ui->confShortcutsAct, &QAction::triggered, [this]()
 	{
 		shortcut_dialog dlg(m_gui_settings, this);

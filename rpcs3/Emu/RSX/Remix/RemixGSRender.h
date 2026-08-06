@@ -67,6 +67,17 @@ private:
 		u64 meshes_destroyed = 0;
 		u64 cam_resolved = 0;
 		u64 cam_fallback = 0;
+		// Frames that produced no candidate of their own and reused the previous frame's camera
+		// instead of falling back to the origin one. cam_fallback keeps its old meaning - a frame
+		// with no usable camera at all - so both counters stay comparable with captures taken
+		// before the hold existed. R2 (NPEA00431) measured cam_resolved=10438 cam_fallback=5352,
+		// i.e. 33.9% of frames dropped a perfectly good camera; those frames land here now.
+		u64 cam_held = 0;
+		// The fused-split path in update_camera_candidate: how often it was entered, and how often
+		// split_view_projection could not factor the matrix. The pair says whether a frame with no
+		// candidate had no 3D draws at all (attempted == 0) or had them and could not split them.
+		u64 split_attempted = 0;
+		u64 split_failed = 0;
 		u64 world_applied = 0;
 		u64 world_fallback = 0;
 		// Of the world_fallback population, how many were refused rather than drawn at the
@@ -99,6 +110,17 @@ private:
 		// there and the coordinates are not, which renders as one flat colour per draw.
 		u64 uv_applied = 0;
 		u64 uv_none = 0;
+		// The uv_none population split by the best attribute_status the scan ever saw, so a total
+		// failure says *which* gate refused. R2 measured uv_none == tex_bound == 2450329 exactly,
+		// i.e. every textured draw in the session; the aggregate alone cannot tell "the title feeds
+		// no such attribute" from "it does and we mis-read the block". uv_none is kept as the
+		// aggregate so every capture taken before this split stays comparable, the same rule the
+		// world_refused comment above states. The residual
+		// uv_none - (uv_absent + uv_layout + uv_memory) is the decode-time rejection below, where
+		// an attribute mapped fine but its type/size pair is one decode_position cannot read.
+		u64 uv_absent = 0;
+		u64 uv_layout = 0;
+		u64 uv_memory = 0;
 		// Resolved from an attribute other than 8+unit, i.e. the convention did not hold.
 		u64 uv_fallback = 0;
 		// Untextured draws that left with the title's own ATTR3 colour instead of flat white.
@@ -244,6 +266,12 @@ private:
 	// bound as a colour or depth surface: the title reading back its own framebuffer.
 	bool samples_bound_surface() const;
 
+	// One line per vertex program whose texcoord scan found nothing, once. Names the two masks
+	// that decide what analyse_inputs_interleaved even placed, and the declared layout of every
+	// attribute the program references - which is what says whether a title's UVs are somewhere
+	// this code is not looking, or are not vertex attributes at all.
+	void report_uv_failure(attribute_status best);
+
 	// Fills m_scratch_vertices' texcoords from the vertex attribute that feeds the albedo unit.
 	// Must run before the mesh content hash is taken: the texcoords are part of the vertex data
 	// the hash covers, and two draws that share positions but not UVs are different meshes.
@@ -354,6 +382,10 @@ private:
 	// census, so a dump run gets one line per combination instead of one per draw.
 	std::unordered_set<u64> m_uv_census_seen;
 
+	// Vertex programs already reported by the UV *failure* census. Separate from the success
+	// census above because the failing draws never reach it - they return before it runs.
+	std::unordered_set<u64> m_uv_fail_census_seen;
+
 	// Vertex programs already reported by the indexed-constant refusal census.
 	std::unordered_set<u64> m_indexed_census_seen;
 
@@ -390,6 +422,12 @@ private:
 
 	camera_candidate m_frame_candidate{};
 	camera_candidate m_active_camera{};
+
+	// Consecutive flips m_active_camera has survived without a candidate of its own. Zeroed every
+	// time a frame resolves one; once it passes remix_rsx::camera_hold_frames() the camera is
+	// dropped and submit_camera() goes back to the origin fallback.
+	u32 m_camera_age = 0;
+
 	u32 m_split_attempts = 0;
 
 	// Reused across subdraws to keep the hot path allocation free.

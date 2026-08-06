@@ -132,6 +132,7 @@ const std::map<emu_settings_type, cfg_location> settings_location =
 	{ emu_settings_type::RemixNoTextures,                  get_cfg_location(local_cfg.video.remix.no_textures) },
 	{ emu_settings_type::RemixTextureBudget,               get_cfg_location(local_cfg.video.remix.texture_budget) },
 	{ emu_settings_type::RemixTextureRehash,               get_cfg_location(local_cfg.video.remix.texture_rehash) },
+	{ emu_settings_type::RemixCameraHold,                  get_cfg_location(local_cfg.video.remix.camera_hold) },
 	{ emu_settings_type::RemixNoWDivide,                   get_cfg_location(local_cfg.video.remix.no_w_divide) },
 	{ emu_settings_type::RemixStrictInput,                 get_cfg_location(local_cfg.video.remix.strict_input) },
 	{ emu_settings_type::RemixDrawWithoutWorld,            get_cfg_location(local_cfg.video.remix.draw_without_world) },

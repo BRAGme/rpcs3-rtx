@@ -573,7 +573,36 @@ void RemixGSRender::flip(const rsx::display_flip_info_t& info)
 
 		// Latch this frame's winner for the next frame. The camera submitted above and the
 		// world transforms used during the frame therefore always share one reference.
-		m_active_camera = m_frame_candidate;
+		//
+		// A frame that produced no candidate keeps the previous one rather than clearing it. The
+		// unconditional latch this replaces is what produced R2's "camera gets lost when I look at
+		// the sun": a sky-dominant frame yields few or no perspective world draws, so
+		// m_frame_candidate stays invalid, m_active_camera was wiped, and submit_camera() fell into
+		// submit_debug_scene()'s origin camera - position 0,0,0, forward +Z, far = the configured
+		// far plane. Measured over one R2 session: cam_resolved=10438 cam_fallback=5352, and
+		// cam_fallback rose 5251 -> 5352 during two minutes of ordinary gameplay.
+		//
+		// Holding is image-exact for the archetype R2 actually resolves (arch=fused, has_reference).
+		// per_draw_transform computes world = fused_now * reference_inverse on that path, so the
+		// submitted clip transform is world * V_old * P_old = fused_now: the rasterised image is
+		// exactly what the title asked for, and only Remix's world-space light anchoring is stale
+		// for the held frames. That argument does NOT hold for a 'layered' active camera, where the
+		// per-draw world is absolute - hence the age cap rather than an unbounded hold.
+		if (m_frame_candidate.valid)
+		{
+			m_active_camera = m_frame_candidate;
+			m_camera_age = 0;
+		}
+		else if (m_active_camera.valid && ++m_camera_age <= remix_rsx::camera_hold_frames())
+		{
+			++m_stats.cam_held;
+		}
+		else
+		{
+			m_active_camera = camera_candidate{};
+			m_camera_age = 0;
+		}
+
 		m_frame_candidate = camera_candidate{};
 		m_split_attempts = 0;
 
@@ -1171,6 +1200,77 @@ int RemixGSRender::albedo_texture_unit(u32 skip_below) const
 	return -1;
 }
 
+void RemixGSRender::report_uv_failure(attribute_status best)
+{
+	// One line per program, once, at notice level - the same census shape the render-target and
+	// indexed-const gates use. This is the line that names the root cause of a zero uv_applied
+	// even when no widening of the scan hits: R2's whole session decoded 0 texcoords across
+	// 2,450,329 textured draws, and the aggregate counter cannot say why.
+	//
+	// The two masks are the inputs to analyse_inputs_interleaved (RSXDrawCommands.cpp:19), which
+	// only places attributes present in 'input_mask & referenced_inputs_mask'. An attribute the
+	// vertex program never reads is therefore never placed, and map_attribute reports it absent -
+	// so "absent on every attribute 8..15" and "ref=0x9" together mean the program reads position
+	// and ATTR3 only, i.e. there is no texcoord attribute to find.
+	if (!m_uv_fail_census_seen.insert(m_current_vp_hash).second)
+	{
+		return;
+	}
+
+	const auto status_name = [](attribute_status s) -> const char*
+	{
+		switch (s)
+		{
+		case attribute_status::ok:     return "ok";
+		case attribute_status::absent: return "absent";
+		case attribute_status::layout: return "layout";
+		case attribute_status::memory: return "memory";
+		}
+
+		return "?";
+	};
+
+	const u32 referenced = u32{current_vp_metadata.referenced_inputs_mask};
+	const u32 input_mask = u32{rsx::method_registers.vertex_attrib_input_mask()};
+
+	std::string attrs;
+
+	for (u32 index = 0; index < 16; ++index)
+	{
+		if (!(referenced & (1u << index)))
+		{
+			continue;
+		}
+
+		const auto& info = rsx::method_registers.vertex_arrays_info[index];
+		const rsx::interleaved_range_info* block = find_attribute_block(index);
+
+		fmt::append(attrs, " a%u=place%u/type%u/size%u/stride%u/blk%u",
+			index,
+			static_cast<u32>(m_vertex_layout.attribute_placement[index]),
+			static_cast<u32>(info.type()),
+			u32{info.size()},
+			u32{info.stride()},
+			block ? block->attribute_stride : 0u);
+	}
+
+	const std::string line = fmt::format(
+		"Remix uv-fail: vp=%016llx best=%s ref=0x%x input=0x%x |%s",
+		m_current_vp_hash, status_name(best), referenced, input_mask, attrs);
+
+	rsx_log.notice("%s", line);
+
+	// RPCS3.log is held with an exclusive lock while the emulator runs, so a dump run gets this
+	// mirrored into the file that can be read live, exactly as dump_vertex_program does.
+	if (remix_rsx::dump_enabled())
+	{
+		if (fs::file out{ fs::get_executable_dir() + "remix_dump.log", fs::write + fs::create + fs::append })
+		{
+			out.write(line + '\n');
+		}
+	}
+}
+
 void RemixGSRender::apply_texcoords(u32 unit, const remix_rsx::texture_entry& entry,
 	const rsx::fragment_texture& tex, u32 first_vertex, u32 vertex_count)
 {
@@ -1192,14 +1292,46 @@ void RemixGSRender::apply_texcoords(u32 unit, const remix_rsx::texture_entry& en
 	attribute_view uvs{};
 	u32 chosen = 0xFFFFFFFFu;
 
-	const auto try_attribute = [&](u32 index)
+	// The best status any scanned attribute reached, ordered by how close it got to a usable
+	// stream: absent (not fed from a persistent block at all) < layout (block found, offsets do
+	// not describe a readable stream) < memory (stream described, span unreadable). Recorded
+	// because R2 measured uv_none == tex_bound == 2450329 - a total failure, where the aggregate
+	// counter alone cannot say whether the title feeds no texcoord attribute or feeds one this
+	// code mis-locates.
+	attribute_status best_status = attribute_status::absent;
+
+	const auto rank = [](attribute_status s) -> u32
 	{
-		if (index < 8 || index > 15 || chosen != 0xFFFFFFFFu)
+		switch (s)
+		{
+		case attribute_status::absent: return 0;
+		case attribute_status::layout: return 1;
+		case attribute_status::memory: return 2;
+		case attribute_status::ok:     return 3;
+		}
+
+		return 0;
+	};
+
+	// 'forced' relaxes the lower bound to 1: RPCS3_REMIX_UVATTR exists to test a title that does
+	// not follow the 8+unit convention, and until now it could not express "the UVs are on a low
+	// attribute" at all because the bound was the same 8 the automatic scan uses. 0 stays refused -
+	// that is the position attribute, never a texcoord.
+	const auto try_attribute = [&](u32 index, bool forced)
+	{
+		if (index < (forced ? 1u : 8u) || index > 15 || chosen != 0xFFFFFFFFu)
 		{
 			return;
 		}
 
-		if (map_attribute(index, first_vertex, vertex_count, uvs) == attribute_status::ok)
+		const attribute_status status = map_attribute(index, first_vertex, vertex_count, uvs);
+
+		if (rank(status) > rank(best_status))
+		{
+			best_status = status;
+		}
+
+		if (status == attribute_status::ok)
 		{
 			chosen = index;
 		}
@@ -1207,23 +1339,32 @@ void RemixGSRender::apply_texcoords(u32 unit, const remix_rsx::texture_entry& en
 
 	if (const u32 forced = remix_rsx::texcoord_attribute(); forced != 0)
 	{
-		try_attribute(forced);
+		try_attribute(forced, true);
 	}
 	else
 	{
-		try_attribute(8 + unit);
+		try_attribute(8 + unit, false);
 
 		// A program that samples unit 1 from in_tc0 (a lightmap or detail map sharing the
 		// diffuse UVs) is common enough to be worth a second look before giving up.
 		for (u32 index = 8; index <= 15; ++index)
 		{
-			try_attribute(index);
+			try_attribute(index, false);
 		}
 	}
 
 	if (chosen == 0xFFFFFFFFu)
 	{
 		++m_stats.uv_none;
+
+		switch (best_status)
+		{
+		case attribute_status::layout: ++m_stats.uv_layout; break;
+		case attribute_status::memory: ++m_stats.uv_memory; break;
+		default:                       ++m_stats.uv_absent; break;
+		}
+
+		report_uv_failure(best_status);
 		return;
 	}
 
@@ -2437,9 +2578,16 @@ void RemixGSRender::update_camera_candidate()
 
 	++m_split_attempts;
 
+	// Counted so "this frame produced no candidate" separates into its three causes without a
+	// dump run: split_attempted == 0 over a window means no qualifying 3D draw reached here at
+	// all (or the 32-attempts-per-frame cap above swallowed them), while
+	// split_failed ~ split_attempted means the draws were there and the 4x4 would not factor.
+	++m_stats.split_attempted;
+
 	remix_rsx::vp_split split{};
 	if (!remix_rsx::split_view_projection(folded, split))
 	{
+		++m_stats.split_failed;
 		return;
 	}
 
@@ -3764,11 +3912,11 @@ void RemixGSRender::log_stats()
 
 	rsx_log.notice(
 		"Remix stats: frame=%llu draws=%llu submitted=%llu meshes_live=%llu created=%llu destroyed=%llu poisoned=%llu | "
-		"cam_resolved=%llu cam_fallback=%llu arch=%s world_applied=%llu world_fallback=%llu world_refused=%llu | "
+		"cam_resolved=%llu cam_fallback=%llu cam_held=%llu split_attempted=%llu split_failed=%llu arch=%s world_applied=%llu world_fallback=%llu world_refused=%llu | "
 		"skip screen=%llu immediate=%llu inline=%llu volatile=%llu reg_attr0=%llu prim=%llu restart=%llu instanced=%llu layout=%llu mem=%llu decode=%llu poison=%llu vp=%llu rt=%llu rt_kept=%llu notinput=%llu wdiv=%llu | "
 		"skin_submitted=%llu skin_skipped=%llu skin_unrecognised=%llu skin_bones_max=%llu | "
 		"cat_sky=%llu cat_hidden=%llu cat_particle=%llu cat_decal=%llu | "
-		"tex_bound=%llu tex_none=%llu tex_no_unit=%llu tex_unit_retry=%llu uv_applied=%llu uv_none=%llu uv_fallback=%llu vcol_applied=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_tombstone=%llu tex_rehashed=%llu tex_refreshed=%llu mat_created=%llu | "
+		"tex_bound=%llu tex_none=%llu tex_no_unit=%llu tex_unit_retry=%llu uv_applied=%llu uv_none=%llu uv_absent=%llu uv_layout=%llu uv_memory=%llu uv_fallback=%llu vcol_applied=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_tombstone=%llu tex_rehashed=%llu tex_refreshed=%llu mat_created=%llu | "
 		"ui_draws=%llu ui_skipped=%llu ui_no_colour=%llu ui_rt=%llu ui_prims=%llu ui_frames=%llu | "
 		"zcull_av=%llu zcull_av_handled=%llu",
 		m_frame_counter,
@@ -3780,6 +3928,9 @@ void RemixGSRender::log_stats()
 		static_cast<u64>(m_poisoned.size()),
 		m_stats.cam_resolved,
 		m_stats.cam_fallback,
+		m_stats.cam_held,
+		m_stats.split_attempted,
+		m_stats.split_failed,
 		remix_rsx::archetype_name(m_active_camera.archetype),
 		m_stats.world_applied,
 		m_stats.world_fallback,
@@ -3815,6 +3966,9 @@ void RemixGSRender::log_stats()
 		m_stats.tex_unit_retry,
 		m_stats.uv_applied,
 		m_stats.uv_none,
+		m_stats.uv_absent,
+		m_stats.uv_layout,
+		m_stats.uv_memory,
 		m_stats.uv_fallback,
 		m_stats.vcol_applied,
 		static_cast<u64>(m_textures.live()),
