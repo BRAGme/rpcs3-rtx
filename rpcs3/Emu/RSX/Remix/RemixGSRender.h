@@ -84,6 +84,13 @@ private:
 		// identity. Counted separately so world_fallback stays comparable across every run
 		// taken before the refusal existed. RPCS3_REMIX_DRAWNOWORLD=1 drives this back to 0.
 		u64 world_refused = 0;
+		// Draws whose world came from folding the *whole* group chain of a layered program under a
+		// fused reference camera, instead of only its outermost group. Appended after world_refused
+		// rather than folded into it so captures taken before the full-chain fold existed stay
+		// comparable. Zero means the fix never fired: either no layered program reaches that branch
+		// on this title, or RPCS3_REMIX_FULLCHAIN=0. It counts draws, not programs, so it scales
+		// with how wide the changed placement path is - which is the tell the risk note asks for.
+		u64 world_layered_ref = 0;
 		// A 3D draw whose albedo samples a surface the RSX itself rendered into: a post-process
 		// pass classified as world geometry. The 3D twin of ui_render_target.
 		u64 skip_render_target = 0;
@@ -103,6 +110,13 @@ private:
 		// explosion. Non-zero with world_applied unchanged means the matcher is recognising a decode
 		// whose constants are not where it thinks; RPCS3_REMIX_POSAFFINE=0 drives it to 0.
 		u64 pos_decode_refused = 0;
+		// Draws dropped as a re-draw of already-established geometry: no depth write, and the
+		// fragment program samples no texture on unit 0. On R2 (NPEA00431) these are the passes
+		// that light the base pass using only a normal map, and submitting them to a path tracer
+		// covers the diffuse surface with the normal map instead of blending into it. Zero on a
+		// title that renders in a single pass. RPCS3_REMIX_PASSSKIP=0 drives it to 0; if the scene
+		// loses real content, that knob is the bisect and this counter says how much went.
+		u64 skip_lighting_pass = 0;
 		u64 tex_bound = 0;
 		u64 tex_none = 0;
 		// Of the tex_none population, how many had no referenced, enabled 2D fragment texture
@@ -149,10 +163,45 @@ private:
 		u64 vcol_applied = 0;
 		// Times a referenced texture unit yielded no material and the next one was tried.
 		u64 tex_unit_retry = 0;
+		// How the albedo unit was chosen, split by evidence. tex_albedo_ucode counts draws whose
+		// fragment program named at least one colour source and excluded at least one other
+		// referenced unit; tex_albedo_guess counts the rest, which fall back to 9c73eb0's lowest
+		// referenced enabled 2D unit. The two sum to the draws that had any unit at all. A high
+		// guess count on a title with two-unit materials means the walk in scan_fragment_program
+		// is not following that title's shaders, not that the units are unambiguous.
+		u64 tex_albedo_ucode = 0;
+		u64 tex_albedo_guess = 0;
+		// Retries the ucode refused to sanction: the first unit yielded no material and the program
+		// named no *other* colour source to walk to. Before this refusal existed the loop walked to
+		// the next referenced unit regardless, which on Resistance 2 (NPEA00431) is unit 1 - 566
+		// DXT45 binds, zero DXT1, the normal map - and bound it as albedo. That is the flat blue.
+		// A missing texture is better than a wrong one, so the draw leaves untextured and says so.
+		u64 tex_retry_refused = 0;
+		// Draws whose material came from a unit other than the first one chosen, i.e. a retry
+		// actually substituted. Non-zero with tex_albedo_ucode high is the healthy case (Haze's
+		// COMPRESSED_HILO8 normal map below its diffuse); non-zero with tex_albedo_guess high is
+		// the population that can still be wrong.
+		u64 tex_unit_substituted = 0;
 		u64 ui_draws = 0;
 		u64 ui_skipped = 0;
 		u64 ui_no_colour = 0;
 		u64 ui_render_target = 0;
+		// Which coordinate space composite_ui_draw decided each 2D draw was already in. The
+		// UI probe put the bar it draws at the top AT the top and the bar it draws at the left
+		// AT the left, so nothing downstream of the compositor mirrors; the only place left for
+		// the reported vertical flip is this classification and the row conversion that follows
+		// it. The 'unit' counter is the load-bearing one: it counts draws whose post-matrix
+		// bbox fits entirely inside [-0.05, 1.05] on both axes, which the extent<=1.5 test
+		// cannot tell apart from real [-1,1] NDC even though the two spaces disagree about
+		// where y=0.4 lands (row 0.4h vs row 0.3h) and about which way y grows.
+		u64 ui_space_ndc = 0;
+		u64 ui_space_unit = 0;   // subset of ui_space_ndc: indistinguishable from [0,1] top-left
+
+		// 2D draws whose HPOS.xy-only transform was rebuilt and applied instead of being dropped
+		// (vp_fingerprint::has_ortho2d). Zero on a title whose 2D programs all write a full 4x4.
+		u64 ui_ortho2d = 0;
+		u64 ui_space_pixel = 0;  // clip-pixel branch
+		u64 ui_space_none = 0;   // neither shape; refused rather than guessed
 		u64 skin_submitted = 0;
 		u64 skin_skipped = 0;
 		u64 skin_bones_max = 0;
@@ -161,6 +210,17 @@ private:
 		// character is an acceptable result, an exploded one is not.
 		u64 skin_unrecognised = 0;
 		u64 skip_vp = 0;
+		// Unique vertex programs, not draws: how the HPOS writer collection went
+		// (vp_fingerprint::hpos_indirect). 'recovered' is programs whose matrix chain was only
+		// found by following a writer through a register, 'refused' is programs where a MOV was
+		// reached whose definition could not be pinned down, and 'indexed' is the skinned rigs the
+		// indirection is deliberately not offered to. Replaying the rule over Resistance 2's
+		// (NPEA00431) 129 dumped programs gives 33 and 25; the dump does not print the condition,
+		// negate or saturate bits, so 'refused' is the one of the three a run has to report rather
+		// than confirm. RPCS3_REMIX_HPOSINDIRECT=0 drives the first two to 0.
+		u64 vp_hpos_indirect = 0;
+		u64 vp_hpos_refused = 0;
+		u64 vp_hpos_indexed = 0;
 		u64 cat_sky = 0;
 		u64 cat_hidden = 0;
 		u64 cat_particle = 0;
@@ -198,6 +258,13 @@ private:
 		u32 inputs = 0;
 		u32 tint = 0;
 		bool have_uv = false;
+		// The draw's bbox *before* the space classification, i.e. straight out of the
+		// program's own matrix chain. Printed so a run says outright which space R2's 2D
+		// programs emit: [-1,1] on both axes is NDC, [0,1] with y growing downwards is a
+		// top-left screen space that the NDC row conversion mirrors and halves.
+		f32 clip_lo[2] = { 0.f, 0.f };
+		f32 clip_hi[2] = { 0.f, 0.f };
+		bool clip_unit = false;
 	};
 
 	// One vertex attribute located inside its interleaved block, with the guest span it
@@ -279,10 +346,23 @@ private:
 	// True when this draw is 2D / pre-projected and must not reach Remix.
 	bool is_screen_space_draw() const;
 
-	// Lowest referenced, enabled, 2D fragment texture unit at or above 'skip_below', or -1.
-	// The caller retries with skip_below = failed_unit + 1 when the cache refuses a unit, so a
-	// normal map bound below the diffuse map does not cost the draw its albedo.
+	// Which fragment texture units may be used as albedo for this draw, and whether the answer
+	// came from the fragment ucode. Non-null 'from_ucode' reports true only when the program named
+	// a colour source *and* excluded at least one other referenced unit - i.e. it discriminated.
+	// A program that reaches COL0 from every unit it samples has told the caller nothing, so it is
+	// reported as a guess and the retry loop stays shut.
+	u32 albedo_unit_mask(bool* from_ucode = nullptr) const;
+
+	// Lowest enabled 2D fragment texture unit in 'mask' at or above 'skip_below', or -1.
+	int albedo_texture_unit_in(u32 mask, u32 skip_below) const;
+
+	// Lowest eligible, enabled, 2D fragment texture unit at or above 'skip_below', or -1, over
+	// albedo_unit_mask()'s population.
 	int albedo_texture_unit(u32 skip_below = 0) const;
+
+	// Cached fragment-program fingerprint, keyed the same way m_vp_fingerprints keys the vertex
+	// one: scanned once per program, never per draw.
+	const remix_rsx::fp_fingerprint& fp_fingerprint_for(u64 fp_hash);
 
 	// True when any referenced, enabled 2D fragment texture unit samples an address the RSX has
 	// bound as a colour or depth surface: the title reading back its own framebuffer.
@@ -451,14 +531,26 @@ private:
 	// How many RPCS3_REMIX_UIDUMP lines have been emitted so far.
 	u32 m_ui_dumped = 0;
 
+	// Stats window (m_frame_counter / s_stats_interval_flips) the RPCS3_REMIX_WORLDVP probe last
+	// printed in. The probe fires per draw, so without this it would write one line per draw call;
+	// umax is the "never printed" sentinel because window 0 is a real window.
+	u64 m_worldvp_window = umax;
+
 	std::unordered_map<u64, remix_rsx::vp_fingerprint> m_vp_fingerprints;
+	std::unordered_map<u64, remix_rsx::fp_fingerprint> m_fp_fingerprints;
 	std::unordered_set<u64> m_vp_dumped;
+	std::unordered_set<u64> m_fp_dumped;
 	std::unordered_set<u64> m_dumped_textures;
 
 	// Identification of the draw clause currently being submitted. Set once in end(),
 	// because the vertex program cannot change between subdraws of one clause.
 	u64 m_current_vp_hash = 0;
 	const remix_rsx::vp_fingerprint* m_current_fingerprint = nullptr;
+
+	// The same for the fragment program. Null when the clause had no valid fragment ucode, which
+	// leaves every albedo choice on the lowest-unit fallback.
+	u64 m_current_fp_hash = 0;
+	const remix_rsx::fp_fingerprint* m_current_fp_fingerprint = nullptr;
 
 	camera_candidate m_frame_candidate{};
 	camera_candidate m_active_camera{};

@@ -221,6 +221,7 @@ struct cfg_root : cfg::node
 			cfg::_bool no_textures{ this, "Disable Textures", false };                      // RPCS3_REMIX_NOTEX
 			cfg::uint<0, 4096> texture_budget{ this, "Texture Uploads Per Frame", 8, true };// RPCS3_REMIX_TEXBUDGET, 0 = unlimited
 			cfg::uint<0, 2> texture_rehash{ this, "Texture Rehash Mode", 0 };               // RPCS3_REMIX_TEXREHASH, >0 costs heavy mesh churn
+			cfg::uint<30, 1000000> texture_idle{ this, "Texture Idle Frames", 300, true };  // RPCS3_REMIX_TEXIDLE, ~5 s at 60 fps
 			cfg::_bool texture_linear{ this, "Force Linear Textures", false };              // RPCS3_REMIX_TEXLINEAR
 			cfg::_bool flip_texcoord_v{ this, "Flip Texcoord V", false };                   // RPCS3_REMIX_UVFLIPV, per-title
 
@@ -237,6 +238,7 @@ struct cfg_root : cfg::node
 			cfg::uint<0, 65536> render_target_verts{ this, "Post-process Quad Vertex Limit", 32 }; // RPCS3_REMIX_RTVERTS
 			cfg::_float<0, 1000000> sky_extent{ this, "Sky Detection Extent", 2000, true }; // RPCS3_REMIX_SKYEXTENT
 			cfg::uint<0, 1000000> mesh_cap{ this, "Live Mesh Cap", 0 };                     // RPCS3_REMIX_MESHCAP, 0 = uncapped
+			cfg::uint<30, 1000000> mesh_idle{ this, "Mesh Idle Frames", 300, true };        // RPCS3_REMIX_MESHIDLE, ~5 s at 60 fps
 
 			// Instance categories. Comma-separated 16-hex-digit albedo content hashes.
 			// Remix's own rtx.*Textures conf lists cannot categorise API-submitted draws.

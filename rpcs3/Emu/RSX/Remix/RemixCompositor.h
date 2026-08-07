@@ -19,6 +19,11 @@ namespace remix_rsx
 	class compositor
 	{
 	public:
+		// Every 'bgra' colour word below is 0xAARRGGBB: bits 0..7 are BLUE, because that is
+		// byte 0 of the buffer and submit() declares the buffer REMIXAPI_FORMAT_B8G8R8A8_UNORM.
+		// Stated here because the UI probe was once authored in the opposite order and rendered
+		// its "red" bar blue (measured B=255, R=23) against a runtime that was behaving.
+
 		// Sizes and clears the target if anything was drawn last frame.
 		void begin_frame(u32 width, u32 height);
 

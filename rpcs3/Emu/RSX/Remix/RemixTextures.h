@@ -171,7 +171,17 @@ namespace remix_rsx
 	bool textures_disabled();
 	u32 texture_budget();
 	bool textures_linear();
+
+	// RPCS3_REMIX_TEXBMP=1: write each unique decoded texture out as a BMP next to the executable.
+	bool dump_texture_images();
 	u32 texture_rehash_mode();
+
+	// RPCS3_REMIX_TEXIDLE=<frames>: how long an unreferenced texture keeps its decode and its Remix
+	// handles before reap() releases them. Config "Texture Idle Frames", default 300 (~5 s at
+	// 60 fps). The tell for it being too low is tex_created and tex_destroyed both climbing over a
+	// window in which the camera stayed in one area; raising it costs VRAM, which tex_live reports.
+	// 0 reaps a texture the frame it stops being bound, so umax is the unset sentinel.
+	u32 texture_idle_frames();
 }
 
 #endif

@@ -140,6 +140,52 @@ namespace remix_rsx
 		u8 affine_scale_component[3] = { 0, 1, 2 };
 		u32 affine_bias_slot = 0;
 
+		// A 2D transform into HPOS.xy only. match_dp4_chain needs four writers, one per HPOS
+		// component, over four consecutive slots - which a 3D 4x4 always has. A 2D ortho does
+		// not: it needs rows for x and y, and z/w are a constant depth written by a single
+		// instruction. R2's menu backdrop fc5915fd48d91a98 is exactly that shape -
+		//   4:DP4>o0.x(...)c32   3:DP4>o0.y(...)c33   1:DP4>o0.zw(...)c35
+		// - three distinct constants, so it fell into the 'no matrix chain, <4 constants'
+		// screen_space case and composite_ui_draw used the *raw* attribute values as if they
+		// were already projected. The dropped row is the one carrying the y flip, which is why
+		// the menu drew upside down while the 2D programs that do match (their y row is
+		// [0 -2 0 0]) drew correctly. Same class as the Haze bone palette: a slot-count
+		// assumption rejecting a legitimate transform.
+		//
+		// Applied by the 2D compositor only. The 3D path still requires a full 4x4 - a program
+		// that never writes HPOS.z is not describing a depth and has no business there.
+		bool has_ortho2d = false;
+		u32 ortho2d_slot_x = 0;
+		u32 ortho2d_slot_y = 0;
+
+		// The matrix chain into HPOS was only found by following a writer through the register it
+		// was parked in. match_dp4_chain wants four writers of HPOS, each a DP4 writing one
+		// component; Resistance 2 (NPEA00431) writes the w row into a temp and moves it out
+		// afterwards, so one of the four is a MOV and the whole 4x4 was discarded:
+		//   da1d428df5ba05b6  16:DP4>o0.x(T2,c32)  15:DP4>o0.y(T2,c33)  14:DP4>o0.z(T2,c34)
+		//                     17:DP4>r1.w(T2,c35)  24:MOV>o0.w(T1.wwww)
+		// c32..c35 over one source is an ordinary 4x4 that only the detour hid. Of R2's 129
+		// programs, 46 came back arch=unknown "no matrix chain into HPOS", and 29 of those are
+		// exactly this shape (11 more are MOV>o0.xyzw, 5 are ADD>o0.xyzw, 1 is mixed). Replaying
+		// the rule over bin\remix_dump.log resolves 33 of the 46 - the 29 plus 4 of the
+		// MOV>o0.xyzw - into c32 (18), c8 (11) and c0 (4). Only 34.1% of submitted draws got a
+		// world matrix at 9c73eb0 (world_applied=437321 / submitted=1283161); the rest drew at the
+		// identity and piled up on the origin, which is the reported vertex explosion.
+		//
+		// Same class as has_ortho2d and the ADD src2 operand scan: a structural assumption about
+		// how a transform is written rejecting a legitimate one.
+		bool hpos_indirect = false;
+
+		// A MOV was reached whose definition could not be pinned down - defined by the SCA half of
+		// a co-issued word, written under a condition, or negated/saturated on the way out. Refused
+		// rather than guessed, and counted so the size of that population is visible.
+		bool hpos_indirect_refused = false;
+
+		// The program's position slice reads an indexed constant, so the indirection was not
+		// offered to it at all (see scan_vertex_program). These are the skinned rigs; resolving
+		// them is a change to the skinning path, not to this one.
+		bool hpos_indirect_indexed = false;
+
 		// Which input attribute the ucode moves into each texcoord output's xy, read from the
 		// program instead of inferred from the attribute's size and type. Index n is TEX<n>, i.e.
 		// output register o[7+n] (rpcs3's own output table, VKVertexProgram.cpp:292-299).
@@ -205,6 +251,50 @@ namespace remix_rsx
 	const char* archetype_name(vp_archetype a);
 	const char* shape_name(chain_shape s);
 
+	// ---------------------------------------------------------------------------------------
+	// Fragment-program fingerprint
+	// ---------------------------------------------------------------------------------------
+
+	// Which fragment texture units the ucode uses as a *colour* source, as opposed to a
+	// perturbation the backend cannot evaluate. Cached per fragment program like vp_fingerprint,
+	// so the walk below costs nothing per draw.
+	struct fp_fingerprint
+	{
+		// Bit N: unit N is sampled by a TEX-family instruction. Same population as
+		// fragment_program_metadata::referenced_textures_mask, recomputed here because the walk
+		// needs the instruction anyway and the two must agree by construction.
+		u16 sampled_mask = 0;
+
+		// Bit N: unit N's sample reaches the COL0 register through colour-preserving operations
+		// only. See scan_fragment_program for what "colour-preserving" means and why a dot
+		// product disqualifies a path.
+		u16 colour_mask = 0;
+
+		// colour_mask needed COL0.w to be non-empty - no unit reached COL0.rgb. Diagnostic only;
+		// the mask is used the same either way.
+		bool alpha_only = false;
+
+		// The ucode contains flow control (BRK/CAL/IFE/LOOP/REP/RET). The walk does not follow it
+		// and never kills a live register, so the result stays an over-approximation - which only
+		// ever moves the answer back towards the lowest-unit guess. Diagnostic only.
+		bool has_flow = false;
+
+		// The walk ran off the end of the ucode instead of stopping on an 'end' bit, or hit more
+		// instructions than it will hold. colour_mask is then whatever it managed and is treated
+		// as unresolved by the caller.
+		bool truncated = false;
+
+		u32 instructions = 0;
+		const char* note = "";
+	};
+
+	// Reads the fragment ucode and reports which sampled units feed the final colour. 'ucode' is
+	// the rebased program start (RSXFragmentProgram::get_data()), 'ucode_length' its byte length,
+	// and 'fp32_outputs' the CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS bit, which is what decides
+	// whether COL0 is R0 or H0 (FragmentProgramDecompiler.cpp:64-82). Never throws; anything it
+	// cannot follow comes back with colour_mask 0 and a reason in 'note'.
+	fp_fingerprint scan_fragment_program(const void* ucode, u32 ucode_length, bool fp32_outputs);
+
 	// Compact disassembly of the instructions that feed HPOS. This is the diagnostic that
 	// says why a program came back 'unknown'.
 	std::string describe_position_slice(const RSXVertexProgram& vp, u32 max_instructions = 32);
@@ -237,6 +327,10 @@ namespace remix_rsx
 
 	// The 'pos * s + b' step described by the fingerprint, as a row-vector affine matrix.
 	bool build_prescale(const vp_fingerprint& fp, mat4& out);
+
+	// The HPOS.xy-only transform described by has_ortho2d, as a row-vector matrix with an
+	// identity z/w. Reads the two slots live, so it is per draw like build_prescale.
+	bool build_ortho2d(const vp_fingerprint& fp, mat4& out);
 
 	// Runs the recorded bone-index op chain over one vertex's attribute component and
 	// truncates like ARL does, yielding the palette slot offset 'a'. False when a constant is
@@ -313,6 +407,14 @@ namespace remix_rsx
 	// look at the sun" symptom, measured at 33.9% of R2's frames. Default 300 (~5 s at 60 fps).
 	u32 camera_hold_frames();
 
+	// RPCS3_REMIX_MESHIDLE=<frames>: how many frames a mesh handle survives after the last draw
+	// that referenced it, before reap_idle_meshes destroys it. Default 300 (~5 s at 60 fps), which
+	// on a title whose level geometry leaves and re-enters view over a corridor's length pays the
+	// BLAS build again every round trip; raising it trades residency for that churn. Config
+	// "Mesh Idle Frames"; the ceiling side is the separate Live Mesh Cap LRU, which this does not
+	// touch. 0 reaps a mesh the first frame it goes unreferenced, so umax is the unset sentinel.
+	u32 mesh_idle_frames();
+
 	// RPCS3_REMIX_DRAWNOWORLD=1: submit a draw whose world transform could not be resolved at
 	// the identity anyway - the behaviour up to and including 41d9adc. Off by default because
 	// identity means "raw model-space vertices at the world origin", i.e. every unresolved draw
@@ -366,6 +468,59 @@ namespace remix_rsx
 	// register, so those 13 programs got attribute 1 - a different UV set - or nothing at all. On by
 	// default; the bisect knob for reading the attribute out of the program.
 	bool texcoord_from_ucode();
+
+	// RPCS3_REMIX_ORTHO2D=0: ignore vp_fingerprint::has_ortho2d, so a 2D program whose transform
+	// writes only HPOS.xy has that transform dropped and its raw attribute values composited as if
+	// already projected - the behaviour up to and including 9c73eb0. Measured on Resistance 2
+	// (NPEA00431): its menu backdrop fc5915fd48d91a98 reports arch=screen_space with consts=3 and a
+	// raw attribute bbox of [-1.064 -0.02847]..[1.064 0.5107], which passes the extent <= 1.5 NDC
+	// test and so composited straight, mirrored, at half height. On by default; the bisect knob for
+	// applying a 2-row transform in the compositor.
+	// RPCS3_REMIX_PASSSKIP=0: submit every pass of a multi-pass forward renderer, the behaviour up
+	// to and including 9c73eb0. Resistance 2 (NPEA00431) draws each surface once to establish it
+	// and again to light it; the lighting pass writes no depth and samples only the normal map on
+	// unit 1. Blended on console, stacked on a path tracer - so the world rendered as its normal
+	// maps. Measured over 665 dumped draws: 244 base (depth_write=1 blend=0) against 346 re-draws
+	// (depth_test=1 depth_write=0). Set 0 to bisect a title where the skip removes real content.
+	bool pass_skip_enabled();
+
+	bool ortho2d_enabled();
+
+	// RPCS3_REMIX_FULLCHAIN=0: under a *fused* active camera, fold only the outermost group of a
+	// layered program's matrix chain and divide that by the reference inverse - the behaviour up to
+	// and including 9c73eb0. For a layered program the outermost group is the projection alone, so
+	// that dropped every inner group carrying the model and view rows and submitted
+	// attr * G(n-1) * ref^-1 in place of attr * G0 * ... * G(n-1) * ref^-1. The result is geometry
+	// placed by a transform that tracks the camera only partially, which is the shape of a HUD that
+	// slides across the visor as the camera pitches instead of staying pinned to it. On by default;
+	// the bisect knob for the full-chain fold, and the A/B that has to bring the drift back for that
+	// hypothesis to hold. world_layered_ref in the stats line counts how wide the path fires.
+	bool full_chain_enabled();
+
+	// RPCS3_REMIX_HPOSINDIRECT=0: collect the writers of HPOS literally and require each of the
+	// four to be a DP4/DPH writing one component itself - the behaviour up to and including
+	// 9c73eb0, which discards any 4x4 whose rows did not all land on HPOS directly. Resistance 2
+	// (NPEA00431) dumped 129 unique vertex programs, 46 of them arch=unknown "no matrix chain into
+	// HPOS"; splitting those 46 by how they write o0 gives 29 x (DP4 x,y,z + MOV w), 11 x
+	// MOV>o0.xyzw, 5 x ADD>o0.xyzw and 1 mixed. The 29 are a plain 4x4 over four consecutive slots
+	// whose w row was computed into a temp first, and 4 of the 11 forward a whole MAD chain out of
+	// a temp that an unrelated co-issued RCP had already disqualified. On by default; the bisect
+	// knob for reaching a writer through the register it was parked in. vp_hpos_indirect and
+	// vp_hpos_refused in the stats line count programs, not draws.
+	bool hpos_indirect_enabled();
+
+	// RPCS3_REMIX_FPALBEDO=0: ignore fp_fingerprint::colour_mask and pick the albedo unit the way
+	// 9c73eb0 did - the lowest referenced, enabled 2D unit - with the retry loop free to walk to any
+	// other referenced unit when the cache refuses that one. That walk is what puts a normal map in
+	// the albedo slot. Measured on Resistance 2 (NPEA00431), 1477 texture binds in bin\remix_dump.log:
+	// unit 0 takes 666 DXT1 (fmt=86), 240 DXT45 (fmt=88) and 5 A4R4G4B4, unit 1 takes 566 DXT45 and
+	// *zero* DXT1. Matched pairs pin the layout - C813D51BD4E562B5 DXT1 128x128 on unit 0 against
+	// 9C6C098778ACE6FA DXT45 128x128 on unit 1, same dimensions, adjacent guest offsets - so unit 0 is
+	// the diffuse map (DXT1 opaque, DXT45 where the cutout needs alpha, which is the foliage that
+	// already renders correctly) and unit 1 is the normal map. Tangent-space normals are ~(128,128,255),
+	// which is exactly the flat blue the dev-menu texture grid shows bound as albedo today. On by
+	// default; the bisect knob for reading the colour source out of the fragment program.
+	bool fp_albedo_enabled();
 
 	// RPCS3_REMIX_POSAFFINE=0: ignore vp_fingerprint::has_const_affine and stop refusing draws whose
 	// recognised position decode could not be rebuilt - the behaviour up to and including fdada2e,
@@ -467,6 +622,15 @@ namespace remix_rsx
 	// bisector for "which program draws that". 0 when unset.
 	u64 skip_vp_hash();
 
+	// RPCS3_REMIX_WORLDVP=<16 hex digits>: print the world transform one named vertex program is
+	// being given, once per stats window, to RPCS3.log and remix_dump.log. The companion to SKIPVP:
+	// SKIPVP names the program by making its draws disappear, WORLDVP then says what transform that
+	// program was placed by, which branch of per_draw_transform built it, and - the load-bearing
+	// number - the L1 residue of the perspective row that to_remix_transform is about to truncate
+	// away. A residue near s_world_affine_tolerance means the draw is being flattened from a genuine
+	// projective transform, which drifts with camera pitch instead of snapping. 0 when unset.
+	u64 world_vp_hash();
+
 	// RPCS3_REMIX_CULL=1: submit doubleSided=0 for draws whose RSX cull state is enabled instead
 	// of forcing every instance double-sided. 23 of the 67 programs in the Haze census cull, and
 	// a double-sided triangle costs the path tracer intersection work on both faces. Off by
@@ -485,6 +649,18 @@ namespace remix_rsx
 	// (vp=fc0fac8afccec49a); with no material it reached Remix as an opaque white shell enclosing
 	// the camera. 0 disables the detection. Default 2000.
 	f32 sky_min_extent();
+
+	// RPCS3_REMIX_SKYTEXTURED=0: require a sky candidate to be untextured, the behaviour up to and
+	// including 9c73eb0. That requirement was written against Haze's vertex-coloured dome and does
+	// not generalise - a sky dome may perfectly well carry a texture. Resistance 2's (NPEA00431)
+	// does: it is drawn with cloud and water detail, so albedo_texture_unit() resolves a material,
+	// the '!material' arm was never entered, and the dome was submitted as world geometry - a solid
+	// sphere standing inside the level that occluded the scene and turned with the camera without
+	// enclosing the player. The remaining two conditions carry the meaning: depth writes off, and a
+	// widest-axis extent past sky_min_extent(). On by default; set 0 to bisect a title where a large
+	// depth-write-off textured draw (a fog card, a full-screen effect) is being mis-tagged and so
+	// hidden from the world pass.
+	bool sky_allows_textured();
 
 	// Debug light knobs so a derived camera can be judged visually at all.
 	f32 debug_light_radius();

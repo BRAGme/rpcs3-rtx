@@ -732,6 +732,8 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 			tr("Caps how many new textures are uploaded each frame. Anything over budget draws untextured until a later frame lets it through, which looks like textures fading in after a camera turn. 0 removes the cap."));
 		add_int(emu_settings_type::RemixTextureRehash, tr("Texture rehash mode (restart)"),
 			tr("0 keys textures by descriptor only. Higher values re-hash sampled content so textures a game rewrites in place stay fresh, at the cost of heavy mesh churn."));
+		add_int(emu_settings_type::RemixTextureIdle, tr("Texture idle frames"),
+			tr("How many frames a texture keeps its decoded pixels and its Remix handles after the last draw that used it. Higher means fewer re-uploads when the camera returns to an area, at the cost of more VRAM held. 300 is about five seconds at 60 fps."));
 		add_check(emu_settings_type::RemixFlipTexcoordV, tr("Flip texcoord V (restart)"),
 			tr("Submits 1-v instead of v for every texture coordinate. Per title, and off by default: v = 0 is the top row of a texture on RSX exactly as it is in D3D, so turning this on for a game whose coordinates are already right will invert every surface. Turn it on only when a game's textures render vertically mirrored - upside-down on-screen text that still reads left to right is the tell."));
 
@@ -754,6 +756,8 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 			tr("World extent above which a draw is considered sky."));
 		add_int(emu_settings_type::RemixMeshCap, tr("Live mesh cap (restart)"),
 			tr("Upper bound on simultaneously live meshes. 0 is uncapped."));
+		add_int(emu_settings_type::RemixMeshIdle, tr("Mesh idle frames"),
+			tr("How many frames a mesh handle survives after the last draw that referenced it. Higher means fewer acceleration-structure rebuilds when geometry leaves and re-enters view, at the cost of more memory held. 300 is about five seconds at 60 fps. The live mesh cap above is the separate ceiling."));
 		add_double(emu_settings_type::RemixFarPlane, tr("Far plane"),
 			tr("Far plane submitted with the camera."));
 

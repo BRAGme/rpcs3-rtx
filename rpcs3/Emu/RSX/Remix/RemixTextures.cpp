@@ -24,9 +24,11 @@ namespace remix_rsx
 {
 	namespace
 	{
-		// Frames a texture may go unreferenced before its handles are released. Deliberately
-		// the same shape as the mesh LRU in RemixGSRender so both age out together.
-		constexpr u64 s_texture_idle_frames = 300;
+		// Frames a texture may go unreferenced before its handles are released: no longer a
+		// constant here. The live value is texture_idle_frames() (RPCS3_REMIX_TEXIDLE /
+		// "Texture Idle Frames", default 300 in system_config.h). Deliberately still the same
+		// shape as the mesh LRU in RemixGSRender - and now the same knob shape too - so both age
+		// out together and a title that wants a longer residency raises both.
 
 		// Upper bound on a single decoded mip 0. 4096x4096 BGRA8 = 64 MiB.
 		constexpr usz s_max_decoded_bytes = 64ull * 1024 * 1024;
@@ -203,6 +205,32 @@ namespace remix_rsx
 		static const u32 env = read_env_u32(L"RPCS3_REMIX_TEXBUDGET", 0);
 		const u32 value = env ? env : g_cfg.video.remix.texture_budget;
 		return value ? value : umax;
+	}
+
+	u32 texture_idle_frames()
+	{
+		// How long a decoded texture and its Remix handles survive after the last draw that bound
+		// them. Read live like texture_budget, so it can be tuned without a restart. The default
+		// 300 (~5 s at 60 fps) makes a title that revisits a room after a corridor pay the decode
+		// and the CreateTexture again; raising it trades VRAM for that. The config floor is 30, but
+		// the environment variable can express 0 - reap the frame a texture stops being bound -
+		// which is a useful bisect, so umax is the unset sentinel rather than 0, exactly as
+		// camera_hold_frames argues.
+		static const u32 env = read_env_u32(L"RPCS3_REMIX_TEXIDLE", umax);
+		return env != umax ? env : g_cfg.video.remix.texture_idle;
+	}
+
+	bool dump_texture_images()
+	{
+		// Alongside the 'Remix tex=' census line, write each unique decoded texture out as a BMP
+		// under remix_tex\. On by default, because the only caller is already inside
+		// dump_enabled() - i.e. the user has deliberately turned Log Draw Diagnostics on, which
+		// is a debug mode that already costs ~590 ms frame stalls, and ~700 small files is not
+		// what makes it expensive. It defaulted off first and produced nothing, because an
+		// environment variable set in a shell never reaches an rpcs3 launched from anywhere else.
+		// RPCS3_REMIX_TEXBMP=0 turns it off without turning the rest of the dump off.
+		static const bool env = read_env_u32(L"RPCS3_REMIX_TEXBMP", 1) != 0;
+		return env;
 	}
 
 	bool textures_linear()
@@ -764,12 +792,14 @@ namespace remix_rsx
 
 	void texture_cache::reap(const remixapi_Interface& api, u64 frame)
 	{
-		if (m_entries.empty() || frame < s_texture_idle_frames)
+		const u64 idle_frames = texture_idle_frames();
+
+		if (m_entries.empty() || frame < idle_frames)
 		{
 			return;
 		}
 
-		const u64 cutoff = frame - s_texture_idle_frames;
+		const u64 cutoff = frame - idle_frames;
 
 		for (auto it = m_entries.begin(); it != m_entries.end();)
 		{

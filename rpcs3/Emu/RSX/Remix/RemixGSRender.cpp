@@ -49,8 +49,11 @@ namespace
 	// Tunable with RPCS3_REMIX_RTVERTS; 0 disables the shape test (refuse on the address alone).
 	constexpr u32 s_rt_feedback_max_vertices = 32;
 
-	// Frames a mesh may go unreferenced before its handle is released.
-	constexpr u64 s_mesh_idle_frames = 300;
+	// Frames a mesh may go unreferenced before its handle is released: no longer a constant here.
+	// The live value is remix_rsx::mesh_idle_frames() (RPCS3_REMIX_MESHIDLE / "Mesh Idle Frames",
+	// default 300 in system_config.h), because 300 (~5 s at 60 fps) is a compromise, not a fact - a
+	// title that streams its level in large pieces wants it far higher, and nothing inside the
+	// backend can tell which title it is looking at. Same shape as camera_hold_frames.
 
 	// How often the stats line is emitted, in flips, and the wall-clock bound that also
 	// forces one so a stalled or sub-1-FPS renderer still reports.
@@ -778,6 +781,26 @@ void RemixGSRender::end()
 		: u64{program_hash_util::vertex_program_utils::get_vertex_program_ucode_hash(current_vertex_program)};
 	m_current_fingerprint = &fingerprint_for(m_current_vp_hash);
 
+	// The fragment program cannot change between subdraws either, so scan it once here too. The
+	// hash is the same one the program caches key on, plus the export-width bit: that bit decides
+	// whether COL0 is R0 or H0, so two programs with identical ucode and different shader_control
+	// have different colour sources and must not share a fingerprint. Note it is read from
+	// method_registers rather than current_fragment_program.ctrl - the latter is only filled by
+	// get_current_fragment_program(), which this backend never calls (RSXThread.cpp:2170).
+	const bool fp32_outputs = (rsx::method_registers.shader_control() & CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS) != 0;
+
+	if (current_fragment_program.valid && current_fragment_program.ucode_length >= 16)
+	{
+		m_current_fp_hash = u64{program_hash_util::fragment_program_utils::get_fragment_program_ucode_hash(current_fragment_program)}
+			^ (fp32_outputs ? 0x9e3779b97f4a7c15ull : 0ull);
+		m_current_fp_fingerprint = &fp_fingerprint_for(m_current_fp_hash);
+	}
+	else
+	{
+		m_current_fp_hash = 0;
+		m_current_fp_fingerprint = nullptr;
+	}
+
 	auto& draw_call = rsx::method_registers.current_draw_clause;
 
 	draw_call.begin();
@@ -1159,21 +1182,60 @@ bool RemixGSRender::is_screen_space_draw() const
 	return remix_rsx::is_orthographic(outer) && !rsx::method_registers.depth_write_enabled();
 }
 
-int RemixGSRender::albedo_texture_unit(u32 skip_below) const
+u32 RemixGSRender::albedo_unit_mask(bool* from_ucode) const
 {
 	// referenced_textures_mask comes from the fragment ucode disassembly that
 	// analyse_current_rsx_pipeline() already ran, so it costs nothing here. GL and VK iterate
 	// the same mask (GLDraw.cpp:301, VKDraw.cpp:286) rather than trusting enabled() alone.
-	//
-	// 'skip_below' lets the caller walk past a unit the cache could not turn into a material.
-	// The lowest referenced unit is a guess at "the diffuse map", not a fact: Haze binds a
-	// 2048x2048 COMPRESSED_HILO8 normal map on a lower unit than the diffuse map it pairs it
-	// with, and taking the lowest unit unconditionally meant every one of those draws resolved
-	// a format this cache cannot decode and submitted flat white with a perfectly good diffuse
-	// texture sitting one unit up. That single descriptor accounted for 123,057 of the 123,059
-	// 'unsupported' draws in the p0 run - 40% of every untextured draw in the frame.
-	u32 mask = current_fp_metadata.referenced_textures_mask;
+	const u32 referenced = current_fp_metadata.referenced_textures_mask;
 
+	if (from_ucode)
+	{
+		*from_ucode = false;
+	}
+
+	if (!remix_rsx::fp_albedo_enabled() || !m_current_fp_fingerprint)
+	{
+		return referenced;
+	}
+
+	// Which of the referenced units the program actually reads as a colour. See
+	// scan_fragment_program: a sample that only reaches COL0 through a dot product is a normal,
+	// and this mask is what removes it.
+	const u32 colour = u32{m_current_fp_fingerprint->colour_mask} & referenced;
+
+	// 'colour == referenced' is not a resolution, it is the ucode declining to discriminate - the
+	// answer is then identical to the lowest-unit guess and, more importantly, sanctions nothing
+	// for the retry loop below. Reported as a guess so tex_albedo_ucode only ever counts draws
+	// where reading the program changed what the caller may do.
+	if (colour == 0 || colour == referenced)
+	{
+		return referenced;
+	}
+
+	if (from_ucode)
+	{
+		*from_ucode = true;
+	}
+
+	return colour;
+}
+
+int RemixGSRender::albedo_texture_unit(u32 skip_below) const
+{
+	return albedo_texture_unit_in(albedo_unit_mask(), skip_below);
+}
+
+int RemixGSRender::albedo_texture_unit_in(u32 mask, u32 skip_below) const
+{
+	// 'skip_below' lets the caller walk past a unit the cache could not turn into a material -
+	// but only within 'mask'. Haze binds a 2048x2048 COMPRESSED_HILO8 normal map on a lower unit
+	// than the diffuse map it pairs it with, and taking the lowest unit unconditionally meant
+	// every one of those draws resolved a format this cache cannot decode and submitted flat
+	// white with a perfectly good diffuse texture sitting one unit up. That single descriptor
+	// accounted for 123,057 of the 123,059 'unsupported' draws in the p0 run - 40% of every
+	// untextured draw in the frame. The walk is what recovers those; albedo_unit_mask is what
+	// stops it from walking onto a normal map instead.
 	for (u32 unit = 0; mask; mask >>= 1, ++unit)
 	{
 		if (!(mask & 1) || unit < skip_below)
@@ -1848,9 +1910,24 @@ void RemixGSRender::draw_ui_probe()
 
 	// A pattern chosen to be unmistakable and to answer three questions at once: is anything
 	// composited, is the buffer stretched to the output, and is the channel order BGRA.
-	// Opaque red bar across the top (B=0x00 G=0x00 R=0xFF), opaque blue bar down the left.
-	m_compositor.draw_quad(0.f, 0.f, w, h * 0.06f, 0.f, 0.f, 1.f, 1.f, nullptr, 0xFF0000FFu, true);
-	m_compositor.draw_quad(0.f, 0.f, w * 0.04f, h, 0.f, 0.f, 1.f, 1.f, nullptr, 0xFFFF0000u, true);
+	//
+	// The compositor's colour word is 0xAARRGGBB: blend() takes alpha from bits 24..31 and
+	// writes bits 0..7 to byte 0 of the buffer, which submit() declares to the runtime as
+	// REMIXAPI_FORMAT_B8G8R8A8_UNORM - so byte 0, i.e. bits 0..7, is BLUE. Every other
+	// producer already packs that way: the title's vertex colours (composite_ui_draw),
+	// rpcs3's own overlay (composite_overlay_command) and the texture decoder
+	// (RemixTextures.cpp, which also declares B8G8R8A8 to CreateTexture).
+	//
+	// This probe was the one exception, and the run confirmed it: the bar below used to be
+	// written 0xFF0000FF with a comment claiming "B=0x00 G=0x00 R=0xFF", and it rendered
+	// blue (measured B=255, R=23), while the left bar written 0xFFFF0000 rendered red
+	// (R=255, B=0). The literals were authored in 0xAABBGGRR order; the runtime and the
+	// four real producers are right, only these two constants were wrong. Swapping the
+	// pipeline instead would have broken all four.
+	//
+	// Opaque red bar across the top (R=0xFF in bits 16..23), opaque blue bar down the left.
+	m_compositor.draw_quad(0.f, 0.f, w, h * 0.06f, 0.f, 0.f, 1.f, 1.f, nullptr, 0xFFFF0000u, true);
+	m_compositor.draw_quad(0.f, 0.f, w * 0.04f, h, 0.f, 0.f, 1.f, 1.f, nullptr, 0xFF0000FFu, true);
 
 	// Half-alpha green block in the middle: proves the alpha path, and shows the scene through it.
 	m_compositor.draw_quad(w * 0.35f, h * 0.4f, w * 0.65f, h * 0.6f, 0.f, 0.f, 1.f, 1.f, nullptr, 0x8000FF00u, true);
@@ -1886,6 +1963,22 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 	// has to be applied before they mean anything on screen. A program with no chain (the
 	// pure screen_space archetype) already hands over post-projection coordinates.
 	remix_rsx::mat4 clip = remix_rsx::mat4_identity();
+
+	// ...except when the chain matcher rejected a real transform for having too few slots. A 2D
+	// ortho writes HPOS.x and HPOS.y from one constant each and puts a fixed depth in z/w, so it
+	// never has the four consecutive slots match_dp4_chain requires, and before 9c73eb0 its
+	// transform was silently dropped here. Resistance 2's menu backdrop fc5915fd48d91a98 is that
+	// shape (consts=3: x<-c32, y<-c33, zw<-c35), and compositing its raw attribute bbox of
+	// [-1.064 -0.02847]..[1.064 0.5107] is what drew the menu mirrored and at half height - the
+	// dropped row is the one carrying the y flip. RPCS3_REMIX_ORTHO2D=0 restores dropping it.
+	if (fp.group_count == 0)
+	{
+		if (remix_rsx::mat4 ortho{}; remix_rsx::build_ortho2d(fp, ortho))
+		{
+			clip = ortho;
+			++m_stats.ui_ortho2d;
+		}
+	}
 
 	for (u32 i = 0; i < fp.group_count; ++i)
 	{
@@ -1963,8 +2056,22 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 	// coordinates, and coordinates already in clip pixels.
 	const f32 extent = std::max(std::max(std::abs(lo[0]), std::abs(hi[0])), std::max(std::abs(lo[1]), std::abs(hi[1])));
 
+	// Diagnostic only, no behaviour change: does this draw's post-matrix bbox fit inside the
+	// unit square? If it does, the NDC branch below and a [0,1] top-left screen space are
+	// observationally identical here, and the branch is a coin toss. R2 emits both shapes -
+	// most of its 2D programs carry [2 0 0 0 | 0 -2 0 0 | 0 0 1 0 | -1 1 0 1] over an attribute
+	// bbox of [0 0]..[1 1], which is genuine NDC, but ef8f10966ce1500b lands its whole draw in
+	// x 0.55..0.75 / y 0.43..0.78 and 2f7d2b0aefd94351 in x -0.04..0.10 / y 1.00..1.07, neither
+	// of which reaches a single NDC edge. The slack is 0.05 so a quad authored flush to a [0,1]
+	// edge still counts.
+	const bool space_unit =
+		lo[0] >= -0.05f && hi[0] <= 1.05f && lo[1] >= -0.05f && hi[1] <= 1.05f;
+
 	if (extent <= 1.5f)
 	{
+		++m_stats.ui_space_ndc;
+		m_stats.ui_space_unit += space_unit ? 1 : 0;
+
 		for (u32 i = 0; i < vertex_count; ++i)
 		{
 			m_scratch_ui_x[i] = (m_scratch_ui_x[i] + 1.f) * 0.5f * fw;
@@ -1973,6 +2080,8 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 	}
 	else if (extent <= (std::max(clip_w, clip_h) * 2.f))
 	{
+		++m_stats.ui_space_pixel;
+
 		const f32 sx = fw / clip_w;
 		const f32 sy = fh / clip_h;
 
@@ -1985,6 +2094,7 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 	else
 	{
 		// Neither space. Guessing would put the UI somewhere arbitrary; counting is honest.
+		++m_stats.ui_space_none;
 		++m_stats.ui_skipped;
 		return;
 	}
@@ -2106,6 +2216,11 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 			m_ui_biggest.inputs = u32{current_vp_metadata.referenced_inputs_mask};
 			m_ui_biggest.tint = tint;
 			m_ui_biggest.have_uv = have_uv;
+			m_ui_biggest.clip_lo[0] = lo[0];
+			m_ui_biggest.clip_lo[1] = lo[1];
+			m_ui_biggest.clip_hi[0] = hi[0];
+			m_ui_biggest.clip_hi[1] = hi[1];
+			m_ui_biggest.clip_unit = space_unit;
 		}
 	}
 
@@ -2830,6 +2945,10 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 	const remix_rsx::vp_fingerprint& fp = *m_current_fingerprint;
 	remix_rsx::mat4 world{};
 
+	// Which of the four world-building branches below produced 'world'. Read only by the
+	// RPCS3_REMIX_WORLDVP probe at the tail; costs one stack slot otherwise.
+	const char* world_branch = "none";
+
 	// The vertices submitted to Remix are the raw attribute values, so any decode the program
 	// applies before its first matrix is part of this transform. A program whose decode was
 	// recognised but whose constants cannot be read back is refused, not drawn raw: raw quantised
@@ -2889,6 +3008,7 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 			&& fp.inner_is_input)
 		{
 			// world = G0 * ... * G(n-3); the last two groups are the view and the projection.
+			world_branch = "layered";
 			const u32 world_groups = (fp.group_count >= 3) ? (fp.group_count - 2) : 1;
 			world = remix_rsx::mat4_identity();
 
@@ -2908,6 +3028,7 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 			// The program folded everything above the vertex attribute into one group, so
 			// dividing out the resolved view-projection leaves exactly the world transform -
 			// including any vertex decompression the program applies before the matrix.
+			world_branch = "fused/vpinv";
 			remix_rsx::slot_block slots{};
 			if (!remix_rsx::read_slot_block(fp.outer_base(), slots))
 			{
@@ -2940,14 +3061,53 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 			return false;
 		}
 
-		remix_rsx::slot_block slots{};
-		if (!remix_rsx::read_slot_block(fp.outer_base(), slots))
+		// This branch accepts any has_outer() program - fused *and* layered - but it only ever read
+		// fp.outer_base(). For a layered program (2+ groups) the outermost group is the projection
+		// alone, so the submitted clip was attr * G(n-1) * ref^-1 instead of
+		// attr * G0 * ... * G(n-1) * ref^-1: the inner groups carrying the model and view rows were
+		// silently dropped. Geometry placed by a transform that only *partially* tracks the camera
+		// is the helmet-HUD symptom verbatim.
+		//
+		// The full product is what the program itself computes - composite_ui_draw folds exactly the
+		// same way for the 2D path (the loop above) and the layered-camera branch folds G0..G(n-3)
+		// for its own case - so this is not a new model, it is the missing multiply.
+		// RPCS3_REMIX_FULLCHAIN=0 restores the outer-only fold.
+		const bool full_chain = fp.is_layered() && fp.group_count > 1 && remix_rsx::full_chain_enabled();
+
+		world_branch = full_chain ? "ref/fullchain" : "ref/outer";
+
+		remix_rsx::mat4 chain{};
+
+		if (full_chain)
 		{
-			return false;
+			chain = remix_rsx::mat4_identity();
+
+			for (u32 i = 0; i < fp.group_count; ++i)
+			{
+				remix_rsx::slot_block slots{};
+				if (!remix_rsx::read_slot_block(fp.group_base[i], slots))
+				{
+					return false;
+				}
+
+				chain = remix_rsx::mat4_multiply(chain, remix_rsx::slots_to_matrix(slots, fp.group_shape[i]));
+			}
+
+			++m_stats.world_layered_ref;
+		}
+		else
+		{
+			remix_rsx::slot_block slots{};
+			if (!remix_rsx::read_slot_block(fp.outer_base(), slots))
+			{
+				return false;
+			}
+
+			chain = remix_rsx::slots_to_matrix(slots, fp.outer_shape());
 		}
 
 		const remix_rsx::mat4 fused = remix_rsx::fold_viewport_z(
-			remix_rsx::slots_to_matrix(slots, fp.outer_shape()),
+			chain,
 			rsx::method_registers.viewport_scale_z(),
 			rsx::method_registers.viewport_offset_z());
 
@@ -2982,6 +3142,50 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 			for (u32 j = 0; j < 4; ++j)
 			{
 				world.m[i][j] *= inv;
+			}
+		}
+	}
+
+	// RPCS3_REMIX_WORLDVP=<16 hex> probe. Instruments the second HUD hypothesis: the gate below
+	// accepts anything within s_world_affine_tolerance and to_remix_transform then *drops* the
+	// perspective row outright (RemixTransforms.h), so a program whose own projection differs
+	// slightly from the reference camera's passes the gate and is silently flattened - which drifts
+	// with pitch rather than snapping. The residue printed here is exactly what that truncation
+	// throws away; a residue near 0 exonerates the gate, a residue near the tolerance indicts it.
+	// Rate-limited to one line per stats window, and mirrored to remix_dump.log because RPCS3.log is
+	// exclusively locked while the emulator runs. Diagnostic only; nothing below reads it.
+	// Note: the skinned_layered branch returns before this point, so it is not instrumented - Haze
+	// skins on the SPU, so its HUD cannot be that archetype.
+	if (const u64 probe_vp = remix_rsx::world_vp_hash(); probe_vp != 0 && probe_vp == m_current_vp_hash)
+	{
+		if (const u64 window = m_frame_counter / s_stats_interval_flips; window != m_worldvp_window)
+		{
+			m_worldvp_window = window;
+
+			const f32 residue =
+				std::abs(world.m[0][3]) + std::abs(world.m[1][3]) +
+				std::abs(world.m[2][3]) + std::abs(world.m[3][3] - 1.f);
+
+			const std::string line = fmt::format(
+				"Remix worldvp: frame=%llu vp=%016llx arch=%s groups=%u branch=%s inner_input=%d "
+				"prescale=%d affine=%d persp_residue=%.6g tol=%.4g world=%s",
+				m_frame_counter,
+				m_current_vp_hash,
+				remix_rsx::archetype_name(fp.archetype),
+				fp.group_count,
+				world_branch,
+				fp.inner_is_input ? 1 : 0,
+				fp.has_prescale ? 1 : 0,
+				fp.has_const_affine ? 1 : 0,
+				static_cast<f64>(residue),
+				static_cast<f64>(s_world_affine_tolerance),
+				remix_rsx::format_matrix(world));
+
+			rsx_log.notice("%s", line);
+
+			if (fs::file out{ fs::get_executable_dir() + "remix_dump.log", fs::write + fs::create + fs::append })
+			{
+				out.write(line + '\n');
 			}
 		}
 	}
@@ -3434,6 +3638,47 @@ void RemixGSRender::submit_subdraw()
 		return;
 	}
 
+	// --- multi-pass forward: keep the pass that establishes the surface -------------------
+	// Resistance 2 (NPEA00431) draws its world in several forward passes over the same geometry,
+	// all into one colour target (every draw reports mrt=1 ctarget=1, so this is not a deferred
+	// G-buffer). The base pass writes depth and samples the diffuse map on unit 0; later passes
+	// re-draw the same surfaces with depth_write off, sampling only the normal map on unit 1 to
+	// light them. On the console those blend into one image. Submitted to a path tracer as
+	// independent instances they do not blend - the later pass simply sits on top, so the world
+	// renders as the normal maps.
+	//
+	// Measured, one capture, 665 dumped draws: 244 with depth_write=1 blend=0 (the base pass) and
+	// 346 with depth_test=1 depth_write=0 - re-draws of geometry whose depth is already laid down.
+	// The unit-1 textures dumped to remix_tex\ are visibly normal maps, and they match the Remix
+	// 'Diffuse Albedo' debug view pixel for pixel: same panel lines, same rivets, same rock relief.
+	// This also accounts for the frame cost, ~2-3x the geometry the title actually shows.
+	//
+	// The rule keeps anything that establishes a surface and drops only a re-draw that cannot be
+	// one: no depth write, and the fragment program never samples the base unit. A pass that does
+	// sample unit 0 is left alone even without a depth write, because decals and blended effects
+	// look exactly like that and are real content. RPCS3_REMIX_PASSSKIP=0 restores submitting
+	// every pass.
+	//
+	// This is deliberately the cheap half of the fix. The right end state is to merge the passes -
+	// albedo from the base pass, normal map from the lighting pass, one Remix material carrying
+	// both - which would also give real normal mapping instead of discarding it.
+	// The depth-write half of this test was wrong and cost a run: skip_lighting_pass came back 0
+	// because these programs *do* write depth. What identifies them is only which units they
+	// sample. Proven three ways in one capture: 'Disable Textures' renders the scene grey rather
+	// than blue, so the blue is a texture and not lighting; the BMPs written from the bind path -
+	// i.e. images that were *selected as albedo* - are 107 normal maps on unit 1 against 155
+	// diffuse maps on unit 0, a clean split; and the fragment-program census reports 6 programs
+	// whose sampled mask has no bit 0 at all. Six programs binding 107 different normal maps is a
+	// large share of the world, and with no diffuse map anywhere in the program there is nothing
+	// for albedo_texture_unit() to pick but the normal map.
+	if (m_current_fp_fingerprint && remix_rsx::pass_skip_enabled()
+		&& m_current_fp_fingerprint->sampled_mask != 0
+		&& (m_current_fp_fingerprint->sampled_mask & 1u) == 0)
+	{
+		++m_stats.skip_lighting_pass;
+		return;
+	}
+
 	// --- albedo material ----------------------------------------------------------------
 	// Resolved before the mesh hash because the material binds at CreateMesh time, so two
 	// draws that share geometry but not their texture must not share a mesh handle.
@@ -3444,10 +3689,27 @@ void RemixGSRender::submit_subdraw()
 
 	if (m_remix.fork_features())
 	{
-		// Walk the referenced 2D units in order and keep the first that yields a material.
-		// A refusal on the lowest unit is not a refusal for the draw: see albedo_texture_unit.
-		int unit = albedo_texture_unit();
+		// Walk the eligible 2D units in order and keep the first that yields a material.
+		// A refusal on the lowest unit is not a refusal for the draw: see albedo_texture_unit_in.
+		bool unit_from_ucode = false;
+		const u32 unit_mask = albedo_unit_mask(&unit_from_ucode);
+
+		int unit = albedo_texture_unit_in(unit_mask, 0);
+		const int first_unit = unit;
 		const bool had_unit = (unit >= 0);
+
+		if (had_unit)
+		{
+			// The pair is what says whether reading the ucode is doing anything on this title.
+			if (unit_from_ucode)
+			{
+				++m_stats.tex_albedo_ucode;
+			}
+			else
+			{
+				++m_stats.tex_albedo_guess;
+			}
+		}
 
 		while (unit >= 0)
 		{
@@ -3459,6 +3721,11 @@ void RemixGSRender::submit_subdraw()
 			{
 				albedo_hash = entry->content_hash;
 				++m_stats.tex_bound;
+
+				if (unit != first_unit)
+				{
+					++m_stats.tex_unit_substituted;
+				}
 
 				// Must happen before the mesh hash below: the texcoords live inside
 				// m_scratch_vertices, which is what the hash is taken over.
@@ -3479,8 +3746,22 @@ void RemixGSRender::submit_subdraw()
 				break;
 			}
 
+			if (remix_rsx::fp_albedo_enabled() && !unit_from_ucode)
+			{
+				// The program named no *other* colour source, so there is nothing this walk can
+				// legitimately substitute - only the next referenced unit, which is the hazard the
+				// budget guard above already recognised and only guarded for its own case. On
+				// Resistance 2 (NPEA00431) that next unit is unit 1: 566 DXT45 binds and zero DXT1
+				// against unit 0's 666 DXT1, i.e. the normal map, and binding it as albedo is the
+				// flat blue on every large surface and the blue thumbnails in Remix's texture grid.
+				// A missing texture is better than a wrong one, so the draw leaves untextured.
+				// RPCS3_REMIX_FPALBEDO=0 restores the unrestricted walk of 9c73eb0.
+				++m_stats.tex_retry_refused;
+				break;
+			}
+
 			++m_stats.tex_unit_retry;
-			unit = albedo_texture_unit(static_cast<u32>(unit) + 1);
+			unit = albedo_texture_unit_in(unit_mask, static_cast<u32>(unit) + 1);
 		}
 
 		if (!material)
@@ -3509,9 +3790,22 @@ void RemixGSRender::submit_subdraw()
 	// with a null material - i.e. as an opaque *white* shell, drawn with a translation-free
 	// camera-locked matrix, which is exactly the "white untextured dome surrounding me" report.
 	// Tagged SKY it renders as the sky instead of as world geometry enclosing the player.
+	//
+	// The '!material' half of that test was Haze-specific and wrong as a general rule. A sky dome
+	// is allowed to be textured, and Resistance 2's (NPEA00431) is: it carries cloud and water
+	// detail, so albedo_texture_unit() resolves, 'material' is non-null, this test never ran, and
+	// the dome was submitted as ordinary world geometry - a solid sphere standing inside the level,
+	// occluding the scene and turning with the camera without ever enclosing the player. The two
+	// conditions that actually mean "sky" are the ones left: the title does not write depth for it,
+	// and it spans thousands of units. Textured sky candidates are gated behind
+	// RPCS3_REMIX_SKYTEXTURED so the pre-9c73eb0 behaviour is one env var away, because widening
+	// this test admits any large depth-write-off textured draw - a distance fog card or a full
+	// screen effect - and mis-tagging one of those hides it from the world pass entirely.
 	bool is_sky = false;
 
-	if (!material && remix_rsx::sky_min_extent() > 0.f && !rsx::method_registers.depth_write_enabled())
+	const bool sky_candidate = !material || remix_rsx::sky_allows_textured();
+
+	if (sky_candidate && remix_rsx::sky_min_extent() > 0.f && !rsx::method_registers.depth_write_enabled())
 	{
 		f32 lo[3] = { +3.4e38f, +3.4e38f, +3.4e38f };
 		f32 hi[3] = { -3.4e38f, -3.4e38f, -3.4e38f };
@@ -3711,6 +4005,41 @@ const remix_rsx::vp_fingerprint& RemixGSRender::fingerprint_for(u64 vp_hash)
 	if (it == m_vp_fingerprints.end())
 	{
 		it = m_vp_fingerprints.emplace(vp_hash, remix_rsx::scan_vertex_program(current_vertex_program)).first;
+
+		// Counted here rather than in the scan: the map is what makes it once per unique program.
+		m_stats.vp_hpos_indirect += it->second.hpos_indirect ? 1 : 0;
+		m_stats.vp_hpos_refused += it->second.hpos_indirect_refused ? 1 : 0;
+		m_stats.vp_hpos_indexed += it->second.hpos_indirect_indexed ? 1 : 0;
+	}
+
+	return it->second;
+}
+
+const remix_rsx::fp_fingerprint& RemixGSRender::fp_fingerprint_for(u64 fp_hash)
+{
+	auto it = m_fp_fingerprints.find(fp_hash);
+
+	if (it == m_fp_fingerprints.end())
+	{
+		const bool fp32_outputs = (rsx::method_registers.shader_control() & CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS) != 0;
+
+		it = m_fp_fingerprints.emplace(fp_hash, remix_rsx::scan_fragment_program(
+			current_fragment_program.get_data(), current_fragment_program.ucode_length, fp32_outputs)).first;
+
+		// One line per fragment program, once. This is the only instrument that can say whether the
+		// colour-source walk is following a title's shaders: 'sampled=0x3 colour=0x1' is the
+		// two-unit material this exists for, 'sampled=0x3 colour=0x3' is a program that told us
+		// nothing, and 'colour=0x0' is one the walk could not follow at all.
+		if (remix_rsx::dump_enabled() && m_fp_dumped.insert(fp_hash).second)
+		{
+			const remix_rsx::fp_fingerprint& fp = it->second;
+
+			rsx_log.notice("Remix fpdump fp=%016llx sampled=0x%x colour=0x%x ref=0x%x instrs=%u fp32=%u alpha_only=%u flow=%u trunc=%u (%s)",
+				fp_hash, u32{fp.sampled_mask}, u32{fp.colour_mask},
+				u32{current_fp_metadata.referenced_textures_mask}, fp.instructions,
+				fp32_outputs ? 1 : 0, fp.alpha_only ? 1 : 0, fp.has_flow ? 1 : 0, fp.truncated ? 1 : 0,
+				fp.note);
+		}
 	}
 
 	return it->second;
@@ -4052,6 +4381,43 @@ void RemixGSRender::dump_vertex_program(u32 first_vertex, u32 vertex_count, u32 
 		static_cast<f64>(rsx::method_registers.viewport_scale_y()),
 		static_cast<f64>(rsx::method_registers.viewport_offset_y()));
 
+	// How many colour surfaces this draw writes. Nothing under Emu\RSX\Remix has ever read this
+	// register, which means the backend cannot currently tell a deferred G-buffer fill from the
+	// pass that produces the final image - it submits both. That is the leading explanation for
+	// Resistance 2 (NPEA00431): its albedo debug view is vivid blue carrying correct surface
+	// detail (i.e. normals written as colour), several of its fragment programs sample only
+	// texture unit 1 and nothing else (fpdump sampled=0x2, which a lit surface never does but a
+	// normal-only prepass does), geometry visibly overlaps itself, and draw time is 40.77 ms of a
+	// 45.79 ms frame where it used to be present-bound. One mesh submitted once per pass explains
+	// every one of those at once.
+	//
+	// Logged, not acted on. If the blue programs and the correct ones separate on mrt/ctarget then
+	// skipping the fill pass is a small change; if they do not, this rules the theory out before
+	// any code is written for it.
+	{
+		const auto target = rsx::method_registers.surface_color_target();
+
+		u32 colour_surfaces = 0;
+		switch (target)
+		{
+		case rsx::surface_target::none:             colour_surfaces = 0; break;
+		case rsx::surface_target::surface_a:
+		case rsx::surface_target::surface_b:        colour_surfaces = 1; break;
+		case rsx::surface_target::surfaces_a_b:     colour_surfaces = 2; break;
+		case rsx::surface_target::surfaces_a_b_c:   colour_surfaces = 3; break;
+		case rsx::surface_target::surfaces_a_b_c_d: colour_surfaces = 4; break;
+		}
+
+		// The surface address as well: two passes over the same geometry writing different targets
+		// is the signature, and the address is what says "different target" rather than just
+		// "different count".
+		fmt::append(groups, " mrt=%u ctarget=%u surf=0x%x depthfmt=%u",
+			colour_surfaces,
+			static_cast<u32>(target),
+			rsx::method_registers.surface_offset(0),
+			static_cast<u32>(rsx::method_registers.surface_depth_fmt()));
+	}
+
 	const std::string line = fmt::format(
 		"Remix dump vp=%016llx arch=%s(%s) groups=%u input=%d prescale=%d(c%u.%u,c%u) consts=%u slice=%u ucode=%u inputs=0x%x | "
 		"vtx=%u idx=%u prim=%u bbox=[%.4g %.4g %.4g]..[%.4g %.4g %.4g] | "
@@ -4119,6 +4485,54 @@ void RemixGSRender::dump_texture(const remix_rsx::texture_entry& entry, const rs
 	{
 		out.write(line + '\n');
 	}
+
+	// RPCS3_REMIX_TEXBMP=1: write the decoded pixels out as well, one BMP per unique texture, into
+	// remix_tex\. Every colour theory tried on Resistance 2 (NPEA00431) has died on a counter -
+	// the decode (a frame renders correctly at spawn), sky over-tagging (cat_sky=0 and still blue),
+	// unit retry (tex_unit_retry=0), a stale cache (tex_rehashed=3 with full content hashing), and
+	// a deferred G-buffer fill (every draw reports mrt=1 ctarget=1). What has never been done is
+	// look at the image actually handed to Remix as albedo. If the texture bound for a blue surface
+	// is a normal map, the fault is unit selection here; if it is the right diffuse map, the fault
+	// is downstream and nothing in this file will fix it. Off by default because a level is ~700
+	// unique textures.
+	if (!remix_rsx::dump_texture_images())
+	{
+		return;
+	}
+
+	if (entry.pixels.size() < usz{entry.width} * entry.height * 4 || !entry.width || !entry.height)
+	{
+		return;
+	}
+
+	const std::string dir = fs::get_executable_dir() + "remix_tex/";
+	fs::create_dir(dir);
+
+	const u32 row_bytes = entry.width * 4;
+	const u32 pixel_bytes = row_bytes * entry.height;
+
+	// 32-bit BGRA, which is exactly how texture_cache::decode already stores it, so the bytes go
+	// out untouched - a re-pack here could itself invert a channel and answer the wrong question.
+	// Negative height makes it top-down, matching the decode's row order.
+	u8 header[54]{};
+	header[0] = 'B'; header[1] = 'M';
+	*reinterpret_cast<u32*>(header + 2) = 54 + pixel_bytes;
+	*reinterpret_cast<u32*>(header + 10) = 54;
+	*reinterpret_cast<u32*>(header + 14) = 40;
+	*reinterpret_cast<s32*>(header + 18) = static_cast<s32>(entry.width);
+	*reinterpret_cast<s32*>(header + 22) = -static_cast<s32>(entry.height);
+	*reinterpret_cast<u16*>(header + 26) = 1;
+	*reinterpret_cast<u16*>(header + 28) = 32;
+	*reinterpret_cast<u32*>(header + 34) = pixel_bytes;
+
+	const std::string path = fmt::format("%sunit%u_%016llX_%ux%u.bmp",
+		dir, unit, entry.content_hash, entry.width, entry.height);
+
+	if (fs::file img{ path, fs::write + fs::create + fs::trunc })
+	{
+		img.write(header, sizeof(header));
+		img.write(entry.pixels.data(), pixel_bytes);
+	}
 }
 
 void RemixGSRender::reap_idle_meshes()
@@ -4130,9 +4544,11 @@ void RemixGSRender::reap_idle_meshes()
 
 	const auto& api = m_remix.api();
 
-	if (m_frame_counter >= s_mesh_idle_frames)
+	const u64 idle_frames = remix_rsx::mesh_idle_frames();
+
+	if (m_frame_counter >= idle_frames)
 	{
-		const u64 cutoff = m_frame_counter - s_mesh_idle_frames;
+		const u64 cutoff = m_frame_counter - idle_frames;
 
 		for (auto it = m_meshes.begin(); it != m_meshes.end();)
 		{
@@ -4208,12 +4624,14 @@ void RemixGSRender::log_stats()
 
 	rsx_log.notice(
 		"Remix stats: frame=%llu draws=%llu submitted=%llu meshes_live=%llu created=%llu destroyed=%llu poisoned=%llu | "
-		"cam_resolved=%llu cam_fallback=%llu cam_held=%llu split_attempted=%llu split_failed=%llu arch=%s world_applied=%llu world_fallback=%llu world_refused=%llu | "
+		"cam_resolved=%llu cam_fallback=%llu cam_held=%llu split_attempted=%llu split_failed=%llu arch=%s world_applied=%llu world_fallback=%llu world_refused=%llu world_layered_ref=%llu | "
 		"skip screen=%llu immediate=%llu inline=%llu volatile=%llu reg_attr0=%llu prim=%llu restart=%llu instanced=%llu layout=%llu mem=%llu decode=%llu poison=%llu vp=%llu rt=%llu rt_kept=%llu notinput=%llu wdiv=%llu posdecode_refused=%llu | "
+		"vp_hpos_indirect=%llu vp_hpos_refused=%llu vp_hpos_indexed=%llu | "
 		"skin_submitted=%llu skin_skipped=%llu skin_unrecognised=%llu skin_bones_max=%llu | "
+		"skip_lighting_pass=%llu | "
 		"cat_sky=%llu cat_hidden=%llu cat_particle=%llu cat_decal=%llu | "
-		"tex_bound=%llu tex_none=%llu tex_no_unit=%llu tex_unit_retry=%llu uv_applied=%llu uv_none=%llu uv_absent=%llu uv_layout=%llu uv_memory=%llu uv_fallback=%llu uv_ucode=%llu uv_heuristic=%llu uv_nonfinite=%llu vcol_applied=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_tombstone=%llu tex_rehashed=%llu tex_refreshed=%llu mat_created=%llu | "
-		"ui_draws=%llu ui_skipped=%llu ui_no_colour=%llu ui_rt=%llu ui_prims=%llu ui_frames=%llu | "
+		"tex_bound=%llu tex_none=%llu tex_no_unit=%llu tex_unit_retry=%llu tex_albedo_ucode=%llu tex_albedo_guess=%llu tex_retry_refused=%llu tex_unit_substituted=%llu uv_applied=%llu uv_none=%llu uv_absent=%llu uv_layout=%llu uv_memory=%llu uv_fallback=%llu uv_ucode=%llu uv_heuristic=%llu uv_nonfinite=%llu vcol_applied=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_tombstone=%llu tex_rehashed=%llu tex_refreshed=%llu mat_created=%llu | "
+		"ui_draws=%llu ui_skipped=%llu ui_no_colour=%llu ui_rt=%llu ui_prims=%llu ui_frames=%llu ui_ndc=%llu ui_unit=%llu ui_pixel=%llu ui_nospace=%llu ui_ortho2d=%llu | "
 		"zcull_av=%llu zcull_av_handled=%llu",
 		m_frame_counter,
 		m_stats.draws_seen,
@@ -4231,6 +4649,7 @@ void RemixGSRender::log_stats()
 		m_stats.world_applied,
 		m_stats.world_fallback,
 		m_stats.world_refused,
+		m_stats.world_layered_ref,
 		m_stats.skip_screen_space,
 		m_stats.skip_immediate,
 		m_stats.skip_inline_array,
@@ -4249,10 +4668,14 @@ void RemixGSRender::log_stats()
 		m_stats.skip_not_input,
 		m_stats.wdiv_draws,
 		m_stats.pos_decode_refused,
+		m_stats.vp_hpos_indirect,
+		m_stats.vp_hpos_refused,
+		m_stats.vp_hpos_indexed,
 		m_stats.skin_submitted,
 		m_stats.skin_skipped,
 		m_stats.skin_unrecognised,
 		m_stats.skin_bones_max,
+		m_stats.skip_lighting_pass,
 		m_stats.cat_sky,
 		m_stats.cat_hidden,
 		m_stats.cat_particle,
@@ -4261,6 +4684,10 @@ void RemixGSRender::log_stats()
 		m_stats.tex_none,
 		m_stats.tex_no_unit,
 		m_stats.tex_unit_retry,
+		m_stats.tex_albedo_ucode,
+		m_stats.tex_albedo_guess,
+		m_stats.tex_retry_refused,
+		m_stats.tex_unit_substituted,
 		m_stats.uv_applied,
 		m_stats.uv_none,
 		m_stats.uv_absent,
@@ -4288,6 +4715,11 @@ void RemixGSRender::log_stats()
 		m_stats.ui_render_target,
 		m_compositor.draws(),
 		m_compositor.frames(),
+		m_stats.ui_space_ndc,
+		m_stats.ui_space_unit,
+		m_stats.ui_space_pixel,
+		m_stats.ui_space_none,
+		m_stats.ui_ortho2d,
 		// ZCULL occlusion-report page faults taken by guest threads. Non-zero means the title polls
 		// cellGcmGetReport while a query is in flight; every one of these that is NOT handled wedges
 		// the faulting PPU thread forever (see on_access_violation).
@@ -4351,7 +4783,7 @@ void RemixGSRender::log_stats()
 	if (m_ui_biggest.area > 0.f)
 	{
 		rsx_log.notice(
-			"Remix ui-biggest: vp=%016llx area=%.0fpx verts=%u inputs=0x%x unit=%d pixels=%llu uv=%d tint=%08X",
+			"Remix ui-biggest: vp=%016llx area=%.0fpx verts=%u inputs=0x%x unit=%d pixels=%llu uv=%d tint=%08X clip=[%.4f %.4f]..[%.4f %.4f] unit_square=%d",
 			m_ui_biggest.vp_hash,
 			m_ui_biggest.area,
 			m_ui_biggest.verts,
@@ -4359,7 +4791,12 @@ void RemixGSRender::log_stats()
 			m_ui_biggest.unit,
 			static_cast<u64>(m_ui_biggest.pixels),
 			m_ui_biggest.have_uv ? 1 : 0,
-			m_ui_biggest.tint);
+			m_ui_biggest.tint,
+			m_ui_biggest.clip_lo[0],
+			m_ui_biggest.clip_lo[1],
+			m_ui_biggest.clip_hi[0],
+			m_ui_biggest.clip_hi[1],
+			m_ui_biggest.clip_unit ? 1 : 0);
 
 		m_ui_biggest = {};
 	}
