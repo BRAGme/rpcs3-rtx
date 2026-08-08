@@ -1,48 +1,260 @@
-RPCS3
-=====
+# RPCS3 with a native RTX Remix render backend
 
-[![GitHub Actions](https://img.shields.io/github/actions/workflow/status/RPCS3/rpcs3/rpcs3.yml?branch=master&logo=github&label=Actions)](https://github.com/RPCS3/rpcs3/actions/workflows/rpcs3.yml)
-[![RPCS3 Discord Server](https://img.shields.io/discord/272035812277878785?color=5865F2&label=RPCS3%20Discord&logo=discord&logoColor=white)](https://discord.gg/rpcs3)
+This is a fork of [RPCS3](https://github.com/RPCS3/rpcs3) that adds a **render backend which
+submits PlayStation 3 geometry to the RTX Remix runtime through the Remix API**, so a PS3 title is
+path traced rather than rasterised.
 
-The world's first free and open-source PlayStation 3 emulator/debugger, written in C++ for Windows, Linux, macOS and FreeBSD.
+There is no d3d9 wrapper and no proxy DLL. The backend calls `remixapi_*` directly -- meshes,
+materials, instances, skinning, lights and a camera, submitted every frame. That matters because
+the normal route into Remix is intercepting a game's fixed-function D3D9 calls, and **RSX has no
+fixed-function transform unit**. There is no `SetTransform` to read a view matrix out of; the
+view-projection is folded into whatever constant slots the game's own vertex program happens to
+use. Recovering it is the central problem this fork solves -- see
+[How the camera is recovered](#how-the-camera-is-recovered).
 
-You can find some basic information on our [**website**](https://rpcs3.net/). Game info is being populated on the [**Wiki**](https://wiki.rpcs3.net/).
-For discussion about this emulator, PS3 emulation, and game compatibility reports, please visit our [**forums**](https://forums.rpcs3.net) and our [**Discord server**](https://discord.gg/RPCS3).
+The sibling project is [pcsx2-rtx-remix](https://github.com/BRAGme/pcsx2-rtx-remix), the same idea
+for PlayStation 2. The consoles need genuinely different techniques (VU1 microcode back-slicing
+there, vertex-program fingerprinting here), so the two READMEs are worth reading together if you
+are attempting this for a third machine.
 
-[**Support the Lead Developers on Patreon**](https://rpcs3.net/patreon)
+Everything about the base emulator is unchanged and documented in
+[upstream's README](https://github.com/RPCS3/rpcs3/blob/master/README.md).
 
-## Contributing
+---
 
-If you want to help the project but do not code, the best way to help out is to test games and make bug reports. See:
-* [Quickstart](https://rpcs3.net/quickstart)
+## Requirements
 
-If you want to contribute as a developer, please take a look at the following pages:
+**This fork does not work with the stock NVIDIA RTX Remix runtime.** It requires the
+**Remix Plus** fork of dxvk-remix:
 
-* [Coding Style](https://github.com/RPCS3/rpcs3/wiki/Coding-Style)
-* [Developer Information](https://github.com/RPCS3/rpcs3/wiki/Developer-Information)
+| | |
+|---|---|
+| Runtime | [`RemixProjGroup/dxvk-remix`](https://github.com/RemixProjGroup/dxvk-remix), maintainer Kim2091 |
+| Release tag | `remix-plus-1.5.1` (tag object `f4173a9c8b94736363cb27c3bd228059780acbcf`) |
+| Asset | `Remix_Plus_v1.5.1_x64_games_release.zip` |
+| API version | `0.1000.1` -- the vendored `remix_c.h`, additive over `0.1000.0` (`2f10eb5`) |
 
-You should also contact any of the developers in the forums or in the Discord server to learn more about the current state of the emulator.
+Remix Plus reserves `REMIXAPI_VERSION_MINOR = 1000`
+(`rpcs3/Emu/RSX/Remix/remix_c.h:58-67`), and the runtime's compatibility check treats every minor
+as breaking while `MAJOR == 0`. Stock dxvk-remix is on the `0.6.x` line, so the handshake rejects
+it outright rather than running on with mismatched struct layouts and category bits. `PATCH` is
+ignored by that check, which is why `0.1000.1` still matches a `remix-plus-1.5.1` runtime.
 
-### AI Use
+The vendored `rpcs3/Emu/RSX/Remix/remix_c.h` is never hand-edited. It is copied wholesale from the
+fork's `public/include/remix/remix_c.h`; a single missed struct member silently misroutes every
+interface slot after the divergence, and that fails at run time, not at build time.
 
-Use of AI tools for research and reverse engineering purposes is permitted. However, contributors are expected to fully own and understand all code they submit. Any communication with the team — including code, code comments, and GitHub comments — must come from the human contributor, not an AI agent acting autonomously.
+### Installing the runtime
 
-We have unfortunately seen a rise in untested and unverified AI-generated slop being submitted to this project. This wastes maintainer time and, in worse cases, such changes get merged and break functionality for all users. Repeated violations will result in a ban from the repository. Please be respectful of everyone's time.
+The backend resolves the runtime DLL as (`rpcs3/Emu/RSX/Remix/RemixRuntime.cpp:67-77`):
 
-**Pull requests opened by AI agents or automated tools must include a disclosure in the PR description** stating the scope of AI involvement — which parts were AI-generated and what human testing or review was performed prior to submission. PRs that omit this disclosure may be closed without review.
+1. `RPCS3_REMIX_DLL`, if set, used verbatim;
+2. otherwise `<exe dir>/remix/d3d9.dll`.
 
-If you are unsure about your work, open a discussion issue to talk it through with the team, or reach out to a maintainer on [Discord](https://discord.gg/RPCS3).
+Unzip the Remix Plus release into a `remix\` **subfolder** next to `rpcs3.exe`. **Do not drop
+`d3d9.dll` directly beside the executable** -- a file by that name there would be picked up by
+anything else in the process that resolves it, which is exactly why the subdirectory is mandatory
+rather than a convention.
 
-## Building
+---
 
-See [BUILDING.md](BUILDING.md) for more information about how to setup an environment to build RPCS3.
+## What it looks like
 
-## Running
+All three stills are frames lifted from a screen capture on this branch. Captures date fast and
+this branch moves several times a day, so each is labelled with **when it was captured and what the
+branch tip was at that moment**.
 
-Check our friendly [quickstart](https://rpcs3.net/quickstart) guide to make sure your computer meets the minimum system requirements to run RPCS3.
+![Resistance 2, textured stone and concrete, path traced](docs/remix/README-assets/rpcs3-r2-concrete.jpg)
 
-Don't forget to have your graphics driver up to date and to install the [Visual C++ Redistributable Packages for Visual Studio 2022](https://aka.ms/vs/17/release/VC_redist.x64.exe) if you are a Windows user.
+*Resistance 2 (NPEA00431). Captured 2026-08-08 06:37; branch tip `148b467`. World geometry with
+albedo textures and path-traced lighting, 51.8 fps on the emulator's own overlay.*
 
-## License
+![Resistance 2, metal walkway and scaffolding](docs/remix/README-assets/rpcs3-r2-walkway.jpg)
 
-Most files are licensed under the terms of GNU GPL-2.0-only License; see LICENSE file for details. Some files may be licensed differently; check appropriate file headers for details.
+*Same capture. Texcoords decoded out of the vertex program, so tiling surfaces resolve correctly.*
+
+![Resistance 2, first-person arms over a valley](docs/remix/README-assets/rpcs3-r2-viewmodel.jpg)
+
+*Same capture. The first-person arms and weapon at bottom right are skinned characters submitted
+through `remixapi_MeshInfoSkinning`. The washed-out translucency across the rock faces and the
+over-bright water are real, current artefacts -- this frame is included because it is honest about
+where the backend is, not because it is the prettiest one in the clip.*
+
+<!-- video link: source clips are not committed -- a git repo is a poor video host. Upload
+     rpcs3__2026-08-08__06-36-55.mp4 and drop the URL here. -->
+
+---
+
+## Current status
+
+This is the further-along of the two backends: camera, textures, skinned characters, per-draw blend
+state, sky classification and UI compositing all work on at least one title. It is still a research
+backend, not a product.
+
+### What has been measured
+
+| Area | State | Evidence |
+|---|---|---|
+| Camera / world transforms | Working | `world_applied` went 34.1% -> **100% of submitted draws** on Resistance 2 once the HPOS chain could be recovered through a register (`ae94587`). On Haze, matching `ADD`'s src2 constant recovered **71% of world transforms** that had been submitting identity (`41d9adc`). |
+| Textures | Working | Texcoords and the position decode are read out of the vertex program (`9c73eb0e`, `188b242`); alpha test honoured. |
+| Skinned characters | Working | Both of Resistance 2's rigs -- 16 programs binding one indexed matrix per vertex, 16 more blending four from a palette -- are submitted natively through `remixapi_MeshInfoSkinning`, so Remix does the blend and the mesh content stays static rigging (`81af315`). |
+| Vertex colours, sky, cull state | Working | `8931f16`, `81af315`. Sky is anchored by camera rather than by geometry. |
+| Game UI compositing | Working | `19d54522`, `2414498`. |
+| First-person viewmodels | Landed, not runtime-verified | Detected by viewport depth range and tagged `VIEW_MODEL` (`148b467`); given their own camera reference rather than the world one (`4945c7eb`). |
+| Texture cache | Working | 2,905,684 cache hits against 41 texture creations, 19 live, no unbounded growth -- measured on Minecraft: PlayStation 3 Edition (NPUB31419). |
+
+### Titles
+
+Only three titles appear anywhere in the branch log or the dump comments, and they are the only
+ones any claim above rests on:
+
+- **Resistance 2** (`NPEA00431`) -- the primary development title; nearly every measurement above
+  is from it.
+- **Haze** -- vertex quantisation scale and the `ADD` src2 transform fix (`e9a7956`, `41d9adc`).
+- **Minecraft: PlayStation 3 Edition** (`NPUB31419`) -- camera parity and texture-cache
+  measurements.
+
+There is no compatibility table and this README will not invent one. Any other title is untested.
+
+### What is not done
+
+- **The viewmodel camera divide is new.** `4945c7eb` compiles and links (`msbuild rpcs3.sln
+  /t:rpcs3 /p:Configuration=Release /p:Platform=x64` exits 0) but has not been runtime-verified.
+  `RPCS3_REMIX_VIEWMODELCAM=0` restores the previous behaviour exactly if it misbehaves.
+- **Two skinning-recovery mechanisms ship defaulted off.** `RPCS3_REMIX_INDEXEDUNIFORM` and
+  `RPCS3_REMIX_INDEXEDBIASREG` each address part of the 119,357 draws Resistance 2 loses to the
+  indexed-const gate over a 2m41s capture, and each is off until a run says what it recovers.
+- **`match_basis_affine` is recognised but not applied.** The object placement it finds is composed
+  and logged, deliberately not used, because wiring it in moves 82,190 draws at once and that wants
+  checking against a drawn frame first.
+- **Lighting is largely the path tracer's, not the game's.** Reconstructing PS3 light sources is
+  not attempted.
+- **No binary release yet.** Build from source; see below. A release is planned.
+
+---
+
+## How the camera is recovered
+
+This is the transferable part.
+
+Remix needs a per-frame view-projection. A fixed-function D3D9 game hands its view and projection
+matrices to the driver and an interposer simply reads them. **RSX offers nothing equivalent.** By
+the time geometry exists it has been through a vertex program the game wrote, and the
+view-projection has been folded into that program's constant slots -- at whatever indices that
+particular program happens to use, composed with whatever else the author decided to fold in.
+Nothing labels it.
+
+So the backend **fingerprints the vertex program**. For each distinct ucode it disassembles the
+program and walks backwards from `HPOS`, the clip-space output, looking for the chain that produced
+it. The canonical shape is four `DP4`s, one per component, over one common source -- that is a 4x4
+matrix multiply, and the constant slot the `DP4`s read is where the matrix lives. Recover that slot
+and you have a matrix that is *derived from the program that uses it*, not scored as plausible.
+
+The interesting work is all in the ways real programs deviate from the canonical shape while still
+being ordinary transforms. Three examples, each of which was a class of broken frames:
+
+- **The chain terminates in an `ADD` with the constant in `src2`.** `ADD` on RSX consumes `src0`
+  and `src2` -- `vec_source_mask(ADD)` is `0b101`, there is no `src1` -- and Haze writes
+  `ADD o0.xyzw, r2, c[3]`, accumulator first. A matcher that only scanned slots 0 and 1 rejected
+  the whole 4x4, submitted identity, and piled raw model-space vertices at the world origin: vertex
+  explosions and characters standing in the wrong place, both from the same cause. Fixing the
+  operand indices recovered **71% of that title's world draws** (`41d9adc`).
+- **One of the four writers is a `MOV`.** Resistance 2 computes its `w` row into a temp and moves
+  it out afterwards, so a strict four-`DP4` matcher discarded the matrix. Of R2's 129 programs, 46
+  came back "no matrix chain into HPOS" and 29 were exactly this shape. Following a `MOV` back to
+  the instruction that defined the component it forwards, then re-running the existing matchers,
+  resolved 33 of the 46 and took `world_applied` from 34.1% to **100% of submitted draws**
+  (`ae94587`).
+- **The address register applies abs-then-negate before truncation.** Reading the signed value gave
+  `31 + (-1) = c30`, a rank-1 matrix with two zero columns, and every skinned character drew as a
+  long thin diagonal box. The magnitudes across all 16 programs are 1, 4, 10, 19 -- every one
+  congruent to 1 mod 3, which with three rows per bone puts bones at c32, c35, c41, c50, exactly
+  three apart. The signed values are not congruent. The congruence is the proof (`81af315`).
+
+The method that found all three is the same and it is the recommendation: **replay real ucode from
+dumps rather than reason about symptoms.** `RPCS3_REMIX_DUMP` writes the disassembled programs and
+the matrices each draw resolved; the matchers can then be re-run offline over a whole capture and
+the answer counted rather than argued. In `ae94587`, six hypotheses died on counters before the
+surviving one was found. Every percentage in this README came out of that loop.
+
+The backend also learns which archetype each program belongs to -- world transform, skinned rig
+with an indexed palette, skinned rig blending four weighted bones, post-process blit, sky, 2D
+overlay -- and routes the draw accordingly, because a post-process blit submitted as world geometry
+is a full-screen quad sitting in the middle of the scene. The classification and every knob that
+bisects it are documented in
+[`rpcs3/Emu/RSX/Remix/RemixTransforms.h`](rpcs3/Emu/RSX/Remix/RemixTransforms.h).
+
+---
+
+## Building (Windows)
+
+Follow upstream [`BUILDING.md`](BUILDING.md). It is correct and this fork changes none of it: VS2022
+x64, Python 3.6+, the Vulkan SDK, Qt with `QTDIR` set, then `rpcs3.sln`. The Remix runtime is loaded
+at run time and is **not** a build dependency.
+
+```bat
+call "...\VC\Auxiliary\Build\vcvars64.bat"
+set QTDIR=C:\Qt\6.10.3\msvc2022_64
+msbuild rpcs3.sln /m:6 /nodeReuse:false /p:Configuration=Release /p:Platform=x64
+```
+
+### Known traps on Windows
+
+These are notes from building *this* fork on one Windows machine, not corrections to upstream. Each
+is a symptom that cost real time.
+
+| Symptom | Cause and fix |
+|---|---|
+| Qt codegen fails with `'"\bin\moc.exe"' is not recognized`, MSB8066, exit code 9009 | `QTDIR` is unset in the shell you invoked msbuild from. Upstream documents `QTDIR` at [`BUILDING.md:29`](BUILDING.md), but a clean non-VS shell still hits this every time. Set `$env:QTDIR = "<Qt>\6.x\msvc2022_64"` before msbuild -- the trailing `msvc2022_64` matters. |
+| `aqtinstall` cannot fetch the Qt version upstream asks for | Upstream lists Qt 6.11.1; aqtinstall 3.3.0 cannot fetch 6.11+. **Qt 6.10.3 via aqt builds this fork fine** and is what the numbers above were built with. |
+| Build dies with MSB4166, "child node exited prematurely" | Unbounded `/m` spawns more msbuild nodes than the machine survives. Use `/m:6 /nodeReuse:false`. Node reuse in particular leaves stale nodes holding file handles between builds. |
+| Link errors against the precompiled `llvmlibs_mt.7z` | It does not link under MSVC 14.44. Build LLVM from source instead -- `3rdparty\llvm\llvm_build.vcxproj`. This is long and one-time; after that incremental builds are normal speed. |
+| `rpcs3_test` fails with `Cannot open include file: 'gtest/gtest.h'` | The googletest NuGet package is not restored. This is the unit-test project only and does not affect `rpcs3.exe`; build the `rpcs3` target (`/t:rpcs3`) to skip it. |
+
+Select the backend under *Configuration -> GPU -> Renderer*, and the RTX Remix page is the last
+entry in the *Configuration* menu.
+
+---
+
+## Knobs
+
+The backend reads **79** `RPCS3_REMIX_*` environment variables. They are a bisect surface as much
+as a tuning surface: most exist so a single run can attribute a visual change to one specific
+decision rather than to a whole milestone.
+
+**[`docs/remix/KNOBS.md`](docs/remix/KNOBS.md)** is the reference -- name, default, effect, and
+whether the knob is also on the GUI page (31 of the 79 are). Where both exist the environment
+variable wins when set, so measurement scripts stay authoritative over whatever the GUI last wrote.
+
+---
+
+## License and credits
+
+GPL-2.0, unchanged from upstream. This fork adds `rpcs3/Emu/RSX/Remix/` and `docs/remix/`, plus the
+RTX Remix settings page; everything else is RPCS3's.
+
+- **[RPCS3](https://github.com/RPCS3/rpcs3)** and its contributors -- the emulator this forks.
+- **[NVIDIA RTX Remix](https://github.com/NVIDIAGameWorks/rtx-remix)** -- the runtime and the API.
+- **[Remix Plus](https://github.com/RemixProjGroup/dxvk-remix)** (maintainer Kim2091) -- the
+  dxvk-remix fork this pins, and the source of the API surface this backend depends on.
+
+Bugs here belong to this fork. Please do not take RPCS3 issues about the Remix renderer to the
+RPCS3 project.
+
+### Provenance, and upstream's AI policy
+
+Upstream RPCS3 has an explicit [AI Use](https://github.com/RPCS3/rpcs3#ai-use) policy, and it is a
+fair one: AI tooling is permitted for research and reverse engineering, but a contributor is
+expected to fully own and understand what they submit, and untested AI-generated output wastes
+maintainer time.
+
+So, plainly: **development on this branch is AI-assisted.** The work is done with Claude and most
+commits carry a `Co-Authored-By` trailer. The decisions, the code and the measurements are owned by
+a human. The practices that make that claim checkable are the ones upstream is asking for anyway --
+every behavioural claim in the commit log is a counter or a percentage that was measured on a real
+capture, a commit that was not build-tested is tagged `(UNVERIFIED)` in its subject line (`8931f16`,
+`19d54522`), and hypotheses that were *refuted* are committed and named rather than quietly
+dropped.
+
+**No pull request has been opened against upstream RPCS3 and none is planned from this branch.**
+This is a research fork; it is not upstream-ready and does not pretend to be.
