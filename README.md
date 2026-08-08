@@ -135,7 +135,10 @@ There is no compatibility table and this README will not invent one. Any other t
   checking against a drawn frame first.
 - **Lighting is largely the path tracer's, not the game's.** Reconstructing PS3 light sources is
   not attempted.
-- **No binary release yet.** Build from source; see below. A release is planned.
+- **A binary build is available** -- see [Releases](https://github.com/BRAGme/rpcs3-rtx/releases),
+  marked prerelease because everything above is still true of it. It ships neither the Remix Plus
+  runtime nor PS3 firmware; the zip's `SETUP.txt` says where to get both. Building from source is
+  still documented below, and the packaging list is `tools/package-release.sh`.
 
 ---
 
