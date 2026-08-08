@@ -2087,7 +2087,43 @@ void RemixGSRender::apply_texcoords(u32 unit, const remix_rsx::texture_entry& en
 		// seven or eight times across a wall. The alternative reading (unit 32768) would give
 		// those four programs a sixteenth of their 128x128 and 512x512 textures, which no
 		// content pipeline produces. RPCS3_REMIX_UVINTSCALE=<n> overrides it in one variable.
-		const f32 divisor = static_cast<f32>(remix_rsx::texcoord_int_scale());
+		// ...except when the program says otherwise. The paragraph above had to choose between
+		// "unit 4096, tiled 7-8x" and "unit 32768" from the UV ranges alone, and picked 4096. The
+		// constant settles it: on the programs that run to ~32600 Haze's c151 holds 3.05176e-05,
+		// which is 1/32768 exactly, so those are one full tile of a 32768 unit and dividing them by
+		// 4096 puts them 8x too large. Other programs in the same scene hold ~1/4094 and 1, so this
+		// is per-program and no single fixed divisor can serve them all.
+		f32 ucode_divisor = 0.f;
+
+		if (remix_rsx::texcoord_scale_from_ucode() && m_current_fingerprint && unit < 8)
+		{
+			const u8 slot = m_current_fingerprint->texcoord_scale_slot[unit];
+			const u8 scale_input = m_current_fingerprint->texcoord_scale_input[unit];
+
+			// Only when the scale belongs to the attribute actually being read: a program can
+			// scale one texcoord set and copy another straight through.
+			if (slot != remix_rsx::s_no_texcoord_scale && scale_input == chosen)
+			{
+				if (f32 v[4]{}; remix_rsx::read_slot(slot, v))
+				{
+					// The multiply is by a reciprocal, so the divisor is 1/c. Guard against a slot
+					// that is zero or not yet uploaded rather than producing an infinity.
+					if (std::isfinite(v[0]) && v[0] > 0.f)
+					{
+						ucode_divisor = 1.f / v[0];
+					}
+				}
+			}
+		}
+
+		const f32 divisor = ucode_divisor > 0.f
+			? ucode_divisor
+			: static_cast<f32>(remix_rsx::texcoord_int_scale());
+
+		if (ucode_divisor > 0.f)
+		{
+			++m_stats.uv_scale_ucode;
+		}
 
 		if (divisor > 0.f)
 		{
@@ -8160,7 +8196,7 @@ void RemixGSRender::log_stats()
 		"vmcam_census=%u vmcam_mode=%u | "
 		"cat_hidden=%llu cat_particle=%llu cat_decal=%llu | "
 		"blend_chained=%llu blend_translucent=%llu blend_unmapped=%llu | "
-		"tex_bound=%llu tex_none=%llu tex_no_unit=%llu tex_unit_retry=%llu tex_albedo_ucode=%llu tex_albedo_guess=%llu tex_retry_refused=%llu tex_unit_substituted=%llu uv_applied=%llu uv_none=%llu uv_absent=%llu uv_layout=%llu uv_memory=%llu uv_fallback=%llu uv_ucode=%llu uv_heuristic=%llu uv_nonfinite=%llu vcol_applied=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_tombstone=%llu tex_rehashed=%llu tex_refreshed=%llu mat_created=%llu tex_retry_unsupported=%llu mat_untested=%llu | "
+		"tex_bound=%llu tex_none=%llu tex_no_unit=%llu tex_unit_retry=%llu tex_albedo_ucode=%llu tex_albedo_guess=%llu tex_retry_refused=%llu tex_unit_substituted=%llu uv_applied=%llu uv_none=%llu uv_absent=%llu uv_layout=%llu uv_memory=%llu uv_fallback=%llu uv_ucode=%llu uv_heuristic=%llu uv_nonfinite=%llu vcol_applied=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_tombstone=%llu tex_rehashed=%llu tex_refreshed=%llu mat_created=%llu tex_retry_unsupported=%llu mat_untested=%llu uv_scale_ucode=%llu | "
 		"ui_draws=%llu ui_skipped=%llu ui_no_colour=%llu ui_rt=%llu ui_prims=%llu ui_frames=%llu ui_ndc=%llu ui_unit=%llu ui_pixel=%llu ui_nospace=%llu ui_ortho2d=%llu "
 		"ui_vpydown=%llu ui_vpyup=%llu ui_vpfallback=%llu ui_vflip_ndc=%llu/%llu ui_vflip_pixel=%llu/%llu ui_vflip_abstain=%llu | "
 		"zcull_av=%llu zcull_av_handled=%llu",
@@ -8329,6 +8365,7 @@ void RemixGSRender::log_stats()
 		tex.materials,
 		m_stats.tex_retry_unsupported,
 		tex.materials_untested,
+		m_stats.uv_scale_ucode,
 		m_stats.ui_draws,
 		m_stats.ui_skipped,
 		m_stats.ui_no_colour,

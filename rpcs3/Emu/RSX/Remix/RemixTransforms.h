@@ -60,6 +60,9 @@ namespace remix_rsx
 	// vp_fingerprint::texcoord_input entry for "the ucode does not say".
 	inline constexpr u8 s_no_texcoord_input = 0xff;
 
+	// vp_fingerprint::texcoord_scale_slot entry for "the ucode names no scale constant".
+	inline constexpr u8 s_no_texcoord_scale = 0xff;
+
 	// One step of the "vertex attribute -> address register" computation, stored innermost
 	// first. Every factor is a transform constant, so the whole chain is re-evaluated per draw
 	// from live register state rather than baked at scan time.
@@ -248,6 +251,15 @@ namespace remix_rsx
 		// output register o[7+n] (rpcs3's own output table, VKVertexProgram.cpp:292-299).
 		// s_no_texcoord_input when the write could not be reduced to one attribute read straight.
 		u8 texcoord_input[8] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+
+		// The constant slot this program multiplies its texcoord attribute by before writing TEXn,
+		// and the attribute that multiply reads. s_no_texcoord_input when the slice holds no such
+		// MUL, or holds more than one and they disagree. This is the divisor UVINTSCALE hardcodes:
+		// Haze (BLUS30094) keeps it in c151 and it is not one value across programs - measured
+		// 1/32768 on most, ~1/4094 on some and 1 on others - so no fixed constant can be right for
+		// all of them. Read the slot instead; s_no_texcoord_scale falls back to UVINTSCALE.
+		u8 texcoord_scale_slot[8] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+		u8 texcoord_scale_input[8] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
 
 		// The program divides the position by the attribute's own w before the first matrix
 		// ('pos.xyz * RCP(pos.w)'). The divisor is per vertex, so unlike has_prescale it cannot
@@ -722,6 +734,13 @@ namespace remix_rsx
 	// three of them, so lowering the floor only moves the cut instead of closing it. Guarded to
 	// draws that come from an armed program, write no depth, resolve no material, and failed on
 	// extent alone. On by default; `0` restores extent-only. Counter: sky_learned_ring.
+	// RPCS3_REMIX_UVSCALEUCODE: take the S32K texcoord divisor from the constant slot the vertex
+	// program actually multiplies by (vp_fingerprint::texcoord_scale_slot) instead of the fixed
+	// UVINTSCALE. Haze keeps it in c151 and it is not one value across programs, so no fixed
+	// divisor can be right for all of them. Falls back to UVINTSCALE wherever the ucode names no
+	// scale. On by default; `0` restores the fixed divisor. Counter: uv_scale_ucode.
+	bool texcoord_scale_from_ucode();
+
 	bool sky_learn_dome_enabled();
 
 	// RPCS3_REMIX_RETRYUNSUP: let the albedo unit walk step past a unit that bind() refused for a

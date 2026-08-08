@@ -2105,6 +2105,119 @@ namespace remix_rsx
 			return true;
 		}
 
+		// Defined below, next to the position slicing it was written for.
+		void slice_position(const program_walker& prog, u32 output_index, u32& out_distinct_consts,
+			u32& out_instructions, bool& out_indexed, std::vector<u32>* out_indices);
+
+		// The constant slot a program scales its texcoord attribute by on the way to TEXn.
+		//
+		// resolve_output_input above refuses any program whose TEXn write is not a straight read of
+		// an attribute, and a scaled texcoord is exactly that shape - so the heuristic scan picks
+		// the attribute up raw and the scale is silently dropped. On Haze (BLUS30094) 25 of 43
+		// TEX0-writing programs are refused and 17 carry one motif:
+		//
+		//     MUL>rN.xy(I0.xyxx, C0.xxxx, ...)c151i8
+		//
+		// attr8 times slot 151, routed through temps into o7. Measured live, c151 holds 1/32768 on
+		// most of those programs, ~1/4094 on some and 1 on others, while UVINTSCALE hardcodes 4096:
+		// the 1/32768 population comes out 8x too large, and the uv census reads u=[0..8.000] and
+		// [0.008..7.862] against a clean [0..1] elsewhere. 32768/4096 = 8.
+		//
+		// This does not attempt the full dataflow - it does not need to. slice_position already
+		// gives the backward slice of the output, so every instruction it returns contributes to
+		// TEXn by construction, and a MUL of an attribute by a constant inside that slice *is* the
+		// scale. Downstream biases and swizzles are still not replicated; the scale is the term that
+		// puts coordinates off by an order of magnitude, which is what tiles the texture.
+		//
+		// Refuses on ambiguity rather than guessing: two MULs naming different slots, or naming
+		// different attributes, and the caller keeps the old fixed divisor.
+		bool resolve_texcoord_scale_slot(const program_walker& prog, u32 output, u32& out_attribute, u32& out_slot)
+		{
+			u32 consts = 0;
+			u32 instructions = 0;
+			bool indexed = false;
+			std::vector<u32> indices;
+
+			slice_position(prog, output, consts, instructions, indexed, &indices);
+
+			if (instructions == 0 || indexed)
+			{
+				return false;
+			}
+
+			bool found = false;
+			u32 slot = 0;
+			u32 attribute = 0;
+
+			for (const u32 i : indices)
+			{
+				const decoded_instr& in = prog[i];
+
+				if (in.d1.vec_opcode != RSX_VEC_OPCODE_MUL || in.d3.index_const)
+				{
+					continue;
+				}
+
+				// Only xy matters: z/w on a texcoord output carry a second set or a fog term.
+				if ((vec_writemask(in) & 0x3) == 0)
+				{
+					continue;
+				}
+
+				const u32 sources = vec_source_mask(in.d1.vec_opcode);
+				u32 input_slot = umax;
+				u32 const_slot = umax;
+
+				for (u32 s = 0; s < 3; ++s)
+				{
+					if (!(sources & (1u << s)))
+					{
+						continue;
+					}
+
+					if (in.src[s].reg_type == RSX_VP_REGISTER_TYPE_INPUT)
+					{
+						input_slot = s;
+					}
+					else if (in.src[s].reg_type == RSX_VP_REGISTER_TYPE_CONSTANT)
+					{
+						const_slot = s;
+					}
+				}
+
+				if (input_slot == umax || const_slot == umax)
+				{
+					continue;
+				}
+
+				const u32 index = u32{in.d1.input_src};
+
+				// Attribute 0 is the position; a texcoord scaled off it is texgen, not a UV.
+				if (index == 0 || index > 15)
+				{
+					continue;
+				}
+
+				if (found && (slot != u32{in.d1.const_src} || attribute != index))
+				{
+					return false;
+				}
+
+				found = true;
+				slot = u32{in.d1.const_src};
+				attribute = index;
+			}
+
+			if (!found)
+			{
+				return false;
+			}
+
+			out_attribute = attribute;
+			out_slot = slot;
+			return true;
+		}
+
 		struct wdivide_result
 		{
 			bool found = false;
@@ -4500,6 +4613,14 @@ namespace remix_rsx
 			{
 				result.texcoord_input[unit] = static_cast<u8>(attribute);
 			}
+
+			// Independent of the above: a program whose write resolves straight can still scale,
+			// and one that does not resolve is precisely the case this exists for.
+			if (u32 attribute = 0, slot = 0; resolve_texcoord_scale_slot(prog, 7 + unit, attribute, slot))
+			{
+				result.texcoord_scale_slot[unit] = static_cast<u8>(std::min<u32>(slot, 0xfeu));
+				result.texcoord_scale_input[unit] = static_cast<u8>(attribute);
+			}
 		}
 
 		slice_position(prog, 0, result.distinct_consts, result.chain_instructions, result.indexed_const);
@@ -4721,14 +4842,24 @@ namespace remix_rsx
 
 			const chain_source source = resolve_source(prog, chain.source, chain.first_instruction);
 
+			// Both exits below leave the walk before match_const_affine is ever called, so without
+			// these the census reports 'untried' - the initialiser - and the refusal carries no
+			// attribution at all. That is the same blind spot 'areason' was added to close one
+			// level down, and it hid two of the three refusals in the first capture that had it.
 			if (source.reg_type == RSX_VP_REGISTER_TYPE_INPUT)
 			{
+				// The chain reads the attribute directly: there is no decode step to find, which is
+				// a healthy answer rather than a refusal.
+				result.affine_reason = "chain-reaches-attr";
 				reached_input = true;
 				break;
 			}
 
 			if (source.reg_type != RSX_VP_REGISTER_TYPE_TEMP)
 			{
+				// Innermost operand is a constant or an address register, so nothing this matcher
+				// understands produced the position.
+				result.affine_reason = "source-not-temp";
 				break;
 			}
 
@@ -4740,6 +4871,9 @@ namespace remix_rsx
 				result.prescale_scale_slot = prescale.scale_slot;
 				result.prescale_scale_component = prescale.scale_component;
 				result.prescale_bias_slot = prescale.bias_slot;
+				// Matched by an earlier, tighter shape - const_affine is never consulted, and
+				// 'untried' on a decoded program would read as a failure rather than a bypass.
+				result.affine_reason = "prescale";
 				reached_input = true;
 				break;
 			}
@@ -4750,6 +4884,7 @@ namespace remix_rsx
 			if (wdivide_result wdivide{}; match_wdivide(prog, source.index, chain.first_instruction, wdivide) && wdivide.attribute == 0)
 			{
 				result.has_wdivide = true;
+				result.affine_reason = "wdivide";
 				reached_input = true;
 				break;
 			}
@@ -4790,6 +4925,15 @@ namespace remix_rsx
 
 			target = walk_target{ false, source.index };
 			before = chain.first_instruction;
+		}
+
+		// Catch-all for the walk exits that reach neither a matcher nor one of the labelled breaks
+		// above: no chain found at all, or the group limit reached with temps still to follow.
+		// Every refusal that gets a census line should say something; 'untried' surviving to the
+		// log means an exit was added without a reason, which is exactly how this gap opened.
+		if (std::string_view{result.affine_reason} == "untried")
+		{
+			result.affine_reason = (count == 0) ? "no-chain" : "walk-exhausted";
 		}
 
 		if (count == 0)
@@ -6362,6 +6506,13 @@ namespace remix_rsx
 		// env_u32 rather than env_flag, same reason texcoord_from_ucode gives: the useful setting is
 		// the off one.
 		static const u32 value = env_u32(L"RPCS3_REMIX_FPALBEDO", 1);
+		return value != 0;
+	}
+
+	bool texcoord_scale_from_ucode()
+	{
+		// On by default and the useful setting is the off one, so env_u32 rather than env_flag.
+		static const u32 value = env_u32(L"RPCS3_REMIX_UVSCALEUCODE", 1);
 		return value != 0;
 	}
 

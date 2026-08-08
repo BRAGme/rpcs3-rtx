@@ -159,6 +159,11 @@ private:
 		// the stats from a draw whose title feeds no texcoord attribute at all. Not a subset of
 		// uv_none: the scan may refuse attribute 1 here and still resolve a later one.
 		u64 uv_nonfinite = 0;
+		// S32K texcoord draws whose divisor came from the constant slot the vertex program
+		// multiplies by, rather than the fixed UVINTSCALE. Reads against uv_applied: on Haze this
+		// should cover the population that was tiling 8x, and on a title whose ucode names no
+		// scale it stays 0 and nothing changes.
+		u64 uv_scale_ucode = 0;
 		// Untextured draws that left with the title's own ATTR3 colour instead of flat white.
 		u64 vcol_applied = 0;
 		// Times a referenced texture unit yielded no material and the next one was tried.
