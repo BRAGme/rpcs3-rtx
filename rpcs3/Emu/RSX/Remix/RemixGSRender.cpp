@@ -6943,9 +6943,18 @@ void RemixGSRender::submit_subdraw()
 		// Same closed form the sky anchor uses: the instance transform's translation against the
 		// eye. R2's viewmodel reads 0.446 against a nearest same-frame world draw of 8.930.
 		f32 anchor = 0.f;
-		const bool measured = is_viewmodel && world_resolved && m_active_camera.valid;
 
-		if (is_viewmodel)
+		// Measured for every *considered* draw, not only tagged ones. On a title the depth rule
+		// selects, the two populations are the same and this changes nothing. On Haze (BLUS30094)
+		// the rule selects nothing at all - vm_tagged=0 of vm_considered=353598, because it reports
+		// scale_z=0.49875 offset_z=0.50125 on every draw in the scene including the sky dome, so
+		// there is no depth signal to threshold - and gating the measurement on the tag meant the
+		// census printed anchor=0 measured=0 on every line and could not be used to look for a
+		// replacement discriminator. The anchor is the obvious candidate: first-person geometry is
+		// camera-locked, so its instance translation should sit ~0 from the eye every frame, which
+		// is the same closed form the sky anchor already uses from the other end of the scale.
+		const bool measured = world_resolved && m_active_camera.valid;
+
 		{
 			if (measured)
 			{
