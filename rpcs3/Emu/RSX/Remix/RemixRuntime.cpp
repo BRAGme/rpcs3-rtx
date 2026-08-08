@@ -10,20 +10,24 @@
 
 // ---------------------------------------------------------------------------------------------
 // Runtime provenance. The vendored header and the deployed runtime MUST come from the same
-// release tag, always in the same commit -- the API's version gate only compares the minor
-// number, so two builds of the same minor with a different interface layout would pass the
-// check and then misroute every slot after the first divergence.
+// source commit, always in the same commit here -- the API's version gate only compares the
+// minor number, so two builds of the same minor with a different interface layout would pass
+// the check and then misroute every slot after the first divergence.
 //
 //   Fork          : RemixProjGroup/dxvk-remix ("Remix Plus", maintainer Kim2091)
-//   Release tag   : remix-plus-1.5.1        (tag object f4173a9c8b94736363cb27c3bd228059780acbcf)
-//   Tagged commit : 8afa36fdecc60e8d3ec57b360e5fd14158b39aea
+//   Source commit : 6476faeaf148b0314c4e03480e48445e796afe5c, branch numos3 (BRAGme/dxvk-remix)
+//                   Past remix-plus-1.5.1, whose copy is still blob 3f4acf5f.../0.1000.0.
 //   API version   : 0.1000.1
 //   remix_c.h     : blob ae61b5db53fa40e1563a47b07822cbbcd4122e9f, 55351 bytes
 //                   SHA-256 693334BE266D380BFE324FCBF2675849E98757CCC5BEB4224A2ED9FB20C6C4F5
-//                   (byte-identical to public/include/remix/remix_c.h at dxvk-remix commit
-//                    6476faeaf148b0314c4e03480e48445e796afe5c, branch numos3 -- past the tag,
-//                    whose copy is still blob 3f4acf5f.../0.1000.0)
-//   Runtime asset : Remix_Plus_v1.5.1_x64_games_release.zip, deployed to <exe dir>\remix\
+//                   (byte-identical to public/include/remix/remix_c.h at that commit)
+//   Runtime asset : local build of that commit -- NOT the Remix_Plus_v1.5.1 release zip, which
+//                   predates the VIEW_MODEL category bit this backend relies on. Deployed to
+//                   <exe dir>\remix\; d3d9.dll is
+//                   SHA-256 A20E4B72D26D919E1011639D0A64DBCA8575B5D404FD2B11E2D649576C4B568A.
+//                   Built from a dirty tree (12 files modified, none of them remix_c.h or the
+//                   API implementation, so the surface still matches the header above), which
+//                   means the commit alone does not reproduce it -- identify the binary by hash.
 //
 // Never update bin\remix\ without re-vendoring remix_c.h in the same commit.
 // ---------------------------------------------------------------------------------------------
