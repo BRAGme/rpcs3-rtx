@@ -85,6 +85,14 @@ private:
 		// identity. Counted separately so world_fallback stays comparable across every run
 		// taken before the refusal existed. RPCS3_REMIX_DRAWNOWORLD=1 drives this back to 0.
 		u64 world_refused = 0;
+
+		// The world_refused subset that failed only because the frame had no camera at all -
+		// per_draw_transform refuses on !m_active_camera.valid before it looks at the program.
+		// Split out because the two have completely different fixes: this one is a camera that
+		// did not resolve for the whole frame, the remainder is a vertex program whose matrix
+		// chain could not be read. Inferring the ratio from flip counts put it near 92%, which
+		// is far too load-bearing a number to leave as arithmetic on two other counters.
+		u64 world_refused_nocam = 0;
 		// Draws whose world came from folding the *whole* group chain of a layered program under a
 		// fused reference camera, instead of only its outermost group. Appended after world_refused
 		// rather than folded into it so captures taken before the full-chain fold existed stay
