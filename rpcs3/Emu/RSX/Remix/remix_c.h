@@ -64,7 +64,7 @@
 // further breaking ABI change.
 #define REMIXAPI_VERSION_MAJOR 0
 #define REMIXAPI_VERSION_MINOR 1000
-#define REMIXAPI_VERSION_PATCH 0
+#define REMIXAPI_VERSION_PATCH 1
 
 
 // External
@@ -225,11 +225,6 @@ extern "C" {
     // Default: false. Use VkSwapchainKHR to present frame into HWND.
     remixapi_Bool       forceNoVkSwapchain;
     remixapi_Bool       editorModeEnabled;
-    // With this disabled, the user must fetch the GUI buffer using 
-    // the, remixapi_dxvk_CopyRenderingOutputType, api with the, 
-    // remixapi_dxvk_CopyRenderingOutputType, field set to: 'REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_GUI'
-    // Otherwise the GUI will be drawn in the final color buffer.
-    remixapi_Bool       combineGuiInFinalColor;
   } remixapi_StartupInfo;
 
   typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_Startup)(const remixapi_StartupInfo* info);
@@ -507,7 +502,22 @@ extern "C" {
     REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_TRANSPARENCY_LAYER = 1 << 22,
     REMIXAPI_INSTANCE_CATEGORY_BIT_PARTICLE_EMITTER          = 1 << 23,
     REMIXAPI_INSTANCE_CATEGORY_BIT_SMOOTH_NORMALS            = 1 << 24,
+    // Reserved: allocated by upstream NVIDIA (REMIX-2901, "preserve alpha-tested
+    // hair cards at distance") and declared here so bit 25 stays claimed and this
+    // enum matches upstream/remix-plus-1.5.1 byte-for-byte. This runtime does NOT
+    // implement it yet — there is no InstanceCategories::HairCards, so
+    // toRtCategories() drops the bit. Setting it is harmless and has no effect.
     REMIXAPI_INSTANCE_CATEGORY_BIT_HAIR_CARDS                = 1 << 25,
+    // The first-person arms/weapon. Unlike every other bit here this does not map
+    // to an InstanceCategories member — internally "view model" is a CameraType,
+    // not a category — so toRtCategories() ignores it by design and
+    // categoryToCameraType() turns it into CameraType::ViewModel instead.
+    //
+    // Tagging instances is necessary but not sufficient. The runtime also needs:
+    //   - a REMIXAPI_CAMERA_TYPE_VIEW_MODEL camera submitted every frame (the
+    //     view-model pass is skipped outright when that camera is invalid, and it
+    //     builds its correction matrix from both that camera and the world one), and
+    //   - rtx.viewModel.enable = True, which defaults to False.
     REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL                = 1 << 26,
   } remixapi_InstanceCategoryBit;
 
@@ -866,7 +876,6 @@ extern "C" {
     REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_DEPTH = 1,
     REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_NORMALS = 2,
     REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_OBJECT_PICKING = 3,
-    REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_GUI = 4,
   } remixapi_dxvk_CopyRenderingOutputType;
 
   typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_dxvk_CopyRenderingOutput)(
