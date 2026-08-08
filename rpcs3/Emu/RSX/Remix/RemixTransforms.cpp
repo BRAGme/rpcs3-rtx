@@ -6375,9 +6375,18 @@ namespace remix_rsx
 
 	bool retry_unsupported_enabled()
 	{
-		// Same shape as fp_albedo_enabled: on by default, and the useful setting is the off one,
-		// which restores fp_albedo_enabled's guard to the unconditional form it had before.
-		static const u32 value = env_u32(L"RPCS3_REMIX_RETRYUNSUP", 1);
+		// Shipped on, then measured off. The rule was sound in principle - a unit refused for its
+		// format holds no albedo to lose, so walking past it cannot be the substitution the guard
+		// prevents - but on Haze the *next* unit is frequently not the diffuse map either. One
+		// in-world capture: tex_unit_substituted went 4 -> 3445 as the walk widened, and the
+		// visible result was character face textures painted onto tree trunks. It also never did
+		// the job it was added for: tex_none stayed at 790122 of 2939973 submitted, because for
+		// ~99% of the walks no higher unit yields a material at all.
+		//
+		// So this defers to the principle the guard was written on and this backend states
+		// everywhere else - a missing texture is better than a wrong one. Off by default;
+		// RPCS3_REMIX_RETRYUNSUP=1 restores the walk. Counter: tex_retry_unsupported.
+		static const u32 value = env_u32(L"RPCS3_REMIX_RETRYUNSUP", 0);
 		return value != 0;
 	}
 

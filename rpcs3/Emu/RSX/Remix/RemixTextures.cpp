@@ -323,7 +323,11 @@ namespace remix_rsx
 		// latter tells the runtime to read the alpha state from a remixapi_InstanceInfoBlendEXT
 		// this backend never chains, so the state was neither the title's nor the material's.
 		// Take it from the RSX registers, where it actually lives.
-		if (!alpha_state_disabled() && rsx::method_registers.alpha_test_enabled())
+		// Recorded here rather than derived from desc.alpha_func at creation time, because ALWAYS
+		// is both the "no test" default and a value a title can legitimately set.
+		const bool alpha_tested = !alpha_state_disabled() && rsx::method_registers.alpha_test_enabled();
+
+		if (alpha_tested)
 		{
 			// RSX comparison_function is CELL_GCM_NEVER..CELL_GCM_ALWAYS = 0x200..0x207, and
 			// VkCompareOp (which is what the runtime's alphaTestType is) is 0..7 in the same
@@ -514,6 +518,11 @@ namespace remix_rsx
 		}
 
 		auto inserted = m_entries.emplace(key, std::move(entry));
+
+		if (!alpha_tested)
+		{
+			++m_stats.materials_untested;
+		}
 
 		if (out_entry)
 		{

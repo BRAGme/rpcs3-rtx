@@ -101,6 +101,15 @@ namespace remix_rsx
 		// handful of bad descriptors inflate it without bound and it cannot be read as "how
 		// many textures does this title bind that we cannot decode". This split can.
 		u64 tombstone_hits = 0;
+
+		// Materials created while the RSX alpha test was disabled, i.e. whose alphaTestType is
+		// ALWAYS and whose transparency - if it has any - can only come from the per-draw blend
+		// state chained onto the instance, never from the material itself. Alpha state is part of
+		// texture_descriptor::key(), so this is not a staleness measure: the same texture bound
+		// under a real alpha test gets its own entry and is counted separately. Read it against
+		// 'materials'. High here on a title whose foliage looks like solid cards says the cutout
+		// is blend-driven and the material is not the place to look; near zero says the opposite.
+		u64 materials_untested = 0;
 	};
 
 	// Per-draw albedo texture cache. Owns every remixapi texture and material it creates.
