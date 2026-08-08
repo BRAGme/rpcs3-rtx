@@ -1752,6 +1752,40 @@ namespace remix_rsx
 
 					if (in.src[0].reg_type != RSX_VP_REGISTER_TYPE_INPUT)
 					{
+						// ...unless this is the placement MAD match_basis_affine already expresses:
+						// 'temp * cS.w + cS.xyz', both constants necessarily naming the same slot.
+						// It sits between the palette and the outer group and is applied separately
+						// in prepend_object_space, so the walk steps through it - the decode it is
+						// looking for is below it. On ba93cfeb/f7576a48 that decode is
+						//     9:MAD>r1.xyz(I0.xyzx,C0.wwww,T1.xyzx)c45i0
+						// and before this step-through the walk stopped one instruction short of it
+						// at the basis MAD and refused with 'mad-src0-not-input'.
+						//
+						// Gated on the same knob that applies the basis, so the two can never
+						// disagree about whether that step is handled: with the knob off nothing
+						// applies the placement, and stepping through it here would silently drop
+						// it from the transform rather than merely leaving it unexpressed.
+						const bool basis_shape =
+							in.src[0].reg_type == RSX_VP_REGISTER_TYPE_TEMP
+							&& in.src[1].reg_type == RSX_VP_REGISTER_TYPE_CONSTANT
+							&& in.src[2].reg_type == RSX_VP_REGISTER_TYPE_CONSTANT
+							&& in.src[1].swz_x == 3 && in.src[1].swz_y == 3 && in.src[1].swz_z == 3
+							&& is_identity_xyz_swizzle(in.src[2])
+							&& is_identity_xyz_swizzle(in.src[0])
+							&& !in.src[0].neg && !in.src[1].neg && !in.src[2].neg;
+
+						if (basis_shape && basis_affine_enabled())
+						{
+							if (sca_touches_xyz(in.src[0].tmp_src, chosen))
+							{
+								return refuse("basis-step-sca-xyz");
+							}
+
+							prog.collect_vec_writers(walk_target{ false, in.src[0].tmp_src }, writers, chosen);
+							cursor = chosen;
+							break;
+						}
+
 						return refuse("mad-src0-not-input");
 					}
 
@@ -6289,6 +6323,14 @@ namespace remix_rsx
 		// env_u32 rather than env_flag, same reason texcoord_from_ucode gives: the useful setting is
 		// the off one.
 		static const u32 value = env_u32(L"RPCS3_REMIX_FPALBEDO", 1);
+		return value != 0;
+	}
+
+	bool retry_unsupported_enabled()
+	{
+		// Same shape as fp_albedo_enabled: on by default, and the useful setting is the off one,
+		// which restores fp_albedo_enabled's guard to the unconditional form it had before.
+		static const u32 value = env_u32(L"RPCS3_REMIX_RETRYUNSUP", 1);
 		return value != 0;
 	}
 

@@ -360,6 +360,19 @@ namespace remix_rsx
 			{
 				++m_stats.unsupported;
 				++m_stats.tombstone_hits;
+
+				// Published even though the bind failed, so a caller walking texture units can
+				// tell a *permanent format* refusal from every other null. Haze binds a
+				// 2048x2048 DEPTH16 shadow map (fmt=92) on the lowest referenced unit of every
+				// shadow-receiving draw: 55,360 refusals in one capture, and the albedo it
+				// wanted is on a higher unit. A caller that cannot see the reason has to treat
+				// this like any other miss. Safe for the refresh_pixels caller, which nulls any
+				// entry with empty pixels - which an unsupported entry always has.
+				if (out_entry)
+				{
+					*out_entry = &entry;
+				}
+
 				return nullptr;
 			}
 
@@ -468,9 +481,17 @@ namespace remix_rsx
 
 		if (!decode(tex, entry))
 		{
-			// Remember the failure so the same descriptor is not retried every draw.
+			// Remember the failure so the same descriptor is not retried every draw. The entry
+			// is published for the same reason as the tombstone path above: this is a permanent
+			// format refusal, and the unit walk has to be able to see that.
 			entry.unsupported = true;
-			m_entries.emplace(key, std::move(entry));
+			auto inserted = m_entries.emplace(key, std::move(entry));
+
+			if (out_entry)
+			{
+				*out_entry = &inserted.first->second;
+			}
+
 			return nullptr;
 		}
 
@@ -481,7 +502,14 @@ namespace remix_rsx
 			entry.unsupported = true;
 			entry.pixels.clear();
 			entry.pixels.shrink_to_fit();
-			m_entries.emplace(key, std::move(entry));
+
+			auto inserted = m_entries.emplace(key, std::move(entry));
+
+			if (out_entry)
+			{
+				*out_entry = &inserted.first->second;
+			}
+
 			return nullptr;
 		}
 

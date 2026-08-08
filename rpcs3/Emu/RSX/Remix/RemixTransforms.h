@@ -716,6 +716,16 @@ namespace remix_rsx
 	// default; the bisect knob for reading the colour source out of the fragment program.
 	bool fp_albedo_enabled();
 
+	// RPCS3_REMIX_RETRYUNSUP: let the albedo unit walk step past a unit that bind() refused for a
+	// permanent format reason, instead of stopping on fp_albedo_enabled's guard. That guard exists
+	// to stop a normal map being substituted for a diffuse map, which cannot be what is happening
+	// when the unit in hand holds nothing bindable at all. Haze (BLUS30094) puts a 2048x2048
+	// DEPTH16 shadow map on the lowest referenced unit of every shadow-receiving draw and its
+	// ucode names no albedo unit (tex_albedo_ucode=0), so the guard fired unconditionally and
+	// 55,360 draws in one capture reached Remix untextured. On by default; `0` restores the
+	// unconditional guard. Counter: tex_retry_unsupported.
+	bool retry_unsupported_enabled();
+
 	// RPCS3_REMIX_POSAFFINE=0: ignore vp_fingerprint::has_const_affine and stop refusing draws whose
 	// recognised position decode could not be rebuilt - the behaviour up to and including fdada2e,
 	// where a program that decodes 'pos = attr * c[S] (+ c[B])' outside a single MAD had the decode

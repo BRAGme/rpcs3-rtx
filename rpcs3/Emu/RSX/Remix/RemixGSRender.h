@@ -177,6 +177,13 @@ private:
 		// DXT45 binds, zero DXT1, the normal map - and bound it as albedo. That is the flat blue.
 		// A missing texture is better than a wrong one, so the draw leaves untextured and says so.
 		u64 tex_retry_refused = 0;
+		// Times the walk stepped past a unit that bind() refused for a permanent format reason
+		// (a tombstoned descriptor) rather than letting tex_retry_refused stop it. There is no
+		// good albedo on such a unit to substitute away from, so the guard above does not apply.
+		// Reads against tex_unsupported: on Haze the two should track, because its refused unit
+		// is one 2048x2048 DEPTH16 shadow map bound by every shadow-receiving draw. If this is
+		// high while tex_unit_substituted stays 0, the walk is running but finding nothing.
+		u64 tex_retry_unsupported = 0;
 		// Draws whose material came from a unit other than the first one chosen, i.e. a retry
 		// actually substituted. Non-zero with tex_albedo_ucode high is the healthy case (Haze's
 		// COMPRESSED_HILO8 normal map below its diffuse); non-zero with tex_albedo_guess high is

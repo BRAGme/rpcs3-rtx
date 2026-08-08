@@ -6311,7 +6311,26 @@ void RemixGSRender::submit_subdraw()
 				break;
 			}
 
-			if (remix_rsx::fp_albedo_enabled() && !unit_from_ucode)
+			// A unit refused for a permanent *format* reason is not a texture this backend could
+			// ever bind, so walking past it is not the substitution the guard below exists to
+			// prevent - there is no good albedo on this unit to lose. Haze (BLUS30094) is the
+			// case: every shadow-receiving draw names a 2048x2048 DEPTH16 shadow map (fmt=92) on
+			// its lowest referenced unit, the only refused format in a whole capture, and the
+			// diffuse map it wants sits on a higher one. Measured 2026-08-08 in-world:
+			// tex_unsupported=55360, tex_tombstone=55359 and tex_retry_refused=55360 are the same
+			// population, with tex_unit_retry=0 - i.e. the guard fired on every one of them and
+			// the walk never once ran. That is the untextured white on the legs, the helmet and
+			// the sky dome. Haze reports tex_albedo_ucode=0, so unit_from_ucode is *always* false
+			// here and the guard can never not fire; the R2 reasoning below is sound but its
+			// precondition does not hold for a title whose ucode names no albedo unit at all.
+			// RPCS3_REMIX_RETRYUNSUP=0 restores the unconditional guard.
+			const bool unit_unsupported = entry && entry->unsupported;
+
+			if (unit_unsupported && remix_rsx::retry_unsupported_enabled())
+			{
+				++m_stats.tex_retry_unsupported;
+			}
+			else if (remix_rsx::fp_albedo_enabled() && !unit_from_ucode)
 			{
 				// The program named no *other* colour source, so there is nothing this walk can
 				// legitimately substitute - only the next referenced unit, which is the hazard the
@@ -8070,7 +8089,7 @@ void RemixGSRender::log_stats()
 		"vmcam_census=%u vmcam_mode=%u | "
 		"cat_hidden=%llu cat_particle=%llu cat_decal=%llu | "
 		"blend_chained=%llu blend_translucent=%llu blend_unmapped=%llu | "
-		"tex_bound=%llu tex_none=%llu tex_no_unit=%llu tex_unit_retry=%llu tex_albedo_ucode=%llu tex_albedo_guess=%llu tex_retry_refused=%llu tex_unit_substituted=%llu uv_applied=%llu uv_none=%llu uv_absent=%llu uv_layout=%llu uv_memory=%llu uv_fallback=%llu uv_ucode=%llu uv_heuristic=%llu uv_nonfinite=%llu vcol_applied=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_tombstone=%llu tex_rehashed=%llu tex_refreshed=%llu mat_created=%llu | "
+		"tex_bound=%llu tex_none=%llu tex_no_unit=%llu tex_unit_retry=%llu tex_albedo_ucode=%llu tex_albedo_guess=%llu tex_retry_refused=%llu tex_unit_substituted=%llu uv_applied=%llu uv_none=%llu uv_absent=%llu uv_layout=%llu uv_memory=%llu uv_fallback=%llu uv_ucode=%llu uv_heuristic=%llu uv_nonfinite=%llu vcol_applied=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_tombstone=%llu tex_rehashed=%llu tex_refreshed=%llu mat_created=%llu tex_retry_unsupported=%llu | "
 		"ui_draws=%llu ui_skipped=%llu ui_no_colour=%llu ui_rt=%llu ui_prims=%llu ui_frames=%llu ui_ndc=%llu ui_unit=%llu ui_pixel=%llu ui_nospace=%llu ui_ortho2d=%llu "
 		"ui_vpydown=%llu ui_vpyup=%llu ui_vpfallback=%llu ui_vflip_ndc=%llu/%llu ui_vflip_pixel=%llu/%llu ui_vflip_abstain=%llu | "
 		"zcull_av=%llu zcull_av_handled=%llu",
@@ -8236,6 +8255,7 @@ void RemixGSRender::log_stats()
 		tex.rehashed,
 		tex.refreshed,
 		tex.materials,
+		m_stats.tex_retry_unsupported,
 		m_stats.ui_draws,
 		m_stats.ui_skipped,
 		m_stats.ui_no_colour,
