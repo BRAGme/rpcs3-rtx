@@ -9,6 +9,7 @@
 #include "Emu/RSX/Remix/RemixTransforms.h"
 #include "Emu/RSX/Remix/RemixVertexDecode.h"
 
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -1208,6 +1209,62 @@ private:
 	const remix_rsx::fp_fingerprint* m_current_fp_fingerprint = nullptr;
 
 	camera_candidate m_frame_candidate{};
+	// --- click-to-identify ---------------------------------------------------------------
+	//
+	// Remix's own dev-menu picker ("hover over an object on screen") cannot resolve a draw
+	// this backend submits, and no amount of binding fixes it. The runtime maps a picked
+	// pixel to a texture through DrawCallMetaInfo::legacyTextureHash, which SceneManager
+	// fills from drawCallState.getMaterialData().getColorTexture().getImageHash() - and
+	// toRtDrawState() assigns 'materialData.colorTextures[0] = TextureRef {}' for every
+	// external draw (rtx_remix_api.cpp:920). The lookup therefore reads an empty hash and
+	// the hover readout stays blank by construction, which is exactly the "can't click on
+	// any textures" symptom. The texture grid still populates because that is fed by
+	// CreateTexture, on a different path.
+	//
+	// The picking *machinery* is unaffected: the runtime writes each instance's
+	// remixapi_InstanceInfoObjectPickingEXT::objectPickingValue into a G-buffer and reads
+	// it back for a screen rect. Only the value->texture mapping is missing, and that is
+	// ours to supply. So every instance is numbered, the value under the cursor is asked
+	// for, and the identity is looked up on this side - which also lets the answer carry
+	// the vertex-program hash and the sky/viewmodel verdict, neither of which Remix could
+	// have reported even on the D3D9 path.
+	struct pick_record
+	{
+		u64 vp_hash = 0;
+		u64 albedo_hash = 0;
+		u32 vertex_count = 0;
+		f32 extent = 0.f;
+		bool sky = false;
+		bool viewmodel = false;
+	};
+
+	// A frame that submits more draws than this stops numbering them rather than growing
+	// without bound. Haze peaks around 1500 instances a frame, so this is slack, not a cut.
+	static constexpr usz s_max_pick_records = 16384;
+
+	// index + 1 == objectPickingValue, so 0 stays "nothing was drawn here".
+	std::vector<pick_record> m_pick_table;
+
+	// The table as it stood on the frame the request was made. Readback lands one or more
+	// frames later, by which time m_pick_table has been rebuilt, so it cannot be consulted.
+	std::vector<pick_record> m_pick_snapshot;
+	std::mutex m_pick_mutex;
+
+	// Frames left to keep re-requesting. The runtime only allocates the object-picking
+	// target once a request has been seen (rtx_context.cpp:2052), so the first request
+	// after a click reliably reads back nothing; retrying for a few frames is what makes a
+	// single click work.
+	u32 m_pick_frames_left = 0;
+	s32 m_pick_x = 0;
+	s32 m_pick_y = 0;
+	bool m_pick_button_down = false;
+
+	// Ctrl+Click in the game window, polled once per flip. Deliberately not routed through
+	// rpcs3's input system: that would mean touching a pad handler, and the mouse is not
+	// bound to anything here anyway.
+	void poll_pick_request();
+	static void pick_callback(const u32* values, u32 count, void* user);
+
 	camera_candidate m_active_camera{};
 
 	// The same pair for the viewmodel population, latched independently at the same flip. Only

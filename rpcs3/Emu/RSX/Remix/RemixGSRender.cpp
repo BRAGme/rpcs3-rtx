@@ -642,6 +642,106 @@ void RemixGSRender::on_exit()
 	GSRender::on_exit();
 }
 
+void RemixGSRender::pick_callback(const u32* values, u32 count, void* user)
+{
+	// Called from a runtime thread, not the RSX thread.
+	auto* self = static_cast<RemixGSRender*>(user);
+
+	if (!self || !values || count == 0)
+	{
+		return;
+	}
+
+	std::lock_guard lock(self->m_pick_mutex);
+
+	// Distinct values only. A rect a few pixels across over one surface reads the same value
+	// many times, and the interesting case - two surfaces stacked at the cursor - is exactly
+	// what the duplicates would bury.
+	std::unordered_set<u32> reported;
+
+	for (u32 i = 0; i < count; ++i)
+	{
+		const u32 value = values[i];
+
+		// 0 is the cleared value: nothing was drawn at that pixel.
+		if (value == 0 || value > self->m_pick_snapshot.size() || !reported.insert(value).second)
+		{
+			continue;
+		}
+
+		const pick_record& r = self->m_pick_snapshot[value - 1];
+
+		// albedo=0 is the answer as often as not - it is the tex_none population, the draws
+		// that reach Remix with no texture at all - so it is printed rather than skipped.
+		rsx_log.success("Remix: picked vp=%016llx albedo=%016llx vtx=%u extent=%.4g sky=%d viewmodel=%d",
+			r.vp_hash, r.albedo_hash, r.vertex_count, static_cast<f64>(r.extent),
+			r.sky ? 1 : 0, r.viewmodel ? 1 : 0);
+	}
+
+	if (!reported.empty())
+	{
+		// Stop retrying: the readback landed.
+		self->m_pick_frames_left = 0;
+	}
+}
+
+void RemixGSRender::poll_pick_request()
+{
+	if (!remix_rsx::pick_enabled())
+	{
+		return;
+	}
+
+	const auto& api = m_remix.api();
+
+	if (!api.pick_RequestObjectPicking)
+	{
+		return;
+	}
+
+	// Ctrl+Click rather than a bare click, so ordinary interaction with the window - including
+	// the Remix dev menu, which owns the same cursor - never fires a request.
+	const bool down = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0
+		&& (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+
+	if (down && !m_pick_button_down)
+	{
+		POINT pt{};
+
+		if (GetCursorPos(&pt) && ScreenToClient(m_frame->handle(), &pt))
+		{
+			m_pick_x = pt.x;
+			m_pick_y = pt.y;
+			m_pick_frames_left = 8;
+
+			std::lock_guard lock(m_pick_mutex);
+			m_pick_snapshot = m_pick_table;
+		}
+	}
+
+	m_pick_button_down = down;
+
+	if (m_pick_frames_left == 0)
+	{
+		return;
+	}
+
+	--m_pick_frames_left;
+
+	// A few pixels either side of the cursor. One pixel is unusable in practice - it lands
+	// between the thin geometry the interesting draws are made of - and a wide rect stops
+	// answering the question that was asked.
+	constexpr s32 radius = 3;
+
+	const remixapi_Rect2D region{
+		m_pick_x - radius,
+		m_pick_y - radius,
+		m_pick_x + radius,
+		m_pick_y + radius };
+
+	api.pick_RequestObjectPicking(&region, &RemixGSRender::pick_callback, this);
+}
+
 void RemixGSRender::flip(const rsx::display_flip_info_t& info)
 {
 #ifdef _WIN32
@@ -656,6 +756,11 @@ void RemixGSRender::flip(const rsx::display_flip_info_t& info)
 		}
 
 		submit_camera();
+
+		// Before the table is cleared for the next frame: it still describes the geometry the
+		// user was looking at when they clicked.
+		poll_pick_request();
+		m_pick_table.clear();
 
 		if (remix_rsx::ui_probe_enabled() && m_remix.fork_features() && !remix_rsx::compositor_disabled())
 		{
@@ -7176,6 +7281,31 @@ void RemixGSRender::submit_subdraw()
 		blend_state.pNext = instance.pNext;
 		instance.pNext = &blend_state;
 		++m_stats.blend_chained;
+	}
+
+	// Numbered last, so the value identifies a draw that actually reached DrawInstance and the
+	// table cannot name geometry that was refused somewhere above. Declared at this scope
+	// because the runtime reads the chain during the call below.
+	remixapi_InstanceInfoObjectPickingEXT picking{};
+
+	if (remix_rsx::pick_enabled() && m_pick_table.size() < s_max_pick_records)
+	{
+		pick_record record{};
+		record.vp_hash = m_current_vp_hash;
+		record.albedo_hash = albedo_hash;
+		record.vertex_count = vertex_count;
+		record.extent = m_streak_extent;
+		record.sky = is_sky;
+		record.viewmodel = is_viewmodel;
+		m_pick_table.push_back(record);
+
+		picking.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_OBJECT_PICKING_EXT;
+
+		// 1-based: the G-buffer clears to 0, so 0 has to stay "no draw here" and cannot be a
+		// legitimate index.
+		picking.objectPickingValue = static_cast<u32>(m_pick_table.size());
+		picking.pNext = instance.pNext;
+		instance.pNext = &picking;
 	}
 
 	const u32 status = remix_rsx::guarded_draw_instance(api.DrawInstance, &instance);

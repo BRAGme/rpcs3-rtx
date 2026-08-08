@@ -6609,6 +6609,12 @@ namespace remix_rsx
 		return value != 0;
 	}
 
+	bool pick_enabled()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_PICK", 1);
+		return value != 0;
+	}
+
 	bool sky_learn_dome_enabled()
 	{
 		// On by default and the useful setting is the off one, so env_u32 rather than env_flag -

@@ -750,6 +750,13 @@ namespace remix_rsx
 	// which is the A/B against uv_scale_ucode / uv_scale_fixed.
 	bool texcoord_scale_temp_form();
 
+	// RPCS3_REMIX_PICK: number every submitted instance and answer Ctrl+Click in the game window
+	// with the vertex-program hash, albedo hash and sky/viewmodel verdict of whatever is under the
+	// cursor, logged at 'Remix: picked'. Exists because Remix's own dev-menu picker is blank for
+	// external draws by construction - see the pick_record comment in RemixGSRender.h. On by
+	// default; the cost is one pNext struct and one vector push per instance.
+	bool pick_enabled();
+
 	bool sky_learn_dome_enabled();
 
 	// RPCS3_REMIX_RETRYUNSUP: let the albedo unit walk step past a unit that bind() refused for a
