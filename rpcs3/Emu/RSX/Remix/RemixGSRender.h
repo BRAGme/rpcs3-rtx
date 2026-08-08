@@ -1282,6 +1282,12 @@ private:
 	std::unordered_set<u64> m_world_refused_seen;
 	u32 m_world_refused_lines = 0;
 
+	// Which exit per_draw_transform took when it refused. Fourteen returns share one counter,
+	// and the last round proved how expensive guessing between them is: the camera-less-frame
+	// theory predicted ~92% of world_refused and measured 0.11%. Set at each return, printed by
+	// the world-refused census, so the population is named rather than modelled.
+	const char* m_world_fail = "";
+
 	bool m_sky_camera_warned = false;
 	bool m_pick_slot_warned = false;
 	bool m_pick_request_warned = false;

@@ -5376,6 +5376,7 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 
 	if (!m_active_camera.valid || remix_rsx::nocam_enabled())
 	{
+		m_world_fail = "nocam";
 		return false;
 	}
 
@@ -5519,6 +5520,7 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 		if (remix_rsx::mat4 probe{}; !remix_rsx::build_prescale(fp, probe))
 		{
 			++m_stats.pos_decode_refused;
+			m_world_fail = "idxworld";
 			return false;
 		}
 	}
@@ -5540,6 +5542,7 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 				remix_rsx::slot_block slots{};
 				if (!remix_rsx::read_slot_block(fp.group_base[i], slots))
 				{
+					m_world_fail = "sl_group";
 					return false;
 				}
 
@@ -5550,6 +5553,7 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 
 			if (!remix_rsx::mat4_is_finite(world) || !remix_rsx::is_affine(world, s_world_affine_tolerance))
 			{
+				m_world_fail = "sl_bone";
 				return false;
 			}
 
@@ -5571,6 +5575,7 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 				remix_rsx::slot_block slots{};
 				if (!remix_rsx::read_slot_block(fp.group_base[i], slots))
 				{
+					m_world_fail = "lay_group";
 					return false;
 				}
 
@@ -5586,6 +5591,7 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 			remix_rsx::slot_block slots{};
 			if (!remix_rsx::read_slot_block(fp.outer_base(), slots))
 			{
+				m_world_fail = "lay_ref";
 				return false;
 			}
 
@@ -5598,6 +5604,7 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 		}
 		else
 		{
+			m_world_fail = "fused_vpi";
 			return false;
 		}
 
@@ -5609,6 +5616,7 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 	{
 		if (!fp.has_outer())
 		{
+			m_world_fail = "lay_other";
 			return false;
 		}
 
@@ -5638,6 +5646,7 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 				remix_rsx::slot_block slots{};
 				if (!remix_rsx::read_slot_block(fp.group_base[i], slots))
 				{
+					m_world_fail = "ref_group";
 					return false;
 				}
 
@@ -5651,6 +5660,7 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 			remix_rsx::slot_block slots{};
 			if (!remix_rsx::read_slot_block(fp.outer_base(), slots))
 			{
+				m_world_fail = "ref_bone";
 				return false;
 			}
 
@@ -5704,6 +5714,7 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 				// missing object is shippable, a smeared one is not.
 				++m_stats.viewmodel_cam_refused;
 				report_viewmodel_camera_census(vm_mode >= 2 ? "REFUSED:noref" : "REFUSED:mode1");
+				m_world_fail = "ref_vm";
 				return false;
 			}
 		}
@@ -5719,11 +5730,13 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 	}
 	else
 	{
+		m_world_fail = "ref_none";
 		return false;
 	}
 
 	if (!remix_rsx::mat4_is_finite(world))
 	{
+		m_world_fail = "no_reference";
 		return false;
 	}
 
@@ -5786,6 +5799,7 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 
 	if (!remix_rsx::is_affine(world, s_world_affine_tolerance))
 	{
+		m_world_fail = "tail";
 		return false;
 	}
 
@@ -6844,7 +6858,7 @@ void RemixGSRender::submit_subdraw()
 
 			const std::string line = fmt::format(
 				"Remix world-refused: vp=%016llx arch=%s vtx=%u skinned=%d prescale=%d affine=%d "
-				"consts=%u chain=%u indexed=%d note=%s areason=%s | frame=%llu line=%u/%u",
+				"consts=%u chain=%u indexed=%d fail=%s note=%s areason=%s | frame=%llu line=%u/%u",
 				m_current_vp_hash,
 				m_current_fingerprint ? remix_rsx::archetype_name(m_current_fingerprint->archetype) : "none",
 				vertex_count,
@@ -6854,6 +6868,7 @@ void RemixGSRender::submit_subdraw()
 				m_current_fingerprint ? m_current_fingerprint->distinct_consts : 0u,
 				m_current_fingerprint ? m_current_fingerprint->chain_instructions : 0u,
 				(m_current_fingerprint && m_current_fingerprint->indexed_const) ? 1 : 0,
+				m_world_fail,
 				m_current_fingerprint ? m_current_fingerprint->note : "no fingerprint",
 				m_current_fingerprint ? m_current_fingerprint->affine_reason : "",
 				m_frame_counter,
