@@ -5844,6 +5844,26 @@ namespace remix_rsx
 		return static_cast<f32>(value);
 	}
 
+	f32 vertex_spread_ratio()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_VTXSPREAD", 64);
+		return static_cast<f32>(value);
+	}
+
+	bool vertex_spread_refuse()
+	{
+		static const bool value = env_flag(L"RPCS3_REMIX_VTXREFUSE");
+		return value;
+	}
+
+	f32 streak_extent_ratio()
+	{
+		// env_u32 rather than env_flag: 0 is the meaningful setting (it restores 81af315) and
+		// env_flag cannot tell "set to 0" from "not set at all".
+		static const u32 value = env_u32(L"RPCS3_REMIX_STREAKGATE", 128);
+		return static_cast<f32>(value);
+	}
+
 	bool wbuffer_z_enabled()
 	{
 		static const u32 value = env_u32(L"RPCS3_REMIX_WBUFFERZ", 1);
@@ -5931,7 +5951,7 @@ namespace remix_rsx
 	f32 sky_min_extent()
 	{
 		static const f32 env = env_float(L"RPCS3_REMIX_SKYEXTENT", -1.f);
-		return env >= 0.f ? env : g_cfg.video.remix.sky_extent;
+		return env >= 0.f ? env : static_cast<f32>(g_cfg.video.remix.sky_extent);
 	}
 
 	f32 sky_max_anchor()
@@ -5966,6 +5986,51 @@ namespace remix_rsx
 		return value;
 	}
 
+	u32 sky_hash_mode()
+	{
+		// Default 1 (measure, tag nothing) - RPCS3_REMIX_SKYHASH=0 is 81af315 exactly.
+		//
+		// Measure-first because the hashes this learns from cannot be replayed out of any capture
+		// taken before it: nothing in the backend has ever written an albedo hash and a draw's
+		// world-space shape on the same line. 'Remix tex=' is emitted once per unique texture at
+		// creation and carries no draw context; 'Remix sky-census:' carries the draw and no hash.
+		// So the fraction of submitted draws a hash rule would cover was not a number anyone had,
+		// and arming a rule on a number nobody has is the exact shape of the ae94587 regression
+		// (cat_sky=825915 of 2038738 draws, 40.5%, scene uniformly blue). Mode 1 produces that
+		// number in one ordinary run - sky_hash_dome / sky_hash_matched / sky_hash_rejected in the
+		// stats line, and 'Remix sky-hash-census:' naming the hashes and the programs - and mode 2
+		// acts on it.
+		//
+		// The rule itself is deliberately not a threshold. A hash is armed only when *every* draw
+		// carrying it has been dome-shaped (camera inside its transformed AABB, world extent past
+		// sky_min_extent(), and at least s_sky_backdrop_min_units_per_vertex of extent per vertex)
+		// over at least s_sky_hash_min_draws draws. One non-dome draw disqualifies the hash for the
+		// life of the process, so the false-positive population is not "draws below a threshold" -
+		// it is "textures this title uses on nothing but a dome", which is a much smaller set and
+		// one the census names before anything is tagged.
+		//
+		// RPCS3_REMIX_CAT_SKY is the manual form of the same thing and predates this: it takes an
+		// explicit comma-separated hash list and tags it unconditionally through classify_draw().
+		// Use it to pin the answer once the census has been read; this knob is what produces the
+		// list to pin.
+		static const u32 value = env_u32(L"RPCS3_REMIX_SKYHASH", 1);
+		return value;
+	}
+
+	u32 viewmodel_mode()
+	{
+		// Default 2 (tag). Unlike sky_backdrop_mode, which ships at 1 because tagging it wrong
+		// paints the scene blue, this one cannot currently change a pixel: the runtime this
+		// backend targets has no bit 26 to receive (dxvk-remix-numos3 public/include/remix/
+		// remix_c.h stops at SMOOTH_NORMALS = 1 << 24, and rtx_remix_api.cpp toRtCategories()
+		// maps bits 0..24 by name under a static_assert on InstanceCategories::Count == 25).
+		// Shipping it at 1 would therefore buy nothing and leave the backend needing a code
+		// change on the day the fork gains the bit, which is precisely when it should already
+		// be measured. RPCS3_REMIX_VIEWMODEL=0 restores 81af315 exactly.
+		static const u32 value = env_u32(L"RPCS3_REMIX_VIEWMODEL", 2);
+		return value;
+	}
+
 	bool sky_allows_textured()
 	{
 		// Default ON as of the sky-anchor rule; it was OFF at ae94587 and that default was a
@@ -5995,13 +6060,13 @@ namespace remix_rsx
 	f32 debug_light_radius()
 	{
 		static const f32 env = env_float(L"RPCS3_REMIX_LIGHTRADIUS", -1.f);
-		return env >= 0.f ? env : g_cfg.video.remix.debug_light_radius;
+		return env >= 0.f ? env : static_cast<f32>(g_cfg.video.remix.debug_light_radius);
 	}
 
 	f32 debug_light_radiance()
 	{
 		static const f32 env = env_float(L"RPCS3_REMIX_LIGHTRADIANCE", -1.f);
-		return env >= 0.f ? env : g_cfg.video.remix.debug_light_radiance;
+		return env >= 0.f ? env : static_cast<f32>(g_cfg.video.remix.debug_light_radiance);
 	}
 
 	bool hash_in_category(draw_category which, u64 hash)
@@ -6102,13 +6167,13 @@ namespace remix_rsx
 		// regardless of the angular diameter (distant_light.slangh:99-101). Single digits are
 		// therefore the useful range, not the sphere light's 100.
 		static const f32 env = env_float(L"RPCS3_REMIX_SUNRADIANCE", -1.f);
-		return env >= 0.f ? env : g_cfg.video.remix.sun_radiance;
+		return env >= 0.f ? env : static_cast<f32>(g_cfg.video.remix.sun_radiance);
 	}
 
 	f32 sun_angular_diameter()
 	{
 		static const f32 env = env_float(L"RPCS3_REMIX_SUNANGLE", -1.f);
-		return env >= 0.f ? env : g_cfg.video.remix.sun_angular_diameter;
+		return env >= 0.f ? env : static_cast<f32>(g_cfg.video.remix.sun_angular_diameter);
 	}
 
 	f32 camera_light_radiance()
@@ -6116,7 +6181,7 @@ namespace remix_rsx
 		// 0 = off. env_float rejects non-positive values, so an explicit 0 from the environment
 		// cannot be distinguished from unset; the config is what to use for turning it off.
 		static const f32 env = env_float(L"RPCS3_REMIX_CAMLIGHT", -1.f);
-		return env >= 0.f ? env : g_cfg.video.remix.camera_light;
+		return env >= 0.f ? env : static_cast<f32>(g_cfg.video.remix.camera_light);
 	}
 
 	bool nosun_enabled()

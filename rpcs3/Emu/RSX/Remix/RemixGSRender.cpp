@@ -723,6 +723,34 @@ void RemixGSRender::flip(const rsx::display_flip_info_t& info)
 		m_frame_candidate = camera_candidate{};
 		m_split_attempts = 0;
 
+		// The scene scale the next frame's streak gate measures against. Taken at flip because the
+		// current frame's median is not knowable while that frame is still being submitted, and
+		// cleared every flip so a scene change carries the reference with it instead of averaging
+		// across the cut. Exempt draws never entered the sample - see audit_world_extent.
+		//
+		// nth_element rather than sort: every drawn extent in the frame is a sample and only the
+		// middle one is ever read.
+		m_world_extent_samples = m_scratch_world_extents.size();
+
+		if (m_world_extent_samples > 0)
+		{
+			const usz mid = m_scratch_world_extents.size() / 2;
+
+			std::nth_element(m_scratch_world_extents.begin(),
+				m_scratch_world_extents.begin() + mid,
+				m_scratch_world_extents.end());
+
+			m_world_extent_median = m_scratch_world_extents[mid];
+		}
+		else
+		{
+			m_world_extent_median = 0.f;
+		}
+
+		// clear() keeps the capacity, so the per-frame sample costs no allocation after the first
+		// few frames. Without this the vector grew for the whole run.
+		m_scratch_world_extents.clear();
+
 		++m_frame_counter;
 		m_textures.begin_frame();
 		reap_idle_meshes();
@@ -1449,7 +1477,8 @@ void RemixGSRender::report_uv_failure(attribute_status best)
 
 void RemixGSRender::report_sky_census(sky_outcome outcome, u32 vertex_count, bool depth_write,
 	const f32 (&lo)[3], const f32 (&hi)[3], const remixapi_Transform& transform,
-	f32 world_extent, f32 anchor, bool measured, bool camera_inside, f32 units_per_vertex)
+	f32 world_extent, f32 anchor, bool measured, bool camera_inside, f32 units_per_vertex,
+	u64 albedo_hash)
 {
 	// The aggregate counters say how many draws each gate refused, not *which*. On the first live
 	// capture of the anchored-sky rule that was the whole problem: 739228 candidates, 707975
@@ -1482,6 +1511,7 @@ void RemixGSRender::report_sky_census(sky_outcome outcome, u32 vertex_count, boo
 	{
 	case sky_outcome::tagged:             outcome_name = "TAGGED";             break;
 	case sky_outcome::tagged_backdrop:    outcome_name = "TAGGED:backdrop";    break;
+	case sky_outcome::tagged_hash:        outcome_name = "TAGGED:hash";        break;
 	case sky_outcome::reject_extent:      outcome_name = "reject:extent";      break;
 	case sky_outcome::reject_anchor:      outcome_name = "reject:anchor";      break;
 	case sky_outcome::reject_noworld:     outcome_name = "reject:noworld";     break;
@@ -1492,7 +1522,11 @@ void RemixGSRender::report_sky_census(sky_outcome outcome, u32 vertex_count, boo
 	const f32 raw_extent = std::max({ hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2] });
 
 	const std::string line = fmt::format(
-		"Remix sky-census: vp=%016llx %s vtx=%u depth_write=%d prim=%u | "
+		// albedo is on this line because until it was, no capture in this project could join a
+		// draw's shape to its material: 'Remix tex=' is written once per unique texture at
+		// creation and names no draw, and this line named no texture. That missing join is why
+		// the hash rule had to be built before it could be measured.
+		"Remix sky-census: vp=%016llx %s vtx=%u depth_write=%d prim=%u albedo=%016llX | "
 		"raw=[%.5g %.5g %.5g]..[%.5g %.5g %.5g] rawext=%.6g wext=%.6g minext=%.6g | "
 		"anchor=%.6g limit=%.6g measured=%d origin=[%.5g %.5g %.5g] cam=[%.5g %.5g %.5g] "
 		"cam_age=%u cam_arch=%s | inside=%d upv=%.6g upvmin=%.6g backdrop=%d | frame=%llu line=%u/%u",
@@ -1501,6 +1535,7 @@ void RemixGSRender::report_sky_census(sky_outcome outcome, u32 vertex_count, boo
 		vertex_count,
 		depth_write ? 1 : 0,
 		static_cast<u32>(rsx::method_registers.current_draw_clause.primitive),
+		albedo_hash,
 		static_cast<f64>(lo[0]), static_cast<f64>(lo[1]), static_cast<f64>(lo[2]),
 		static_cast<f64>(hi[0]), static_cast<f64>(hi[1]), static_cast<f64>(hi[2]),
 		static_cast<f64>(raw_extent),
@@ -1534,6 +1569,139 @@ void RemixGSRender::report_sky_census(sky_outcome outcome, u32 vertex_count, boo
 	// the file that can be read live. Unconditionally, not behind dump_enabled(): the census exists
 	// to be read against what is on screen during an ordinary run, and requiring a dump run to see
 	// it would change the frame timing of the thing being looked at.
+	if (fs::file out{ fs::get_executable_dir() + "remix_dump.log", fs::write + fs::create + fs::append })
+	{
+		out.write(line + '\n');
+	}
+}
+
+void RemixGSRender::report_sky_hash_census(u64 albedo_hash, const sky_hash_entry& entry, bool armed,
+	f32 world_extent, f32 units_per_vertex, u32 vertex_count)
+{
+	// The counters say how many draws the hash rule matched and refused; this says *which textures*,
+	// which is the only form of the answer that can be acted on - pasted into RPCS3_REMIX_CAT_SKY to
+	// pin the rule, or into rtx.skyBoxTextures in rtx.conf, which the fork already matches against
+	// API-submitted draws by albedo hash (fork_hooks::externalDrawTextureCategories,
+	// dxvk-remix-numos3 src/dxvk/rtx_render/rtx_fork_submit.cpp:65).
+	//
+	// Bounded three ways, like the sky census: one line when a hash arms, one when it is
+	// disqualified, and a hard ceiling of s_max_sky_hash_census_lines. A full budget is itself the
+	// signal that the rule is wrong - a title has a handful of sky textures, not sixty-four.
+	if (m_sky_hash_census_lines >= s_max_sky_hash_census_lines)
+	{
+		return;
+	}
+
+	++m_sky_hash_census_lines;
+
+	const u32 total = entry.dome + entry.other;
+
+	const std::string line = fmt::format(
+		"Remix sky-hash-census: albedo=%016llX %s dome=%u other=%u total=%u agree=%.4g | "
+		"vp=%016llx vtx=%u wext=%.6g minext=%.6g upv=%.6g upvmin=%.6g need=%u mode=%u | "
+		"frame=%llu line=%u/%u",
+		albedo_hash,
+		armed ? "ARMED" : "reject:mixed",
+		entry.dome,
+		entry.other,
+		total,
+		// dome / total. 1.0 is a texture this title has never drawn as anything but a dome; the
+		// distance below 1.0 is exactly the false-positive risk of arming it, per draw.
+		total ? static_cast<f64>(entry.dome) / static_cast<f64>(total) : 0.0,
+		entry.vp,
+		vertex_count,
+		static_cast<f64>(world_extent),
+		static_cast<f64>(remix_rsx::sky_min_extent()),
+		static_cast<f64>(units_per_vertex),
+		static_cast<f64>(s_sky_backdrop_min_units_per_vertex),
+		s_sky_hash_min_draws,
+		remix_rsx::sky_hash_mode(),
+		m_frame_counter,
+		m_sky_hash_census_lines,
+		s_max_sky_hash_census_lines);
+
+	rsx_log.notice("%s", line);
+
+	// Mirrored for the same reason the sky census is: RPCS3.log is locked while the emulator runs,
+	// and this census exists to be read against what is on screen during an ordinary run.
+	if (fs::file out{ fs::get_executable_dir() + "remix_dump.log", fs::write + fs::create + fs::append })
+	{
+		out.write(line + '\n');
+	}
+}
+
+void RemixGSRender::report_viewmodel_census(viewmodel_outcome outcome, u32 vertex_count,
+	f32 scale_z, f32 offset_z, const remixapi_Transform& transform, f32 anchor, bool measured)
+{
+	// Names the programs the viewmodel rule selects, in the shape of 'Remix: indexed-world' and
+	// 'Remix sky-census:'. The counters say how many; this says which - and on this title that is
+	// the whole question, because the two programs it should name draw world characters as well
+	// and a census line is the only thing that can distinguish "it tagged the arms" from "it
+	// tagged the arms and a squadmate".
+	//
+	// Bounded twice: one line per (program, outcome) for the life of the process, and a hard
+	// ceiling of s_max_viewmodel_census_lines. The dumps put the tagged population at two
+	// programs, so a full budget is itself the signal that the rule is wrong.
+	const u64 key = m_current_vp_hash ^ (u64{static_cast<u32>(outcome)} << 60);
+
+	if (!m_viewmodel_census_seen.insert(key).second)
+	{
+		return;
+	}
+
+	++m_viewmodel_census_lines;
+
+	const char* outcome_name = "?";
+
+	switch (outcome)
+	{
+	case viewmodel_outcome::tagged:            outcome_name = "TAGGED";            break;
+	case viewmodel_outcome::reject_full_range: outcome_name = "reject:fullrange";  break;
+	case viewmodel_outcome::reject_offset:     outcome_name = "reject:offset";     break;
+	case viewmodel_outcome::count:                                                 break;
+	}
+
+	// depth=[near..far] is the window depth span the draw was given, which is the whole rule in
+	// one field: R2's world reads [0..1] and its arms read [0..0.2]. anchor and the origin/cam
+	// pair are the corroboration, not the rule, and measured=0 says the anchor is meaningless on
+	// this line rather than zero.
+	const std::string line = fmt::format(
+		"Remix viewmodel-census: vp=%016llx %s vtx=%u prim=%u depth_test=%d depth_write=%d | "
+		"scale_z=%.6g offset_z=%.6g depth=[%.6g..%.6g] maxscale=%.6g maxoffset=%.6g | "
+		"anchor=%.6g limit=%.6g measured=%d origin=[%.5g %.5g %.5g] cam=[%.5g %.5g %.5g] "
+		"cam_age=%u | mode=%u frame=%llu line=%u/%u",
+		m_current_vp_hash,
+		outcome_name,
+		vertex_count,
+		static_cast<u32>(rsx::method_registers.current_draw_clause.primitive),
+		rsx::method_registers.depth_test_enabled() ? 1 : 0,
+		rsx::method_registers.depth_write_enabled() ? 1 : 0,
+		static_cast<f64>(scale_z),
+		static_cast<f64>(offset_z),
+		static_cast<f64>(offset_z),
+		static_cast<f64>(offset_z + scale_z),
+		static_cast<f64>(s_viewmodel_max_depth_scale),
+		static_cast<f64>(s_viewmodel_max_depth_offset),
+		static_cast<f64>(anchor),
+		static_cast<f64>(s_viewmodel_max_anchor),
+		measured ? 1 : 0,
+		static_cast<f64>(transform.matrix[0][3]),
+		static_cast<f64>(transform.matrix[1][3]),
+		static_cast<f64>(transform.matrix[2][3]),
+		static_cast<f64>(m_active_camera.position[0]),
+		static_cast<f64>(m_active_camera.position[1]),
+		static_cast<f64>(m_active_camera.position[2]),
+		m_camera_age,
+		remix_rsx::viewmodel_mode(),
+		m_frame_counter,
+		m_viewmodel_census_lines,
+		s_max_viewmodel_census_lines);
+
+	rsx_log.notice("%s", line);
+
+	// Mirrored into remix_dump.log for the same reason report_sky_census is: RPCS3.log is held
+	// under an exclusive lock while the emulator runs, and this census has to be readable against
+	// what is on screen during an ordinary run rather than only after it.
 	if (fs::file out{ fs::get_executable_dir() + "remix_dump.log", fs::write + fs::create + fs::append })
 	{
 		out.write(line + '\n');
@@ -3313,6 +3481,612 @@ bool RemixGSRender::bones_consistent()
 	return true;
 }
 
+// Do the vertices this draw submits form one object?
+//
+// audit_skin_extent measured the transform and cleared it: across 26747 blended and 28558 skinned
+// draws, with the shards on screen, not one vertex blended outside its own bone's neighbourhood.
+// An affine instance transform maps every vertex of a mesh identically - it can move, scale or
+// rotate a mesh but cannot tear one apart - so a torn mesh whose skinning measures clean was torn
+// before any transform touched it. That leaves the positions themselves, which is what this reads.
+//
+// The measure is the same shape as skin-reach, one level earlier and with no transform involved:
+// each vertex's distance from the draw's own median position, reported as max/median. Scale-free
+// again, so it needs to know nothing about the title's units or how big the object is. A coherent
+// object has a narrow spread - the furthest vertex is a small multiple of the typical one. A mesh
+// with a subset collapsed somewhere else has two populations, and the ratio separates them
+// immediately.
+//
+// That is exactly the artifact's shape: long thin shards radiating from one point. Every triangle
+// spanning a correctly-decoded vertex and a collapsed one stretches into a spike between the two,
+// which is what a partial decode failure draws.
+//
+// Median rather than centroid, and nth_element rather than a sort, so one bad population cannot
+// drag the reference it is being measured against and the pass stays linear. Runs on every draw -
+// Resistance 2 submits on the order of 130 per frame - because if the flagged draws turn out not to
+// be skinned, that closes the whole line of investigation.
+//
+// Exact zeros are counted and reported separately on purpose: "N of M vertices decoded to exactly
+// (0,0,0)" is a far more specific finding than "N are outliers", and it points straight at a read
+// that returned nothing rather than at arithmetic that went wrong.
+//
+// RPCS3_REMIX_VTXSPREAD=<ratio> sets the threshold (0 disables). Diagnostic only - nothing is
+// refused on it, which is what made the skin-reach result trustworthy.
+void RemixGSRender::audit_vertex_extent(u32 first_vertex, u32 vertex_count, const attribute_view& positions, bool w_divide)
+{
+	const f32 ratio_limit = remix_rsx::vertex_spread_ratio();
+
+	if (!(ratio_limit > 0.f) || vertex_count < 4 || m_scratch_vertices.size() < vertex_count)
+	{
+		return;
+	}
+
+	u32 zeros = 0;
+	u32 nonfinite = 0;
+
+	for (u32 i = 0; i < vertex_count; ++i)
+	{
+		const f32* p = m_scratch_vertices[i].position;
+
+		if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2]))
+		{
+			++nonfinite;
+		}
+		else if (p[0] == 0.f && p[1] == 0.f && p[2] == 0.f)
+		{
+			++zeros;
+		}
+	}
+
+	// Per-axis median, so the reference point is one a majority of the vertices agree on.
+	f32 centre[3] = {};
+
+	for (u32 axis = 0; axis < 3; ++axis)
+	{
+		m_scratch_vertex_spread.clear();
+		m_scratch_vertex_spread.reserve(vertex_count);
+
+		for (u32 i = 0; i < vertex_count; ++i)
+		{
+			const f32 v = m_scratch_vertices[i].position[axis];
+
+			if (std::isfinite(v))
+			{
+				m_scratch_vertex_spread.push_back(v);
+			}
+		}
+
+		if (m_scratch_vertex_spread.empty())
+		{
+			return;
+		}
+
+		const usz mid = m_scratch_vertex_spread.size() / 2;
+		std::nth_element(m_scratch_vertex_spread.begin(), m_scratch_vertex_spread.begin() + mid, m_scratch_vertex_spread.end());
+		centre[axis] = m_scratch_vertex_spread[mid];
+	}
+
+	m_scratch_vertex_spread.clear();
+	m_scratch_vertex_spread.reserve(vertex_count);
+
+	f32 worst = -1.f;
+	u32 worst_vertex = 0;
+
+	for (u32 i = 0; i < vertex_count; ++i)
+	{
+		const f32* p = m_scratch_vertices[i].position;
+		const f32 dx = p[0] - centre[0];
+		const f32 dy = p[1] - centre[1];
+		const f32 dz = p[2] - centre[2];
+		const f32 d = std::sqrt((dx * dx) + (dy * dy) + (dz * dz));
+
+		if (!std::isfinite(d))
+		{
+			continue;
+		}
+
+		m_scratch_vertex_spread.push_back(d);
+
+		if (d > worst)
+		{
+			worst = d;
+			worst_vertex = i;
+		}
+	}
+
+	if (m_scratch_vertex_spread.size() < 4)
+	{
+		return;
+	}
+
+	const usz mid = m_scratch_vertex_spread.size() / 2;
+	std::nth_element(m_scratch_vertex_spread.begin(), m_scratch_vertex_spread.begin() + mid, m_scratch_vertex_spread.end());
+	const f32 median = m_scratch_vertex_spread[mid];
+
+	const f32 ratio = (median > 1e-9f) ? (worst / median) : 0.f;
+
+	// A subset at exactly the origin while the rest of the mesh is elsewhere is the specific shape
+	// this is hunting, so it is counted whether or not the spread test also trips.
+	const bool split_zero = (zeros > 0) && (zeros < vertex_count);
+
+	if (split_zero)
+	{
+		++m_stats.vtx_zero_split;
+	}
+
+	const bool flagged = (nonfinite > 0) || (ratio > ratio_limit);
+
+	if (flagged)
+	{
+		++m_stats.vtx_spread_flagged;
+
+		// This pass runs immediately after the decode, long before the world transform is resolved,
+		// so a flagged draw has not yet been through any of the gates that might drop it. That
+		// matters here more than usual: the one program producing an extreme ratio reports
+		// arch=unknown, and a program with no matrix chain into HPOS gets no world transform, which
+		// world_refused already discards. Whether the incoherent geometry ever reaches the scene is
+		// therefore an open question that this counter closes - and it has to be answered before a
+		// refusal is worth writing, because refusing a draw that is already refused changes nothing
+		// and would leave the real cause untouched.
+		m_vertex_flagged = true;
+	}
+
+	if (!flagged && !split_zero)
+	{
+		return;
+	}
+
+	// One line per program: the flag describes a shape, and a shape repeats. The two counters carry
+	// the per-draw populations.
+	if (!m_vertex_spread_seen.insert(m_current_vp_hash).second)
+	{
+		return;
+	}
+
+	// How much of the mesh is in the far population, which vertices, and - the question that
+	// separates a short data block from a stride error - how those indices are arranged. A tail
+	// means the read ran off the end of real data; an even spacing means the walk is landing on the
+	// wrong bytes at a fixed period; a scatter means neither and the layout is not the story.
+	u32 outliers = 0;
+	std::string offenders;
+
+	m_scratch_outlier_indices.clear();
+
+	for (u32 i = 0; i < vertex_count; ++i)
+	{
+		const f32* p = m_scratch_vertices[i].position;
+		const f32 dx = p[0] - centre[0];
+		const f32 dy = p[1] - centre[1];
+		const f32 dz = p[2] - centre[2];
+		const f32 d = std::sqrt((dx * dx) + (dy * dy) + (dz * dz));
+
+		if (std::isfinite(d) && median > 1e-9f && d <= (ratio_limit * median))
+		{
+			continue;
+		}
+
+		++outliers;
+		m_scratch_outlier_indices.push_back(i);
+
+		if (outliers <= 4)
+		{
+			fmt::append(offenders, " v%u=[%.6g %.6g %.6g]", i,
+				static_cast<f64>(p[0]), static_cast<f64>(p[1]), static_cast<f64>(p[2]));
+		}
+	}
+
+	// Topology of the outlier set, computed rather than left to be eyeballed off a list.
+	std::string topology;
+
+	if (!m_scratch_outlier_indices.empty())
+	{
+		const u32 lo = m_scratch_outlier_indices.front();
+		const u32 hi = m_scratch_outlier_indices.back();
+		const bool contiguous = (hi - lo + 1) == ::size32(m_scratch_outlier_indices);
+		const bool tail = contiguous && (hi + 1 == vertex_count);
+
+		// The most common gap between consecutive offenders. A single dominant gap over most of the
+		// set is a period; a spread of gaps is not.
+		u32 best_gap = 0;
+		u32 best_count = 0;
+
+		for (u32 candidate = 1; candidate <= 8; ++candidate)
+		{
+			u32 hits = 0;
+
+			for (usz k = 1; k < m_scratch_outlier_indices.size(); ++k)
+			{
+				if ((m_scratch_outlier_indices[k] - m_scratch_outlier_indices[k - 1]) == candidate)
+				{
+					++hits;
+				}
+			}
+
+			if (hits > best_count)
+			{
+				best_count = hits;
+				best_gap = candidate;
+			}
+		}
+
+		fmt::append(topology, " span=[%u..%u] contiguous=%d tail=%d gap=%u/%llu", lo, hi,
+			contiguous ? 1 : 0, tail ? 1 : 0, best_gap,
+			static_cast<u64>(m_scratch_outlier_indices.size() > 1 ? m_scratch_outlier_indices.size() - 1 : 0));
+
+		topology += " idx=";
+
+		for (usz k = 0; k < m_scratch_outlier_indices.size() && k < 48; ++k)
+		{
+			fmt::append(topology, "%s%u", k ? "," : "", m_scratch_outlier_indices[k]);
+		}
+
+		if (m_scratch_outlier_indices.size() > 48)
+		{
+			topology += ",...";
+		}
+	}
+
+	// A high quantile beside the median says whether the distribution is genuinely bimodal or
+	// merely long-tailed: p90 close to the median with a huge max is two populations.
+	const usz p90_index = (m_scratch_vertex_spread.size() * 9) / 10;
+	std::nth_element(m_scratch_vertex_spread.begin(), m_scratch_vertex_spread.begin() + p90_index, m_scratch_vertex_spread.end());
+	const f32 p90 = m_scratch_vertex_spread[p90_index];
+
+	// The worst vertex's attribute exactly as it sits in guest memory, beside what the fetch made
+	// of it. A stride or offset that walks off the real data shows up here as bytes that are not
+	// the shape of the format; a decode fault shows up as sane bytes with an insane result.
+	std::string raw_bytes;
+	const u32 attr_bytes = remix_rsx::attribute_byte_size(positions.type, positions.size);
+
+	if (attr_bytes != 0)
+	{
+		const u8* src = positions.at(worst_vertex);
+
+		for (u32 b = 0; b < attr_bytes && b < 16; ++b)
+		{
+			fmt::append(raw_bytes, "%02x", src[b]);
+		}
+	}
+
+	f32 decoded[4] = {};
+	f32 raw_attr[4] = {};
+	remix_rsx::decode_position(positions.at(worst_vertex), positions.type, positions.size, decoded);
+	remix_rsx::decode_attribute_raw(positions.at(worst_vertex), positions.type, positions.size, raw_attr);
+
+	// Which decode the ucode applies before its first matrix, and the matrix it rebuilds to. This
+	// travels in the instance transform (or, for a blended rig, in the bone matrices), so it is not
+	// applied to the numbers above - but a draw whose decode cannot be read back is a draw whose
+	// submitted positions mean something different from what the transform expects.
+	const remix_rsx::vp_fingerprint& fp = *m_current_fingerprint;
+	std::string decode;
+
+	if (fp.has_prescale)
+	{
+		fmt::append(decode, "prescale scale=c%u.%c bias=c%u",
+			fp.prescale_scale_slot, "xyzw"[fp.prescale_scale_component & 3], fp.prescale_bias_slot);
+	}
+	else if (fp.has_const_affine)
+	{
+		fmt::append(decode, "const_affine scale=%d c%u.[%c%c%c] bias=%d c%u",
+			fp.affine_has_scale ? 1 : 0, fp.affine_scale_slot,
+			"xyzw"[fp.affine_scale_component[0] & 3],
+			"xyzw"[fp.affine_scale_component[1] & 3],
+			"xyzw"[fp.affine_scale_component[2] & 3],
+			fp.affine_has_bias ? 1 : 0, fp.affine_bias_slot);
+	}
+	else
+	{
+		decode = "none";
+	}
+
+	if (remix_rsx::mat4 built{}; remix_rsx::build_prescale(fp, built))
+	{
+		fmt::append(decode, " -> %s", remix_rsx::format_matrix(built));
+	}
+	else if (fp.has_prescale || fp.has_const_affine)
+	{
+		decode += " -> UNREADABLE";
+	}
+
+	rsx_log.notice("Remix: vtx-spread frame=%llu vp=%016llx arch=%s vtx=%u ratio=%.4g worst=%.6g median=%.6g p90=%.6g "
+		"| zeros=%u/%u nonfinite=%u outliers=%u%s | centre=[%.6g %.6g %.6g]%s "
+		"| worst=v%u raw=%s decoded=[%.6g %.6g %.6g %.6g] stored=[%.6g %.6g %.6g %.6g] "
+		"| attr0 type=%u size=%u stride=%u off=%u first_vertex=%u wdiv=%d | decode %s",
+		m_frame_counter,
+		m_current_vp_hash,
+		remix_rsx::archetype_name(fp.archetype),
+		vertex_count,
+		static_cast<f64>(ratio),
+		static_cast<f64>(worst),
+		static_cast<f64>(median),
+		static_cast<f64>(p90),
+		zeros, vertex_count, nonfinite, outliers,
+		topology,
+		static_cast<f64>(centre[0]), static_cast<f64>(centre[1]), static_cast<f64>(centre[2]),
+		offenders,
+		worst_vertex,
+		raw_bytes.empty() ? "?" : raw_bytes.c_str(),
+		static_cast<f64>(decoded[0]), static_cast<f64>(decoded[1]), static_cast<f64>(decoded[2]), static_cast<f64>(decoded[3]),
+		static_cast<f64>(raw_attr[0]), static_cast<f64>(raw_attr[1]), static_cast<f64>(raw_attr[2]), static_cast<f64>(raw_attr[3]),
+		static_cast<u32>(positions.type), positions.size, positions.stride, positions.offset,
+		first_vertex, w_divide ? 1 : 0,
+		decode);
+}
+
+// How big is the geometry Remix actually receives?
+//
+// Nothing at 81af315 answered that, and the reason every audit there read clean is that each one is
+// scale-free by construction and therefore cannot see a mesh that is simply too big:
+//
+//   audit_vertex_extent   max/median over the *decoded* positions. No matrix of any kind. 2036
+//                         draws of 1303434 flagged, and vtx_spread_submitted = 0 for every one of
+//                         them - i.e. the incoherent decodes were all dropped by a later gate and
+//                         none of them reached the scene.
+//   audit_skin_extent     max/median over 'bones x position', each vertex measured against its own
+//                         dominant bone's origin. Applies the palette but not the instance
+//                         transform, and reports a ratio, so a palette that is uniformly a thousand
+//                         times too large reads exactly 1. skin_reach_flagged = 0.
+//   sky-census 'wext'     the raw ATTR0 box transformed by the instance matrix. Absolute, but it
+//                         omits the bones - and a blended rig folds its whole position decode into
+//                         the bone matrices (build_blend_skinning, m_scratch_bone_prescale_folded),
+//                         so for every skinned draw this over-reports by the decode factor. It is
+//                         why 11 of the 12 largest 'wext' in the rK/rM/rN censuses are blend=4 rigs
+//                         whose wext/rawext is ~1.0: not a measurement of those draws at all.
+//
+// This is 'instance x bones x position' per vertex, in world units, taken at the submission point.
+// One pass, same shape and same cost as the pass audit_skin_extent already runs, and it is the
+// number the three above each miss a different third of.
+//
+// What it found in the replay of the captured censuses, and what the gate is set from: R2's camera
+// moves in tens of units and its ordinary draws measure under 1 to a few hundred, while a
+// population of programs whose position decode the ucode matcher never recognised (dumps report
+// prescale=0) reaches the world at raw quantised scale - c87769e09c995db9 at 15895 units across 4
+// vertices, d736a5bdc6e2552a at 8621, a426abcdd77da419 at 5445. A flat 16000-unit sheet in a
+// hundred-unit scene is a streak across the screen and a BLAS every primary ray intersects, which
+// is the shape of both symptoms.
+//
+// Ratio against the frame's own median rather than an absolute limit, so this needs to know nothing
+// about the title's units - the same reason bones_consistent measures a bone against its siblings
+// rather than against a number. Sky is exempt: a dome legitimately spans the level, and gating it on
+// the scene median would delete the sky.
+//
+// Returns false when the draw is refused. RPCS3_REMIX_STREAKGATE=0 restores 81af315.
+bool RemixGSRender::audit_world_extent(const remixapi_Transform& transform, bool skinned, u32 vertex_count, bool exempt)
+{
+	m_streak_extent = 0.f;
+	m_streak_flagged = false;
+	m_streak_measured = false;
+
+	if (vertex_count == 0 || m_scratch_vertices.size() < vertex_count)
+	{
+		return true;
+	}
+
+	// Exactly the blend dxvk-remix's skinning pass performs (src/dxvk/shaders/rtx/pass/skinning.h,
+	// 'sum_k bone[idx_k] * pos * w_k'), then the instance transform Remix applies on top of it.
+	// Reproduced rather than approximated, because the whole point of this pass is to measure the
+	// value the runtime ends up with and not the one this backend thinks it sent.
+	const u32 per_vertex = std::max<u32>(1u, m_scratch_bones_per_vertex);
+	const bool blend = skinned && !m_scratch_bone_transforms.empty();
+
+	f32 lo[3] = { +3.4e38f, +3.4e38f, +3.4e38f };
+	f32 hi[3] = { -3.4e38f, -3.4e38f, -3.4e38f };
+	u32 nonfinite = 0;
+	u32 counted = 0;
+
+	// Over the vertices the index buffer actually references, not over the whole decoded buffer.
+	// Remix builds its BLAS from the index list, so an unreferenced vertex contributes no geometry
+	// and must not be able to refuse the draw. On this title the gap is not hypothetical: the first
+	// armed run censused vp=d2468f79dc136cfd at vtx=695 idx=36 and refused it, i.e. a box drawn
+	// around 695 decoded positions decided the fate of the 36 that render. Falls back to the whole
+	// buffer only when the draw has no index list at all.
+	const usz index_count = m_scratch_indices.size();
+	const usz sample_count = index_count ? index_count : static_cast<usz>(vertex_count);
+
+	for (usz n = 0; n < sample_count; ++n)
+	{
+		const u32 i = index_count ? static_cast<u32>(m_scratch_indices[n]) : static_cast<u32>(n);
+
+		if (i >= vertex_count)
+		{
+			continue;
+		}
+
+		const f32* src = m_scratch_vertices[i].position;
+		f32 p[3] = { src[0], src[1], src[2] };
+
+		if (blend)
+		{
+			f32 blended[3] = {};
+
+			for (u32 k = 0; k < per_vertex; ++k)
+			{
+				const usz t = (static_cast<usz>(i) * per_vertex) + k;
+
+				if (t >= m_scratch_bone_weights.size() || t >= m_scratch_bone_indices.size())
+				{
+					break;
+				}
+
+				const f32 w = m_scratch_bone_weights[t];
+				const u32 dense = m_scratch_bone_indices[t];
+
+				if (!(w > 0.f) || dense >= m_scratch_bone_transforms.size())
+				{
+					continue;
+				}
+
+				const auto& m = m_scratch_bone_transforms[dense].matrix;
+
+				for (u32 r = 0; r < 3; ++r)
+				{
+					blended[r] += w * ((m[r][0] * p[0]) + (m[r][1] * p[1]) + (m[r][2] * p[2]) + m[r][3]);
+				}
+			}
+
+			p[0] = blended[0];
+			p[1] = blended[1];
+			p[2] = blended[2];
+		}
+
+		f32 world[3] = {};
+		bool finite = true;
+
+		for (u32 r = 0; r < 3; ++r)
+		{
+			world[r] = (transform.matrix[r][0] * p[0]) + (transform.matrix[r][1] * p[1])
+				+ (transform.matrix[r][2] * p[2]) + transform.matrix[r][3];
+
+			finite = finite && std::isfinite(world[r]);
+		}
+
+		if (!finite)
+		{
+			++nonfinite;
+			continue;
+		}
+
+		for (u32 r = 0; r < 3; ++r)
+		{
+			lo[r] = std::min(lo[r], world[r]);
+			hi[r] = std::max(hi[r], world[r]);
+		}
+
+		++counted;
+	}
+
+	++m_stats.wext_examined;
+
+	if (nonfinite > 0)
+	{
+		++m_stats.wext_nonfinite;
+	}
+
+	if (counted == 0)
+	{
+		// Every vertex non-finite. There is no extent to measure and nothing this can be compared
+		// against, so it is counted and left to the gates that already refuse on finiteness.
+		return true;
+	}
+
+	f32 extent = 0.f;
+
+	for (u32 r = 0; r < 3; ++r)
+	{
+		extent = std::max(extent, hi[r] - lo[r]);
+	}
+
+	m_streak_extent = extent;
+	m_streak_measured = true;
+
+	if (exempt)
+	{
+		++m_stats.wext_exempt;
+		return true;
+	}
+
+	// The sample the *next* frame's median is taken from. Exempt draws are left out of it for the
+	// same reason they are not gated: a dome the size of the level is not this scene's typical
+	// object and letting it into the median would raise the bar for everything else.
+	m_scratch_world_extents.push_back(extent);
+
+	// The knob decides whether the draw is *refused*, never whether it is *measured*: with
+	// RPCS3_REMIX_STREAKGATE=0 the same test still runs and still names the same programs, and the
+	// draws land in wext_flagged_drawn instead of wext_refused. That is the whole A/B - one run with
+	// the gate off and one with it on, against the same census - and it only exists because the
+	// measurement is independent of the refusal.
+	const f32 knob = remix_rsx::streak_extent_ratio();
+	const bool gate_on = (knob > 0.f);
+	const f32 ratio_limit = gate_on ? knob : s_streak_report_ratio;
+
+	// No median means no scene to compare against, so nothing is judged. Both conditions are about
+	// the reference rather than about this draw.
+	if (!(m_world_extent_median > 0.f) || m_world_extent_samples < s_streak_median_min_samples)
+	{
+		return true;
+	}
+
+	const f32 ratio = extent / m_world_extent_median;
+
+	if (!(ratio > ratio_limit))
+	{
+		return true;
+	}
+
+	m_streak_flagged = true;
+
+	// One line per program, once, bounded - the shape the indexed-world census uses. The counters
+	// say how many; this says which, with the vertex count and the two extents that separate "this
+	// mesh is genuinely large" from "this mesh arrived undecoded".
+	if (m_world_extent_seen.insert(m_current_vp_hash).second
+		&& m_world_extent_census_lines < s_max_world_extent_census_lines)
+	{
+		++m_world_extent_census_lines;
+
+		f32 model_lo[3] = { +3.4e38f, +3.4e38f, +3.4e38f };
+		f32 model_hi[3] = { -3.4e38f, -3.4e38f, -3.4e38f };
+
+		// Same referenced-only rule as the world pass, so world/model stays a ratio between two
+		// boxes drawn around the same vertices and 'scale' remains readable as a decode factor.
+		for (usz n = 0; n < sample_count; ++n)
+		{
+			const u32 i = index_count ? static_cast<u32>(m_scratch_indices[n]) : static_cast<u32>(n);
+
+			if (i >= vertex_count)
+			{
+				continue;
+			}
+
+			for (u32 r = 0; r < 3; ++r)
+			{
+				model_lo[r] = std::min(model_lo[r], m_scratch_vertices[i].position[r]);
+				model_hi[r] = std::max(model_hi[r], m_scratch_vertices[i].position[r]);
+			}
+		}
+
+		f32 model_extent = 0.f;
+
+		for (u32 r = 0; r < 3; ++r)
+		{
+			model_extent = std::max(model_extent, model_hi[r] - model_lo[r]);
+		}
+
+		// world/model is the whole diagnosis in one number. A recognised decode drives it to ~1e-4
+		// on this title (quantised 16-bit positions); ~1 means the raw attribute values reached the
+		// world untouched, which is the population the dumps report as prescale=0.
+		const f32 decode_scale = (model_extent > 1e-9f) ? (extent / model_extent) : 0.f;
+
+		rsx_log.notice("Remix: world-extent vp=%016llx arch=%s vtx=%u idx=%llu skinned=%d bones=%llu prescale=%d "
+			"wext=%.6g model=%.6g scale=%.4g median=%.6g ratio=%.4g nonfinite=%u refused=%d",
+			m_current_vp_hash,
+			remix_rsx::archetype_name(m_current_fingerprint->archetype),
+			vertex_count,
+			static_cast<u64>(m_scratch_indices.size()),
+			blend ? 1 : 0,
+			static_cast<u64>(m_scratch_bone_transforms.size()),
+			m_current_fingerprint->has_prescale ? 1 : 0,
+			static_cast<f64>(extent),
+			static_cast<f64>(model_extent),
+			static_cast<f64>(decode_scale),
+			static_cast<f64>(m_world_extent_median),
+			static_cast<f64>(ratio),
+			nonfinite,
+			gate_on ? 1 : 0);
+	}
+
+	if (!gate_on)
+	{
+		// Flagged and left alone. The draw goes on to the mesh, the material and DrawInstance, any
+		// of which can still drop it - so it is counted at the far side of DrawInstance and not
+		// here, which is what makes wext_flagged_drawn a count of geometry that reached the scene.
+		return true;
+	}
+
+	// Refuse-and-count. The draw never reaches CreateMesh, so wext_refused and wext_flagged_drawn
+	// are disjoint by construction and neither can be read as a drawn count.
+	++m_stats.wext_refused;
+	return false;
+}
+
 // Measures the explosion instead of theorising about it.
 //
 // Every hypothesis about the shards so far has been a guess at a *cause* - an index past the end of
@@ -4438,6 +5212,9 @@ void RemixGSRender::submit_subdraw()
 	// decode - the raw-quantised-position explosion, arriving one draw late.
 	m_scratch_bone_prescale_folded = false;
 
+	// Same per-subdraw lifetime: set by audit_vertex_extent, read at the submission point.
+	m_vertex_flagged = false;
+
 	// --- classify and skip -------------------------------------------------------------
 	if (draw_call.is_immediate_draw)
 	{
@@ -4734,6 +5511,22 @@ void RemixGSRender::submit_subdraw()
 		}
 	}
 
+	// Every draw, skinned or not: do these vertices form one object?
+	audit_vertex_extent(first_vertex, vertex_count, positions, w_divide);
+
+	// RPCS3_REMIX_VTXREFUSE=1 drops a draw the audit called incoherent instead of submitting it.
+	// Deliberately off by default and deliberately not landed as a fix: whether these draws reach
+	// the scene at all is what vtx_spread_submitted is measuring, and refusing before that number
+	// is in would be the third hypothesis-led change in a row on a problem that has twice turned
+	// out to be somewhere else. With it on, one run says whether removing this geometry removes the
+	// artifact - which is the same one-run A/B the skinning knobs provide, and the reason the
+	// skin-reach result could be trusted.
+	if (m_vertex_flagged && remix_rsx::vertex_spread_refuse())
+	{
+		++m_stats.vtx_spread_refused;
+		return;
+	}
+
 	if (remix_rsx::dump_enabled())
 	{
 		dump_vertex_program(first_vertex, vertex_count, ::size32(m_scratch_indices));
@@ -4834,6 +5627,46 @@ void RemixGSRender::submit_subdraw()
 		// A rig the recogniser detected but cannot prove it understands. Nothing is drawn: an
 		// absent character is a shippable result, a character torn across the map is not.
 		++m_stats.skin_unrecognised;
+
+		// Split by which hardening condition fired, in the same order scan_vertex_program tests
+		// them, so the three counters partition skin_unrecognised exactly and the dominant reason
+		// is a number rather than a guess. Reading this aggregate as one population is what has
+		// kept 186648 dropped draws unexplained.
+		if (fp.arl_count > 1)
+		{
+			++m_stats.skin_unrec_arl;
+		}
+		else if (fp.foreign_indexed_reads != 0)
+		{
+			++m_stats.skin_unrec_foreign;
+		}
+		else
+		{
+			++m_stats.skin_unrec_reads;
+		}
+
+		// Names the program and the counts the refusal was decided on. Without this the only record
+		// of a dropped rig is an aggregate, and the missing characters cannot be tied to a program.
+		if (m_skin_unrec_seen.insert(m_current_vp_hash).second
+			&& m_skin_unrec_census_lines < s_max_skin_unrec_census_lines)
+		{
+			++m_skin_unrec_census_lines;
+
+			rsx_log.notice("Remix: skin-unrecognised vp=%016llx arch=%s arl=%u idx_reads=%u foreign=%u "
+				"blended=%d bones=%u vtx=%u line=%u/%u | %s",
+				m_current_vp_hash,
+				remix_rsx::archetype_name(fp.archetype),
+				fp.arl_count,
+				fp.indexed_reads,
+				fp.foreign_indexed_reads,
+				fp.skin_blended ? 1 : 0,
+				fp.blend_bones,
+				vertex_count,
+				m_skin_unrec_census_lines,
+				s_max_skin_unrec_census_lines,
+				fp.skin_note);
+		}
+
 		return;
 	}
 
@@ -5149,7 +5982,16 @@ void RemixGSRender::submit_subdraw()
 	// The backdrop rule needs the same bounding box, and needs it for draws the sky test skips.
 	const bool sky_backdrop = sky_texture_ok && remix_rsx::sky_backdrop_mode() != 0;
 
-	if (sky_candidate || sky_census || sky_backdrop)
+	// The hash rule needs it for a third population again: every *textured* draw, whatever its
+	// depth state and whatever sky_allows_textured() says, because it is not deciding anything from
+	// the geometry - it is learning which albedo hashes only ever appear on dome-shaped draws, and
+	// a hash cannot be disqualified by a draw nobody measured. Untextured draws are skipped because
+	// there is no hash to key on; the anchored rule above is what covers those (Haze's dome).
+	const bool sky_hash = albedo_hash != 0
+		&& remix_rsx::sky_hash_mode() != 0
+		&& remix_rsx::sky_min_extent() > 0.f;
+
+	if (sky_candidate || sky_census || sky_backdrop || sky_hash)
 	{
 		for (const remixapi_HardcodedVertex& v : m_scratch_vertices)
 		{
@@ -5329,7 +6171,7 @@ void RemixGSRender::submit_subdraw()
 	// applies to the geometry itself. RPCS3_REMIX_SKYANCHOR=0 drops the anchor requirement.
 	bool is_sky = false;
 
-	if (sky_candidate || sky_census || sky_backdrop)
+	if (sky_candidate || sky_census || sky_backdrop || sky_hash)
 	{
 		// Counted here rather than at the bounding box, so that candidates is exactly the sum of
 		// the four refusals plus the cat_sky increments made below - the RPCS3_REMIX_CAT_SKY hash
@@ -5448,11 +6290,215 @@ void RemixGSRender::submit_subdraw()
 			}
 		}
 
+		// --- albedo-hash rule (sky_hash_mode) ----------------------------------------------
+		// Material identity instead of geometry. Every rule above asks how big a draw is or where
+		// it sits, and on this title those answers are fuzzy: the geometric backdrop rule matched
+		// 1.11% of submitted draws in the capture it was measured against, which is far too broad
+		// to arm because 1.11% of R2's draws is world geometry. A texture hash is exact - two draws
+		// either sample the same image or they do not.
+		//
+		// The geometry is still used, but only to *learn*. 'dome_shaped' is the backdrop rule's own
+		// predicate, evaluated here for its answer rather than for its verdict, and a hash is armed
+		// only when every draw carrying it has come back dome-shaped over at least
+		// s_sky_hash_min_draws draws. A single non-dome draw disqualifies it permanently. That
+		// inverts the failure mode: a threshold rule mis-tags whatever sits near the threshold,
+		// while this one can only mis-tag a texture the title uses on nothing but domes - and the
+		// census names those before mode 2 tags anything.
+		//
+		// A hash is inserted only on a dome-shaped draw, which is what keeps the table small: R2
+		// binds 737 unique textures across the dumped captures and only a handful of them are ever
+		// drawn as a dome. The cost of that is an ordering asymmetry worth stating - a texture used
+		// on world geometry *before* its first dome-shaped draw contributes nothing to 'other'
+		// until the next world draw carrying it. In practice both orders occur within a frame,
+		// because the draws that would disqualify it are submitted every frame, so the
+		// disqualification arrives inside the first second and s_sky_hash_min_draws is not reached.
+		if (sky_hash)
+		{
+			const bool dome_shaped = measured && inside
+				&& std::isfinite(extent) && extent >= remix_rsx::sky_min_extent()
+				&& units_per_vertex >= s_sky_backdrop_min_units_per_vertex;
+
+			auto it = m_sky_hash_seen.find(albedo_hash);
+
+			if (it == m_sky_hash_seen.end() && dome_shaped && m_sky_hash_seen.size() < s_max_sky_hash_tracked)
+			{
+				it = m_sky_hash_seen.emplace(albedo_hash, sky_hash_entry{}).first;
+				++m_stats.sky_hash_tracked;
+			}
+
+			if (it != m_sky_hash_seen.end())
+			{
+				sky_hash_entry& hash_entry = it->second;
+
+				++m_stats.sky_hash_considered;
+
+				if (dome_shaped)
+				{
+					++hash_entry.dome;
+					++m_stats.sky_hash_dome;
+
+					if (!hash_entry.vp)
+					{
+						hash_entry.vp = m_current_vp_hash;
+					}
+				}
+				else
+				{
+					++hash_entry.other;
+				}
+
+				// Refuse-and-count: a mixed hash is not merely skipped, it is counted, so that
+				// "the rule tagged nothing" and "the rule found the sky and threw it away because
+				// the title reuses the texture" are two different readings rather than one silence.
+				if (hash_entry.other != 0)
+				{
+					++m_stats.sky_hash_rejected;
+
+					if (!hash_entry.reported_mixed)
+					{
+						hash_entry.reported_mixed = true;
+						report_sky_hash_census(albedo_hash, hash_entry, false, extent, units_per_vertex, vertex_count);
+					}
+				}
+				else if (hash_entry.dome >= s_sky_hash_min_draws)
+				{
+					++m_stats.sky_hash_matched;
+
+					if (!hash_entry.reported_armed)
+					{
+						hash_entry.reported_armed = true;
+						report_sky_hash_census(albedo_hash, hash_entry, true, extent, units_per_vertex, vertex_count);
+					}
+
+					// Mode 1 stops here: matched is the preview of what mode 2 would tag, with the
+					// image untouched, which is the measurement the geometric rules never had
+					// before they were widened.
+					if (remix_rsx::sky_hash_mode() >= 2)
+					{
+						is_sky = true;
+						outcome = sky_outcome::tagged_hash;
+						++m_stats.sky_hash_tagged;
+					}
+				}
+			}
+		}
+
 		if (sky_census)
 		{
 			report_sky_census(outcome, vertex_count, !sky_depth_ok, sky_lo, sky_hi, transform,
-				extent, anchor, measured, inside, units_per_vertex);
+				extent, anchor, measured, inside, units_per_vertex, albedo_hash);
 		}
+	}
+
+	// --- viewmodel, decided by the viewport depth range ---------------------------------------
+	// The first-person arms and weapon. Up to 81af315 nothing in this backend had any notion of
+	// one: REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL and REMIXAPI_CAMERA_TYPE_VIEW_MODEL were both
+	// declared in remix_c.h and neither appeared anywhere in code, so the arms were submitted as
+	// ordinary world geometry - lit by world lights, occluded by world walls, placed by the world
+	// camera - and the Remix dev menu read "VIEWMODEL Position: -" on every capture.
+	//
+	// This is the mirror image of the sky-dome test above and is decided in the same place and for
+	// the same reason: the anchor it reports is a statement about world space, so it cannot be made
+	// before per_draw_transform() has resolved the instance transform. The *rule* itself needs
+	// neither world space nor a camera, which is deliberate - see s_viewmodel_max_anchor.
+	//
+	// The rule is the viewport depth range, and it is a mechanism rather than a correlation. The
+	// G0 recovery over these dumps gives z_ndc = 1 - near/w, i.e. z_ndc in [0, 1] with the far
+	// plane at infinity, so the viewport maps a draw into window depth [offset_z, offset_z+scale_z].
+	// R2 runs its entire world at [0, 1] and one thing at [0, 0.2]: the front fifth of the buffer,
+	// which forces every pixel of it in front of any world pixel past w = near/0.8 ~= 0.11 units.
+	// That is the standard "the weapon never clips into a wall" trick and it is why the bucket is
+	// there at all. Full measurement and the two corroborating readings are on viewmodel_mode().
+	//
+	// Replayed before it was written, over all 10153 draws in the scratchpad dumps: this rule
+	// selects 168, every one of them [0, 0.2] at clip 1280x704, over exactly two vertex programs.
+	// Nothing from any other program, title or resolution.
+	//
+	// The one thing worth restating here, because it is what a shortcut would get wrong: the two
+	// programs in that bucket, 1438eb79c0843fea and 7a4a57869f9c4a1f, *also* draw a 5954-vertex
+	// character at [0, 1] in 78 dumped draws. The program hash does not separate the viewmodel from
+	// world geometry. Only the per-draw depth range does, which is why this test is here and not in
+	// classify_draw() or a hash list.
+	bool is_viewmodel = false;
+
+	const u32 viewmodel_mode = remix_rsx::viewmodel_mode();
+
+	if (viewmodel_mode != 0)
+	{
+		++m_stats.viewmodel_considered;
+
+		const f32 depth_scale = rsx::method_registers.viewport_scale_z();
+		const f32 depth_offset = rsx::method_registers.viewport_offset_z();
+
+		viewmodel_outcome outcome = viewmodel_outcome::tagged;
+
+		// Ordered so the counters partition 'considered' exactly: the span test first, because it
+		// is the one that rejects the whole world, then the near-end test on what survives.
+		// std::isfinite guards a register that has never been seen unset but is guest-writable.
+		if (!std::isfinite(depth_scale) || !(depth_scale > 0.f) ||
+			depth_scale >= s_viewmodel_max_depth_scale)
+		{
+			outcome = viewmodel_outcome::reject_full_range;
+			++m_stats.viewmodel_refused_full_range;
+		}
+		else if (!std::isfinite(depth_offset) || std::abs(depth_offset) > s_viewmodel_max_depth_offset)
+		{
+			outcome = viewmodel_outcome::reject_offset;
+			++m_stats.viewmodel_refused_offset;
+		}
+		else
+		{
+			is_viewmodel = true;
+			++m_stats.viewmodel_tagged;
+		}
+
+		// Measured for every draw the rule selects, reported and counted, never used to refuse.
+		// Same closed form the sky anchor uses: the instance transform's translation against the
+		// eye. R2's viewmodel reads 0.446 against a nearest same-frame world draw of 8.930.
+		f32 anchor = 0.f;
+		const bool measured = is_viewmodel && world_resolved && m_active_camera.valid;
+
+		if (is_viewmodel)
+		{
+			if (measured)
+			{
+				const f32 dx = transform.matrix[0][3] - m_active_camera.position[0];
+				const f32 dy = transform.matrix[1][3] - m_active_camera.position[1];
+				const f32 dz = transform.matrix[2][3] - m_active_camera.position[2];
+				anchor = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+				if (!std::isfinite(anchor) || anchor > s_viewmodel_max_anchor)
+				{
+					++m_stats.viewmodel_far;
+				}
+			}
+			else
+			{
+				++m_stats.viewmodel_noanchor;
+			}
+		}
+
+		// reject_full_range is deliberately not censused. It is every world program in the title -
+		// 77 of them at clip 1280x704 in these dumps - and naming them would spend the whole
+		// budget before the two that matter ever drew. The counter already bounds that
+		// population; the census exists to name the draws the rule *selects*, and the near-miss
+		// it rejects on the near-end test.
+		if (outcome != viewmodel_outcome::reject_full_range &&
+			m_viewmodel_census_lines < s_max_viewmodel_census_lines)
+		{
+			report_viewmodel_census(outcome, vertex_count, depth_scale, depth_offset,
+				transform, anchor, measured);
+		}
+	}
+
+	// --- post-transform geometry, measured ----------------------------------------------
+	// The last point at which every input to the submitted geometry exists: the vertices, the bone
+	// palette, and the instance transform. Placed after the sky decision because a dome is
+	// legitimately the size of the level and has to be exempt, and before the instance is built
+	// because a refusal here must cost nothing downstream.
+	if (!audit_world_extent(transform, skinned, vertex_count, is_sky))
+	{
+		return;
 	}
 
 	remixapi_InstanceInfoBoneTransformsEXT bone_transforms{};
@@ -5468,6 +6514,41 @@ void RemixGSRender::submit_subdraw()
 		instance.categoryFlags |= REMIXAPI_INSTANCE_CATEGORY_BIT_SKY;
 		++m_stats.cat_sky;
 	}
+
+	if (is_viewmodel && viewmodel_mode >= 2)
+	{
+		// The runtime side of this now exists. The fork at dxvk-remix-numos3 declares
+		// VIEW_MODEL = 1 << 26 (matching this header, which is synced wholesale from its
+		// public/include), routes it in categoryToCameraType() (rtx_remix_api.cpp:730), and
+		// assigns the result to 'prototype.cameraType' in toRtDrawState() (:916) rather than
+		// hardcoding CameraType::Main. That assignment is the load-bearing half: the runtime
+		// registers a viewmodel candidate on 'drawCall.cameraType == CameraType::ViewModel'
+		// and nothing else (rtx_instance_manager.cpp:1374), and ExternalDrawState's own
+		// cameraType field never reaches it - it only selects which camera's matrices
+		// submitExternalDraw() fetches. Requires runtime >= 0.1000.1.
+		//
+		// Note the bit is deliberately *not* an InstanceCategories member on the runtime side:
+		// internally "view model" is a CameraType, so toRtCategories() ignores this bit by
+		// design. Do not expect it to show up in category-flag dumps.
+		//
+		// Tagging is necessary but still not sufficient. Three things outside this file gate
+		// whether the arms actually render through the viewmodel pass:
+		//   1. a REMIXAPI_CAMERA_TYPE_VIEW_MODEL camera submitted every frame - not optional
+		//      and not synthesised. createViewModelInstances() returns early on
+		//      '!cameraManager.isCameraValid(CameraType::ViewModel)' (rtx_instance_manager.cpp
+		//      :1504) and then builds its correction matrix from *both* cameras, taking XY
+		//      from the viewmodel projection and Z/W from the main one (:1521 onward). The
+		//      measurement is in hand: these draws carry fovx 60.001 / fovy 36.132 with near
+		//      0.090, against the world's 72.000 / 44.634. That is the camera to submit;
+		//   2. rtx.viewModel.enable = True in rtx.conf. It defaults to false
+		//      (rtx_options.h:435), and the pass bails at rtx_instance_manager.cpp:1499;
+		//   3. rtx.playerModel.enableInPrimarySpace = False. When it is on, the pass masks
+		//      every viewmodel candidate to zero and returns (:1510) - the tag is honoured
+		//      and the geometry is then deliberately hidden.
+		// Of these, only (1) is this backend's job; (2) and (3) are rtx.conf.
+		instance.categoryFlags |= REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL;
+	}
+
 	instance.mesh = it->second.handle;
 	instance.transform = transform;
 	instance.doubleSided = (remix_rsx::cull_from_rsx() && rsx::method_registers.cull_face_enabled()) ? 0u : 1u;
@@ -5607,9 +6688,42 @@ void RemixGSRender::submit_subdraw()
 
 	++m_stats.draws_submitted;
 
+	// The draw survived every gate and is now in the scene. If it was flagged as geometrically
+	// incoherent back at the decode, this is the counter that says the artifact is actually being
+	// rendered rather than being discarded later for an unrelated reason.
+	if (m_vertex_flagged)
+	{
+		++m_stats.vtx_spread_submitted;
+	}
+
 	if (skinned)
 	{
 		++m_stats.skin_submitted;
+	}
+
+	// Drawn, not merely measured. Both of these are read at the far side of DrawInstance for the
+	// reason the header gives: wext_examined sits before the mesh, the material and DrawInstance,
+	// any of which can still drop the draw, so it cannot be read as a drawn count. These can.
+	//
+	// wext_drawn is the only histogram of the geometry that actually reached the scene; a streak is
+	// a decade that has no business being occupied, and it is readable without arming anything.
+	// wext_flagged_drawn is the A/B: over the ratio and rendered anyway because the gate was off.
+	if (m_streak_measured)
+	{
+		u32 decade = 0;
+
+		for (f32 limit = 1.f; decade < 7 && m_streak_extent >= limit; limit *= 10.f)
+		{
+			++decade;
+		}
+
+		++m_stats.wext_drawn[decade];
+		m_stats.wext_drawn_max = std::max(m_stats.wext_drawn_max, m_streak_extent);
+	}
+
+	if (m_streak_flagged)
+	{
+		++m_stats.wext_flagged_drawn;
 	}
 }
 
@@ -6527,11 +7641,18 @@ void RemixGSRender::log_stats()
 		"skip screen=%llu immediate=%llu inline=%llu volatile=%llu reg_attr0=%llu prim=%llu restart=%llu instanced=%llu layout=%llu mem=%llu decode=%llu poison=%llu vp=%llu rt=%llu rt_kept=%llu notinput=%llu wdiv=%llu posdecode_refused=%llu | "
 		"vp_hpos_indirect=%llu vp_hpos_refused=%llu vp_hpos_indexed=%llu vp_wbuffer_z=%llu | "
 		"idxworld_rigid=%llu idxworld_skinned=%llu idxworld_refused=%llu vp_indexed_matched=%llu vp_indexed_unmatched=%llu bone_degenerate=%llu | "
-		"skin_submitted=%llu skin_skipped=%llu skin_unrecognised=%llu skin_bones_max=%llu | "
-		"skinblend_submitted=%llu skinblend_idx=%llu skinblend_weight=%llu skinblend_bone=%llu skinblend_palette=%llu skinblend_scale=%llu skinblend_uniform=%llu skinblend_rescaled=%llu skin_reach_flagged=%llu | "
+		"skin_submitted=%llu skin_skipped=%llu skin_unrecognised=%llu skin_bones_max=%llu "
+		"skin_unrec_arl=%llu skin_unrec_foreign=%llu skin_unrec_reads=%llu skin_unrec_census=%u | "
+		"skinblend_submitted=%llu skinblend_idx=%llu skinblend_weight=%llu skinblend_bone=%llu skinblend_palette=%llu skinblend_scale=%llu skinblend_uniform=%llu skinblend_rescaled=%llu skin_reach_flagged=%llu vtx_spread=%llu vtx_zero_split=%llu vtx_spread_submitted=%llu vtx_spread_refused=%llu | "
+		"wext_examined=%llu wext_exempt=%llu wext_nonfinite=%llu wext_refused=%llu wext_flagged_drawn=%llu "
+		"wext_median=%.6g wext_samples=%llu wext_max=%.6g wext_drawn=%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu | "
 		"skip_lighting_pass=%llu | "
 		"cat_sky=%llu sky_cand=%llu sky_noworld=%llu sky_extent=%llu sky_anchor=%llu sky_anchor_held=%llu sky_census=%u "
 		"sky_backdrop_hit=%llu sky_backdrop_dw=%llu sky_backdrop_mode=%u | "
+		"skyhash_considered=%llu skyhash_dome=%llu skyhash_matched=%llu skyhash_tagged=%llu "
+		"skyhash_rejected=%llu skyhash_tracked=%llu skyhash_census=%u skyhash_mode=%u | "
+		"vm_tagged=%llu vm_considered=%llu vm_fullrange=%llu vm_offset=%llu vm_far=%llu vm_noanchor=%llu "
+		"vm_census=%u vm_mode=%u | "
 		"cat_hidden=%llu cat_particle=%llu cat_decal=%llu | "
 		"blend_chained=%llu blend_translucent=%llu blend_unmapped=%llu | "
 		"tex_bound=%llu tex_none=%llu tex_no_unit=%llu tex_unit_retry=%llu tex_albedo_ucode=%llu tex_albedo_guess=%llu tex_retry_refused=%llu tex_unit_substituted=%llu uv_applied=%llu uv_none=%llu uv_absent=%llu uv_layout=%llu uv_memory=%llu uv_fallback=%llu uv_ucode=%llu uv_heuristic=%llu uv_nonfinite=%llu vcol_applied=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_tombstone=%llu tex_rehashed=%llu tex_refreshed=%llu mat_created=%llu | "
@@ -6587,6 +7708,10 @@ void RemixGSRender::log_stats()
 		m_stats.skin_skipped,
 		m_stats.skin_unrecognised,
 		m_stats.skin_bones_max,
+		m_stats.skin_unrec_arl,
+		m_stats.skin_unrec_foreign,
+		m_stats.skin_unrec_reads,
+		m_skin_unrec_census_lines,
 		m_stats.skin_blend_submitted,
 		m_stats.skin_blend_refused_index,
 		m_stats.skin_blend_refused_weight,
@@ -6596,6 +7721,26 @@ void RemixGSRender::log_stats()
 		m_stats.skin_blend_uniform,
 		m_stats.skin_blend_rescaled,
 		m_stats.skin_reach_flagged,
+		m_stats.vtx_spread_flagged,
+		m_stats.vtx_zero_split,
+		m_stats.vtx_spread_submitted,
+		m_stats.vtx_spread_refused,
+		m_stats.wext_examined,
+		m_stats.wext_exempt,
+		m_stats.wext_nonfinite,
+		m_stats.wext_refused,
+		m_stats.wext_flagged_drawn,
+		static_cast<f64>(m_world_extent_median),
+		m_world_extent_samples,
+		static_cast<f64>(m_stats.wext_drawn_max),
+		m_stats.wext_drawn[0],
+		m_stats.wext_drawn[1],
+		m_stats.wext_drawn[2],
+		m_stats.wext_drawn[3],
+		m_stats.wext_drawn[4],
+		m_stats.wext_drawn[5],
+		m_stats.wext_drawn[6],
+		m_stats.wext_drawn[7],
 		m_stats.skip_lighting_pass,
 		m_stats.cat_sky,
 		m_stats.sky_candidates,
@@ -6607,6 +7752,22 @@ void RemixGSRender::log_stats()
 		m_stats.sky_backdrop_hit,
 		m_stats.sky_backdrop_dw,
 		remix_rsx::sky_backdrop_mode(),
+		m_stats.sky_hash_considered,
+		m_stats.sky_hash_dome,
+		m_stats.sky_hash_matched,
+		m_stats.sky_hash_tagged,
+		m_stats.sky_hash_rejected,
+		m_stats.sky_hash_tracked,
+		m_sky_hash_census_lines,
+		remix_rsx::sky_hash_mode(),
+		m_stats.viewmodel_tagged,
+		m_stats.viewmodel_considered,
+		m_stats.viewmodel_refused_full_range,
+		m_stats.viewmodel_refused_offset,
+		m_stats.viewmodel_far,
+		m_stats.viewmodel_noanchor,
+		m_viewmodel_census_lines,
+		remix_rsx::viewmodel_mode(),
 		m_stats.cat_hidden,
 		m_stats.cat_particle,
 		m_stats.cat_decal,

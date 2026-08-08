@@ -245,6 +245,19 @@ private:
 		// (a blend rig partially matched as single-bone). Refused, never mis-skinned: a missing
 		// character is an acceptable result, an exploded one is not.
 		u64 skin_unrecognised = 0;
+
+		// Which of the three hardening conditions in scan_vertex_program refused the rig. The
+		// aggregate above has been non-zero and unattributed for this whole title: 186648 draws
+		// against skin_submitted=43698 in the 4:50 capture, i.e. 81% of the skinned population
+		// dropped, with no record of why. The reason was already computed and stored in
+		// vp_fingerprint::skin_note and simply never reported, so these cost nothing to produce.
+		//   arl      more than one ARL: the address register is reloaded mid-program.
+		//   foreign  the palette is read through an address component the match does not cover.
+		//   reads    the program indexes the palette more times than rows x bones explains.
+		u64 skin_unrec_arl = 0;
+		u64 skin_unrec_foreign = 0;
+		u64 skin_unrec_reads = 0;
+
 		u64 skip_vp = 0;
 		// Unique vertex programs, not draws: how the HPOS writer collection went
 		// (vp_fingerprint::hpos_indirect). 'recovered' is programs whose matrix chain was only
@@ -340,6 +353,59 @@ private:
 		// clean was not torn by this backend's per-vertex maths.
 		u64 skin_reach_flagged = 0;
 
+		// Draws whose decoded positions do not form one object (audit_vertex_extent), measured
+		// before any transform is applied. 'spread' is the furthest vertex being a large multiple
+		// of the typical one, or a non-finite position; 'zero_split' is the much more specific
+		// finding that some - but not all - of the draw's vertices decoded to exactly (0,0,0),
+		// which is a read that returned nothing rather than arithmetic that went wrong. Both are
+		// instruments: nothing is refused on either. skin_reach_flagged staying 0 while these are
+		// non-zero locates the tearing in the decode rather than the transform.
+		u64 vtx_spread_flagged = 0;
+		u64 vtx_zero_split = 0;
+
+		// Of the flagged draws, how many survived every later gate and actually reached the scene.
+		// The audit runs right after the decode, so 'flagged' counts draws that may still be
+		// dropped for unrelated reasons - and the extreme case on Resistance 2 reports
+		// arch=unknown, which has no matrix chain into HPOS and is already discarded by
+		// world_refused. flagged >> submitted means the incoherent geometry is not being drawn and
+		// the artifact is elsewhere; flagged == submitted means it is.
+		u64 vtx_spread_submitted = 0;
+
+		// Draws dropped by RPCS3_REMIX_VTXREFUSE=1. Zero unless that knob is set.
+		u64 vtx_spread_refused = 0;
+
+		// --- post-transform geometry census (audit_world_extent) ----------------------------
+		//
+		// The size of the geometry Remix is actually handed: 'instance transform x bone palette x
+		// decoded position', in world units. Everything above this line is measured before at least
+		// one of those three, which is why all of it read clean at 81af315 while the streaks were on
+		// screen - see RemixTransforms.h, RPCS3_REMIX_STREAKGATE.
+		//
+		// The names say where each number is taken, because reading a flagged count as a drawn count
+		// has already cost this session two captures:
+		//   examined  reached the measurement. It sits after the world transform is resolved and
+		//             after every refusal above it, but before the mesh, the material and
+		//             DrawInstance, any of which can still drop the draw. NOT a count of drawn
+		//             geometry.
+		//   exempt    measured and never gated: sky domes are legitimately the size of the level, so
+		//             gating them on the scene's median would delete the sky. Excluded from the
+		//             median sample too, for the same reason.
+		//   refused   the gate dropped it. These never reached the scene, by construction.
+		//   flagged_drawn  over the ratio and drawn anyway, i.e. RPCS3_REMIX_STREAKGATE=0. This is
+		//             the A/B number: non-zero here with streaks on screen and zero without is what
+		//             ties the artifact to this population.
+		//   drawn[]   the only histogram of geometry that reached the scene: filled from the stored
+		//             extent at the point DrawInstance returned success, not at the gate.
+		u64 wext_examined = 0;
+		u64 wext_exempt = 0;
+		u64 wext_nonfinite = 0;
+		u64 wext_refused = 0;
+		u64 wext_flagged_drawn = 0;
+
+		// Decades of world extent over drawn geometry: <1, <10, <100, <1e3, <1e4, <1e5, <1e6, rest.
+		u64 wext_drawn[8] = {};
+		f32 wext_drawn_max = 0.f;
+
 		// Unique vertex programs whose HPOS.z was written as a w-buffer premultiply and whose 4x4
 		// was only recovered by taking z from the row feeding it (vp_fingerprint::hpos_wbuffer_z).
 		u64 vp_wbuffer_z = 0;
@@ -383,6 +449,71 @@ private:
 		// percent means the rule is selecting geometry, not backdrop, and mode 2 must not be used.
 		u64 sky_backdrop_hit = 0;
 		u64 sky_backdrop_dw = 0;
+
+		// The albedo-hash sky rule (sky_hash_mode), added after 81af315. Read as ratios; the whole
+		// point of the set is that an over-match is a number here rather than a missing world.
+		//
+		//   sky_hash_considered  every submitted draw that carried an albedo hash the rule is
+		//                        tracking, i.e. one that has been dome-shaped at least once. It
+		//                        partitions exactly:
+		//                          considered == matched + rejected
+		//   sky_hash_dome        the subset of considered whose *own* geometry was dome-shaped.
+		//                        dome / considered is the rule's internal agreement: a hash that
+		//                        really is the sky runs at 1.0, and anything well below it is a
+		//                        texture the title also uses on something that is not a dome.
+		//   sky_hash_matched     draws whose hash is currently armed (all-dome, enough samples).
+		//   sky_hash_tagged      the subset actually given SKY, i.e. matched at mode 2. At mode 1
+		//                        this is 0 by construction and matched is the preview of what
+		//                        mode 2 would do, with the image untouched.
+		//   sky_hash_rejected    considered-but-refused: the hash has been seen on a non-dome draw
+		//                        and is disqualified for the life of the process. This is the
+		//                        counter that says the rule is *working* rather than merely quiet -
+		//                        a title whose sky texture is also a wall texture reads here.
+		//   sky_hash_tracked     unique hashes in the table, capped at s_max_sky_hash_tracked.
+		//
+		// The ratio to watch before arming mode 2 is sky_hash_matched / draws_submitted, against
+		// the two numbers this rule exists to beat: the raw-extent regression of ae94587 tagged
+		// 825915 of 2038738 draws (40.5%), and the geometric backdrop rule measured 1.11%. A sky is
+		// a handful of draws a frame, so a healthy reading is small fractions of a percent.
+		u64 sky_hash_considered = 0;
+		u64 sky_hash_dome = 0;
+		u64 sky_hash_matched = 0;
+		u64 sky_hash_tagged = 0;
+		u64 sky_hash_rejected = 0;
+		u64 sky_hash_tracked = 0;
+
+		// Viewmodel detection (viewmodel_mode), added after 81af315. 'considered' is every draw
+		// that reached the test, and the three buckets below partition it exactly:
+		//
+		//   viewmodel_considered == viewmodel_tagged
+		//                         + viewmodel_refused_full_range
+		//                         + viewmodel_refused_offset
+		//
+		// so an over-tag reads as one ratio. The expected resting value on Resistance 2 is
+		// tagged / considered ~= 2.4% (the replay gives 168 of 7041 dumped 3D draws, 2.39%),
+		// with refused_full_range carrying essentially all of the remainder. The failure shapes:
+		//   tagged approaching a double-digit share   the depth-range test is selecting world
+		//                                             geometry; read the census for which
+		//                                             programs and set RPCS3_REMIX_VIEWMODEL=1.
+		//   refused_offset large                      some title puts its whole scene in a
+		//                                             sub-unit depth slice that is not pinned at
+		//                                             the near end; the offset gate is doing the
+		//                                             work and the rule needs re-measuring there.
+		//   tagged = 0 on R2 gameplay                 the arms are not reaching submit_subdraw at
+		//                                             all - look at skip_screen_space and
+		//                                             world_refused, not here.
+		u64 viewmodel_considered = 0;
+		u64 viewmodel_tagged = 0;
+		u64 viewmodel_refused_full_range = 0;
+		u64 viewmodel_refused_offset = 0;
+
+		// Tagged draws whose origin was further from the eye than s_viewmodel_max_anchor, and
+		// tagged draws for which no anchor could be measured at all (no resolved world transform
+		// or no valid camera). Neither refuses anything - they are the over-tag alarm described
+		// on s_viewmodel_max_anchor. far > 0 with tagged small means the depth-range test found
+		// something that is not in front of the player's face.
+		u64 viewmodel_far = 0;
+		u64 viewmodel_noanchor = 0;
 
 		u64 cat_hidden = 0;
 		u64 cat_particle = 0;
@@ -603,6 +734,7 @@ private:
 	{
 		tagged,
 		tagged_backdrop,
+		tagged_hash,
 		reject_extent,
 		reject_anchor,
 		reject_noworld,
@@ -624,7 +756,91 @@ private:
 	// bounding-box scan that feeds it, once the budget is spent.
 	void report_sky_census(sky_outcome outcome, u32 vertex_count, bool depth_write,
 		const f32 (&lo)[3], const f32 (&hi)[3], const remixapi_Transform& transform,
-		f32 world_extent, f32 anchor, bool measured, bool camera_inside, f32 units_per_vertex);
+		f32 world_extent, f32 anchor, bool measured, bool camera_inside, f32 units_per_vertex,
+		u64 albedo_hash);
+
+	// --- albedo-hash sky rule (sky_hash_mode) -----------------------------------------------
+	// What the rule knows about one albedo content hash. 'dome' and 'other' partition every
+	// submitted draw that carried it since it was first seen dome-shaped, so dome/(dome+other) is
+	// the hash's agreement with the geometry and 'other' is the disqualifier.
+	struct sky_hash_entry
+	{
+		u32 dome = 0;
+		u32 other = 0;
+
+		// The first program seen drawing it as a dome, so the census can name a program as well as
+		// a hash - a hash says which texture, a program says which mesh, and the two together are
+		// what a reader can check against what is on screen.
+		u64 vp = 0;
+
+		// One census line when the hash arms and one when it is disqualified, never repeated.
+		bool reported_armed = false;
+		bool reported_mixed = false;
+	};
+
+	// One line per hash per transition, in the shape of 'Remix sky-census:'.
+	void report_sky_hash_census(u64 albedo_hash, const sky_hash_entry& entry, bool armed,
+		f32 world_extent, f32 units_per_vertex, u32 vertex_count);
+
+	// How many all-dome draws a hash needs before it is armed. 8 rather than 1 because a single
+	// dome-shaped draw is exactly what a large flat effect card looks like for one frame, and R2
+	// draws its backdrop every frame - so a hash that is really the sky reaches 8 in under a
+	// second at 60 fps while a one-off cannot reach it at all.
+	static constexpr u32 s_sky_hash_min_draws = 8;
+
+	// Hard cap on the table. Only hashes that have been dome-shaped at least once are ever
+	// inserted, which on the dumped R2 captures is a few hundred textures out of 737 unique ones
+	// in remix_tex\, so this is headroom rather than a limit that is expected to bind.
+	static constexpr usz s_max_sky_hash_tracked = 4096;
+
+	std::unordered_map<u64, sky_hash_entry> m_sky_hash_seen;
+
+	u32 m_sky_hash_census_lines = 0;
+	static constexpr u32 s_max_sky_hash_census_lines = 64;
+
+	// --- viewmodel (viewmodel_mode) --------------------------------------------------------
+	enum class viewmodel_outcome
+	{
+		tagged,
+		reject_full_range,
+		reject_offset,
+		count
+	};
+
+	// Largest viewport depth-range span a draw may occupy and still be called a viewmodel. R2
+	// runs the world at scale_z=1 and the arms/weapon at scale_z=0.2 across all 7041 dumped 3D
+	// draws, with nothing at all in between; 0.5 is the round number in a 5x gap, not a tuned
+	// one. A draw at or above it is ordinary world geometry.
+	static constexpr f32 s_viewmodel_max_depth_scale = 0.5f;
+
+	// How far from 0 the near end of that span may sit. A compressed slice is only a viewmodel if
+	// it is pinned at the *front* of the range; a compressed slice anywhere else is some other
+	// title-specific trick. Replaying the shipped rule over all 10153 dumped draws in the
+	// scratchpad, this gate is the one that carries the 153 draws of the second title in those
+	// captures - [0.50125, 1.0] and [0.00125, 0.0025], clip 1024x576 and 512x288 - which the span
+	// test alone admits (their scale_z of 0.49875 and 0.00125 are both under s_viewmodel_max_
+	// depth_scale). R2's own 2D UI at [0.5, 1.0] never reaches here: scale_z is exactly 0.5, so
+	// the span test rejects it on the boundary. 1e-3 sits below the smallest non-zero offset_z on
+	// record, 0.00125.
+	static constexpr f32 s_viewmodel_max_depth_offset = 1e-3f;
+
+	// Distance from the eye past which a tagged draw is counted as suspicious - reported, never
+	// refused. The measured viewmodel anchor is 0.446 world units and the nearest same-frame
+	// world draw is 8.930, so 4.0 (the sky rule's number, and for the same reason: it is the
+	// round value inside a 20x gap) separates them with room to spare. It is not a gate because
+	// the depth-range test was already exclusive over 8857 draws with no false positive, and an
+	// anchor needs a resolved world transform and a live camera, either of which can be missing
+	// on exactly the frames the arms still need drawing. Replaying the shipped rule over all
+	// 10153 dumped draws returns 168, all of them those two programs, with no false positive to
+	// gate away. Its job is to be the alarm that fires if that stops being true on some other
+	// title, not a second gate.
+	static constexpr f32 s_viewmodel_max_anchor = 4.f;
+
+	// One line per (vertex program, outcome), once, under a hard ceiling. No re-emission rule
+	// like the sky census': the population this names is two programs, so "once" is already
+	// bounded, and a repeat would say nothing the counters do not.
+	void report_viewmodel_census(viewmodel_outcome outcome, u32 vertex_count,
+		f32 scale_z, f32 offset_z, const remixapi_Transform& transform, f32 anchor, bool measured);
 
 	// Fills m_scratch_vertices' texcoords from the vertex attribute that feeds the albedo unit.
 	// Must run before the mesh content hash is taken: the texcoords are part of the vertex data
@@ -686,6 +902,14 @@ private:
 	// further than the mesh's own spread can explain. Measures the artifact rather than any theory
 	// about it; see the definition. Runs on both skinned paths, after the bones are final.
 	void audit_skin_extent(u32 vertex_count);
+
+	// Asks whether a draw's decoded positions form one object, before any transform touches them.
+	// Runs on every draw, skinned or not; see the definition. Diagnostic only.
+	void audit_vertex_extent(u32 first_vertex, u32 vertex_count, const attribute_view& positions, bool w_divide);
+
+	// The only measurement of the geometry Remix is actually handed. Returns false when the streak
+	// gate refuses the draw. See RemixTransforms.h, RPCS3_REMIX_STREAKGATE.
+	bool audit_world_extent(const remixapi_Transform& transform, bool skinned, u32 vertex_count, bool exempt);
 
 	// Decides what an indexed-constant draw actually is, from the draw's own vertex data rather
 	// than from the ucode: evaluates the palette index for every vertex and, when they all agree,
@@ -779,7 +1003,8 @@ private:
 	// each sky_outcome, or -1 for "not reported yet".
 	struct sky_census_entry
 	{
-		f32 printed_extent[static_cast<usz>(sky_outcome::count)] = { -1.f, -1.f, -1.f, -1.f, -1.f, -1.f };
+		// One per sky_outcome - keep the initialiser the same length as the enum.
+		f32 printed_extent[static_cast<usz>(sky_outcome::count)] = { -1.f, -1.f, -1.f, -1.f, -1.f, -1.f, -1.f };
 	};
 
 	std::unordered_map<u64, sky_census_entry> m_sky_census_seen;
@@ -789,6 +1014,13 @@ private:
 	// covers depth-writing draws has to scan a bounding box for draws the sky test itself skips.
 	u32 m_sky_census_lines = 0;
 	static constexpr u32 s_max_sky_census_lines = 256;
+
+	// Viewmodel census state: (vertex program ^ outcome) already named. 64 lines is generous for
+	// a population the dumps put at two programs - if it ever fills, the rule is selecting far
+	// more than a viewmodel and viewmodel_tagged / viewmodel_considered will say so first.
+	std::unordered_set<u64> m_viewmodel_census_seen;
+	u32 m_viewmodel_census_lines = 0;
+	static constexpr u32 s_max_viewmodel_census_lines = 64;
 
 	// CreateMesh calls attributed to the vertex program that issued them, reset every stats
 	// window. A title that skins on the SPU rewrites its vertex bytes every frame, so the
@@ -896,6 +1128,61 @@ private:
 	// Vertex programs already reported by audit_skin_extent. The flag describes a shape, and a
 	// shape repeats every frame the rig is on screen; skin_reach_flagged carries the per-draw count.
 	std::unordered_set<u64> m_skin_reach_seen;
+
+	// Vertex programs already reported by audit_vertex_extent, same once-per-shape rule.
+	std::unordered_set<u64> m_vertex_spread_seen;
+
+	// Reused by audit_vertex_extent for its per-axis and per-distance median selection. A member so
+	// a pass that runs on every draw does not allocate on every draw.
+	std::vector<f32> m_scratch_vertex_spread;
+	std::vector<u32> m_scratch_outlier_indices;
+
+	// audit_vertex_extent flagged this subdraw's geometry as incoherent. Read at the submission
+	// point, because the audit runs before every gate that could still drop the draw.
+	bool m_vertex_flagged = false;
+
+	// --- post-transform geometry census, per subdraw ------------------------------------
+	// The world extent audit_world_extent measured for this subdraw, and whether it was over the
+	// ratio. Both have the same per-subdraw lifetime as m_vertex_flagged and are read once more at
+	// the point DrawInstance succeeded - which is what keeps 'examined' and 'drawn' separate
+	// counters rather than one number that has to be interpreted.
+	f32 m_streak_extent = 0.f;
+	bool m_streak_flagged = false;
+	bool m_streak_measured = false;
+
+	// World extents of this frame's non-exempt drawn geometry, and the median of the frame before
+	// it. The gate compares a draw against its own scene rather than against a constant, so it needs
+	// to know nothing about the title's units; the previous frame's median is used because the
+	// current frame's is not knowable while the frame is still being submitted. Reset per flip.
+	std::vector<f32> m_scratch_world_extents;
+	f32 m_world_extent_median = 0.f;
+	u64 m_world_extent_samples = 0;
+
+	// One census line per program, the same once-per-shape rule the indexed-world census uses, with
+	// a hard line cap on top: a streak population that turns out to be a hundred programs must not
+	// spend the whole log before the frame it appeared in is readable.
+	std::unordered_set<u64> m_world_extent_seen;
+	u32 m_world_extent_census_lines = 0;
+	static constexpr u32 s_max_world_extent_census_lines = 64;
+
+	// One line per unrecognised rig, once per program, bounded - the same shape. The dump cannot
+	// answer this: it emitted 72 lines in the 4:50 capture and not one of them carried
+	// unrecognised=1, so the programs being dropped were never sampled by it at all.
+	std::unordered_set<u64> m_skin_unrec_seen;
+	u32 m_skin_unrec_census_lines = 0;
+	static constexpr u32 s_max_skin_unrec_census_lines = 32;
+
+	// The gate stays disarmed until the previous frame has this many non-exempt samples. A median
+	// over a handful of draws is not a scene scale, and arming on one would refuse whatever happened
+	// to be biggest in a frame that drew almost nothing - a loading screen, or the first frame after
+	// a camera change.
+	static constexpr u64 s_streak_median_min_samples = 16;
+
+	// The ratio audit_world_extent reports at when the gate is switched off, i.e. the same threshold
+	// RPCS3_REMIX_STREAKGATE defaults to. Present so that the off run and the on run flag the same
+	// draws and their censuses can be diffed line for line; if it drifted from the env default the
+	// A/B would be comparing two different questions.
+	static constexpr f32 s_streak_report_ratio = 128.f;
 
 	// Screen-space positions in compositor pixels, one entry per decoded vertex.
 	std::vector<f32> m_scratch_ui_x;

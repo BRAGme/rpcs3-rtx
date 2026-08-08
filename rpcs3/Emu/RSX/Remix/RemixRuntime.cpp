@@ -592,7 +592,7 @@ namespace remix_rsx
 			return 0.f;
 		}();
 
-		return env > 1.f ? env : g_cfg.video.remix.far_plane;
+		return env > 1.f ? env : static_cast<f32>(g_cfg.video.remix.far_plane);
 	}
 }
 

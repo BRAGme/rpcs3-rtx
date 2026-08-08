@@ -798,6 +798,41 @@ namespace remix_rsx
 	// an explosion. 0 disables the pass. Diagnostic only: nothing is ever refused on it.
 	f32 skin_reach_ratio();
 
+	// RPCS3_REMIX_VTXSPREAD=<ratio>: how many times the median a draw's furthest decoded vertex may
+	// sit from the draw's own median position before audit_vertex_extent reports it. Default 64 -
+	// a coherent object's furthest vertex is a small multiple of its typical one, and a subset that
+	// collapsed elsewhere is orders of magnitude out. 0 disables the pass. Diagnostic only.
+	f32 vertex_spread_ratio();
+
+	// RPCS3_REMIX_VTXREFUSE=1: drop a draw audit_vertex_extent called geometrically incoherent
+	// instead of submitting it. Off by default - it is an A/B, not a fix, until vtx_spread_submitted
+	// says the flagged draws reach the scene at all.
+	bool vertex_spread_refuse();
+
+	// RPCS3_REMIX_STREAKGATE=<ratio>: how many times the frame's own median world extent a draw's
+	// post-transform bounding box may span before audit_world_extent refuses it. 0 restores the
+	// behaviour at 81af315, where nothing measured the geometry Remix actually receives.
+	//
+	// Every audit that existed at 81af315 is scale-free by construction and therefore blind to
+	// exactly this: audit_vertex_extent reports max/median over the *decoded* positions, before any
+	// matrix; audit_skin_extent reports max/median over 'bones x position', measured against each
+	// vertex's own bone origin and before the instance transform. A mesh that is coherent but a
+	// thousand times too big passes both with ratio ~1, and at 81af315 both said so - vtx_spread
+	// flagged 2036 draws of 1303434 and vtx_spread_submitted was 0 for every one of them, and
+	// skin_reach_flagged was 0 outright, while the streaks were on screen.
+	//
+	// The one number nobody had was the absolute size of 'instance x bones x position'. The
+	// sky-census 'wext' comes closest and is not it: it transforms the raw ATTR0 box by the instance
+	// matrix only, which for a blended rig omits the bone matrices that carry that draw's whole
+	// position decode - so it over-reports every skinned draw by the decode factor and cannot be read
+	// as a world size for them.
+	//
+	// Default 128 against the frame's own median, so the test needs to know nothing about the title's
+	// units and moves with the scene. Provisional: the wext_drawn histogram in the stats line is what
+	// re-tunes it from one run, and it is deliberately far looser than the 64 audit_vertex_extent
+	// uses in model space, because a terrain chunk really is tens of times a character.
+	f32 streak_extent_ratio();
+
 	// RPCS3_REMIX_WBUFFERZ=0: refuse a program that writes HPOS.z as its clip z premultiplied by
 	// its clip w, instead of recovering the matrix row that feeds the premultiply. The behaviour up
 	// to and including ae94587, where Resistance 2's 3152b710c603e12d - a 34679 x 0 x 32770 plane,
@@ -915,6 +950,41 @@ namespace remix_rsx
 	// anything: run once, read sky_backdrop_hit against draws_submitted, then decide.
 	u32 sky_backdrop_mode();
 
+	// RPCS3_REMIX_SKYHASH=<0|1|2>: identify the sky by *material* rather than by geometry.
+	//   0  off. Exactly the 81af315 behaviour: nothing measured, nothing tagged.
+	//   1  measure only (default). Learns the hashes, counts and censuses them, tags nothing.
+	//   2  measure and tag SKY.
+	//
+	// Every geometric sky rule in this file asks a question about size or placement, and on this
+	// title the answers are fuzzy: sky_backdrop_mode()'s rule matched 1.11% of submitted draws in
+	// the capture it was measured against, which is far too broad to arm, because 1.11% of R2's
+	// draws is world geometry. A texture hash is exact where an extent threshold is fuzzy - two
+	// draws either sample the same image or they do not - so this keys on the albedo content hash
+	// and uses the geometry only to *learn* which hashes belong to a dome.
+	//
+	// A hash is armed when every draw carrying it has been dome-shaped over at least
+	// s_sky_hash_min_draws draws, and is disqualified permanently by a single draw that is not.
+	// That inverts the usual failure mode: a threshold rule mis-tags whatever sits near the
+	// threshold, while this one can only mis-tag a texture the title uses on nothing but domes.
+	//
+	// What tagging SKY actually does on this backend, read out of the runtime it targets rather
+	// than assumed: the API path routes categoryFlags through toRtCategories() (dxvk-remix-numos3
+	// src/dxvk/rtx_render/rtx_remix_api.cpp:741) and categoryToCameraType() (same file, :731), and
+	// an instance whose cameraType is Sky is force-hidden - rtx_instance_manager.cpp:1005-1008,
+	// "Hide the sky instance since it is not raytraced", which clears its ray mask to 0 at
+	// rtx_instance_manager.cpp:1288-1289. It is *not* rasterised into the sky cubemap: that
+	// happens in tryHandleSky(), which is called only from RtxContext (rtx_context.cpp:981 and
+	// :2240, both D3D9 raster paths) and never from SceneManager::submitExternalDraw
+	// (rtx_scene_manager.cpp:2388). So on this path SKY means "remove from the BVH", and the sky
+	// itself has to come from somewhere else - set rtx.skyMode = 1 (Numos, Hillaire atmospheric
+	// scattering, rtx_options.h:1266) so the hole is filled procedurally.
+	//
+	// Note also that the fork already matches rtx.skyBoxTextures against API-submitted draws by
+	// albedo hash - fork_hooks::externalDrawTextureCategories, rtx_fork_submit.cpp:65-100, called
+	// from rtx_scene_manager.cpp:2460 - so once the census names the hashes they can equally be
+	// put in rtx.conf. This knob exists because it finds them.
+	u32 sky_hash_mode();
+
 	// RPCS3_REMIX_SKYTEXTURED=0: require a sky candidate to be untextured, the behaviour up to and
 	// including 9c73eb0. That requirement was written against Haze's vertex-coloured dome and does
 	// not generalise - a sky dome may perfectly well carry a texture. Resistance 2's (NPEA00431)
@@ -926,6 +996,50 @@ namespace remix_rsx
 	// set 0 to bisect a title where a large depth-write-off textured draw (a fog card, a full-screen
 	// effect) is being mis-tagged and so hidden from the world pass.
 	bool sky_allows_textured();
+
+	// RPCS3_REMIX_VIEWMODEL. The first-person arms/weapon rule, added after 81af315, where the
+	// backend had no notion of a viewmodel at all: REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL and
+	// REMIXAPI_CAMERA_TYPE_VIEW_MODEL were both declared in remix_c.h and neither was ever used,
+	// so the player's arms and weapon were submitted as ordinary world geometry.
+	//   0  off. Exactly the 81af315 behaviour: nothing measured, nothing tagged.
+	//   1  measure only. Counts and censuses, and leaves categoryFlags alone.
+	//   2  measure and tag VIEW_MODEL (default).
+	//
+	// The rule is the viewport depth range, which is a mechanism rather than a correlation. The
+	// G0 recovery says Resistance 2's projection maps to z_ndc = 1 - near/w, i.e. z_ndc in [0,1]
+	// with the far plane at infinity, so viewport z maps that to [offset_z, offset_z + scale_z].
+	// R2 draws the whole world at [0, 1] and one thing at [0, 0.2] - the front fifth - which
+	// forces every one of its pixels in front of any world pixel past w = near/0.8. That is the
+	// standard "the weapon never clips into a wall" trick, and it is *why* the bucket exists.
+	//
+	// Measured over every dump log in the scratchpad, 7041 R2 3D draws (clip 1280x704). Only two
+	// depth ranges occur in the whole 3D pass, with nothing between them:
+	//   [0, 1]     6873 draws over 77 vertex programs - the world.
+	//   [0, 0.2]    168 draws (2.39%) over exactly two - 1438eb79c0843fea (depth_write=1) and
+	//               7a4a57869f9c4a1f (depth_write=0) - always the same mesh (vtx=1687 idx=6948),
+	//               always as that pair, always skinned, in every gameplay capture.
+	// Those same two programs also draw a 5954-vertex character at [0, 1] in 78 dumped draws, so
+	// the program hash does *not* separate the viewmodel from world geometry and a per-program
+	// rule would tag that character. The depth range does separate them, per draw.
+	//
+	// Two independent measurements corroborate, neither of them used as a gate:
+	//   projection  recovering the fused G0 gives the [0, 0.2] draws fovx 60.001 / fovy 36.132,
+	//               near 0.090, against fovx 72.000 / fovy 44.634 for the world in the same
+	//               captures. 44.634 is what the Remix dev menu reports for R2 (44.6), which is
+	//               what says the recovery is right rather than merely self-consistent.
+	//   anchor      on frames where a camera was sampled in the same frame, the [0, 0.2] draw's
+	//               instance origin sits 0.446 units from the eye at eye height ([-4.048 15.241
+	//               -6.450] against cam [-3.664 15.205 -6.226], dY 0.036) while the nearest
+	//               same-frame world draw is 8.930 away. A 20x gap - the mirror image of the sky
+	//               dome, pinned a fixed short distance in front of the eye instead of enclosing it.
+	//
+	// Ships at 2 because tagging is provably image-identical against the runtime this backend is
+	// built for: bit 26 does not exist in dxvk-remix-numos3's own remix_c.h (its enum stops at
+	// SMOOTH_NORMALS = 1 << 24) and toRtCategories() maps by name over bits 0..24, so the bit is
+	// dropped. See the comment on the tagging site in submit_subdraw for what the fork needs
+	// before it means anything. Mode 1 is there for the day that changes and the ratio needs
+	// reading before the image does.
+	u32 viewmodel_mode();
 
 	// Debug light knobs so a derived camera can be judged visually at all.
 	f32 debug_light_radius();
