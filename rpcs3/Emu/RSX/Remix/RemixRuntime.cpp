@@ -23,11 +23,14 @@
 //                   (byte-identical to public/include/remix/remix_c.h at that commit)
 //   Runtime asset : local build of that commit -- NOT the Remix_Plus_v1.5.1 release zip, which
 //                   predates the VIEW_MODEL category bit this backend relies on. Deployed to
-//                   <exe dir>\remix\; d3d9.dll is
+//                   <exe dir>\remix\; d3d9.dll is 240655872 bytes,
 //                   SHA-256 A20E4B72D26D919E1011639D0A64DBCA8575B5D404FD2B11E2D649576C4B568A.
-//                   Built from a dirty tree (12 files modified, none of them remix_c.h or the
-//                   API implementation, so the surface still matches the header above), which
-//                   means the commit alone does not reproduce it -- identify the binary by hash.
+//                   The byte count is there to be read off a log: log_dll_identity prints
+//                   size= for whatever actually loaded, so a run can be matched against this
+//                   line without rehashing anything. Built from a dirty tree (12 files
+//                   modified, none of them remix_c.h or the API implementation, so the surface
+//                   still matches the header above), which means the commit alone does not
+//                   reproduce it -- identify the binary by hash.
 //
 // Never update bin\remix\ without re-vendoring remix_c.h in the same commit.
 // ---------------------------------------------------------------------------------------------
