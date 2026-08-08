@@ -1236,6 +1236,16 @@ private:
 		f32 extent = 0.f;
 		bool sky = false;
 		bool viewmodel = false;
+
+		// The decode verdict for the program that drew it. Carried here rather than looked up
+		// afterwards because these are the fields that separate "this mesh is genuinely large"
+		// from "this mesh arrived undecoded", and a click on a streak is asking exactly that.
+		// affine_reason points into static strings owned by the fingerprint cache.
+		u8 archetype = 0;
+		bool has_prescale = false;
+		bool has_const_affine = false;
+		bool skinned = false;
+		const char* affine_reason = "";
 	};
 
 	// A frame that submits more draws than this stops numbering them rather than growing

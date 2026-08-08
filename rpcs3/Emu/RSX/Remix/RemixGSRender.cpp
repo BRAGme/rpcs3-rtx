@@ -673,9 +673,25 @@ void RemixGSRender::pick_callback(const u32* values, u32 count, void* user)
 
 		// albedo=0 is the answer as often as not - it is the tex_none population, the draws
 		// that reach Remix with no texture at all - so it is printed rather than skipped.
-		rsx_log.success("Remix: picked vp=%016llx albedo=%016llx vtx=%u extent=%.4g sky=%d viewmodel=%d",
+		const std::string line = fmt::format(
+			"Remix picked: vp=%016llx albedo=%016llX vtx=%u extent=%.4g sky=%d viewmodel=%d "
+			"arch=%s skinned=%d prescale=%d affine=%d areason=%s",
 			r.vp_hash, r.albedo_hash, r.vertex_count, static_cast<f64>(r.extent),
-			r.sky ? 1 : 0, r.viewmodel ? 1 : 0);
+			r.sky ? 1 : 0, r.viewmodel ? 1 : 0,
+			remix_rsx::archetype_name(static_cast<remix_rsx::vp_archetype>(r.archetype)),
+			r.skinned ? 1 : 0, r.has_prescale ? 1 : 0, r.has_const_affine ? 1 : 0,
+			r.affine_reason);
+
+		rsx_log.success("%s", line);
+
+		// Mirrored for the same reason every census here is: RPCS3.log is held open and
+		// exclusively locked for the whole run, so a line that only lands there cannot be read
+		// until the emulator is closed - and a picked draw is worth nothing after the fact,
+		// because the whole point is to name what is on screen right now.
+		if (fs::file out{ fs::get_executable_dir() + "remix_dump.log", fs::write + fs::create + fs::append })
+		{
+			out.write(line + '\n');
+		}
 	}
 
 	if (!reported.empty())
@@ -7297,6 +7313,16 @@ void RemixGSRender::submit_subdraw()
 		record.extent = m_streak_extent;
 		record.sky = is_sky;
 		record.viewmodel = is_viewmodel;
+		record.skinned = skinned;
+
+		if (m_current_fingerprint)
+		{
+			record.archetype = static_cast<u8>(m_current_fingerprint->archetype);
+			record.has_prescale = m_current_fingerprint->has_prescale;
+			record.has_const_affine = m_current_fingerprint->has_const_affine;
+			record.affine_reason = m_current_fingerprint->affine_reason;
+		}
+
 		m_pick_table.push_back(record);
 
 		picking.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_OBJECT_PICKING_EXT;
@@ -8643,6 +8669,32 @@ void RemixGSRender::log_stats()
 		if (any && m_ui_vote_spill != 0)
 		{
 			rsx_log.notice("Remix ui-vote: spill=%llu (programs past the table)", m_ui_vote_spill);
+		}
+	}
+
+	// The counters that answer a "did that change anything?" question, mirrored where they can
+	// be read during the run. Everything above this point goes only to RPCS3.log, which is held
+	// exclusively locked until the emulator exits - so the whole stats block has been unreadable
+	// while the thing it describes is on screen, and a question like "is the tiling still there"
+	// had to be answered by eye. Deliberately a short line and not the full block: the full one
+	// is 60 counters wide and would bury the census lines it sits between.
+	{
+		const std::string line = fmt::format(
+			"Remix live: seen=%llu submitted=%llu | uv_applied=%llu uv_scale_ucode=%llu uv_scale_fixed=%llu | "
+			"tex_bound=%llu tex_none=%llu | world_refused=%llu wext_refused=%llu",
+			m_stats.draws_seen,
+			m_stats.draws_submitted,
+			m_stats.uv_applied,
+			m_stats.uv_scale_ucode,
+			m_stats.uv_scale_fixed,
+			m_stats.tex_bound,
+			m_stats.tex_none,
+			m_stats.world_refused,
+			m_stats.wext_refused);
+
+		if (fs::file out{ fs::get_executable_dir() + "remix_dump.log", fs::write + fs::create + fs::append })
+		{
+			out.write(line + '\n');
 		}
 	}
 }
