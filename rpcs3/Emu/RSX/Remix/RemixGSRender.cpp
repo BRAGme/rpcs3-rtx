@@ -8758,7 +8758,8 @@ void RemixGSRender::log_stats()
 	{
 		const std::string line = fmt::format(
 			"Remix live: seen=%llu submitted=%llu | uv_applied=%llu uv_scale_ucode=%llu uv_scale_fixed=%llu | "
-			"tex_bound=%llu tex_none=%llu | world_refused=%llu wext_refused=%llu",
+			"tex_bound=%llu tex_none=%llu | world_refused=%llu wext_refused=%llu | "
+			"cam_resolved=%llu cam_fallback=%llu cam_held=%llu",
 			m_stats.draws_seen,
 			m_stats.draws_submitted,
 			m_stats.uv_applied,
@@ -8767,7 +8768,10 @@ void RemixGSRender::log_stats()
 			m_stats.tex_bound,
 			m_stats.tex_none,
 			m_stats.world_refused,
-			m_stats.wext_refused);
+			m_stats.wext_refused,
+			m_stats.cam_resolved,
+			m_stats.cam_fallback,
+			m_stats.cam_held);
 
 		if (fs::file out{ fs::get_executable_dir() + "remix_dump.log", fs::write + fs::create + fs::append })
 		{
