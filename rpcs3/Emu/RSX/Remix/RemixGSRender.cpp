@@ -7786,6 +7786,46 @@ void RemixGSRender::dump_vertex_program(u32 first_vertex, u32 vertex_count, u32 
 		tc0 != " <not written>")
 	{
 		fmt::append(groups, " tc0:%s", tc0);
+
+		// Live values of every constant slot the TEX0 slice reads. resolve_output_input refuses a
+		// program that scales its texcoord before writing o7, and on Haze 17 of the 25 refusals
+		// carry the same shape - MUL>rN.xy(I0.xyxx, C0.xxxx, ...)c151i8, i.e. attr8 times slot 151.
+		// The heuristic then supplies attr8 raw and the scale is dropped, which is the tiling.
+		// UVINTSCALE's own doc already concedes the point ("whose real divisor is a vertex-program
+		// constant this backend does not read"); this prints the constant so the 4096 stand-in can
+		// be checked against it rather than assumed. Parsed back out of the slice string because
+		// that is where the slot numbers already are - a diagnostic, not a decode path.
+		{
+			std::string slot_values;
+			std::unordered_set<u32> seen_slots;
+
+			for (usz p = tc0.find(")c"); p != std::string::npos; p = tc0.find(")c", p + 1))
+			{
+				u32 slot = 0;
+				usz d = p + 2;
+
+				for (; d < tc0.size() && tc0[d] >= '0' && tc0[d] <= '9'; ++d)
+				{
+					slot = (slot * 10) + static_cast<u32>(tc0[d] - '0');
+				}
+
+				// Slot 0 is the "no constant" filler in the slice format, not a real read.
+				if (d == p + 2 || slot == 0 || !seen_slots.insert(slot).second)
+				{
+					continue;
+				}
+
+				if (f32 v[4]{}; remix_rsx::read_slot(slot, v))
+				{
+					fmt::append(slot_values, " c%u=[%g %g %g %g]", slot, v[0], v[1], v[2], v[3]);
+				}
+			}
+
+			if (!slot_values.empty())
+			{
+				fmt::append(groups, " tc0consts:%s", slot_values);
+			}
+		}
 	}
 
 	// What the two ucode readers made of this program: the attribute each texcoord output takes its
