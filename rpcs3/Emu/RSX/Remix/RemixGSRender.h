@@ -164,6 +164,13 @@ private:
 		// should cover the population that was tiling 8x, and on a title whose ucode names no
 		// scale it stays 0 and nothing changes.
 		u64 uv_scale_ucode = 0;
+
+		// The other half of the S32K population: draws whose program named no scale, so the fixed
+		// UVINTSCALE divisor was used. uv_scale_ucode alone could not be read, because it was only
+		// ever comparable against uv_applied - which counts every UV path including the normalised
+		// formats that never divide at all - and 344234/738738 says nothing about how many S32K
+		// draws were actually guessed at. These two sum to the S32K population exactly.
+		u64 uv_scale_fixed = 0;
 		// Untextured draws that left with the title's own ATTR3 colour instead of flat white.
 		u64 vcol_applied = 0;
 		// Times a referenced texture unit yielded no material and the next one was tried.

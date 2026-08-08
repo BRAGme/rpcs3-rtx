@@ -741,6 +741,15 @@ namespace remix_rsx
 	// scale. On by default; `0` restores the fixed divisor. Counter: uv_scale_ucode.
 	bool texcoord_scale_from_ucode();
 
+	// RPCS3_REMIX_UVSCALETEMP: also accept the scale when the program multiplies a *temp* by the
+	// constant rather than the attribute itself, i.e. after a MOV of the attribute into a register.
+	// The strict form only matched `MUL rN.xy(I0.xyxx, C0.xxxx)` and every program that staged the
+	// attribute first fell through to the fixed divisor - the population uv_scale_fixed counts.
+	// Only consulted when the strict form finds nothing, and still refuses unless the slice names
+	// exactly one constant slot and exactly one attribute. On by default; `0` restores strict-only,
+	// which is the A/B against uv_scale_ucode / uv_scale_fixed.
+	bool texcoord_scale_temp_form();
+
 	bool sky_learn_dome_enabled();
 
 	// RPCS3_REMIX_RETRYUNSUP: let the albedo unit walk step past a unit that bind() refused for a

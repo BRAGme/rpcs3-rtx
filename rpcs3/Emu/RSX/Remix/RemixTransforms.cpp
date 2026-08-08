@@ -2149,9 +2149,50 @@ namespace remix_rsx
 			u32 slot = 0;
 			u32 attribute = 0;
 
+			// The one attribute the whole slice reads, if it reads exactly one. Collected on the
+			// same walk so the temp-form pass below costs no extra traversal. A slice that touches
+			// two attributes cannot say which one a 'temp * constant' scales, and is refused.
+			u32 slice_attribute = umax;
+			bool slice_attribute_ambiguous = false;
+
+			// 'temp.xy = temp.xy * cN' - the same scale with the attribute already MOVed into a
+			// register. Kept separate from the direct form and only consulted when the direct form
+			// finds nothing, so a program that states the scale outright is never second-guessed.
+			bool temp_found = false;
+			u32 temp_slot = 0;
+			bool temp_ambiguous = false;
+
 			for (const u32 i : indices)
 			{
 				const decoded_instr& in = prog[i];
+
+				// Which attribute this instruction reads, if any. One input register per
+				// instruction on RSX, so d1.input_src is only meaningful when a source names it.
+				for (u32 s = 0; s < 3; ++s)
+				{
+					if (!(vec_source_mask(in.d1.vec_opcode) & (1u << s))
+						|| in.src[s].reg_type != RSX_VP_REGISTER_TYPE_INPUT)
+					{
+						continue;
+					}
+
+					const u32 read = u32{in.d1.input_src};
+
+					// Position feeding a texcoord slice is texgen, not a UV set, and must not
+					// become the attribute this scale is attributed to.
+					if (read == 0 || read > 15)
+					{
+						break;
+					}
+
+					if (slice_attribute != umax && slice_attribute != read)
+					{
+						slice_attribute_ambiguous = true;
+					}
+
+					slice_attribute = read;
+					break;
+				}
 
 				if (in.d1.vec_opcode != RSX_VEC_OPCODE_MUL || in.d3.index_const)
 				{
@@ -2185,8 +2226,41 @@ namespace remix_rsx
 					}
 				}
 
-				if (input_slot == umax || const_slot == umax)
+				if (const_slot == umax)
 				{
+					continue;
+				}
+
+				if (input_slot == umax)
+				{
+					// No attribute in this MUL, but it is still a multiply by a constant inside the
+					// backward slice of TEXn, so it contributes to the coordinate by construction -
+					// the same argument the direct form rests on. The only thing it cannot supply is
+					// which attribute it scales, which is what slice_attribute is for.
+					//
+					// This is the form the strict pass was dropping. resolve_output_input already
+					// refuses a program whose TEXn write is not a straight attribute read, so the
+					// scaled programs were meant to be caught here; requiring the MUL's operand to
+					// be the input register itself missed every program that MOVs the attribute into
+					// a temp first, and those fell back to the fixed divisor.
+					for (u32 s = 0; s < 3; ++s)
+					{
+						if ((sources & (1u << s)) && s != const_slot
+							&& in.src[s].reg_type != RSX_VP_REGISTER_TYPE_TEMP)
+						{
+							// Multiplied by something that is neither a temp nor the constant -
+							// not the shape this recognises.
+							temp_ambiguous = true;
+						}
+					}
+
+					if (temp_found && temp_slot != u32{in.d1.const_src})
+					{
+						temp_ambiguous = true;
+					}
+
+					temp_found = true;
+					temp_slot = u32{in.d1.const_src};
 					continue;
 				}
 
@@ -2210,7 +2284,20 @@ namespace remix_rsx
 
 			if (!found)
 			{
-				return false;
+				// Second chance on the temp form, under its own knob so the two populations can be
+				// separated in one run. Every condition below has to hold: exactly one constant
+				// slot across the slice's MULs, nothing multiplied by a third operand kind, and
+				// exactly one attribute read anywhere in the slice. Any ambiguity keeps the fixed
+				// divisor, which is the old behaviour and a known-safe answer.
+				if (!texcoord_scale_temp_form() || !temp_found || temp_ambiguous
+					|| slice_attribute_ambiguous || slice_attribute == umax)
+				{
+					return false;
+				}
+
+				out_attribute = slice_attribute;
+				out_slot = temp_slot;
+				return true;
 			}
 
 			out_attribute = attribute;
@@ -6513,6 +6600,12 @@ namespace remix_rsx
 	{
 		// On by default and the useful setting is the off one, so env_u32 rather than env_flag.
 		static const u32 value = env_u32(L"RPCS3_REMIX_UVSCALEUCODE", 1);
+		return value != 0;
+	}
+
+	bool texcoord_scale_temp_form()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_UVSCALETEMP", 1);
 		return value != 0;
 	}
 
