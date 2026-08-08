@@ -96,8 +96,10 @@ capture carries two tracks and one of them is a microphone.
 ## Current status
 
 This is the further-along of the two backends: camera, textures, skinned characters, per-draw blend
-state, sky classification and UI compositing all work on at least one title. It is still a research
-backend, not a product.
+state, sky classification and UI compositing all work on at least one title. Three titles have been
+run -- **Resistance 2**, **Haze** and **Minecraft: PS3 Edition** -- and each carries the
+measurements it contributed; see [Titles](#titles) for what each one actually establishes. It is
+still a research backend, not a product.
 
 ### What has been measured
 
@@ -113,16 +115,24 @@ backend, not a product.
 
 ### Titles
 
-Only three titles appear anywhere in the branch log or the dump comments, and they are the only
-ones any claim above rests on:
+Three titles appear anywhere in the branch log or the dump comments, and they are the only ones any
+claim above rests on. They are not equally exercised, so what each one actually demonstrates is
+listed rather than a single "works / doesn't" verdict.
 
-- **Resistance 2** (`NPEA00431`) -- the primary development title; nearly every measurement above
-  is from it.
-- **Haze** -- vertex quantisation scale and the `ADD` src2 transform fix (`e9a7956`, `41d9adc`).
-- **Minecraft: PlayStation 3 Edition** (`NPUB31419`) -- camera parity and texture-cache
-  measurements.
+| Title | Serial | What it demonstrates | Ships a config |
+|---|---|---|---|
+| **Resistance 2** | `NPEA00431` | The primary development title -- nearly every measurement above is from it. Camera, texcoords out of the vertex program, both skinning families, blend state, sky, 2D UI. | yes |
+| **Haze** | `BLUS30094` | A second, structurally different engine. It skins on the SPU, so vertices reach RSX already animated -- nothing in its position path is indexed, and it has no `layered` vertex programs at all. Matching `ADD`'s `src2` constant here recovered **71%** of world transforms that had been drawing at identity (`41d9adc`); its quantised positions are undone by `match_wdivide` (`e9a7956`). | yes |
+| **Minecraft: PS3 Edition** | `NPUB31419` | Camera parity, quantised chunk meshes through `match_prescale`, and the texture-cache design. Descriptor-only texture hashing was chosen *because* of a measurement here: content-rehashing took mesh creation from **5,881 creates / 887 live** to **188,427 / 31,793** over 9,120 frames, because the albedo hash folds into the mesh key (`RemixTextures.cpp:249-255`). | yes |
 
-There is no compatibility table and this README will not invent one. Any other title is untested.
+Haze carries one known-bad of its own: its shadow-receiving draws bind a 2048x2048 `DEPTH16` shadow
+map on the lowest referenced texture unit and its ucode names no albedo unit, so **55,360 draws in
+one capture reached Remix untextured**. `0d3d3517` walks the unit list past a permanent format
+refusal to fix that; it is build-verified and **not run-verified**, and
+`RPCS3_REMIX_RETRYUNSUP=0` restores the previous behaviour.
+
+There is no compatibility table and this README will not invent one. Any other title is untested,
+which is not the same as broken.
 
 ### What is not done
 
