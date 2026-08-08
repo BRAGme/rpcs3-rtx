@@ -322,6 +322,27 @@ namespace
 	// Tolerance on the perspective row of a derived world transform.
 	constexpr f32 s_world_affine_tolerance = 0.02f;
 
+	// How far a bone's 3x3 basis may be from spanning three dimensions before it is refused, as the
+	// ratio |det| / (|x||y||z|). 1.0 is any rotation at any uniform scale; 0 is coplanar. 1e-3
+	// admits a heavily squashed but still invertible basis and rejects the collapse Resistance 2
+	// produced at c30, whose determinant is exactly zero. Deliberately loose: the purpose is to
+	// catch a mis-read palette, not to police a title's own modelling.
+	constexpr f32 s_bone_basis_tolerance = 1e-3f;
+
+	// How far one bone's basis or translation may sit from the median of the other bones in the
+	// same draw before the draw is refused. The bones of one draw are one skeleton at one model
+	// scale, so they are each other's control - and unlike s_bone_basis_tolerance these are
+	// magnitude tests, which is the thing no other gate here performs: build_palette_matrix
+	// synthesises the perspective column for a 3-row palette, so is_affine passes unconditionally,
+	// and has_usable_basis is scale-invariant by construction.
+	//
+	// 8x and 64x are deliberately loose. A skeleton's bones differ by a few percent, not by an
+	// order of magnitude; anything this catches is a palette read that landed outside the bones the
+	// title uploaded, not a rig that squashes a limb. Both are ratios, so they hold whatever units
+	// the title models in.
+	constexpr f32 s_bone_scale_ratio = 8.f;
+	constexpr f32 s_bone_offset_ratio = 64.f;
+
 	// RPCS3_REMIX_UIDUMP=N logs the geometry of the first N textured UI draws: screen bbox and
 	// the raw (x,y,u,v) of the first triangle. A glyph batch whose per-quad UVs span the whole
 	// 0..1 atlas instead of one glyph cell is the "overlapping text" signature, and this is the
@@ -362,6 +383,35 @@ namespace
 			}
 
 			return ::wcstoull(buffer, nullptr, 16);
+		}();
+
+		return value;
+	}
+
+	// RPCS3_REMIX_UISPACE=0 restores ae94587's clip-pixel row conversion, which multiplied the
+	// guest coordinate by fh/surface_clip_height and so hard-coded 'guest pixel y=0 is the top
+	// row'. Nothing in any capture established that. The default now derives the same conversion
+	// from the viewport registers the guest itself programmed, which state the convention
+	// outright: RSX window space is y-down exactly when viewport_scale_y is negative.
+	//
+	// This is deliberately not a flip. On Resistance 2 (NPEA00431) the registers read
+	// vp_scale_y=-352 vp_offset_y=352 at clip=1280x704, and substituting those reproduces the old
+	// expression exactly - (p.y - 352)/(-352) unprojected through (1-ndc)*0.5*fh is p.y*fh/704 -
+	// so R2's numbers do not move. What changes is that the convention is now read rather than
+	// assumed, and a title whose viewport is y-up stops being drawn mirrored.
+	bool ui_space_from_viewport()
+	{
+		static const bool value = []() -> bool
+		{
+			wchar_t buffer[16]{};
+			const DWORD written = GetEnvironmentVariableW(L"RPCS3_REMIX_UISPACE", buffer, static_cast<DWORD>(std::size(buffer)));
+
+			if (written == 0 || written >= std::size(buffer))
+			{
+				return true;
+			}
+
+			return ::wcstol(buffer, nullptr, 10) != 0;
 		}();
 
 		return value;
@@ -409,6 +459,70 @@ namespace
 		{ 0.f, 1.f, 0.f, 0.f },
 		{ 0.f, 0.f, 1.f, 0.f },
 	} };
+
+	// remixapi_InstanceInfoBlendEXT carries *Vulkan* enum values, not D3D9 ones, even though the
+	// fork is a D3D9 runtime. Verified in the fork this backend targets rather than assumed:
+	// rtx_remix_api.cpp:930-936 casts srcColorBlendFactor/dstColorBlendFactor to VkBlendFactor,
+	// colorBlendOp/alphaBlendOp to VkBlendOp and writeMask to VkColorComponentFlags, all into a
+	// DxvkBlendMode whose members are declared with exactly those types
+	// (dxvk_constant_state.h:155-164); alphaTestCompareOp becomes a VkCompareOp
+	// (rtx_materials.h:1816), reinterpreted as AlphaTestType at rtx_instance_manager.cpp:691,
+	// and surface_shared.h:46-58 says AlphaTestType is deliberately identical to VkCompareOp.
+	// The fork's own C++ wrapper spells the encoding out in its defaults - remix.h:818-826 writes
+	// "alphaTestCompareOp = 7 /* VK_COMPARE_OP_ALWAYS */" and "srcColorBlendFactor = 1
+	// /* VK_BLEND_FACTOR_ONE */". D3DBLEND would have been off by one on every single value and
+	// would have matched the wrong arm of calculateAlphaState()'s factor-pair table silently.
+	//
+	// The GCM -> Vulkan half is VKGSRender.cpp's get_blend_factor()/get_blend_op()
+	// (Emu/RSX/VK/VKGSRender.cpp:133-176) transcribed, minus the fmt::throw_exception: aborting
+	// the emulation over a blend factor nobody has seen yet is not a trade this path wants, so an
+	// unrecognised value degrades to ONE/ZERO/ADD - the runtime's own "opaque alias", i.e. the
+	// pre-ae94587 behaviour for that one draw - and is counted as blend_unmapped.
+	u32 vk_blend_factor_from_gcm(rsx::blend_factor factor, bool& mapped)
+	{
+		switch (factor)
+		{
+		case rsx::blend_factor::zero: return 0;                     // VK_BLEND_FACTOR_ZERO
+		case rsx::blend_factor::one: return 1;                      // VK_BLEND_FACTOR_ONE
+		case rsx::blend_factor::src_color: return 2;                // VK_BLEND_FACTOR_SRC_COLOR
+		case rsx::blend_factor::one_minus_src_color: return 3;      // VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR
+		case rsx::blend_factor::dst_color: return 4;                // VK_BLEND_FACTOR_DST_COLOR
+		case rsx::blend_factor::one_minus_dst_color: return 5;      // VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR
+		case rsx::blend_factor::src_alpha: return 6;                // VK_BLEND_FACTOR_SRC_ALPHA
+		case rsx::blend_factor::one_minus_src_alpha: return 7;      // VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA
+		case rsx::blend_factor::dst_alpha: return 8;                // VK_BLEND_FACTOR_DST_ALPHA
+		case rsx::blend_factor::one_minus_dst_alpha: return 9;      // VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA
+		case rsx::blend_factor::constant_color: return 10;          // VK_BLEND_FACTOR_CONSTANT_COLOR
+		case rsx::blend_factor::one_minus_constant_color: return 11;// VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR
+		case rsx::blend_factor::constant_alpha: return 12;          // VK_BLEND_FACTOR_CONSTANT_ALPHA
+		case rsx::blend_factor::one_minus_constant_alpha: return 13;// VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA
+		case rsx::blend_factor::src_alpha_saturate: return 14;      // VK_BLEND_FACTOR_SRC_ALPHA_SATURATE
+		default: break;
+		}
+
+		mapped = false;
+		return 1;
+	}
+
+	u32 vk_blend_op_from_gcm(rsx::blend_equation op, bool& mapped)
+	{
+		switch (op)
+		{
+		// Same emulation VKGSRender makes: the signed variants bias the result by -0.5 on RSX and
+		// there is no Vulkan (or Remix) op for that, so they run as their unsigned counterpart.
+		case rsx::blend_equation::add_signed:
+		case rsx::blend_equation::add: return 0;                    // VK_BLEND_OP_ADD
+		case rsx::blend_equation::subtract: return 1;               // VK_BLEND_OP_SUBTRACT
+		case rsx::blend_equation::reverse_subtract_signed:
+		case rsx::blend_equation::reverse_subtract: return 2;       // VK_BLEND_OP_REVERSE_SUBTRACT
+		case rsx::blend_equation::min: return 3;                    // VK_BLEND_OP_MIN
+		case rsx::blend_equation::max: return 4;                    // VK_BLEND_OP_MAX
+		default: break;                                             // incl. reverse_add_signed, which VKGSRender also refuses
+		}
+
+		mapped = false;
+		return 0;
+	}
 }
 
 #endif
@@ -1333,6 +1447,99 @@ void RemixGSRender::report_uv_failure(attribute_status best)
 	}
 }
 
+void RemixGSRender::report_sky_census(sky_outcome outcome, u32 vertex_count, bool depth_write,
+	const f32 (&lo)[3], const f32 (&hi)[3], const remixapi_Transform& transform,
+	f32 world_extent, f32 anchor, bool measured, bool camera_inside, f32 units_per_vertex)
+{
+	// The aggregate counters say how many draws each gate refused, not *which*. On the first live
+	// capture of the anchored-sky rule that was the whole problem: 739228 candidates, 707975
+	// refused on extent, 28025 on anchor, 3228 tagged - and the dome the user could see was in one
+	// of the refused piles with no way to say which. This names them.
+	//
+	// Bounded three ways so it cannot flood a session: one line per (program, outcome); a repeat
+	// only when the pair draws something at least twice as wide as it has already reported, which
+	// makes re-emission monotone in the extent; and a hard ceiling of s_max_sky_census_lines lines
+	// after which the caller stops scanning bounding boxes for it at all.
+	//
+	// The line carries the extent *and* the raw box it came from, because the two together are
+	// what distinguish "this draw is small" from "the decode in its instance transform is wrong":
+	// a raw box of tens of thousands collapsing to a world extent of single digits is a decode
+	// that is scaling the dome away, not a small dome.
+	auto& entry = m_sky_census_seen[m_current_vp_hash];
+	f32& printed = entry.printed_extent[static_cast<usz>(outcome)];
+
+	if (printed >= 0.f && !(world_extent > printed * 2.f))
+	{
+		return;
+	}
+
+	printed = std::max(world_extent, 0.f);
+	++m_sky_census_lines;
+
+	const char* outcome_name = "?";
+
+	switch (outcome)
+	{
+	case sky_outcome::tagged:             outcome_name = "TAGGED";             break;
+	case sky_outcome::tagged_backdrop:    outcome_name = "TAGGED:backdrop";    break;
+	case sky_outcome::reject_extent:      outcome_name = "reject:extent";      break;
+	case sky_outcome::reject_anchor:      outcome_name = "reject:anchor";      break;
+	case sky_outcome::reject_noworld:     outcome_name = "reject:noworld";     break;
+	case sky_outcome::reject_depth_write: outcome_name = "reject:depthwrite";  break;
+	case sky_outcome::count:                                                   break;
+	}
+
+	const f32 raw_extent = std::max({ hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2] });
+
+	const std::string line = fmt::format(
+		"Remix sky-census: vp=%016llx %s vtx=%u depth_write=%d prim=%u | "
+		"raw=[%.5g %.5g %.5g]..[%.5g %.5g %.5g] rawext=%.6g wext=%.6g minext=%.6g | "
+		"anchor=%.6g limit=%.6g measured=%d origin=[%.5g %.5g %.5g] cam=[%.5g %.5g %.5g] "
+		"cam_age=%u cam_arch=%s | inside=%d upv=%.6g upvmin=%.6g backdrop=%d | frame=%llu line=%u/%u",
+		m_current_vp_hash,
+		outcome_name,
+		vertex_count,
+		depth_write ? 1 : 0,
+		static_cast<u32>(rsx::method_registers.current_draw_clause.primitive),
+		static_cast<f64>(lo[0]), static_cast<f64>(lo[1]), static_cast<f64>(lo[2]),
+		static_cast<f64>(hi[0]), static_cast<f64>(hi[1]), static_cast<f64>(hi[2]),
+		static_cast<f64>(raw_extent),
+		static_cast<f64>(world_extent),
+		static_cast<f64>(remix_rsx::sky_min_extent()),
+		static_cast<f64>(anchor),
+		static_cast<f64>(remix_rsx::sky_max_anchor()),
+		measured ? 1 : 0,
+		static_cast<f64>(transform.matrix[0][3]),
+		static_cast<f64>(transform.matrix[1][3]),
+		static_cast<f64>(transform.matrix[2][3]),
+		static_cast<f64>(m_active_camera.position[0]),
+		static_cast<f64>(m_active_camera.position[1]),
+		static_cast<f64>(m_active_camera.position[2]),
+		m_camera_age,
+		remix_rsx::archetype_name(m_active_camera.archetype),
+		camera_inside ? 1 : 0,
+		static_cast<f64>(units_per_vertex),
+		static_cast<f64>(s_sky_backdrop_min_units_per_vertex),
+		// What the backdrop rule makes of this draw, whether or not it is armed. A census run with
+		// no env var set therefore already says which programs mode 2 would tag.
+		(measured && camera_inside && world_extent >= remix_rsx::sky_min_extent()
+			&& units_per_vertex >= s_sky_backdrop_min_units_per_vertex) ? 1 : 0,
+		m_frame_counter,
+		m_sky_census_lines,
+		s_max_sky_census_lines);
+
+	rsx_log.notice("%s", line);
+
+	// RPCS3.log is held with an exclusive lock while the emulator runs, so this is mirrored into
+	// the file that can be read live. Unconditionally, not behind dump_enabled(): the census exists
+	// to be read against what is on screen during an ordinary run, and requiring a dump run to see
+	// it would change the frame timing of the thing being looked at.
+	if (fs::file out{ fs::get_executable_dir() + "remix_dump.log", fs::write + fs::create + fs::append })
+	{
+		out.write(line + '\n');
+	}
+}
+
 u32 RemixGSRender::resolve_texcoord_attribute(u32 unit, u32 first_vertex, u32 vertex_count,
 	attribute_view& out, attribute_status& best, bool* from_ucode)
 {
@@ -1971,11 +2178,26 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 	// shape (consts=3: x<-c32, y<-c33, zw<-c35), and compositing its raw attribute bbox of
 	// [-1.064 -0.02847]..[1.064 0.5107] is what drew the menu mirrored and at half height - the
 	// dropped row is the one carrying the y flip. RPCS3_REMIX_ORTHO2D=0 restores dropping it.
+	//
+	// Note this counter is incremented *before* the space classification and nothing between the
+	// two can return for a group_count == 0 program - the group loop and build_prescale are both
+	// gated on group_count, and a finite ortho over finite attributes passes the isfinite checks.
+	// So every rebuilt draw reaches the classification, which makes ui_ortho2d directly comparable
+	// against ui_ndc + ui_pixel. That comparison is load-bearing: the first audit run had
+	// ui_ortho2d=66702 against ui_ndc=22413, so at least 44289 rebuilt draws were classified as
+	// clip-pixel, not NDC. The ortho2d family is therefore not confined to the NDC branch, and
+	// "the NDC branch votes inverted" does not contradict "the ortho2d text is upright on screen".
+	//
+	// used_ortho2d carries the per-draw fact down to the orientation audit so the inverted
+	// population can be named instead of inferred.
+	bool used_ortho2d = false;
+
 	if (fp.group_count == 0)
 	{
 		if (remix_rsx::mat4 ortho{}; remix_rsx::build_ortho2d(fp, ortho))
 		{
 			clip = ortho;
+			used_ortho2d = true;
 			++m_stats.ui_ortho2d;
 		}
 	}
@@ -2067,6 +2289,10 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 	const bool space_unit =
 		lo[0] >= -0.05f && hi[0] <= 1.05f && lo[1] >= -0.05f && hi[1] <= 1.05f;
 
+	// Which branch mapped this draw, so the orientation audit below can be attributed to it and
+	// the known-good NDC family acts as the control for the pixel one.
+	bool mapped_pixel = false;
+
 	if (extent <= 1.5f)
 	{
 		++m_stats.ui_space_ndc;
@@ -2081,14 +2307,70 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 	else if (extent <= (std::max(clip_w, clip_h) * 2.f))
 	{
 		++m_stats.ui_space_pixel;
+		mapped_pixel = true;
 
-		const f32 sx = fw / clip_w;
-		const f32 sy = fh / clip_h;
+		// The legacy conversion. It is only correct when the guest's window space is y-down, and
+		// ae94587 asserted that rather than reading it.
+		f32 sx = fw / clip_w;
+		f32 sy = fh / clip_h;
+		f32 bx = 0.f;
+		f32 by = 0.f;
+		bool from_viewport = false;
+
+		// The guest states its own convention in the viewport registers, and this branch's input
+		// is by construction in the space those registers produce: a 'clip pixel' draw is one
+		// whose vertices are already window coordinates. Inverting the viewport back to NDC and
+		// re-projecting through the same (1-y)*0.5*fh the NDC branch uses makes the two branches
+		// agree by derivation instead of by coincidence:
+		//     ndc = (p - offset) / scale
+		//     col = (ndc.x + 1) * 0.5 * fw      row = (1 - ndc.y) * 0.5 * fh
+		// which collapses to the affine form below. Resistance 2's registers (scale -352 / offset
+		// 352 at clip height 704) put sy back at fh/704 and by at 0, i.e. bit-for-bit the legacy
+		// expression - this is not a flip, it is the same number with its assumption removed.
+		if (ui_space_from_viewport())
+		{
+			const f32 vsx = rsx::method_registers.viewport_scale_x();
+			const f32 vsy = rsx::method_registers.viewport_scale_y();
+			const f32 vox = rsx::method_registers.viewport_offset_x();
+			const f32 voy = rsx::method_registers.viewport_offset_y();
+
+			if (std::isfinite(vsx) && std::isfinite(vsy) && std::isfinite(vox) && std::isfinite(voy) &&
+				std::abs(vsx) > 1e-3f && std::abs(vsy) > 1e-3f)
+			{
+				// col = ((p.x - vox)/vsx + 1) * 0.5 * fw
+				sx = (0.5f * fw) / vsx;
+				bx = ((-vox / vsx) + 1.f) * 0.5f * fw;
+
+				// row = (1 - (p.y - voy)/vsy) * 0.5 * fh
+				sy = -(0.5f * fh) / vsy;
+				by = (1.f + (voy / vsy)) * 0.5f * fh;
+
+				from_viewport = true;
+
+				// vsy < 0 is the standard cellGcmSetViewport form and means window y grows
+				// downward, which is what the legacy expression assumed. vsy > 0 is the case it
+				// got wrong. Counted rather than asserted so the next capture says which one this
+				// title is in one number.
+				if (vsy < 0.f)
+				{
+					++m_stats.ui_space_vp_ydown;
+				}
+				else
+				{
+					++m_stats.ui_space_vp_yup;
+				}
+			}
+		}
+
+		if (!from_viewport)
+		{
+			++m_stats.ui_space_vp_fallback;
+		}
 
 		for (u32 i = 0; i < vertex_count; ++i)
 		{
-			m_scratch_ui_x[i] *= sx;
-			m_scratch_ui_y[i] *= sy;
+			m_scratch_ui_x[i] = (m_scratch_ui_x[i] * sx) + bx;
+			m_scratch_ui_y[i] = (m_scratch_ui_y[i] * sy) + by;
 		}
 	}
 	else
@@ -2255,6 +2537,122 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 			}
 		}
 
+		// The orientation audit. A textured UI quad is upright exactly when the atlas row it
+		// samples grows the same way the composited row does - v and y must move together, or the
+		// glyph is drawn upside down inside a correctly placed cell. That is a property of the
+		// three numbers already in hand, so it needs no ucode reading, no screenshot and no guess
+		// about which coordinate space the draw was authored in.
+		//
+		// Split by branch because the point is the comparison, not the absolute value: the
+		// ortho2d/NDC family is confirmed to render correctly today, so it calibrates what 'ok'
+		// looks like for this title's atlases and V convention. ndc_ok high with pixel_bad high is
+		// the remaining flip, proven, in two numbers. Both families agreeing means the flip is not
+		// in this classification at all and the next place to look is the fragment side.
+		//
+		// Only the first triangle votes (one vote per draw, not per triangle), and only when the
+		// triangle actually spans some v and some y - a degenerate or axis-parallel edge carries
+		// no orientation and votes for neither.
+		// The gates matter as much as the sign. v is only an atlas row when a texture was actually
+		// resolved - without one the draw rasterizes as flat tint and 'v' is whatever attribute
+		// resolve_texcoord_attribute happened to pick, which votes on nothing. And the sign of
+		// dv/dy only describes an orientation when v genuinely varies along y: on a rotated or
+		// skewed sprite v varies mostly along x and the covariance picks up a cross term whose
+		// sign is meaningless. Requiring the correlation to be near-perfect keeps axis-aligned UI
+		// (where a quad's triangle gives |r| == 1 exactly) and abstains on everything else. The
+		// first run's audit had neither gate, which is one reason its aggregate cannot be trusted.
+		if (t == 0 && have_uv && entry)
+		{
+			const f32 my = (y[0] + y[1] + y[2]) / 3.f;
+			const f32 mv = (v[0] + v[1] + v[2]) / 3.f;
+			const f32 mx = (x[0] + x[1] + x[2]) / 3.f;
+
+			f32 cov = 0.f;
+			f32 var_y = 0.f;
+			f32 var_v = 0.f;
+			f32 cov_x = 0.f;
+			f32 var_x = 0.f;
+
+			for (u32 c = 0; c < 3; ++c)
+			{
+				cov += (y[c] - my) * (v[c] - mv);
+				var_y += (y[c] - my) * (y[c] - my);
+				var_v += (v[c] - mv) * (v[c] - mv);
+				cov_x += (x[c] - mx) * (v[c] - mv);
+				var_x += (x[c] - mx) * (x[c] - mx);
+			}
+
+			// A quarter of a composited pixel of vertical span, and a v span wide enough to be a
+			// real texel step rather than interpolation noise.
+			const bool spans = var_y > 0.0625f && var_v > 1e-8f;
+			const f32 denom = std::sqrt(var_y * var_v);
+			const f32 r = (denom > 0.f) ? (cov / denom) : 0.f;
+
+			// v must track y and not x. Both tests, because a triangle can satisfy one by accident.
+			const bool axis_aligned = std::abs(r) > 0.9f &&
+				(var_x <= 0.0625f || std::abs(cov_x) * std::abs(cov_x) * var_y <= std::abs(cov) * std::abs(cov) * var_x);
+
+			if (std::isfinite(cov) && std::isfinite(cov_x) && spans && axis_aligned)
+			{
+				ui_vote_row* row = nullptr;
+
+				for (u32 i = 0; i < s_ui_vote_rows; ++i)
+				{
+					if (m_ui_votes[i].vp_hash == m_current_vp_hash)
+					{
+						row = &m_ui_votes[i];
+						break;
+					}
+
+					if (m_ui_votes[i].vp_hash == 0)
+					{
+						m_ui_votes[i].vp_hash = m_current_vp_hash;
+						row = &m_ui_votes[i];
+						break;
+					}
+				}
+
+				if (row)
+				{
+					row->ortho = used_ortho2d;
+				}
+				else
+				{
+					++m_ui_vote_spill;
+				}
+
+				if (mapped_pixel)
+				{
+					if (cov > 0.f)
+					{
+						++m_stats.ui_vflip_pixel_ok;
+						if (row) ++row->pixel_ok;
+					}
+					else
+					{
+						++m_stats.ui_vflip_pixel_bad;
+						if (row) ++row->pixel_bad;
+					}
+				}
+				else
+				{
+					if (cov > 0.f)
+					{
+						++m_stats.ui_vflip_ndc_ok;
+						if (row) ++row->ndc_ok;
+					}
+					else
+					{
+						++m_stats.ui_vflip_ndc_bad;
+						if (row) ++row->ndc_bad;
+					}
+				}
+			}
+			else
+			{
+				++m_stats.ui_vflip_abstain;
+			}
+		}
+
 		if (t == 0 && entry && have_uv && ui_dump_vp() != 0 && m_current_vp_hash == ui_dump_vp() &&
 			m_ui_dumped < ui_dump_limit())
 		{
@@ -2289,6 +2687,58 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 				}
 
 				rsx_log.notice("%s", units);
+
+				// The one value no capture has ever carried, and the one that closes the
+				// screen_space(0-1 constants feed HPOS) case outright.
+				//
+				// That archetype is assigned when the position slice reads at most one constant,
+				// so there is no matrix for build_ortho2d to rebuild and composite_ui_draw falls
+				// through to classifying the raw attribute by its magnitude. Resistance 2's only
+				// program of that shape, 73eb16ea7b1cbed6, is
+				//     9:ADD>r0.zw(C0.xxxy,..)c6  10:RCP>r0.y(C0.wwww)c6  11:RCP>r0.x(C0.zzzz)c6
+				//     12:MUL>o0.y(T0.yyyy,T0.wwww)  13:MUL>o0.x(T0.zzzz,T0.xxxx)
+				// i.e. HPOS.xy = (attr.xy + c6.xy) / c6.zw over an attribute bbox of exactly
+				// [0 0]..[1280 704] against clip=1280x704 - a viewport inverse. Solving it against
+				// the viewport leaves precisely one bit undetermined by geometry: c6.w is -352 if
+				// the guest authored y downward and +352 if upward, and c6.y is -352 either way.
+				// Printing the slots next to the registers they should mirror makes that bit
+				// readable directly instead of inferred, and confirms or refutes the reading that
+				// c6 is just (-offset.xy, scale.xy).
+				std::string consts = fmt::format(
+					"Remix ui-consts: vp=%016llx arch=%s(%s) clip=%ux%u vp_scale=%.6g,%.6g vp_offset=%.6g,%.6g",
+					m_current_vp_hash,
+					remix_rsx::archetype_name(fp.archetype),
+					fp.note,
+					static_cast<u32>(rsx::method_registers.surface_clip_width()),
+					static_cast<u32>(rsx::method_registers.surface_clip_height()),
+					static_cast<f64>(rsx::method_registers.viewport_scale_x()),
+					static_cast<f64>(rsx::method_registers.viewport_scale_y()),
+					static_cast<f64>(rsx::method_registers.viewport_offset_x()),
+					static_cast<f64>(rsx::method_registers.viewport_offset_y()));
+
+				// The low slots are where a 2D program parks its screen constants: R2's ortho2d
+				// family uses c32/c33/c35 and is already rebuilt, the one that is not uses c6.
+				// 16 slots is enough to cover both without turning the dump into a constant file.
+				for (u32 slot = 0; slot < 16; ++slot)
+				{
+					f32 k[4]{};
+
+					if (!remix_rsx::read_slot(slot, k))
+					{
+						break;
+					}
+
+					if (k[0] == 0.f && k[1] == 0.f && k[2] == 0.f && k[3] == 0.f)
+					{
+						continue;
+					}
+
+					fmt::append(consts, " c%u=[%.4g %.4g %.4g %.4g]", slot,
+						static_cast<f64>(k[0]), static_cast<f64>(k[1]),
+						static_cast<f64>(k[2]), static_cast<f64>(k[3]));
+				}
+
+				rsx_log.notice("%s", consts);
 			}
 
 			// Every quad, in vertex order: two triangles per quad, so vertices 4n..4n+3.
@@ -2680,9 +3130,730 @@ void RemixGSRender::submit_compositor()
 	m_compositor_open = false;
 }
 
+bool RemixGSRender::resolve_indexed_world(u32 first_vertex, u32 vertex_count, bool& out_rigid)
+{
+	const remix_rsx::vp_fingerprint& fp = *m_current_fingerprint;
+
+	out_rigid = false;
+	m_indexed_world_valid = false;
+
+	attribute_view indices{};
+
+	if (map_attribute(fp.bone_attribute, first_vertex, vertex_count, indices) != attribute_status::ok)
+	{
+		return false;
+	}
+
+	// Whether the draw reads one palette entry or many is a property of the *data*, not of the
+	// ucode, so it is answered here and never assumed. Resistance 2's dumps only print the min and
+	// max of the index attribute (w=[-1..4], w=[-19..19], w=[-16511..-16384]) and those ranges
+	// cannot say how many distinct values a draw actually uses - which is precisely why the
+	// question is settled per draw against the real vertices.
+	u32 first_slot = umax;
+	bool uniform = true;
+
+	for (u32 i = 0; i < vertex_count; ++i)
+	{
+		f32 scaled[4] = {};
+		f32 raw[4] = {};
+
+		if (!remix_rsx::decode_position(indices.at(i), indices.type, indices.size, scaled) ||
+			!remix_rsx::decode_attribute_raw(indices.at(i), indices.type, indices.size, raw))
+		{
+			return false;
+		}
+
+		// Same choice build_skinning makes, and for the same reason: the ucode's constants are
+		// authored against what the vertex fetch hands the shader.
+		const f32 index_value = remix_rsx::skinraw_enabled()
+			? raw[fp.bone_component]
+			: scaled[fp.bone_component];
+
+		u32 slot = 0;
+
+		if (!remix_rsx::evaluate_palette_slot(fp, index_value, slot))
+		{
+			return false;
+		}
+
+		if (first_slot == umax)
+		{
+			first_slot = slot;
+		}
+		else if (slot != first_slot)
+		{
+			uniform = false;
+			break;
+		}
+	}
+
+	if (first_slot == umax || !uniform)
+	{
+		// Not one matrix. The caller hands it to the skinning path, which proves its own case.
+		return false;
+	}
+
+	remix_rsx::mat4 palette{};
+
+	if (!remix_rsx::build_palette_matrix(fp, first_slot, palette))
+	{
+		return false;
+	}
+
+	// The last proofs, and the ones that catch a mis-read palette whatever the index said: an
+	// object-to-world transform is affine, and its basis spans three dimensions. The second is not
+	// implied by the first - Resistance 2's c30 is affine and rank 1 - and a rank-deficient basis
+	// draws the whole mesh as a line.
+	if (!remix_rsx::is_affine(palette, s_world_affine_tolerance))
+	{
+		return false;
+	}
+
+	if (!remix_rsx::has_usable_basis(palette, s_bone_basis_tolerance))
+	{
+		++m_stats.bone_degenerate;
+		return false;
+	}
+
+	m_indexed_world = palette;
+	m_indexed_world_valid = true;
+	out_rigid = true;
+	return true;
+}
+
+// Weighted skinning: one palette entry per bone per vertex, blended by per-vertex weights.
+//
+// Submitted to Remix as blend weights and indices rather than evaluated here. The API carries the
+// channels (remixapi_MeshInfoSkinning: bonesPerVertex, blendWeights_values, blendIndices_values)
+// and the fork consumes them in a compute pass that does 'sum_k bone[idx_k] * pos * w_k'
+// (dxvk-remix src/dxvk/shaders/rtx/pass/skinning.h), so the mesh this backend uploads stays the
+// rigging - which is static per model - and only the bone matrices move per animation frame. The
+// alternative, folding the blend into the vertex positions on the CPU, would make the mesh content
+// change every frame, and this backend's mesh cache is keyed on content.
+//
+// Two properties of the consumer decide the layout and are not negotiable:
+//   - numBonesPerVertex is asserted <= 4 (rtx_types.cpp:333), which is exactly the four the
+//     observed ucode blends.
+//   - the last weight of each tuple is *derived*, not read: the shader computes
+//     lastWeight = 1 - sum(the first bonesPerVertex - 1). So the weights this writes have to sum
+//     to 1, or the fourth bone silently gets a different weight than the ucode gave it. That is
+//     why a set that does not sum is normalised (and counted) rather than passed through.
+// The bones of one draw are one skeleton, so they are each other's control.
+//
+// Nothing else on this path bounds the *magnitude* of a bone, and for a 3-row palette nothing else
+// can. build_palette_matrix synthesises the perspective column, so is_affine inspects a column this
+// code wrote itself and passes unconditionally; has_usable_basis is a scale-invariant rank test
+// (|det| / product of axis lengths) that a huge but full-rank basis passes cleanly. So an inflating
+// bone reaches Remix with every refusal counter reading 0 - which is exactly what Resistance 2's
+// stalker turret did while its legs, weighted to other bones of the same palette, drew correctly.
+//
+// The leading cause is an index landing past the end of the palette the title actually uploaded.
+// evaluate_palette_slot only bounds the slot by the 468 legal constants; the real palette is
+// however many bones the skeleton has (skin_bones_max peaked at 122), so an index past it reads
+// whatever uniforms sit beyond - fog, colours, ranges - which form a full-rank 3x4 window of
+// plausible-looking numbers at an arbitrary scale. That window cannot be recognised on its own; it
+// can only be recognised next to the bones around it.
+//
+// Median rather than mean, because the thing being detected is precisely the outlier that would
+// drag a mean. Ratios rather than absolutes, so the test holds whatever units the title models in.
+// 8x and 64x are deliberately loose: a skeleton's bones differ by a few percent, not by an order of
+// magnitude, so anything this catches is a bad palette read rather than a rig that squashes a limb.
+// Fewer than three bones gives no median worth the name and the draw is left alone.
+//
+// Shared by both skinned paths - the blend rig and the single-bone rig have the same palette and
+// the same hole - so the two can never disagree about what a plausible bone is.
+// RPCS3_REMIX_BONESCALE=0 disables it and puts the explosion back.
+bool RemixGSRender::bones_consistent()
+{
+	if (!remix_rsx::bone_scale_gate_enabled() || m_scratch_bone_axis.size() < 3)
+	{
+		return true;
+	}
+
+	m_scratch_bone_sorted = m_scratch_bone_axis;
+	std::sort(m_scratch_bone_sorted.begin(), m_scratch_bone_sorted.end());
+	const f32 axis_ref = m_scratch_bone_sorted[m_scratch_bone_sorted.size() / 2];
+
+	if (!(axis_ref > 0.f) || !std::isfinite(axis_ref))
+	{
+		return false;
+	}
+
+	for (const f32 axis : m_scratch_bone_axis)
+	{
+		if (!(axis > 0.f) || !std::isfinite(axis)
+			|| axis > (s_bone_scale_ratio * axis_ref)
+			|| (axis * s_bone_scale_ratio) < axis_ref)
+		{
+			return false;
+		}
+	}
+
+	m_scratch_bone_sorted = m_scratch_bone_offset;
+	std::sort(m_scratch_bone_sorted.begin(), m_scratch_bone_sorted.end());
+	const f32 offset_ref = m_scratch_bone_sorted[m_scratch_bone_sorted.size() / 2];
+
+	// One-sided, and only when the skeleton has a translation spread to compare against: a bone
+	// sitting at the rig's own origin is ordinary, a bone 64x further out than half its siblings is
+	// not. A median of zero means there is nothing to measure against, so the test is skipped
+	// rather than guessed at.
+	if (!(offset_ref > 0.f) || !std::isfinite(offset_ref))
+	{
+		return true;
+	}
+
+	for (const f32 offset : m_scratch_bone_offset)
+	{
+		if (!std::isfinite(offset) || offset > (s_bone_offset_ratio * offset_ref))
+		{
+			return false;
+		}
+	}
+
+	return true;
+}
+
+// Measures the explosion instead of theorising about it.
+//
+// Every hypothesis about the shards so far has been a guess at a *cause* - an index past the end of
+// the palette, a palette of identical matrices - and each was killed by data that showed the bones
+// were healthy. This measures the *effect*: it reproduces exactly the blend Remix is about to
+// perform and asks how far the result travels.
+//
+// The quantity is deliberately scale-free. For each vertex it computes the blended world position
+// the way dxvk-remix's skinning pass computes it (sum_k w_k * bone_k * position, with the bone
+// matrices as submitted, decode already composed in) and takes the distance from that position to
+// the origin of the bone carrying most of its weight. On a sane skin every vertex sits within a
+// limb's length of its own bone, so the spread of that distance across the mesh is narrow - the
+// extremities are a small multiple of the median, never an order of magnitude. A vertex being
+// thrown across the map is a huge multiple, whatever produced it.
+//
+// Reporting max/median rather than an absolute distance means the test needs to know nothing about
+// the title's units, the quantisation scale, or how big a character is - which is what makes it an
+// instrument rather than another assumption. It names the program, the vertex, the bone and the
+// palette slot, so the next question is asked of a specific bone in a specific draw.
+//
+// Runs on every skinned draw: Resistance 2 submits on the order of twenty of them per frame, so the
+// per-vertex pass costs nothing measurable. RPCS3_REMIX_SKINREACH=<ratio> sets the threshold, 0
+// disables it entirely.
+void RemixGSRender::audit_skin_extent(u32 vertex_count)
+{
+	const f32 ratio_limit = remix_rsx::skin_reach_ratio();
+
+	if (!(ratio_limit > 0.f) || vertex_count == 0
+		|| m_scratch_bone_transforms.empty()
+		|| m_scratch_vertices.size() < vertex_count)
+	{
+		return;
+	}
+
+	const u32 per_vertex = std::max<u32>(1u, m_scratch_bones_per_vertex);
+
+	m_scratch_bone_sorted.clear();
+	m_scratch_bone_sorted.reserve(vertex_count);
+
+	f32 worst = -1.f;
+	u32 worst_vertex = 0;
+	u32 worst_bone = 0;
+	f32 worst_pos[3] = {};
+	u32 nonfinite = 0;
+
+	// The submitted geometry's own extent, and the source it was built from, both reported on the
+	// flag line: they say whether the draw grew because the bones spread it or because the vertices
+	// arrived wrong.
+	f32 src_lo[3] = { +3.4e38f, +3.4e38f, +3.4e38f };
+	f32 src_hi[3] = { -3.4e38f, -3.4e38f, -3.4e38f };
+	f32 out_lo[3] = { +3.4e38f, +3.4e38f, +3.4e38f };
+	f32 out_hi[3] = { -3.4e38f, -3.4e38f, -3.4e38f };
+
+	for (u32 i = 0; i < vertex_count; ++i)
+	{
+		const remixapi_HardcodedVertex& v = m_scratch_vertices[i];
+		const f32 p[3] = { v.position[0], v.position[1], v.position[2] };
+
+		for (u32 r = 0; r < 3; ++r)
+		{
+			src_lo[r] = std::min(src_lo[r], p[r]);
+			src_hi[r] = std::max(src_hi[r], p[r]);
+		}
+
+		f32 blended[3] = {};
+		f32 best_weight = -1.f;
+		u32 dominant = umax;
+
+		for (u32 k = 0; k < per_vertex; ++k)
+		{
+			const usz t = (static_cast<usz>(i) * per_vertex) + k;
+
+			if (t >= m_scratch_bone_weights.size() || t >= m_scratch_bone_indices.size())
+			{
+				break;
+			}
+
+			const f32 w = m_scratch_bone_weights[t];
+			const u32 dense = m_scratch_bone_indices[t];
+
+			if (dense >= m_scratch_bone_transforms.size())
+			{
+				continue;
+			}
+
+			if (w > best_weight)
+			{
+				best_weight = w;
+				dominant = dense;
+			}
+
+			if (!(w > 0.f))
+			{
+				continue;
+			}
+
+			// remixapi_Transform is column-vector: out_i = sum_j matrix[i][j] * in_j, in_3 = 1.
+			const auto& m = m_scratch_bone_transforms[dense].matrix;
+
+			for (u32 r = 0; r < 3; ++r)
+			{
+				blended[r] += w * ((m[r][0] * p[0]) + (m[r][1] * p[1]) + (m[r][2] * p[2]) + m[r][3]);
+			}
+		}
+
+		if (dominant == umax)
+		{
+			continue;
+		}
+
+		for (u32 r = 0; r < 3; ++r)
+		{
+			out_lo[r] = std::min(out_lo[r], blended[r]);
+			out_hi[r] = std::max(out_hi[r], blended[r]);
+		}
+
+		// Distance from the vertex's own bone's origin - the bone it is mostly weighted to. That is
+		// the length the skin would have to stretch for this vertex to be where it ended up.
+		const auto& d = m_scratch_bone_transforms[dominant].matrix;
+		const f32 dx = blended[0] - d[0][3];
+		const f32 dy = blended[1] - d[1][3];
+		const f32 dz = blended[2] - d[2][3];
+		const f32 reach = std::sqrt((dx * dx) + (dy * dy) + (dz * dz));
+
+		if (!std::isfinite(reach))
+		{
+			++nonfinite;
+			continue;
+		}
+
+		m_scratch_bone_sorted.push_back(reach);
+
+		if (reach > worst)
+		{
+			worst = reach;
+			worst_vertex = i;
+			worst_bone = dominant;
+			worst_pos[0] = blended[0];
+			worst_pos[1] = blended[1];
+			worst_pos[2] = blended[2];
+		}
+	}
+
+	if (m_scratch_bone_sorted.empty())
+	{
+		return;
+	}
+
+	std::sort(m_scratch_bone_sorted.begin(), m_scratch_bone_sorted.end());
+	const f32 median = m_scratch_bone_sorted[m_scratch_bone_sorted.size() / 2];
+
+	// A median of zero means every vertex sits on its bone's origin, which is not a mesh this test
+	// can say anything about.
+	const f32 ratio = (median > 1e-6f) ? (worst / median) : 0.f;
+
+	if (nonfinite == 0 && ratio <= ratio_limit)
+	{
+		return;
+	}
+
+	++m_stats.skin_reach_flagged;
+
+	// One line per program: the flag is about a shape, and a shape repeats. The counter carries the
+	// per-draw population.
+	if (!m_skin_reach_seen.insert(m_current_vp_hash).second)
+	{
+		return;
+	}
+
+	const u32 slot = (worst_bone < m_scratch_bone_slots.size()) ? m_scratch_bone_slots[worst_bone] : umax;
+
+	std::string weights;
+
+	for (u32 k = 0; k < per_vertex; ++k)
+	{
+		const usz t = (static_cast<usz>(worst_vertex) * per_vertex) + k;
+
+		if (t < m_scratch_bone_weights.size() && t < m_scratch_bone_indices.size())
+		{
+			const u32 dense = m_scratch_bone_indices[t];
+			const u32 dense_slot = (dense < m_scratch_bone_slots.size()) ? m_scratch_bone_slots[dense] : umax;
+			fmt::append(weights, " b%u[w=%.4g dense=%u c%u]", k,
+				static_cast<f64>(m_scratch_bone_weights[t]), dense, dense_slot);
+		}
+	}
+
+	// The offending bone's palette entry as it stands *at this instant*, straight out of the
+	// constant file. The fingerprint is cached per program and cannot go stale; the constants are
+	// read live per draw and can. If a rig that measures clean in one frame is flagged in the next
+	// with garbage here while its fingerprint is unchanged, the fault is the palette not being
+	// ready when this samples it - a timing problem, not a matcher problem. That is the one
+	// hypothesis the cached-fingerprint diagnostics cannot reach, and it is the shape a flickering
+	// defect on a static mesh with a static rig takes.
+	std::string worst_raw;
+
+	if (slot != umax)
+	{
+		if (remix_rsx::slot_block raw{}; remix_rsx::read_slot_block(slot, raw))
+		{
+			fmt::append(worst_raw, " raw c%u=[%.4g %.4g %.4g %.4g][%.4g %.4g %.4g %.4g][%.4g %.4g %.4g %.4g]",
+				slot,
+				static_cast<f64>(raw.v[0][0]), static_cast<f64>(raw.v[0][1]), static_cast<f64>(raw.v[0][2]), static_cast<f64>(raw.v[0][3]),
+				static_cast<f64>(raw.v[1][0]), static_cast<f64>(raw.v[1][1]), static_cast<f64>(raw.v[1][2]), static_cast<f64>(raw.v[1][3]),
+				static_cast<f64>(raw.v[2][0]), static_cast<f64>(raw.v[2][1]), static_cast<f64>(raw.v[2][2]), static_cast<f64>(raw.v[2][3]));
+		}
+	}
+
+	rsx_log.notice("Remix: skin-reach frame=%llu vp=%016llx blended=%d bones=%llu vtx=%u ratio=%.4g "
+		"worst=%.6g median=%.6g nonfinite=%u | vertex=%u bone=%u c%u at=[%.6g %.6g %.6g]%s | "
+		"src=[%.6g %.6g %.6g] out=[%.6g %.6g %.6g]%s",
+		m_frame_counter,
+		m_current_vp_hash,
+		(m_scratch_bones_per_vertex > 1) ? 1 : 0,
+		static_cast<u64>(m_scratch_bone_transforms.size()),
+		vertex_count,
+		static_cast<f64>(ratio),
+		static_cast<f64>(worst),
+		static_cast<f64>(median),
+		nonfinite,
+		worst_vertex,
+		worst_bone,
+		slot,
+		static_cast<f64>(worst_pos[0]), static_cast<f64>(worst_pos[1]), static_cast<f64>(worst_pos[2]),
+		weights,
+		static_cast<f64>(src_hi[0] - src_lo[0]), static_cast<f64>(src_hi[1] - src_lo[1]), static_cast<f64>(src_hi[2] - src_lo[2]),
+		static_cast<f64>(out_hi[0] - out_lo[0]), static_cast<f64>(out_hi[1] - out_lo[1]), static_cast<f64>(out_hi[2] - out_lo[2]),
+		worst_raw);
+}
+
+bool RemixGSRender::build_blend_skinning(u32 first_vertex, u32 vertex_count)
+{
+	const remix_rsx::vp_fingerprint& fp = *m_current_fingerprint;
+
+	const u32 bones_per_vertex = std::min<u32>(fp.blend_bones, remix_rsx::max_blend_bones);
+
+	if (bones_per_vertex == 0)
+	{
+		return false;
+	}
+
+	attribute_view indices{};
+	attribute_view weights{};
+
+	if (map_attribute(fp.bone_attribute, first_vertex, vertex_count, indices) != attribute_status::ok
+		|| map_attribute(fp.blend_weight_attribute, first_vertex, vertex_count, weights) != attribute_status::ok)
+	{
+		return false;
+	}
+
+	// The position decode belongs in *front* of the bones, and this is the only place it can go.
+	//
+	//   ucode:  clip = ((attr * decode) * M_blend + bias) * outer
+	//   Remix:  world = objectToWorld * (sum_k w_k * bone_k * vertex)
+	//
+	// The vertices this backend submits are the raw attribute values, so per_draw_transform folds
+	// the decode into the instance transform (prepend_object_space). For a rigid draw that is the
+	// right place - one matrix, one order. For a skinned draw it is the wrong side of the bones:
+	// Remix applies the palette first, so the instance transform lands as (attr * M) * decode
+	// instead of (attr * decode) * M. With a bone that has a translation the two are not the same
+	// transform - the decode scales the bone's translation as well as its rotation. Every one of
+	// the sixteen R2 blend programs decodes with a uniform 'attr0.xyz * c18.w', so getting this
+	// backwards shrinks every bone's translation by that factor and pulls the whole skeleton in
+	// towards its own origin: a character drawn as a collapsed box.
+	//
+	// So the decode is composed into each bone matrix here, and m_scratch_bone_prescale_folded
+	// tells per_draw_transform not to apply it a second time on the far side.
+	remix_rsx::mat4 prescale = remix_rsx::mat4_identity();
+	const bool have_prescale = remix_rsx::build_prescale(fp, prescale);
+
+	if ((fp.has_prescale || fp.has_const_affine) && remix_rsx::position_affine_enabled() && !have_prescale)
+	{
+		// The decode was recognised but its constants cannot be read back. Refused, not drawn raw:
+		// raw quantised positions against a matrix that expects decoded ones is the vertex
+		// explosion, and the whole point of recognising the decode is knowing the raw values are
+		// wrong. Same rule per_draw_transform applies for the unskinned case.
+		++m_stats.pos_decode_refused;
+		return false;
+	}
+
+	const usz tuples = static_cast<usz>(vertex_count) * bones_per_vertex;
+
+	m_scratch_bone_indices.clear();
+	m_scratch_bone_indices.resize(tuples);
+	m_scratch_bone_weights.clear();
+	m_scratch_bone_weights.resize(tuples);
+	m_scratch_bone_raw.clear();
+	m_scratch_bone_raw.resize(tuples);
+	m_scratch_bone_slots.clear();
+	m_scratch_bone_transforms.clear();
+	m_scratch_bone_axis.clear();
+	m_scratch_bone_offset.clear();
+
+	// 8-bit and 16-bit normalised weights quantise, so an exact sum of 1 is not available: four
+	// components of a ub256 attribute can be off by up to 4/255 = 0.0157 between them. 1/32 clears
+	// that with room to spare while still catching the cases this is really guarding against - an
+	// attribute that is not normalised at all (sums near 255), or a weight set that is not a blend.
+	constexpr f32 s_weight_sum_tolerance = 1.f / 32.f;
+
+	for (u32 i = 0; i < vertex_count; ++i)
+	{
+		f32 index_scaled[4] = {};
+		f32 index_raw[4] = {};
+		f32 weight_scaled[4] = {};
+
+		if (!remix_rsx::decode_position(indices.at(i), indices.type, indices.size, index_scaled)
+			|| !remix_rsx::decode_attribute_raw(indices.at(i), indices.type, indices.size, index_raw)
+			|| !remix_rsx::decode_position(weights.at(i), weights.type, weights.size, weight_scaled))
+		{
+			++m_stats.skin_blend_refused_index;
+			return false;
+		}
+
+		// The weights first: a bone whose weight is zero contributes nothing, and its index is
+		// commonly padding the ucode never reads. Resolving those would refuse a whole draw over a
+		// slot the hardware never touches.
+		f32 w[remix_rsx::max_blend_bones] = {};
+		f32 sum = 0.f;
+
+		for (u32 k = 0; k < bones_per_vertex; ++k)
+		{
+			w[k] = weight_scaled[fp.blend_weight_component[k] & 3];
+
+			if (!std::isfinite(w[k]) || w[k] < 0.f)
+			{
+				// Remix's blend skips any weight <= 0 outright, so a negative weight is not a
+				// thing this can submit and pretend to have submitted.
+				++m_stats.skin_blend_refused_weight;
+				return false;
+			}
+
+			sum += w[k];
+		}
+
+		if (!(sum > 0.f) || !std::isfinite(sum))
+		{
+			++m_stats.skin_blend_refused_weight;
+			return false;
+		}
+
+		if (std::abs(sum - 1.f) > s_weight_sum_tolerance)
+		{
+			++m_stats.skin_blend_rescaled;
+		}
+
+		const f32 inv_sum = 1.f / sum;
+
+		for (u32 k = 0; k < bones_per_vertex; ++k)
+		{
+			w[k] *= inv_sum;
+		}
+
+		for (u32 k = 0; k < bones_per_vertex; ++k)
+		{
+			const usz out = (static_cast<usz>(i) * bones_per_vertex) + k;
+
+			m_scratch_bone_weights[out] = w[k];
+
+			if (w[k] <= 0.f)
+			{
+				// Weightless: any valid bone will do, and dense 0 always exists by the time the
+				// mesh is submitted (the loop below refuses the draw if it never fills one).
+				m_scratch_bone_indices[out] = 0;
+				m_scratch_bone_raw[out] = 0.f;
+				continue;
+			}
+
+			const remix_rsx::bone_index_chain& chain = fp.blend_bone[k];
+
+			// Same choice the single-bone path makes and for the same reason: the ucode's constants
+			// are authored against what the vertex fetch hands the shader, i.e. the scaled value.
+			const f32 index_value = remix_rsx::skinraw_enabled()
+				? index_raw[chain.component & 3]
+				: index_scaled[chain.component & 3];
+
+			u32 slot = 0;
+
+			if (!remix_rsx::evaluate_palette_slot(fp, chain, index_value, slot))
+			{
+				++m_stats.skin_blend_refused_index;
+				return false;
+			}
+
+			m_scratch_bone_raw[out] = index_raw[chain.component & 3];
+
+			u32 dense = umax;
+
+			for (u32 s = 0; s < ::size32(m_scratch_bone_slots); ++s)
+			{
+				if (m_scratch_bone_slots[s] == slot)
+				{
+					dense = s;
+					break;
+				}
+			}
+
+			if (dense == umax)
+			{
+				// The fork packs blendIndices into one byte each (rtx_remix_api.cpp:1088,
+				// 'vertIndices |= blendIndicesStorage[j + k] << 8 * k'), so a dense index has to
+				// stay inside 0..255 as well as inside the 256-entry transform array.
+				if (m_scratch_bone_slots.size() >= REMIXAPI_INSTANCE_INFO_MAX_BONES_COUNT)
+				{
+					++m_stats.skin_blend_refused_palette;
+					return false;
+				}
+
+				remix_rsx::mat4 bone{};
+
+				if (!remix_rsx::build_palette_matrix(fp, slot, bone))
+				{
+					++m_stats.skin_blend_refused_bone;
+					return false;
+				}
+
+				// 'attr * decode * bone', in the ucode's order. Checked below in the composed form
+				// because that is the matrix Remix is handed.
+				if (have_prescale)
+				{
+					bone = remix_rsx::mat4_multiply(prescale, bone);
+				}
+
+				if (!remix_rsx::mat4_is_finite(bone) || !remix_rsx::is_affine(bone, s_world_affine_tolerance))
+				{
+					++m_stats.skin_blend_refused_bone;
+					return false;
+				}
+
+				// ...and neither is one whose basis has collapsed. is_affine only inspects the
+				// perspective column, so Resistance 2's c30 passes it with three basis rows all
+				// parallel to Z - every vertex weighted to that bone lands on a line, which is the
+				// character-as-a-collapsed-box artifact this whole gate exists to refuse.
+				if (!remix_rsx::has_usable_basis(bone, s_bone_basis_tolerance))
+				{
+					++m_stats.bone_degenerate;
+					++m_stats.skin_blend_refused_bone;
+					return false;
+				}
+
+				dense = ::size32(m_scratch_bone_slots);
+				m_scratch_bone_slots.push_back(slot);
+				m_scratch_bone_transforms.push_back(remix_rsx::to_remix_transform(bone));
+				m_scratch_bone_axis.push_back(remix_rsx::basis_extent(bone));
+				m_scratch_bone_offset.push_back(remix_rsx::translation_extent(bone));
+			}
+
+			m_scratch_bone_indices[out] = dense;
+		}
+	}
+
+	if (m_scratch_bone_transforms.empty())
+	{
+		// Every vertex weightless: nothing was proven about any bone, so nothing is drawn.
+		++m_stats.skin_blend_refused_weight;
+		return false;
+	}
+
+	if (!bones_consistent())
+	{
+		++m_stats.skin_blend_refused_scale;
+		return false;
+	}
+
+	// --- every bone in this palette is the same matrix ------------------------------------
+	//
+	// Measured on Resistance 2: six of the eight blend rigs report eight bones at c32..c53 whose
+	// assembled matrices are identical - unit basis, and a translation equal to the c18 bias to
+	// every printed digit, which is what happens when the palette's own fourth components are zero.
+	// The two that look like real skeletons (a3af6e3d5f0ac8e6, 6090af134e07aa65) report 24 bones
+	// with a genuine spread. Eight consecutive palette entries holding one matrix is not a pose.
+	//
+	// Counted, not refused, and the distinction is not cosmetic: a palette whose entries are all
+	// the same matrix blends - for weights that sum to 1, which skinblend_rescaled proves they do -
+	// to exactly that one matrix. The draw is then a mathematically *correct* rigid draw, and
+	// refusing it would delete geometry that is rendering properly. It also cannot be the source of
+	// radiating shards: an identical palette moves every vertex of the mesh the same way, which is
+	// the definition of rigid, whereas shards require neighbouring vertices to be pulled apart.
+	//
+	// RPCS3_REMIX_BONEUNIFORM=0 refuses them instead, which is the one-run A/B for whether this
+	// population is implicated in an artifact at all.
+	if (m_scratch_bone_transforms.size() >= 2)
+	{
+		bool uniform = true;
+
+		for (usz b = 1; b < m_scratch_bone_transforms.size() && uniform; ++b)
+		{
+			for (u32 r = 0; r < 3 && uniform; ++r)
+			{
+				for (u32 c = 0; c < 4; ++c)
+				{
+					if (std::abs(m_scratch_bone_transforms[b].matrix[r][c] - m_scratch_bone_transforms[0].matrix[r][c]) > 1e-6f)
+					{
+						uniform = false;
+						break;
+					}
+				}
+			}
+		}
+
+		if (uniform)
+		{
+			++m_stats.skin_blend_uniform;
+
+			if (!remix_rsx::bone_uniform_allowed())
+			{
+				return false;
+			}
+		}
+	}
+
+	// --- bisect knobs -------------------------------------------------------------------
+	// Applied after the real decode, same as the single-bone path, so only the one link under
+	// test changes.
+	if (const u32 forced = remix_rsx::skinbone_index(); forced != umax)
+	{
+		const u32 clamped = std::min<u32>(forced, ::size32(m_scratch_bone_transforms) - 1);
+		std::fill(m_scratch_bone_indices.begin(), m_scratch_bone_indices.end(), clamped);
+	}
+
+	if (remix_rsx::skinid_enabled())
+	{
+		std::fill(m_scratch_bone_transforms.begin(), m_scratch_bone_transforms.end(), s_identity_transform);
+	}
+
+	m_scratch_bones_per_vertex = bones_per_vertex;
+	m_scratch_bone_prescale_folded = have_prescale;
+	m_stats.skin_bones_max = std::max(m_stats.skin_bones_max, static_cast<u64>(m_scratch_bone_transforms.size()));
+	++m_stats.skin_blend_submitted;
+	audit_skin_extent(vertex_count);
+	return true;
+}
+
 bool RemixGSRender::build_skinning(u32 first_vertex, u32 vertex_count)
 {
 	const remix_rsx::vp_fingerprint& fp = *m_current_fingerprint;
+
+	if (fp.skin_blended)
+	{
+		return build_blend_skinning(first_vertex, vertex_count);
+	}
+
+	m_scratch_bones_per_vertex = 1;
 
 	attribute_view bones{};
 
@@ -2697,6 +3868,8 @@ bool RemixGSRender::build_skinning(u32 first_vertex, u32 vertex_count)
 	m_scratch_bone_raw.resize(vertex_count);
 	m_scratch_bone_slots.clear();
 	m_scratch_bone_transforms.clear();
+	m_scratch_bone_axis.clear();
+	m_scratch_bone_offset.clear();
 
 	for (u32 i = 0; i < vertex_count; ++i)
 	{
@@ -2713,7 +3886,7 @@ bool RemixGSRender::build_skinning(u32 first_vertex, u32 vertex_count)
 			return false;
 		}
 
-		u32 offset = 0;
+		u32 slot = 0;
 
 		// RPCS3_REMIX_SKINRAW=1 feeds the stored value instead of the scaled one, which is the
 		// M4 deviation D1 decision under test: a ub bone index that the ucode does not rescale
@@ -2722,20 +3895,24 @@ bool RemixGSRender::build_skinning(u32 first_vertex, u32 vertex_count)
 			? raw[fp.bone_component]
 			: scaled[fp.bone_component];
 
-		if (!remix_rsx::evaluate_bone_offset(fp, index_value, offset))
+		// The absolute slot rather than the offset, because a signed index attribute makes the
+		// offset alone meaningless - see evaluate_palette_slot. For every rig that resolved before
+		// this change the two are the same number plus palette_base, so the dense remap below is
+		// keyed on exactly the same distinctions it was.
+		if (!remix_rsx::evaluate_palette_slot(fp, index_value, slot))
 		{
 			return false;
 		}
 
 		m_scratch_bone_raw[i] = raw[fp.bone_component];
 
-		// Remix indexes boneTransforms[] directly, so the palette offsets have to be packed
+		// Remix indexes boneTransforms[] directly, so the palette slots have to be packed
 		// down to 0..count-1. Counts are small (one skeleton), so a linear scan is cheapest.
 		u32 dense = umax;
 
 		for (u32 s = 0; s < ::size32(m_scratch_bone_slots); ++s)
 		{
-			if (m_scratch_bone_slots[s] == offset)
+			if (m_scratch_bone_slots[s] == slot)
 			{
 				dense = s;
 				break;
@@ -2749,14 +3926,16 @@ bool RemixGSRender::build_skinning(u32 first_vertex, u32 vertex_count)
 				return false;
 			}
 
-			remix_rsx::slot_block slots{};
+			// build_palette_matrix rather than a raw 4-slot read: the group may supply three rows
+			// rather than four, may be strided, and may carry a constant translation the ucode
+			// applies after it. Reading four consecutive slots and calling it a matrix is what made
+			// this refuse every real palette it was ever shown.
+			remix_rsx::mat4 bone{};
 
-			if (!remix_rsx::read_slot_block(fp.palette_base + offset, slots))
+			if (!remix_rsx::build_palette_matrix(fp, slot, bone))
 			{
 				return false;
 			}
-
-			const remix_rsx::mat4 bone = remix_rsx::slots_to_matrix(slots, fp.palette_shape);
 
 			// A bone that is not a plain affine transform is not a bone; refusing it here is
 			// what keeps a mis-read palette from smearing geometry across the world.
@@ -2765,9 +3944,22 @@ bool RemixGSRender::build_skinning(u32 first_vertex, u32 vertex_count)
 				return false;
 			}
 
+			// ...and neither is one whose basis has collapsed. is_affine only inspects the
+			// perspective column, so it passed Resistance 2's c30 - three basis rows all parallel
+			// to Z, determinant zero - and every vertex weighted to that bone landed on a line.
+			// That is the character-as-a-thin-box artifact, and it is the exploded case this gate
+			// exists to refuse.
+			if (!remix_rsx::has_usable_basis(bone, s_bone_basis_tolerance))
+			{
+				++m_stats.bone_degenerate;
+				return false;
+			}
+
 			dense = ::size32(m_scratch_bone_slots);
-			m_scratch_bone_slots.push_back(offset);
+			m_scratch_bone_slots.push_back(slot);
 			m_scratch_bone_transforms.push_back(remix_rsx::to_remix_transform(bone));
+			m_scratch_bone_axis.push_back(remix_rsx::basis_extent(bone));
+			m_scratch_bone_offset.push_back(remix_rsx::translation_extent(bone));
 		}
 
 		m_scratch_bone_indices[i] = dense;
@@ -2775,6 +3967,16 @@ bool RemixGSRender::build_skinning(u32 first_vertex, u32 vertex_count)
 
 	if (m_scratch_bone_transforms.empty())
 	{
+		return false;
+	}
+
+	// The same sibling test the blend path applies, and for the same reason: this palette is also
+	// three rows, so is_affine above inspected a column build_palette_matrix wrote itself and
+	// has_usable_basis cannot see an inflating bone either. Counted into the same statistic so one
+	// number covers "a bone was implausible next to its siblings" whichever rig produced it.
+	if (!bones_consistent())
+	{
+		++m_stats.skin_blend_refused_scale;
 		return false;
 	}
 
@@ -2799,6 +4001,7 @@ bool RemixGSRender::build_skinning(u32 first_vertex, u32 vertex_count)
 	m_scratch_bone_weights.assign(vertex_count, 1.f);
 
 	m_stats.skin_bones_max = std::max(m_stats.skin_bones_max, static_cast<u64>(m_scratch_bone_transforms.size()));
+	audit_skin_extent(vertex_count);
 	return true;
 }
 
@@ -2949,6 +4152,36 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 	// RPCS3_REMIX_WORLDVP probe at the tail; costs one stack slot otherwise.
 	const char* world_branch = "none";
 
+	// Everything the ucode applies between the vertex attribute and the outer group, in the order
+	// it applies it:
+	//     clip = ((attr * decode) * palette[a]) * outer
+	// The decode half is why every branch below ends by prepending build_prescale - the vertices
+	// submitted to Remix are the raw attribute values. The palette half is the one object matrix a
+	// rigid indexed draw resolved to (resolve_indexed_world); it is composed here rather than in
+	// each branch so the two can never end up in the wrong order relative to each other. A skinned
+	// draw leaves m_indexed_world_valid clear, because its palette travels as bone transforms.
+	const auto prepend_object_space = [&](remix_rsx::mat4& m)
+	{
+		if (m_indexed_world_valid)
+		{
+			m = remix_rsx::mat4_multiply(m_indexed_world, m);
+		}
+
+		// ...unless the bones already carry it. Remix applies the palette before the instance
+		// transform, so for a blended draw the decode has to sit in front of each bone matrix
+		// rather than out here - build_blend_skinning composes it there and sets this flag. Doing
+		// both would apply the decode twice.
+		if (m_scratch_bone_prescale_folded)
+		{
+			return;
+		}
+
+		if (remix_rsx::mat4 prescale{}; remix_rsx::build_prescale(fp, prescale))
+		{
+			m = remix_rsx::mat4_multiply(prescale, m);
+		}
+	};
+
 	// The vertices submitted to Remix are the raw attribute values, so any decode the program
 	// applies before its first matrix is part of this transform. A program whose decode was
 	// recognised but whose constants cannot be read back is refused, not drawn raw: raw quantised
@@ -2989,10 +4222,7 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 				world = remix_rsx::mat4_multiply(world, remix_rsx::slots_to_matrix(slots, fp.group_shape[i]));
 			}
 
-			if (remix_rsx::mat4 prescale{}; remix_rsx::build_prescale(fp, prescale))
-			{
-				world = remix_rsx::mat4_multiply(prescale, world);
-			}
+			prepend_object_space(world);
 
 			if (!remix_rsx::mat4_is_finite(world) || !remix_rsx::is_affine(world, s_world_affine_tolerance))
 			{
@@ -3049,10 +4279,7 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 
 		// The decompression the program applies before its first matrix has to come first here
 		// too, because the vertices submitted to Remix are the raw attribute values.
-		if (remix_rsx::mat4 prescale{}; remix_rsx::build_prescale(fp, prescale))
-		{
-			world = remix_rsx::mat4_multiply(prescale, world);
-		}
+		prepend_object_space(world);
 	}
 	else if (m_active_camera.has_reference)
 	{
@@ -3118,10 +4345,7 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 		// the log records arch=fused - had its quantised positions submitted undecoded even when the
 		// matcher had already recognised the decode. clip = (attr*S + B) * M and we submit attr, so
 		// the instance transform has to be S,B * M * reference_inverse, in that order.
-		if (remix_rsx::mat4 prescale{}; remix_rsx::build_prescale(fp, prescale))
-		{
-			world = remix_rsx::mat4_multiply(prescale, world);
-		}
+		prepend_object_space(world);
 	}
 	else
 	{
@@ -3202,6 +4426,17 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 void RemixGSRender::submit_subdraw()
 {
 	auto& draw_call = rsx::method_registers.current_draw_clause;
+
+	// Cleared here rather than next to the code that sets it, because dump_vertex_program runs
+	// further down but *before* the skinning gate and calls per_draw_transform through
+	// describe_skinning: leaving a previous subdraw's matrix live would have the diagnostic print
+	// a world transform belonging to some other draw.
+	m_indexed_world_valid = false;
+
+	// Same reason, same lifetime: a blended draw folds the position decode into its bone matrices
+	// and this says so. Left set, the next draw's instance transform would silently lose its
+	// decode - the raw-quantised-position explosion, arriving one draw late.
+	m_scratch_bone_prescale_folded = false;
 
 	// --- classify and skip -------------------------------------------------------------
 	if (draw_call.is_immediate_draw)
@@ -3604,13 +4839,105 @@ void RemixGSRender::submit_subdraw()
 
 	if (fp.archetype == remix_rsx::vp_archetype::skinned_layered)
 	{
-		if (remix_rsx::noskin_enabled() || !m_remix.fork_features() || !build_skinning(first_vertex, vertex_count))
+		// Rigid first. A draw whose palette index comes out the same for every vertex is reading
+		// one fixed matrix, so it needs no bone transforms at all - which also means it does not
+		// need the Remix fork, and on a stock runtime it is the only half of this that can be
+		// submitted. On Resistance 2 that is the terrain-chunk and batched-prop shape: 16 of its
+		// 36 indexed programs are a 3-row object matrix at c31 selected by attr0.w, and a draw
+		// that only ever touches one object is one matrix by definition.
+		bool rigid = false;
+
+		// A blended rig is never offered to the rigid path. resolve_indexed_world reads one
+		// attribute component and asks whether it is uniform over the draw; on a blend program that
+		// component is bone 0's index only, so a draw whose bone 0 happens to be constant would be
+		// collapsed onto a single matrix and the other three bones dropped - which is a character
+		// drawn as one rigid lump. Proving a blend rig is really rigid would mean evaluating all
+		// four bones and all four weights, i.e. doing build_blend_skinning's work to decide whether
+		// to call it, so the draw simply goes there.
+		if (!fp.skin_blended
+			&& remix_rsx::indexed_world_enabled() && resolve_indexed_world(first_vertex, vertex_count, rigid) && rigid)
 		{
+			++m_stats.indexed_world_rigid;
+		}
+		else if (remix_rsx::noskin_enabled() || !m_remix.fork_features() || !build_skinning(first_vertex, vertex_count))
+		{
+			// Neither one matrix nor a palette this can prove. Refused and counted, never drawn
+			// with the palette unapplied - that is a mesh in its bind pose at the world origin.
 			++m_stats.skin_skipped;
+			++m_stats.indexed_world_refused;
 			return;
 		}
+		else
+		{
+			skinned = true;
+			++m_stats.indexed_world_skinned;
+		}
 
-		skinned = true;
+		// One line per program, once, at notice level: what the recogniser made of this rig and
+		// what its indices turned out to be. Without it 'rigid' and 'skinned' are two numbers over
+		// however many programs happen to land in them, and the shape of the palette - which is the
+		// thing every previous milestone here got wrong - is not readable from a run at all.
+		if (m_indexed_world_seen.insert(m_current_vp_hash).second)
+		{
+			std::string blend;
+
+			// The four resolved slots of a blend rig, straight from the fingerprint: which
+			// attribute component carries each bone's weight, which address-register component
+			// selects its palette entry, and which component of the index attribute that address
+			// component came from. The pairing is the one thing here that cannot be guessed - the
+			// ARL of twelve of the sixteen R2 programs permutes a0 - so it is printed rather than
+			// assumed, the same way the abs/negate bits are.
+			if (fp.skin_blended)
+			{
+				fmt::append(blend, " blend=%u wattr=ATTR%u bones=[", fp.blend_bones, fp.blend_weight_attribute);
+
+				for (u32 k = 0; k < fp.blend_bones && k < remix_rsx::max_blend_bones; ++k)
+				{
+					const remix_rsx::bone_index_chain& chain = fp.blend_bone[k];
+
+					fmt::append(blend, "%sw.%c->a0.%c=%s%sATTR%u.%c%s ops=%u",
+						k ? " " : "",
+						"xyzw"[fp.blend_weight_component[k] & 3],
+						"xyzw"[fp.blend_addr_swz[k] & 3],
+						chain.index_negate ? "-" : "",
+						chain.index_abs ? "|" : "",
+						chain.attribute,
+						"xyzw"[chain.component & 3],
+						chain.index_abs ? "|" : "",
+						chain.op_count);
+
+					for (u32 o = 0; o < chain.op_count && o < remix_rsx::max_bone_index_ops; ++o)
+					{
+						const remix_rsx::bone_index_op& op = chain.ops[o];
+
+						switch (op.op)
+						{
+						case remix_rsx::bone_index_op::kind::floor:
+							blend += ",floor";
+							break;
+						case remix_rsx::bone_index_op::kind::immediate_scale:
+							fmt::append(blend, ",*%g", static_cast<f64>(op.immediate));
+							break;
+						case remix_rsx::bone_index_op::kind::scale:
+							fmt::append(blend, ",*c%u.%c", op.mul_slot, "xyzw"[op.mul_component & 3]);
+							break;
+						case remix_rsx::bone_index_op::kind::affine:
+							fmt::append(blend, ",*c%u.%c+c%u.%c", op.mul_slot, "xyzw"[op.mul_component & 3],
+								op.add_slot, "xyzw"[op.add_component & 3]);
+							break;
+						}
+					}
+				}
+
+				blend += "]";
+			}
+
+			rsx_log.notice("Remix: indexed-world vp=%016llx base=c%u rows=%u stride=%u bias=%d attr=%u.%c abs=%d neg=%d rigid=%d vtx=%u%s",
+				m_current_vp_hash, fp.palette_base, fp.palette_rows, fp.palette_stride,
+				fp.palette_has_bias ? 1 : 0, fp.bone_attribute, "xyzw"[fp.bone_component & 3],
+				fp.bone_index_abs ? 1 : 0, fp.bone_index_negate ? 1 : 0,
+				rigid ? 1 : 0, vertex_count, blend);
+		}
 	}
 	else if (fp.indexed_const && !remix_rsx::draw_indexed_const())
 	{
@@ -3795,35 +5122,42 @@ void RemixGSRender::submit_subdraw()
 	// is allowed to be textured, and Resistance 2's (NPEA00431) is: it carries cloud and water
 	// detail, so albedo_texture_unit() resolves, 'material' is non-null, this test never ran, and
 	// the dome was submitted as ordinary world geometry - a solid sphere standing inside the level,
-	// occluding the scene and turning with the camera without ever enclosing the player. The two
-	// conditions that actually mean "sky" are the ones left: the title does not write depth for it,
-	// and it spans thousands of units. Textured sky candidates are gated behind
-	// RPCS3_REMIX_SKYTEXTURED so the pre-9c73eb0 behaviour is one env var away, because widening
-	// this test admits any large depth-write-off textured draw - a distance fog card or a full
-	// screen effect - and mis-tagging one of those hides it from the world pass entirely.
-	bool is_sky = false;
+	// occluding the scene and turning with the camera without ever enclosing the player.
+	//
+	// The decision itself is made further down, once per_draw_transform() has resolved the
+	// instance transform, because both of the conditions that mean "sky" are statements about
+	// *world* space and nothing here is in world space yet. All that is measured here is the raw
+	// bounding box of what was submitted, which is the input to that.
+	f32 sky_lo[3] = { +3.4e38f, +3.4e38f, +3.4e38f };
+	f32 sky_hi[3] = { -3.4e38f, -3.4e38f, -3.4e38f };
 
-	const bool sky_candidate = !material || remix_rsx::sky_allows_textured();
+	const bool sky_depth_ok = !rsx::method_registers.depth_write_enabled();
 
-	if (sky_candidate && remix_rsx::sky_min_extent() > 0.f && !rsx::method_registers.depth_write_enabled())
+	const bool sky_texture_ok =
+		(!material || remix_rsx::sky_allows_textured()) &&
+		remix_rsx::sky_min_extent() > 0.f;
+
+	const bool sky_candidate = sky_texture_ok && sky_depth_ok;
+
+	// The census deliberately covers one population the test itself refuses to look at: draws that
+	// write depth. The first live capture tagged 3228 draws out of 739228 candidates and the dome
+	// was not among them, and the two anchored programs left untagged at that build were exactly
+	// the depth-writing ones (f7576a48e6289f83 / ba93cfebcefde22f, 87 vtx, 3608 units). Censusing
+	// them is what turns "should the depth-write requirement be relaxed?" into a measurement.
+	const bool sky_census = sky_texture_ok && m_sky_census_lines < s_max_sky_census_lines;
+
+	// The backdrop rule needs the same bounding box, and needs it for draws the sky test skips.
+	const bool sky_backdrop = sky_texture_ok && remix_rsx::sky_backdrop_mode() != 0;
+
+	if (sky_candidate || sky_census || sky_backdrop)
 	{
-		f32 lo[3] = { +3.4e38f, +3.4e38f, +3.4e38f };
-		f32 hi[3] = { -3.4e38f, -3.4e38f, -3.4e38f };
-
 		for (const remixapi_HardcodedVertex& v : m_scratch_vertices)
 		{
 			for (u32 c = 0; c < 3; ++c)
 			{
-				lo[c] = std::min(lo[c], v.position[c]);
-				hi[c] = std::max(hi[c], v.position[c]);
+				sky_lo[c] = std::min(sky_lo[c], v.position[c]);
+				sky_hi[c] = std::max(sky_hi[c], v.position[c]);
 			}
-		}
-
-		const f32 extent = std::max({ hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2] });
-
-		if (std::isfinite(extent) && extent >= remix_rsx::sky_min_extent())
-		{
-			is_sky = true;
 		}
 	}
 
@@ -3868,6 +5202,17 @@ void RemixGSRender::submit_subdraw()
 			{
 				hash = rpcs3::hash64(hash, index);
 			}
+
+			// ...and the weights, for the same reason: on a blend rig they are per-vertex mesh
+			// content, so the same positions bound with a different weighting are a different
+			// mesh. They are as static as the indices are - a skin's weighting does not animate,
+			// only the matrices it selects do - so this does not churn the cache.
+			for (const f32 weight : m_scratch_bone_weights)
+			{
+				hash = rpcs3::hash64(hash, std::bit_cast<u32>(weight));
+			}
+
+			hash = rpcs3::hash64(hash, m_scratch_bones_per_vertex);
 		}
 	}
 
@@ -3896,7 +5241,10 @@ void RemixGSRender::submit_subdraw()
 
 		if (skinned)
 		{
-			surface.skinning_value.bonesPerVertex = 1;
+			// One tuple entry per bone per vertex. The fork asserts this is <= 4
+			// (rtx_types.cpp:333) and derives the last weight of each tuple as
+			// 1 - sum(the rest), which build_blend_skinning normalises for.
+			surface.skinning_value.bonesPerVertex = m_scratch_bones_per_vertex;
 			surface.skinning_value.blendWeights_values = m_scratch_bone_weights.data();
 			surface.skinning_value.blendWeights_count = ::size32(m_scratch_bone_weights);
 			surface.skinning_value.blendIndices_values = m_scratch_bone_indices.data();
@@ -3931,7 +5279,9 @@ void RemixGSRender::submit_subdraw()
 
 	remixapi_Transform transform = s_identity_transform;
 
-	if (per_draw_transform(transform))
+	const bool world_resolved = per_draw_transform(transform);
+
+	if (world_resolved)
 	{
 		++m_stats.world_applied;
 	}
@@ -3955,7 +5305,158 @@ void RemixGSRender::submit_subdraw()
 		}
 	}
 
+	// --- sky dome, decided --------------------------------------------------------------
+	// Both tests are in world space, which is why this could not run where the bounding box was
+	// taken: the vertices submitted to Remix are the program's *raw* attribute values and the
+	// decode that turns them into world units lives in 'transform' (per_draw_transform prepends
+	// build_prescale). Measuring the raw box is what tagged cat_sky=825915 of 2038738 R2 draws -
+	// 40.5% of the scene, lit as sky, uniformly blue - because R2's positions are quantised 16-bit
+	// integers and every one of its meshes "spans tens of thousands of units" before the decode.
+	//
+	//   extent  the transformed AABB's widest axis, sum_j |M[i][j]| * raw_extent_j, which is exact
+	//           for an affine transform. Replaying the 157 dumped draws that carry a fused matrix:
+	//           63 clear 2000 measured raw, 27 measured in world units.
+	//   anchor  the distance from the camera to the draw's own origin - the instance transform's
+	//           translation. A sky dome is the only thing in a scene that is *placed on the eye*:
+	//           Haze's fc0fac8afccec49a sits at 0.000, R2's 41c59a3a2bfc71bf and c1781a2e32aba35d
+	//           at 2.404 (on the ground below the eye), and the nearest draw that clears the other
+	//           two gates without being a dome is 96.91 away. That is what carries the filter -
+	//           extent alone leaves 27 of 157, the anchor alone leaves 5, the pair leaves 3 and all
+	//           3 are domes.
+	//
+	// No resolved world transform means no world space to measure in and no camera to measure
+	// against, so those draws are refused rather than guessed - the same rule the world gate above
+	// applies to the geometry itself. RPCS3_REMIX_SKYANCHOR=0 drops the anchor requirement.
+	bool is_sky = false;
+
+	if (sky_candidate || sky_census || sky_backdrop)
+	{
+		// Counted here rather than at the bounding box, so that candidates is exactly the sum of
+		// the four refusals plus the cat_sky increments made below - the RPCS3_REMIX_CAT_SKY hash
+		// list also raises cat_sky, and it is not this test. An over-tag is then one ratio to read
+		// rather than a blue screen to look at.
+		if (sky_candidate)
+		{
+			++m_stats.sky_candidates;
+		}
+
+		const bool measured = world_resolved && m_active_camera.valid;
+
+		f32 extent = 0.f;
+		f32 anchor = 0.f;
+		f32 units_per_vertex = 0.f;
+
+		// Whether the camera is inside the draw's transformed bounding box. Computed here rather
+		// than inside the backdrop rule that consumes it, so that an ordinary census run - no env
+		// var set - already reports it per program and the rule can be judged before it is armed.
+		bool inside = false;
+
+		if (measured)
+		{
+			inside = true;
+
+			for (u32 i = 0; i < 3; ++i)
+			{
+				// Centre and half-extent of the transformed box on this world axis. The transform
+				// is affine, so the image of the box is exactly the box of the transformed corners
+				// and this closed form is that box without visiting all eight.
+				f32 centre = transform.matrix[i][3];
+				f32 half = 0.f;
+
+				for (u32 j = 0; j < 3; ++j)
+				{
+					centre += transform.matrix[i][j] * (sky_hi[j] + sky_lo[j]) * 0.5f;
+					half += std::abs(transform.matrix[i][j]) * (sky_hi[j] - sky_lo[j]) * 0.5f;
+				}
+
+				extent = std::max(extent, half * 2.f);
+
+				if (!(std::abs(m_active_camera.position[i] - centre) <= half))
+				{
+					inside = false;
+				}
+			}
+
+			const f32 dx = transform.matrix[0][3] - m_active_camera.position[0];
+			const f32 dy = transform.matrix[1][3] - m_active_camera.position[1];
+			const f32 dz = transform.matrix[2][3] - m_active_camera.position[2];
+			anchor = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+			units_per_vertex = extent / static_cast<f32>(std::max(vertex_count, 1u));
+		}
+
+		const f32 anchor_limit = remix_rsx::sky_max_anchor();
+
+		sky_outcome outcome = sky_outcome::tagged;
+
+		if (!sky_depth_ok)
+		{
+			// Census-only: this draw was never a candidate, so nothing is counted for it.
+			outcome = sky_outcome::reject_depth_write;
+		}
+		else if (!measured)
+		{
+			outcome = sky_outcome::reject_noworld;
+			++m_stats.sky_refused_noworld;
+		}
+		else if (!std::isfinite(extent) || extent < remix_rsx::sky_min_extent())
+		{
+			outcome = sky_outcome::reject_extent;
+			++m_stats.sky_refused_extent;
+		}
+		else if (anchor_limit > 0.f && (!std::isfinite(anchor) || anchor > anchor_limit))
+		{
+			outcome = sky_outcome::reject_anchor;
+			++m_stats.sky_refused_anchor;
+
+			// Split out the frames where the camera is a held one, i.e. the anchor was measured
+			// against the previous frame's eye rather than this frame's. Those are the only
+			// rejections that can be an artefact of the camera rather than of the draw.
+			if (m_camera_age != 0)
+			{
+				++m_stats.sky_refused_anchor_held;
+			}
+		}
+		else
+		{
+			is_sky = true;
+		}
+
+		// --- backdrop rule, evaluated independently of everything above ---------------------
+		// R2's visible backdrop is refused twice over by the dome rule: it writes depth, and its
+		// origin is 82 units from the eye. Relaxing either gate on its own does not reach it, and
+		// relaxing both at once is exactly the change that produced the 40.5% over-tag. So this
+		// asks three different questions of the same draw - is it bigger than sky_min_extent(), is
+		// the camera *inside* it, and is it made of so few vertices per unit that it cannot be a
+		// wall - and at mode 1 it only counts the answer. RPCS3_REMIX_SKYBACKDROP=2 tags.
+		if (sky_backdrop && measured && std::isfinite(extent) && extent >= remix_rsx::sky_min_extent())
+		{
+			if (inside && units_per_vertex >= s_sky_backdrop_min_units_per_vertex)
+			{
+				++m_stats.sky_backdrop_hit;
+
+				if (!sky_depth_ok)
+				{
+					++m_stats.sky_backdrop_dw;
+				}
+
+				if (remix_rsx::sky_backdrop_mode() >= 2)
+				{
+					is_sky = true;
+					outcome = sky_outcome::tagged_backdrop;
+				}
+			}
+		}
+
+		if (sky_census)
+		{
+			report_sky_census(outcome, vertex_count, !sky_depth_ok, sky_lo, sky_hi, transform,
+				extent, anchor, measured, inside, units_per_vertex);
+		}
+	}
+
 	remixapi_InstanceInfoBoneTransformsEXT bone_transforms{};
+	remixapi_InstanceInfoBlendEXT blend_state{};
 
 	remixapi_InstanceInfo instance{};
 	instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
@@ -3980,6 +5481,120 @@ void RemixGSRender::submit_subdraw()
 		bone_transforms.boneTransforms_values = m_scratch_bone_transforms.data();
 		bone_transforms.boneTransforms_count = ::size32(m_scratch_bone_transforms);
 		instance.pNext = &bone_transforms;
+	}
+
+	if (remix_rsx::blend_state_enabled())
+	{
+		// Everything up to ae94587 submitted every draw fully opaque: instance.pNext only ever
+		// carried bone transforms, so the runtime never saw NV4097_SET_BLEND_ENABLE at all. One
+		// Resistance 2 capture of 665 dumped draws had ~163 with blend=1 and all 163 arrived as
+		// solid geometry - light shafts as white walls, a sun card occluding the level behind it,
+		// world-space distance markers as black boxes.
+		//
+		// Chained *in front of* whatever is already there rather than replacing it: a skinned
+		// translucent draw has to carry both structs, and the runtime walks the chain by sType
+		// (pnext::find, rtx_remix_api.cpp:916) so the order does not matter.
+		blend_state.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BLEND_EXT;
+
+		// These nine are copied out of the ext unconditionally (rtx_remix_api.cpp:921-929),
+		// i.e. whether or not the material asked for the draw call's alpha state, so they must
+		// reproduce LegacyMaterialData's own defaults (rtx_materials.h:1822-1831) or merely
+		// chaining the struct would rewrite a fixed-function texture stage this backend has
+		// never configured. They are byte-for-byte what remix.h:827-834 defaults them to.
+		// isVertexColorBakedLighting is the one with a visible effect and true is what the
+		// pre-ext path ran with, so parity means 1 here, not 0.
+		blend_state.textureColorArg1Source = 1;  // RtTextureArgSource::Texture
+		blend_state.textureColorArg2Source = 0;  // RtTextureArgSource::None
+		blend_state.textureColorOperation = 3;   // DxvkRtTextureOperation::Modulate
+		blend_state.textureAlphaArg1Source = 1;  // RtTextureArgSource::Texture
+		blend_state.textureAlphaArg2Source = 0;  // RtTextureArgSource::None
+		blend_state.textureAlphaOperation = 1;   // DxvkRtTextureOperation::SelectArg1
+		blend_state.tFactor = 0xFFFFFFFFu;
+		blend_state.isTextureFactorBlend = 0;
+		blend_state.isVertexColorBakedLighting = 1;
+
+		// ONE/ZERO with ADD is the runtime's "Opaque Alias" (rtx_instance_manager.cpp:717-719):
+		// the pair that means "this draw is not really blended". Correct rest state for the
+		// blend-disabled majority, and correct fallback for anything the mapping refuses.
+		blend_state.alphaBlendEnabled = 0;
+		blend_state.srcColorBlendFactor = 1;
+		blend_state.dstColorBlendFactor = 0;
+		blend_state.colorBlendOp = 0;
+		blend_state.srcAlphaBlendFactor = 1;
+		blend_state.dstAlphaBlendFactor = 0;
+		blend_state.alphaBlendOp = 0;
+		blend_state.writeMask = 0xFu;            // R|G|B|A, VkColorComponentFlags
+		blend_state.alphaTestEnabled = 0;
+		blend_state.alphaTestReferenceValue = 0;
+		blend_state.alphaTestCompareOp = 7;      // VK_COMPARE_OP_ALWAYS, i.e. no test
+
+		// The material now sets useDrawCallAlphaState = 1, and that one option gates alpha test
+		// and alpha blend together (rtx_instance_manager.cpp:687-709), so the alpha test has to
+		// be restated here or the cutout fix that put it on the material would be undone. Same
+		// RSX-register source and same 0x200 subtraction the texture cache used, just read per
+		// draw instead of once per texture descriptor - which is the more honest scope for it.
+		// Note alphaTestEnabled itself is dead weight in the RT path (it lands on
+		// LegacyMaterialData::alphaTestEnabled, which only the rasteriser reads); what actually
+		// turns the test on is alphaTestCompareOp != 7 at rtx_instance_manager.cpp:680.
+		if (!remix_rsx::alpha_state_disabled() && rsx::method_registers.alpha_test_enabled())
+		{
+			const u32 func = static_cast<u32>(rsx::method_registers.alpha_func());
+
+			if (func >= 0x200 && func <= 0x207)
+			{
+				blend_state.alphaTestCompareOp = func - 0x200;
+			}
+
+			blend_state.alphaTestReferenceValue =
+				static_cast<uint8_t>(std::clamp(rsx::method_registers.alpha_ref(), 0.f, 1.f) * 255.f + 0.5f);
+			blend_state.alphaTestEnabled = 1;
+		}
+
+		if (!remix_rsx::alpha_state_disabled() && rsx::method_registers.blend_enabled())
+		{
+			bool mapped = true;
+
+			blend_state.alphaBlendEnabled = 1;
+			blend_state.srcColorBlendFactor = vk_blend_factor_from_gcm(rsx::method_registers.blend_func_sfactor_rgb(), mapped);
+			blend_state.dstColorBlendFactor = vk_blend_factor_from_gcm(rsx::method_registers.blend_func_dfactor_rgb(), mapped);
+			blend_state.colorBlendOp = vk_blend_op_from_gcm(rsx::method_registers.blend_equation_rgb(), mapped);
+			blend_state.srcAlphaBlendFactor = vk_blend_factor_from_gcm(rsx::method_registers.blend_func_sfactor_a(), mapped);
+			blend_state.dstAlphaBlendFactor = vk_blend_factor_from_gcm(rsx::method_registers.blend_func_dfactor_a(), mapped);
+			blend_state.alphaBlendOp = vk_blend_op_from_gcm(rsx::method_registers.blend_equation_a(), mapped);
+
+			// Surface 0 only: this backend submits one instance per draw, and the alpha bit is
+			// the only one the runtime reads - it uses "alpha writes disabled" to tell
+			// premultiplied alpha from inverted reverse-emissive when the colour pair is
+			// ONE / ONE_MINUS_SRC_ALPHA (rtx_instance_manager.cpp:745-752).
+			blend_state.writeMask =
+				(rsx::method_registers.color_mask_r(0) ? 0x1u : 0u) |
+				(rsx::method_registers.color_mask_g(0) ? 0x2u : 0u) |
+				(rsx::method_registers.color_mask_b(0) ? 0x4u : 0u) |
+				(rsx::method_registers.color_mask_a(0) ? 0x8u : 0u);
+
+			if (mapped)
+			{
+				++m_stats.blend_translucent;
+			}
+			else
+			{
+				// Refuse the pair rather than ship half of it: a factor the mapping does not know
+				// would otherwise land on whatever arm of calculateAlphaState()'s table the
+				// fallback happened to hit, which is a worse failure than staying opaque.
+				blend_state.srcColorBlendFactor = 1;
+				blend_state.dstColorBlendFactor = 0;
+				blend_state.colorBlendOp = 0;
+				blend_state.srcAlphaBlendFactor = 1;
+				blend_state.dstAlphaBlendFactor = 0;
+				blend_state.alphaBlendOp = 0;
+				blend_state.alphaBlendEnabled = 0;
+				++m_stats.blend_unmapped;
+			}
+		}
+
+		blend_state.pNext = instance.pNext;
+		instance.pNext = &blend_state;
+		++m_stats.blend_chained;
 	}
 
 	const u32 status = remix_rsx::guarded_draw_instance(api.DrawInstance, &instance);
@@ -4010,6 +5625,26 @@ const remix_rsx::vp_fingerprint& RemixGSRender::fingerprint_for(u64 vp_hash)
 		m_stats.vp_hpos_indirect += it->second.hpos_indirect ? 1 : 0;
 		m_stats.vp_hpos_refused += it->second.hpos_indirect_refused ? 1 : 0;
 		m_stats.vp_hpos_indexed += it->second.hpos_indirect_indexed ? 1 : 0;
+		m_stats.vp_wbuffer_z += it->second.hpos_wbuffer_z ? 1 : 0;
+
+		// The indexed population split by program rather than by draw: how many of the programs
+		// that read a constant palette this file can now express, and how many it still cannot.
+		// The second number is the honest size of what is left. It was 16 at ae94587 - the four-bone
+		// blend rigs - and those are now expressed (match_blend_palette), so on Resistance 2 it
+		// should be the 4 remaining oddities the paper replay listed: 2 that index a single
+		// non-matrix row off a constant, 1 with three ARLs and branches, 1 reading two unrelated
+		// indexed slots. Larger than 4 and there is another shape to find.
+		if (it->second.indexed_const)
+		{
+			if (it->second.skinned && it->second.bone_resolved && !it->second.skin_unrecognised)
+			{
+				++m_stats.vp_indexed_matched;
+			}
+			else
+			{
+				++m_stats.vp_indexed_unmatched;
+			}
+		}
 	}
 
 	return it->second;
@@ -4069,15 +5704,270 @@ std::string RemixGSRender::describe_skinning(u32 first_vertex, u32 vertex_count)
 		return out;
 	}
 
-	fmt::append(out, " attr=ATTR%u.%c type=%u size=%u stride=%u off=%u first_vertex=%u verts=%u",
+	// 'idx=' is how the ARL reads the attribute, not just which component: the abs and negate bits
+	// do not appear in the position slice (describe_output_slice prints neither), so without this
+	// the one thing that decides which palette entry a draw reads is invisible in a capture.
+	fmt::append(out, " attr=ATTR%u.%c idx=%s%s%c%s type=%u size=%u stride=%u off=%u first_vertex=%u verts=%u",
 		fp.bone_attribute,
 		"xyzw"[fp.bone_component & 3],
+		fp.bone_index_negate ? "-" : "",
+		fp.bone_index_abs ? "|" : "",
+		"xyzw"[fp.bone_component & 3],
+		fp.bone_index_abs ? "|" : "",
 		static_cast<u32>(bones.type),
 		bones.size,
 		bones.stride,
 		bones.offset,
 		first_vertex,
 		vertex_count);
+
+	// The blend, decoded exactly the way build_blend_skinning does it: for the first few vertices,
+	// every bone's weight and the palette slot it resolved to, side by side. That pairing is the
+	// thing a wrong blend shows up in first - a swapped weight-to-address mapping gives plausible
+	// slots with implausible weights on them - and it is not derivable from any of the aggregate
+	// counters. The same shape of line is what caught the ARL modifier bug in one read.
+	if (fp.skin_blended)
+	{
+		attribute_view blend_weights{};
+		const attribute_status weight_status = map_attribute(fp.blend_weight_attribute, first_vertex, vertex_count, blend_weights);
+
+		fmt::append(out, " | blend bones=%u wattr=ATTR%u(%s)",
+			fp.blend_bones, fp.blend_weight_attribute,
+			(weight_status == attribute_status::ok) ? "ok" : "UNMAPPED");
+
+		if (weight_status == attribute_status::ok)
+		{
+			u32 blend_decode_failed = 0;
+			u32 blend_slot_failed = 0;
+			u32 weight_unsummed = 0;
+			std::string blend_samples;
+
+			for (u32 i = 0; i < vertex_count; ++i)
+			{
+				f32 index_scaled[4] = {};
+				f32 index_raw[4] = {};
+				f32 weight_scaled[4] = {};
+
+				if (!remix_rsx::decode_position(bones.at(i), bones.type, bones.size, index_scaled)
+					|| !remix_rsx::decode_attribute_raw(bones.at(i), bones.type, bones.size, index_raw)
+					|| !remix_rsx::decode_position(blend_weights.at(i), blend_weights.type, blend_weights.size, weight_scaled))
+				{
+					++blend_decode_failed;
+					continue;
+				}
+
+				f32 sum = 0.f;
+				std::string per_bone;
+
+				for (u32 k = 0; k < fp.blend_bones && k < remix_rsx::max_blend_bones; ++k)
+				{
+					const remix_rsx::bone_index_chain& chain = fp.blend_bone[k];
+					const f32 weight = weight_scaled[fp.blend_weight_component[k] & 3];
+					const f32 index_value = remix_rsx::skinraw_enabled()
+						? index_raw[chain.component & 3]
+						: index_scaled[chain.component & 3];
+
+					sum += weight;
+
+					u32 slot = 0;
+					const bool slot_ok = remix_rsx::evaluate_palette_slot(fp, chain, index_value, slot);
+
+					if (!slot_ok)
+					{
+						++blend_slot_failed;
+					}
+
+					if (i < 4)
+					{
+						fmt::append(per_bone, " b%u[w=%.4g idx=%.6g->%s%u]",
+							k, static_cast<f64>(weight), static_cast<f64>(index_value),
+							slot_ok ? "c" : "!c", slot);
+					}
+				}
+
+				// The number Remix's shader actually depends on: it derives the last weight as
+				// 1 - sum(the others), so a set that does not sum to 1 is submitted with a
+				// different fourth bone than the ucode blended.
+				if (std::abs(sum - 1.f) > (1.f / 32.f))
+				{
+					++weight_unsummed;
+				}
+
+				if (i < 4)
+				{
+					fmt::append(blend_samples, " v%u(sum=%.4g)%s", i, static_cast<f64>(sum), per_bone);
+				}
+			}
+
+			fmt::append(out, " decode_fail=%u slot_fail=%u unsummed=%u/%u%s",
+				blend_decode_failed, blend_slot_failed, weight_unsummed, vertex_count, blend_samples);
+
+			// Every distinct bone this draw touches, assembled exactly as build_blend_skinning
+			// assembles it, with the two numbers no other gate looks at: the longest basis axis and
+			// the translation length.
+			//
+			// The whole draw is scanned, and the extremes are reported by slot. The first version of
+			// this stopped collecting once it had 24 distinct bones, which is precisely the wrong
+			// place to stop: a rig with more bones than that would hide the outlier the line exists
+			// to find, and the two Resistance 2 rigs that look like real skeletons have exactly 24.
+			// The per-bone list is still truncated - only the scan is not.
+			{
+				std::vector<u32> bone_slots;
+				std::string extents;
+
+				remix_rsx::mat4 first_bone{};
+				bool have_first = false;
+				bool uniform = true;
+
+				f32 axis_min = 0.f, axis_max = 0.f, trans_min = 0.f, trans_max = 0.f;
+				u32 axis_min_slot = 0, axis_max_slot = 0, trans_min_slot = 0, trans_max_slot = 0;
+
+				for (u32 i = 0; i < vertex_count; ++i)
+				{
+					f32 index_scaled[4] = {};
+					f32 index_raw[4] = {};
+					f32 weight_scaled[4] = {};
+
+					if (!remix_rsx::decode_position(bones.at(i), bones.type, bones.size, index_scaled)
+						|| !remix_rsx::decode_attribute_raw(bones.at(i), bones.type, bones.size, index_raw)
+						|| !remix_rsx::decode_position(blend_weights.at(i), blend_weights.type, blend_weights.size, weight_scaled))
+					{
+						continue;
+					}
+
+					for (u32 k = 0; k < fp.blend_bones && k < remix_rsx::max_blend_bones; ++k)
+					{
+						const remix_rsx::bone_index_chain& chain = fp.blend_bone[k];
+
+						if (!(weight_scaled[fp.blend_weight_component[k] & 3] > 0.f))
+						{
+							continue;
+						}
+
+						const f32 index_value = remix_rsx::skinraw_enabled()
+							? index_raw[chain.component & 3]
+							: index_scaled[chain.component & 3];
+
+						u32 slot = 0;
+
+						if (!remix_rsx::evaluate_palette_slot(fp, chain, index_value, slot)
+							|| std::find(bone_slots.begin(), bone_slots.end(), slot) != bone_slots.end())
+						{
+							continue;
+						}
+
+						bone_slots.push_back(slot);
+
+						remix_rsx::mat4 bone{};
+
+						if (!remix_rsx::build_palette_matrix(fp, slot, bone))
+						{
+							if (bone_slots.size() <= 12)
+							{
+								fmt::append(extents, " c%u=UNBUILDABLE", slot);
+							}
+
+							uniform = false;
+							continue;
+						}
+
+						const f32 axis = remix_rsx::basis_extent(bone);
+						const f32 trans = remix_rsx::translation_extent(bone);
+
+						if (!have_first)
+						{
+							first_bone = bone;
+							have_first = true;
+							axis_min = axis_max = axis;
+							trans_min = trans_max = trans;
+							axis_min_slot = axis_max_slot = trans_min_slot = trans_max_slot = slot;
+						}
+						else
+						{
+							if (axis < axis_min) { axis_min = axis; axis_min_slot = slot; }
+							if (axis > axis_max) { axis_max = axis; axis_max_slot = slot; }
+							if (trans < trans_min) { trans_min = trans; trans_min_slot = slot; }
+							if (trans > trans_max) { trans_max = trans; trans_max_slot = slot; }
+
+							for (u32 r = 0; r < 4 && uniform; ++r)
+							{
+								for (u32 c = 0; c < 4; ++c)
+								{
+									if (std::abs(bone.m[r][c] - first_bone.m[r][c]) > 1e-6f)
+									{
+										uniform = false;
+										break;
+									}
+								}
+							}
+						}
+
+						if (bone_slots.size() <= 12)
+						{
+							fmt::append(extents, " c%u[axis=%.4g trans=%.4g%s]",
+								slot,
+								static_cast<f64>(axis),
+								static_cast<f64>(trans),
+								remix_rsx::has_usable_basis(bone, s_bone_basis_tolerance) ? "" : " RANK");
+						}
+					}
+				}
+
+				// 'uniform' is the shape no rig has: every bone of the palette the same matrix. It
+				// is reported rather than refused - see build_blend_skinning for why an identical
+				// palette is a mathematically *correct* rigid draw - but it is the signature of a
+				// palette that was never written, so it is the first thing to look for.
+				fmt::append(out, " | bones=%u uniform=%d axis[%.4g@c%u..%.4g@c%u] trans[%.4g@c%u..%.4g@c%u]%s",
+					::size32(bone_slots), (have_first && uniform) ? 1 : 0,
+					static_cast<f64>(axis_min), axis_min_slot, static_cast<f64>(axis_max), axis_max_slot,
+					static_cast<f64>(trans_min), trans_min_slot, static_cast<f64>(trans_max), trans_max_slot,
+					extents);
+
+				// The palette as the ucode actually reads it, before build_palette_matrix folds the
+				// bias in and before the decode is composed onto it. This is what separates "the
+				// constants were never written" from "we are reading the wrong place": an identity
+				// row set says the title has not posed this rig, a plausible rotation with a zero
+				// fourth component says the translation lives somewhere this does not look, and
+				// garbage says the base is wrong. Two bones is enough to tell those apart, and the
+				// bias is printed beside them because for a 3-row group it is the entire translation
+				// of every bone when the palette's own fourth components are zero.
+				for (u32 b = 0; b < 2 && b < bone_slots.size(); ++b)
+				{
+					remix_rsx::slot_block raw{};
+
+					if (!remix_rsx::read_slot_block(bone_slots[b], raw))
+					{
+						fmt::append(out, " | raw c%u UNREADABLE", bone_slots[b]);
+						continue;
+					}
+
+					fmt::append(out, " | raw c%u=[%.4g %.4g %.4g %.4g][%.4g %.4g %.4g %.4g][%.4g %.4g %.4g %.4g]",
+						bone_slots[b],
+						static_cast<f64>(raw.v[0][0]), static_cast<f64>(raw.v[0][1]), static_cast<f64>(raw.v[0][2]), static_cast<f64>(raw.v[0][3]),
+						static_cast<f64>(raw.v[1][0]), static_cast<f64>(raw.v[1][1]), static_cast<f64>(raw.v[1][2]), static_cast<f64>(raw.v[1][3]),
+						static_cast<f64>(raw.v[2][0]), static_cast<f64>(raw.v[2][1]), static_cast<f64>(raw.v[2][2]), static_cast<f64>(raw.v[2][3]));
+				}
+
+				if (fp.palette_has_bias)
+				{
+					if (remix_rsx::slot_block bias{}; remix_rsx::read_slot_block(fp.palette_bias_slot, bias))
+					{
+						fmt::append(out, " | bias c%u=[%.4g %.4g %.4g]", fp.palette_bias_slot,
+							static_cast<f64>(bias.v[0][0]), static_cast<f64>(bias.v[0][1]), static_cast<f64>(bias.v[0][2]));
+					}
+				}
+			}
+
+			// This runs before the skinning gate, so m_scratch_bone_prescale_folded is still clear
+			// and the 'world=' matrix printed at the end of this line still carries the position
+			// decode. On the real submission the decode travels in front of the bone matrices
+			// instead - see build_blend_skinning - so the two differ by exactly that factor.
+			if (fp.has_prescale || fp.has_const_affine)
+			{
+				out += " (world below still carries the decode; the submitted bones carry it instead)";
+			}
+		}
+	}
 
 	// Decoded per vertex exactly the way build_skinning does it, with both candidate values
 	// carried side by side so the raw-vs-scaled question (M4 D1) is answered by reading the
@@ -4100,10 +5990,12 @@ std::string RemixGSRender::describe_skinning(u32 first_vertex, u32 vertex_count)
 			continue;
 		}
 
+		// The absolute palette slot, which is what build_skinning and resolve_indexed_world both
+		// key on now - printing the offset would no longer describe the code being diagnosed.
 		u32 scaled_offset = 0;
 		u32 raw_offset = 0;
-		const bool scaled_ok = remix_rsx::evaluate_bone_offset(fp, scaled[fp.bone_component], scaled_offset);
-		const bool raw_ok = remix_rsx::evaluate_bone_offset(fp, raw[fp.bone_component], raw_offset);
+		const bool scaled_ok = remix_rsx::evaluate_palette_slot(fp, scaled[fp.bone_component], scaled_offset);
+		const bool raw_ok = remix_rsx::evaluate_palette_slot(fp, raw[fp.bone_component], raw_offset);
 
 		if (!scaled_ok) { ++scaled_failed; }
 		if (!raw_ok) { ++raw_failed; }
@@ -4142,27 +6034,30 @@ std::string RemixGSRender::describe_skinning(u32 first_vertex, u32 vertex_count)
 		}
 	}
 
-	fmt::append(out, " distinct=%u decode_fail=%u scaled_fail=%u raw_fail=%u%s",
+	// 'distinct' is the whole rigid-vs-skinned question in one number: 1 means this draw reads one
+	// object matrix and folds into the instance transform, more than 1 means it is a real rig.
+	fmt::append(out, " base=c%u rows=%u stride=%u bias=%d distinct=%u decode_fail=%u scaled_fail=%u raw_fail=%u%s",
+		fp.palette_base, fp.palette_rows, fp.palette_stride, fp.palette_has_bias ? 1 : 0,
 		::size32(slots), decode_failed, scaled_failed, raw_failed, samples);
 
 	// The palette itself. A bind pose is affine with plausible translations; a transpose puts
-	// the translation in the perspective row, which is exactly what this prints.
+	// the translation in the perspective row, which is exactly what this prints. Built the way the
+	// submit path builds it - rows the group actually supplies, the post-matrix translation folded
+	// in - so a matrix that looks wrong here is wrong in the draw too.
 	if (!slots.empty())
 	{
-		remix_rsx::slot_block block{};
+		remix_rsx::mat4 bone{};
 
-		if (remix_rsx::read_slot_block(fp.palette_base + slots[0], block))
+		if (remix_rsx::build_palette_matrix(fp, slots[0], bone))
 		{
-			const remix_rsx::mat4 bone = remix_rsx::slots_to_matrix(block, fp.palette_shape);
-			fmt::append(out, " | bone0 c[%u] slots=%s mat=%s affine=%d",
-				fp.palette_base + slots[0],
-				remix_rsx::format_slots(block),
+			fmt::append(out, " | bone0 c[%u] mat=%s affine=%d",
+				slots[0],
 				remix_rsx::format_matrix(bone),
 				remix_rsx::is_affine(bone, s_world_affine_tolerance) ? 1 : 0);
 		}
 		else
 		{
-			fmt::append(out, " | bone0 c[%u] UNREADABLE", fp.palette_base + slots[0]);
+			fmt::append(out, " | bone0 c[%u] UNBUILDABLE", slots[0]);
 		}
 	}
 
@@ -4226,7 +6121,7 @@ void RemixGSRender::dump_vertex_program(u32 first_vertex, u32 vertex_count, u32 
 	{
 		// The line that settles the open question: which attribute carries the bone index,
 		// which component of it, and what is applied on the way to the address register.
-		fmt::append(groups, " | skin palette=c[%u+a] shape=%s attr=ATTR%u.%c resolved=%d ops=%u arl=%u idx=%u foreign=%u unrecognised=%d",
+		fmt::append(groups, " | skin palette=c[%u+a] shape=%s attr=ATTR%u.%c resolved=%d ops=%u arl=%u idx=%u foreign=%u unrecognised=%d blend=%u",
 			fp.palette_base,
 			remix_rsx::shape_name(fp.palette_shape),
 			fp.bone_attribute,
@@ -4236,7 +6131,11 @@ void RemixGSRender::dump_vertex_program(u32 first_vertex, u32 vertex_count, u32 
 			fp.arl_count,
 			fp.indexed_reads,
 			fp.foreign_indexed_reads,
-			fp.skin_unrecognised ? 1 : 0);
+			fp.skin_unrecognised ? 1 : 0,
+			// 0 for a single-matrix palette, 4 for the summed four-bone form. 'idx' should be
+			// rows x blend for a blend rig - 12 for R2's three-row palettes - and 'foreign' 0:
+			// that pair is the whole indexing audit in two numbers.
+			fp.skin_blended ? fp.blend_bones : 0);
 
 		for (u32 i = 0; i < fp.bone_op_count; ++i)
 		{
@@ -4626,12 +6525,18 @@ void RemixGSRender::log_stats()
 		"Remix stats: frame=%llu draws=%llu submitted=%llu meshes_live=%llu created=%llu destroyed=%llu poisoned=%llu | "
 		"cam_resolved=%llu cam_fallback=%llu cam_held=%llu split_attempted=%llu split_failed=%llu arch=%s world_applied=%llu world_fallback=%llu world_refused=%llu world_layered_ref=%llu | "
 		"skip screen=%llu immediate=%llu inline=%llu volatile=%llu reg_attr0=%llu prim=%llu restart=%llu instanced=%llu layout=%llu mem=%llu decode=%llu poison=%llu vp=%llu rt=%llu rt_kept=%llu notinput=%llu wdiv=%llu posdecode_refused=%llu | "
-		"vp_hpos_indirect=%llu vp_hpos_refused=%llu vp_hpos_indexed=%llu | "
+		"vp_hpos_indirect=%llu vp_hpos_refused=%llu vp_hpos_indexed=%llu vp_wbuffer_z=%llu | "
+		"idxworld_rigid=%llu idxworld_skinned=%llu idxworld_refused=%llu vp_indexed_matched=%llu vp_indexed_unmatched=%llu bone_degenerate=%llu | "
 		"skin_submitted=%llu skin_skipped=%llu skin_unrecognised=%llu skin_bones_max=%llu | "
+		"skinblend_submitted=%llu skinblend_idx=%llu skinblend_weight=%llu skinblend_bone=%llu skinblend_palette=%llu skinblend_scale=%llu skinblend_uniform=%llu skinblend_rescaled=%llu skin_reach_flagged=%llu | "
 		"skip_lighting_pass=%llu | "
-		"cat_sky=%llu cat_hidden=%llu cat_particle=%llu cat_decal=%llu | "
+		"cat_sky=%llu sky_cand=%llu sky_noworld=%llu sky_extent=%llu sky_anchor=%llu sky_anchor_held=%llu sky_census=%u "
+		"sky_backdrop_hit=%llu sky_backdrop_dw=%llu sky_backdrop_mode=%u | "
+		"cat_hidden=%llu cat_particle=%llu cat_decal=%llu | "
+		"blend_chained=%llu blend_translucent=%llu blend_unmapped=%llu | "
 		"tex_bound=%llu tex_none=%llu tex_no_unit=%llu tex_unit_retry=%llu tex_albedo_ucode=%llu tex_albedo_guess=%llu tex_retry_refused=%llu tex_unit_substituted=%llu uv_applied=%llu uv_none=%llu uv_absent=%llu uv_layout=%llu uv_memory=%llu uv_fallback=%llu uv_ucode=%llu uv_heuristic=%llu uv_nonfinite=%llu vcol_applied=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_tombstone=%llu tex_rehashed=%llu tex_refreshed=%llu mat_created=%llu | "
-		"ui_draws=%llu ui_skipped=%llu ui_no_colour=%llu ui_rt=%llu ui_prims=%llu ui_frames=%llu ui_ndc=%llu ui_unit=%llu ui_pixel=%llu ui_nospace=%llu ui_ortho2d=%llu | "
+		"ui_draws=%llu ui_skipped=%llu ui_no_colour=%llu ui_rt=%llu ui_prims=%llu ui_frames=%llu ui_ndc=%llu ui_unit=%llu ui_pixel=%llu ui_nospace=%llu ui_ortho2d=%llu "
+		"ui_vpydown=%llu ui_vpyup=%llu ui_vpfallback=%llu ui_vflip_ndc=%llu/%llu ui_vflip_pixel=%llu/%llu ui_vflip_abstain=%llu | "
 		"zcull_av=%llu zcull_av_handled=%llu",
 		m_frame_counter,
 		m_stats.draws_seen,
@@ -4671,15 +6576,43 @@ void RemixGSRender::log_stats()
 		m_stats.vp_hpos_indirect,
 		m_stats.vp_hpos_refused,
 		m_stats.vp_hpos_indexed,
+		m_stats.vp_wbuffer_z,
+		m_stats.indexed_world_rigid,
+		m_stats.indexed_world_skinned,
+		m_stats.indexed_world_refused,
+		m_stats.vp_indexed_matched,
+		m_stats.vp_indexed_unmatched,
+		m_stats.bone_degenerate,
 		m_stats.skin_submitted,
 		m_stats.skin_skipped,
 		m_stats.skin_unrecognised,
 		m_stats.skin_bones_max,
+		m_stats.skin_blend_submitted,
+		m_stats.skin_blend_refused_index,
+		m_stats.skin_blend_refused_weight,
+		m_stats.skin_blend_refused_bone,
+		m_stats.skin_blend_refused_palette,
+		m_stats.skin_blend_refused_scale,
+		m_stats.skin_blend_uniform,
+		m_stats.skin_blend_rescaled,
+		m_stats.skin_reach_flagged,
 		m_stats.skip_lighting_pass,
 		m_stats.cat_sky,
+		m_stats.sky_candidates,
+		m_stats.sky_refused_noworld,
+		m_stats.sky_refused_extent,
+		m_stats.sky_refused_anchor,
+		m_stats.sky_refused_anchor_held,
+		m_sky_census_lines,
+		m_stats.sky_backdrop_hit,
+		m_stats.sky_backdrop_dw,
+		remix_rsx::sky_backdrop_mode(),
 		m_stats.cat_hidden,
 		m_stats.cat_particle,
 		m_stats.cat_decal,
+		m_stats.blend_chained,
+		m_stats.blend_translucent,
+		m_stats.blend_unmapped,
 		m_stats.tex_bound,
 		m_stats.tex_none,
 		m_stats.tex_no_unit,
@@ -4720,6 +6653,19 @@ void RemixGSRender::log_stats()
 		m_stats.ui_space_pixel,
 		m_stats.ui_space_none,
 		m_stats.ui_ortho2d,
+		// Which convention the guest's viewport states for the clip-pixel branch, and the ok/bad
+		// orientation vote per branch. 'ui_vflip_ndc=A/B' reads A upright, B upside down, over the
+		// family already confirmed correct on screen; ui_vflip_pixel is the same vote for the
+		// branch whose row conversion had no evidence behind it. The two disagreeing is the
+		// remaining flip, measured.
+		m_stats.ui_space_vp_ydown,
+		m_stats.ui_space_vp_yup,
+		m_stats.ui_space_vp_fallback,
+		m_stats.ui_vflip_ndc_ok,
+		m_stats.ui_vflip_ndc_bad,
+		m_stats.ui_vflip_pixel_ok,
+		m_stats.ui_vflip_pixel_bad,
+		m_stats.ui_vflip_abstain,
 		// ZCULL occlusion-report page faults taken by guest threads. Non-zero means the title polls
 		// cellGcmGetReport while a query is in flight; every one of these that is NOT handled wedges
 		// the faulting PPU thread forever (see on_access_violation).
@@ -4799,6 +6745,37 @@ void RemixGSRender::log_stats()
 			m_ui_biggest.clip_unit ? 1 : 0);
 
 		m_ui_biggest = {};
+	}
+
+	// The orientation audit, named. One row per vertex program that cast a vote, so a run says
+	// which programs are inverted rather than which branch - the distinction the aggregate cannot
+	// draw and the one that decides whether the fix is a mapping change or a classification
+	// change for a single program. 'ortho=1' is the family already confirmed upright on screen, so
+	// an inverted row with ortho=1 means the audit disagrees with the screen and the instrument is
+	// wrong; an inverted row with ortho=0 names the program actually still flipped.
+	{
+		bool any = false;
+
+		for (u32 i = 0; i < s_ui_vote_rows; ++i)
+		{
+			const ui_vote_row& row = m_ui_votes[i];
+
+			if (row.vp_hash == 0)
+			{
+				break;
+			}
+
+			any = true;
+
+			rsx_log.notice("Remix ui-vote: vp=%016llx ortho=%d ndc=%llu/%llu pixel=%llu/%llu",
+				row.vp_hash, row.ortho ? 1 : 0,
+				row.ndc_ok, row.ndc_bad, row.pixel_ok, row.pixel_bad);
+		}
+
+		if (any && m_ui_vote_spill != 0)
+		{
+			rsx_log.notice("Remix ui-vote: spill=%llu (programs past the table)", m_ui_vote_spill);
+		}
 	}
 }
 

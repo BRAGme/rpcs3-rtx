@@ -202,6 +202,42 @@ private:
 		u64 ui_ortho2d = 0;
 		u64 ui_space_pixel = 0;  // clip-pixel branch
 		u64 ui_space_none = 0;   // neither shape; refused rather than guessed
+
+		// The clip-pixel branch's row conversion, audited. As of ae94587 it multiplied the guest
+		// coordinate by fh/surface_clip_height, which silently asserts that guest pixel y=0 is the
+		// top row; no capture ever established that. It is now derived from the viewport registers
+		// the guest programmed, which say so outright - RSX window space is y-down exactly when
+		// viewport_scale_y is negative. R2 (NPEA00431) reads vp_scale_y=-352 vp_offset_y=352 at
+		// clip=1280x704, where the derivation collapses back to the old expression, so ydown is
+		// expected to carry every pixel-branch draw there and yup to stay 0. A non-zero yup on any
+		// title is the population the old form drew mirrored. fallback counts draws whose viewport
+		// was unusable (scale ~0 or non-finite) and kept the legacy form.
+		// RPCS3_REMIX_UISPACE=0 restores it everywhere.
+		u64 ui_space_vp_ydown = 0;
+		u64 ui_space_vp_yup = 0;
+		u64 ui_space_vp_fallback = 0;
+
+		// The orientation audit, and the measurement that settles the remaining upside-down HUD
+		// without a screenshot or a ucode read. A textured UI quad is upright exactly when the
+		// atlas row it samples grows the same way the composited row does, so the sign of the
+		// covariance between v and screen y over one triangle is the answer, per draw.
+		//
+		// Split by branch because the comparison is the point. Against
+		// ui_draws=91008 ui_no_colour=18610 ui_ndc=22413 ui_unit=5064 ui_pixel=218395
+		// ui_nospace=0 ui_ortho2d=66702, the ortho2d/NDC family is confirmed correct on screen, so
+		// it calibrates 'ok' for this title's atlases and V convention. ndc_ok dominant while
+		// pixel_bad dominant is the flip, proven; both families agreeing means the flip is not in
+		// this classification and the fragment side is the next place to look. A draw with no UVs,
+		// or whose first triangle spans no v or no y, votes for neither.
+		u64 ui_vflip_ndc_ok = 0;
+		u64 ui_vflip_ndc_bad = 0;
+		u64 ui_vflip_pixel_ok = 0;
+		u64 ui_vflip_pixel_bad = 0;
+		// Textured draws whose first triangle carried no usable orientation - too little vertical
+		// span, too little v span, or a v that tracks x rather than y (a rotated or skewed sprite).
+		// Large relative to the votes means the audit is looking at geometry it cannot read, and
+		// the ok/bad split above describes a minority of what is actually on screen.
+		u64 ui_vflip_abstain = 0;
 		u64 skin_submitted = 0;
 		u64 skin_skipped = 0;
 		u64 skin_bones_max = 0;
@@ -221,10 +257,155 @@ private:
 		u64 vp_hpos_indirect = 0;
 		u64 vp_hpos_refused = 0;
 		u64 vp_hpos_indexed = 0;
+
+		// What became of the draws that read a constant palette through the address register - the
+		// population the gate refused whole at ae94587, where it was skin_unrecognised = 1481510 of
+		// 7588805 draws with skin_submitted = 0.
+		//
+		// 'rigid' is a draw whose index came out the same for every vertex, so the palette read is
+		// one fixed matrix and it folds into the instance transform with no bones at all: the
+		// terrain-chunk and batched-prop case, and the one that does not need the Remix fork.
+		// 'skinned' is a draw whose index genuinely varies, handed to build_skinning as bone
+		// transforms. 'refused' is everything still proven-or-nothing: an index that does not
+		// evaluate, a slot outside the 468 legal constants, or a palette matrix that is not affine.
+		//
+		// Programs, not draws, for the last two: 'unmatched' counts unique vertex programs whose
+		// position reads an indexed constant that match_indexed_affine could not express - on
+		// Resistance 2 that is the four-bone blend rigs, 16 of its 36 indexed programs, which stay
+		// refused because submitting one bone of a four-bone blend is what tears a character apart.
+		u64 indexed_world_rigid = 0;
+		u64 indexed_world_skinned = 0;
+		u64 indexed_world_refused = 0;
+		u64 vp_indexed_matched = 0;
+		u64 vp_indexed_unmatched = 0;
+
+		// Draws refused because a palette entry's 3x3 basis does not span three dimensions
+		// (has_usable_basis). Separate from the other refusals because it means the *index* is
+		// landing outside the palette, not that the palette is unreadable - it is the counter that
+		// says whether the ARL source modifiers are being replayed correctly. Should be 0 once the
+		// index decode is right; a non-zero value with characters drawn is the thin-box artifact.
+		u64 bone_degenerate = 0;
+
+		// Weighted (multi-bone) skinning, the population ae94587 refused whole: 16 vertex programs
+		// on Resistance 2 (NPEA00431) whose palette is read once per bone and summed, taking 541960
+		// draws into skin_unrecognised with skin_submitted = 0. They are the character rigs.
+		//
+		// 'submitted' is draws handed to Remix with real per-vertex blend weights and indices
+		// (remixapi_MeshInfoSkinning, bonesPerVertex 4). The four refusals are split because they
+		// fail for different reasons and only one of them is a bug in this code:
+		//   _index   a bone's index attribute did not decode, or evaluated to a slot outside the
+		//            468 legal constants. The index decode is wrong, or the attribute is not the
+		//            one the ucode reads.
+		//   _weight  the weights are not a convex blend - non-finite, negative, or summing to zero.
+		//            Remix derives the last weight as 1 - sum(the others), so a set that does not
+		//            sum cannot be expressed and forcing it would move geometry.
+		//   _bone    a palette entry is not a usable affine transform (is_affine /
+		//            has_usable_basis). Same gate the single-bone path uses; a rank-deficient bone
+		//            draws its vertices on a line, which is the reported collapsed box.
+		//   _palette more than REMIXAPI_INSTANCE_INFO_MAX_BONES_COUNT distinct bones in one draw.
+		// 'rescaled' is not a refusal: the draw was submitted, but its weights did not sum to 1
+		// within 1/32 and were normalised. Non-zero means the weight attribute is not stored the
+		// way this assumes, and the number says how much of the scene is affected.
+		u64 skin_blend_submitted = 0;
+		u64 skin_blend_refused_index = 0;
+		u64 skin_blend_refused_weight = 0;
+		u64 skin_blend_refused_bone = 0;
+		u64 skin_blend_refused_palette = 0;
+		u64 skin_blend_rescaled = 0;
+
+		// Draws refused because one bone's basis or translation sits orders of magnitude away from
+		// the median of the other bones in the same draw. This is the only magnitude gate on the
+		// path: a 3-row palette passes is_affine (whose perspective column build_palette_matrix
+		// wrote itself) and passes has_usable_basis (scale-invariant by construction), so before
+		// this existed an inflating bone reached Remix with every refusal counter reading 0 -
+		// which is what Resistance 2's stalker turret did while its legs, weighted to other bones
+		// of the same palette, drew correctly. Non-zero here with the character still intact is the
+		// gate working: the draw it refuses is the sub-mesh that used to explode.
+		u64 skin_blend_refused_scale = 0;
+
+		// Blended draws whose palette entries are all the same matrix - the shape no rig has. Six
+		// of Resistance 2's eight blend rigs are in this population, reporting eight identical
+		// bones at c32..c53 against the two that report 24 with a real spread. Submitted rather
+		// than refused: an identical palette blends to exactly that one matrix, so the draw is a
+		// correct rigid draw and refusing it would delete working geometry. It also cannot produce
+		// radiating shards - it moves every vertex the same way, which is what rigid means.
+		// RPCS3_REMIX_BONEUNIFORM=0 refuses them, which is the one-run A/B on that population.
+		u64 skin_blend_uniform = 0;
+
+		// Skinned draws whose blended result travels far further from its own bones than the mesh's
+		// own spread explains (audit_skin_extent). Purely an instrument - nothing is refused on it -
+		// and the number that matters is whether it is zero. Zero while the shards are on screen
+		// exonerates the skinning path outright: an affine instance transform maps every vertex of
+		// a mesh the same way and cannot tear one apart, so a torn mesh whose skinning measures
+		// clean was not torn by this backend's per-vertex maths.
+		u64 skin_reach_flagged = 0;
+
+		// Unique vertex programs whose HPOS.z was written as a w-buffer premultiply and whose 4x4
+		// was only recovered by taking z from the row feeding it (vp_fingerprint::hpos_wbuffer_z).
+		u64 vp_wbuffer_z = 0;
 		u64 cat_sky = 0;
+
+		// Sky-dome detection, added after ae94587 - where it had no instrumentation at all, and an
+		// over-tag was only visible as a uniformly blue scene. 'candidates' is every draw that
+		// reached the test (depth writes off, and either untextured or sky_allows_textured()), and
+		// it is exactly the sum of the three refusals plus the cat_sky increments the test itself
+		// makes, so the shape of a mis-tag is readable in one line:
+		//   candidates high, extent ~= candidates    the title's geometry is simply not sky-sized;
+		//                                            the normal resting state.
+		//   candidates high, cat_sky a large share   the anchor gate is not filtering - this is the
+		//                                            ae94587 failure, where the raw-extent rule
+		//                                            tagged cat_sky=825915 of 2038738 draws (40.5%)
+		//                                            on Resistance 2 and lit the scene as sky.
+		//   noworld dominating                       the camera or the world transform is not
+		//                                            resolving for these draws, so the test never
+		//                                            ran; look at world_refused, not at the sky.
+		u64 sky_candidates = 0;
+		u64 sky_refused_noworld = 0;
+		u64 sky_refused_extent = 0;
+		u64 sky_refused_anchor = 0;
+
+		// The subset of sky_refused_anchor measured against a *held* camera - a frame that resolved
+		// no candidate of its own and reused the previous frame's (m_camera_age != 0). Those are the
+		// only frames on which the anchor can be measured against a camera that is not the one the
+		// draw was placed by: a frame with no usable camera at all takes cam_fallback, and there
+		// per_draw_transform refuses the draw outright, so it never reaches the sky test. The first
+		// capture bears that out - 1242 of 4377 R2 frames were cam_fallback and sky_noworld was 0.
+		u64 sky_refused_anchor_held = 0;
+
+		// The backdrop rule (RPCS3_REMIX_SKYBACKDROP). 'hit' is every draw it selects - counted at
+		// mode 1 without tagging anything, so the cost of turning it on is a number read from an
+		// ordinary run rather than a blue screen. 'dw' is the subset that writes depth, i.e. the
+		// part the sky-dome rule can never reach; on R2 the visible backdrop is entirely in there.
+		//
+		// The ratio to watch is sky_backdrop_hit / draws_submitted. The regression this is guarding
+		// against measured 825915 / 2038738 = 40.5%; the backdrop the census names is three draws
+		// of one program, so a healthy reading is a fraction of a percent. Anything approaching a
+		// percent means the rule is selecting geometry, not backdrop, and mode 2 must not be used.
+		u64 sky_backdrop_hit = 0;
+		u64 sky_backdrop_dw = 0;
+
 		u64 cat_hidden = 0;
 		u64 cat_particle = 0;
 		u64 cat_decal = 0;
+
+		// Alpha blending, added after ae94587. blend_chained is every instance that carried a
+		// remixapi_InstanceInfoBlendEXT (i.e. every submitted draw while RPCS3_REMIX_BLENDSTATE
+		// is on), blend_translucent is the subset that reached the runtime with
+		// alphaBlendEnabled = 1, and blend_unmapped is draws whose GCM factor or equation had no
+		// Vulkan counterpart and were therefore left opaque.
+		//
+		// The tell: blend_translucent = 0 over a window in which the scene visibly has light
+		// shafts or particles means the state is not reaching the instance at all, whereas
+		// blend_translucent > 0 with the shafts still solid means it is reaching it and
+		// calculateAlphaState() is rejecting the factor pair - it silently disables blending for
+		// anything outside its table and for any colorBlendOp other than ADD
+		// (rtx_instance_manager.cpp:802-807), which those two numbers cannot distinguish on
+		// their own but which blend_unmapped bounds from below. One Resistance 2 capture of 665
+		// dumped draws put the expected blend_translucent share at ~163/665, i.e. about a
+		// quarter of submitted draws.
+		u64 blend_chained = 0;
+		u64 blend_translucent = 0;
+		u64 blend_unmapped = 0;
 	};
 
 	// Wall-clock breakdown of the RSX thread's frame, in microseconds, accumulated over one
@@ -266,6 +447,30 @@ private:
 		f32 clip_hi[2] = { 0.f, 0.f };
 		bool clip_unit = false;
 	};
+
+	// The orientation audit, broken out per vertex program. The aggregate counters cannot tell
+	// "this branch's row conversion is inverted" from "one program with a high draw count is
+	// inverted", and those two call for opposite fixes - the first is a mapping change, the second
+	// is a classification change for one program. The first live run made that distinction the
+	// whole question: ui_vflip_ndc came back 92 upright / 12300 upside down while ui_vflip_pixel
+	// came back 54237 / 385, which reads as a wholesale NDC inversion, yet the ortho2d family that
+	// dominates the NDC branch is confirmed upright on screen. Both cannot be true of the same
+	// population, so the population has to be named before anything is changed.
+	//
+	// 'ortho' records whether that program's draws had their HPOS.xy-only transform rebuilt
+	// (vp_fingerprint::has_ortho2d), which answers the specific question directly: an inverted
+	// population with ortho=0 is not the visually-confirmed family and never was.
+	struct ui_vote_row
+	{
+		u64 vp_hash = 0;
+		u64 ndc_ok = 0;
+		u64 ndc_bad = 0;
+		u64 pixel_ok = 0;
+		u64 pixel_bad = 0;
+		bool ortho = false;
+	};
+
+	static constexpr u32 s_ui_vote_rows = 24;
 
 	// One vertex attribute located inside its interleaved block, with the guest span it
 	// spells out already validated. 'base' points at the block's first decoded vertex.
@@ -390,6 +595,37 @@ private:
 	// this code is not looking, or are not vertex attributes at all.
 	void report_uv_failure(attribute_status best);
 
+	// Which gate the sky test came out of, for the census below. 'depth_write' is not one of the
+	// test's own outcomes - a depth-writing draw is never a candidate - but it is censused anyway,
+	// because "is the dome one of the draws we refuse for writing depth?" is a question the
+	// counters cannot answer and a guess at it would be a threshold change made blind.
+	enum class sky_outcome
+	{
+		tagged,
+		tagged_backdrop,
+		reject_extent,
+		reject_anchor,
+		reject_noworld,
+		reject_depth_write,
+		count
+	};
+
+	// Minimum world units of extent per vertex for the backdrop rule (sky_backdrop_mode). The live
+	// census separates on this by a factor of 8: R2's backdrop c87769e09c995db9 runs 234..3974
+	// units per vertex, the largest draw that is not it runs 27.9, and its 715- and 502-vertex
+	// terrain draws run 2.3 and 1.2. A 15,895-unit surface made of four vertices is a card, not a
+	// wall, and this is the number that says so.
+	static constexpr f32 s_sky_backdrop_min_units_per_vertex = 100.f;
+
+	// One line per (vertex program, outcome), and again only when that pair draws something at
+	// least twice as wide as whatever was already reported for it - so a program that draws one
+	// big thing and a thousand small ones is named by its big one. Bounded twice over: the 2x rule
+	// makes re-emission monotone, and s_max_sky_census_lines stops the whole census, including the
+	// bounding-box scan that feeds it, once the budget is spent.
+	void report_sky_census(sky_outcome outcome, u32 vertex_count, bool depth_write,
+		const f32 (&lo)[3], const f32 (&hi)[3], const remixapi_Transform& transform,
+		f32 world_extent, f32 anchor, bool measured, bool camera_inside, f32 units_per_vertex);
+
 	// Fills m_scratch_vertices' texcoords from the vertex attribute that feeds the albedo unit.
 	// Must run before the mesh content hash is taken: the texcoords are part of the vertex data
 	// the hash covers, and two draws that share positions but not UVs are different meshes.
@@ -435,6 +671,33 @@ private:
 	// dense remap, and the matrices behind them. False means the draw must be skipped - never
 	// drawn at identity, which is what parked skinned meshes at the world origin before.
 	bool build_skinning(u32 first_vertex, u32 vertex_count);
+
+	// The same, for a rig that blends several palette entries per vertex
+	// (vp_fingerprint::skin_blended). Reached through build_skinning, never called directly, so
+	// every caller keeps one entry point and one refusal contract.
+	bool build_blend_skinning(u32 first_vertex, u32 vertex_count);
+
+	// True when every bone this draw assembled is plausible next to the others in the same draw.
+	// The only magnitude test on the skinning path; see the definition for why nothing else can be
+	// one. Reads m_scratch_bone_axis / m_scratch_bone_offset, so it runs after the bones are built.
+	bool bones_consistent();
+
+	// Reproduces the blend Remix is about to perform and reports draws whose result travels far
+	// further than the mesh's own spread can explain. Measures the artifact rather than any theory
+	// about it; see the definition. Runs on both skinned paths, after the bones are final.
+	void audit_skin_extent(u32 vertex_count);
+
+	// Decides what an indexed-constant draw actually is, from the draw's own vertex data rather
+	// than from the ucode: evaluates the palette index for every vertex and, when they all agree,
+	// reports the one matrix that index selects. That is the rigid/instanced case - a terrain
+	// chunk or a batched prop, where the "palette" holds one object transform per object and a
+	// given draw only ever reads one of them - and it needs no bone transforms and no Remix fork.
+	// A draw whose indices differ is a real rig and goes to build_skinning instead.
+	//
+	// False means refuse: an index that does not evaluate, a slot outside the legal constants, or
+	// a matrix that is not a finite affine transform. Never drawn at identity - the palette
+	// unapplied is a mesh at the world origin, which is the vertex explosion by another route.
+	bool resolve_indexed_world(u32 first_vertex, u32 vertex_count, bool& out_rigid);
 
 	// RPCS3_REMIX_UIPROBE=1: a fixed known pattern through the same path, so the fork call can
 	// be judged on its own before any real UI data is wired through it.
@@ -512,6 +775,21 @@ private:
 	// Vertex programs already reported by the screen-space refusal census.
 	std::unordered_set<u64> m_screen_census_seen;
 
+	// Sky-dome census state. Per vertex program, the largest world extent already reported under
+	// each sky_outcome, or -1 for "not reported yet".
+	struct sky_census_entry
+	{
+		f32 printed_extent[static_cast<usz>(sky_outcome::count)] = { -1.f, -1.f, -1.f, -1.f, -1.f, -1.f };
+	};
+
+	std::unordered_map<u64, sky_census_entry> m_sky_census_seen;
+
+	// Hard ceiling on census lines. Once spent, every sky-census branch short-circuits on this one
+	// comparison and the diagnostic costs nothing - which matters because the census arm that
+	// covers depth-writing draws has to scan a bounding box for draws the sky test itself skips.
+	u32 m_sky_census_lines = 0;
+	static constexpr u32 s_max_sky_census_lines = 256;
+
 	// CreateMesh calls attributed to the vertex program that issued them, reset every stats
 	// window. A title that skins on the SPU rewrites its vertex bytes every frame, so the
 	// content-hashed mesh cache mints a fresh handle per frame per animated draw - and this map
@@ -527,6 +805,13 @@ private:
 
 	// Diagnostic accumulator, reset every time it is logged.
 	ui_biggest_draw m_ui_biggest{};
+
+	// Per-program orientation votes. Cumulative like m_stats, not per-window like m_ui_biggest,
+	// so the last line printed is the whole run. Programs past the table fold into m_ui_vote_spill
+	// rather than evicting a row - a stable table beats a complete one here, because the question
+	// is which of a handful of 2D programs is inverted.
+	ui_vote_row m_ui_votes[s_ui_vote_rows]{};
+	u64 m_ui_vote_spill = 0;
 
 	// How many RPCS3_REMIX_UIDUMP lines have been emitted so far.
 	u32 m_ui_dumped = 0;
@@ -570,11 +855,47 @@ private:
 
 	// Skinning scratch. 'slots' is the distinct set of palette offsets this draw touched;
 	// 'indices' is the per-vertex index into it, which is what Remix's blendIndices means.
+	//
+	// 'indices', 'weights' and 'raw' are laid out as vertex-major tuples of
+	// m_scratch_bones_per_vertex entries, which is the layout remixapi_MeshInfoSkinning documents
+	// ("each tuple of 'bonesPerVertex' ... defines a vertex") and the stride the fork's unpacker
+	// builds its buffers with (rtx_remix_api.cpp:1116-1117). A single-bone rig is the same layout
+	// with a tuple of one, so the submit path does not branch on it.
 	std::vector<u32> m_scratch_bone_indices;
 	std::vector<f32> m_scratch_bone_weights;
 	std::vector<u32> m_scratch_bone_slots;
 	std::vector<f32> m_scratch_bone_raw;
 	std::vector<remixapi_Transform> m_scratch_bone_transforms;
+
+	// Per accepted bone, the longest basis axis and the translation length, parallel to
+	// m_scratch_bone_transforms. Kept because the transform itself is already converted to Remix's
+	// column-vector form by then, and because the per-draw median needs all of them before any can
+	// be judged. 'sorted' is the scratch the median selection sorts, so the two source vectors stay
+	// in bone order for the diagnostic.
+	std::vector<f32> m_scratch_bone_axis;
+	std::vector<f32> m_scratch_bone_offset;
+	std::vector<f32> m_scratch_bone_sorted;
+	u32 m_scratch_bones_per_vertex = 1;
+
+	// The position decode is already composed into m_scratch_bone_transforms, so
+	// per_draw_transform must not compose it into the instance transform as well. Set only by
+	// build_blend_skinning, cleared per subdraw next to m_indexed_world_valid - the two answer the
+	// same question ("what did this subdraw already fold in") and must never survive into another.
+	bool m_scratch_bone_prescale_folded = false;
+
+	// The one object matrix a rigid indexed draw resolved to, valid only for the subdraw that set
+	// it. per_draw_transform composes it between the position decode and the outer group, because
+	// that is exactly where the ucode reads it: clip = ((attr * decode) * palette[a]) * outer.
+	remix_rsx::mat4 m_indexed_world{};
+	bool m_indexed_world_valid = false;
+
+	// One census line per indexed program, the same shape the render-target and indexed-const
+	// gates already use: what the recogniser made of it and what its indices actually were.
+	std::unordered_set<u64> m_indexed_world_seen;
+
+	// Vertex programs already reported by audit_skin_extent. The flag describes a shape, and a
+	// shape repeats every frame the rig is on screen; skin_reach_flagged carries the per-draw count.
+	std::unordered_set<u64> m_skin_reach_seen;
 
 	// Screen-space positions in compositor pixels, one entry per decoded vertex.
 	std::vector<f32> m_scratch_ui_x;

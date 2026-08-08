@@ -69,7 +69,8 @@ namespace remix_rsx
 		{
 			scale, // v = v * c[mul_slot][mul_component]
 			affine, // v = v * c[mul_slot][mul_component] + c[add_slot][add_component]
-			floor  // v = floor(v)
+			floor, // v = floor(v)
+			immediate_scale // v = v * immediate
 		};
 
 		kind op = kind::floor;
@@ -77,11 +78,43 @@ namespace remix_rsx
 		u32 add_slot = 0;
 		u8 mul_component = 0;
 		u8 add_component = 0;
+
+		// v = v * immediate. Unlike 'scale' the factor is an integer the *ucode* built out of
+		// repeated self-addition rather than a constant slot, so there is nothing to read back
+		// per draw. Every one of Resistance 2's (NPEA00431) 16 four-bone blend programs opens
+		// with the same two instructions - 'r1 = attr + attr' then 'r1 = attr + r1' - which is
+		// x3, and 3 is exactly the row stride of the c32/c33/c34 palette those programs read.
+		// Without this the ADD walk below refuses them ("bone index ADD has no constant bias")
+		// and the index lands on bone/3 instead of bone.
+		f32 immediate = 1.f;
 	};
 
 	// Longest attribute -> address-register chain that is followed. The one observed program
 	// needs three steps (MAD, FLR, MUL); the rest is headroom, not speculation.
 	inline constexpr u32 max_bone_index_ops = 6;
+
+	// One resolved "vertex attribute component -> address register component" path. The
+	// single-matrix rigs need exactly one; a weighted blend needs one per bone, because each
+	// bone's palette row is selected by a different component of the same address register.
+	struct bone_index_chain
+	{
+		bool resolved = false;
+		u32 attribute = 0;
+		u32 component = 0;
+		u32 op_count = 0;
+		bone_index_op ops[max_bone_index_ops] = {};
+
+		// The ARL's own source modifiers, applied after 'ops' and before the truncate, in the
+		// hardware's order: absolute value first, then negate (VertexProgramDecompiler.cpp:151-163).
+		bool index_abs = false;
+		bool index_negate = false;
+	};
+
+	// Bones one vertex may be weighted to. Four is not a choice: it is what
+	// remixapi_MeshInfoSkinning's consumer asserts (rtx_types.cpp:333,
+	// 'assert(skinningData.numBonesPerVertex <= 4)') and what every observed RSX blend program
+	// writes (one MUL plus three MADs per palette row, weighted by .x/.y/.z/.w of one attribute).
+	inline constexpr u32 max_blend_bones = 4;
 
 	enum class vp_archetype
 	{
@@ -176,6 +209,11 @@ namespace remix_rsx
 		// how a transform is written rejecting a legitimate one.
 		bool hpos_indirect = false;
 
+		// HPOS.z was written as a w-buffer premultiply, '(c[k].pos) * (c[w].pos)', and the matrix
+		// was only recovered by taking z from the c[k] row (repair_wbuffer_z). Diagnostic; the
+		// group it produces is an ordinary one.
+		bool hpos_wbuffer_z = false;
+
 		// A MOV was reached whose definition could not be pinned down - defined by the SCA half of
 		// a co-issued word, written under a condition, or negated/saturated on the way out. Refused
 		// rather than guessed, and counted so the size of that population is visible.
@@ -206,12 +244,74 @@ namespace remix_rsx
 		u32 palette_base = 0;
 		chain_shape palette_shape = chain_shape::none;
 
+		// The palette's actual layout. Up to and including ae94587 every matcher produced a
+		// 4-row, stride-1, all-columns group, because both of them refused anything else - and
+		// that is why build_skinning had never run on any title and skin_submitted was 0 against
+		// skin_unrecognised = 1481510 on Resistance 2 (NPEA00431), 8965 frames, 7588805 draws.
+		//
+		// Replaying the matchers on paper over every dumped program that reads an indexed constant
+		// in its position slice (36 unique, fp.log / d8.log / r2_dump3.log) says what the real
+		// shapes are. R2 uses 3 rows of DP4 at stride 1 from c31, with the homogeneous 1 moved into
+		// the operand's w by a separate MOV and a constant translation added *after* the matrix -
+		// 16 of the 36 programs, every one of them identical. Haze is on record as 3 rows of .xyz
+		// at stride 2 (c27, c29). Neither could be expressed before.
+		//
+		// palette_w_slot is the constant component the ucode moves into the operand's w for a
+		// 3-row group. It is read back per draw and required to be 1: three rows only transform a
+		// *point* when the fourth coordinate is one. s_no_palette_w when the group supplies all four.
+		u32 palette_rows = 4;
+		u32 palette_stride = 1;
+		bool palette_xyz_only = false;
+		bool palette_has_bias = false;
+		u32 palette_bias_slot = 0;
+		u32 palette_w_slot = 0xffffffff;
+		u32 palette_w_component = 0;
+
 		// The attribute component that feeds the address register, and how.
 		u32 bone_attribute = 0;
 		u32 bone_component = 0;
 		bool bone_resolved = false;
 		u32 bone_op_count = 0;
 		bone_index_op bone_ops[max_bone_index_ops] = {};
+
+		// The source modifiers on the ARL itself, applied after bone_ops and before the truncate,
+		// in the hardware's order: absolute value first, then negate
+		// (VertexProgramDecompiler.cpp:151-163). Ignoring them read the wrong palette entry on
+		// every Resistance 2 rig - see resolve_bone_index for the measurement. An index attribute
+		// that packs a flag into its sign bit is read by the ucode as |w|, and 31 + (-1) = c30 is
+		// not a bone: its three basis rows all point along Z, which draws a character as a line.
+		bool bone_index_abs = false;
+		bool bone_index_negate = false;
+
+		// Per-vertex weighted skinning: the palette group is read once per bone per row and the
+		// reads are summed, 'sum_k weight.k * c[palette_base + row + a.<swz_k>]'. Resistance 2
+		// (NPEA00431) has 16 such programs and they are byte-for-byte the same shape - three
+		// accumulators over c32/c33/c34, each built by one MUL and three MADs weighted by
+		// .y/.x/.z/.w of one attribute (attr2 in 14 of them, attr3 in dc56c444e5cc83e7 and
+		// 2f310e8120a344b2), and one ARL writing all four components of a0 from a temp holding
+		// 3 x the index attribute.
+		// They are the character rigs: refused whole at ae94587, where audit_indexing counted
+		// their three extra address-register components as foreign_indexed_reads and the gate
+		// took 541960 draws into skin_unrecognised.
+		//
+		// This is submitted to Remix as real per-vertex blend weights and indices
+		// (remixapi_MeshInfoSkinning), *not* evaluated on the CPU: the API carries the channels,
+		// so the mesh content stays the rigging (static per model) and only the bone matrices
+		// move per frame. Baking the blend into positions instead would make the mesh content
+		// change every animation frame, and a content-keyed mesh cache under that load is the
+		// 32x mesh-creation blowup this backend has already been bitten by once.
+		//
+		// blend_weight_component[k] is the attribute component holding bone k's weight;
+		// blend_bone[k] is the address-register path that selects bone k's palette entry. The
+		// two are paired by the instruction that reads them, never by position: the ARL of every
+		// R2 blend program carries a swizzle (a0.xyzw <- r1.wzxy in 12 of the 16), so assuming
+		// "weight .x goes with a0.x" would read a different bone than the hardware does.
+		bool skin_blended = false;
+		u32 blend_bones = 0;
+		u32 blend_weight_attribute = 0;
+		u8 blend_weight_component[max_blend_bones] = {};
+		u8 blend_addr_swz[max_blend_bones] = {};
+		bone_index_chain blend_bone[max_blend_bones] = {};
 
 		// The ucode carries skinning this recogniser cannot prove it understands: a second ARL,
 		// or an indexed constant read through an address register/component other than the one
@@ -337,6 +437,30 @@ namespace remix_rsx
 	// out of range or the result is not a usable non-negative offset.
 	bool evaluate_bone_offset(const vp_fingerprint& fp, f32 value, u32& out);
 
+	// vp_fingerprint::palette_w_slot for "the group supplies all four rows itself".
+	inline constexpr u32 s_no_palette_w = 0xffffffff;
+
+	// The same walk, resolved all the way to the absolute constant slot the ucode reads,
+	// palette_base + a. Split from evaluate_bone_offset because 'a' is only non-negative by
+	// convention: Resistance 2's index attribute is a signed 16-bit integer (type 5, s32k) and its
+	// dumps carry ranges like w=[-19..19], so the *slot* rather than the offset is the quantity
+	// that has to land inside the 468 legal constants. evaluate_bone_offset is left exactly as it
+	// was so the pre-existing path's refusals do not move.
+	bool evaluate_palette_slot(const vp_fingerprint& fp, f32 value, u32& out_slot);
+
+	// The same walk for one bone of a weighted blend. The palette geometry (base, rows) is shared
+	// by every bone - they are entries of one palette - so only the attribute -> address-register
+	// path differs, and that is what 'chain' carries.
+	bool evaluate_palette_slot(const vp_fingerprint& fp, const bone_index_chain& chain, f32 value, u32& out_slot);
+
+	// The object-to-world matrix the palette holds at 'slot', as a row-vector matrix: the rows the
+	// group actually supplies, an implicit (0,0,0,1) for any it does not, and the constant
+	// translation the ucode adds after it folded into row 3. Reads the slots live, so it is per
+	// draw like build_prescale. False when a slot is out of range, a value is not finite, or - for
+	// a 3-row group - the homogeneous w the ucode moves into the operand is not 1, which would mean
+	// the rows are not being applied to a point at all.
+	bool build_palette_matrix(const vp_fingerprint& fp, u32 slot, mat4& out);
+
 	// Row-vector affine matrix to remixapi_Transform (column-vector, translation in column 3).
 	remixapi_Transform to_remix_transform(const mat4& m);
 
@@ -371,6 +495,27 @@ namespace remix_rsx
 
 	// Perspective row (column 3) is 0,0,0,1 - i.e. the matrix is a plain affine transform.
 	bool is_affine(const mat4& m, f32 tol = 1e-3f);
+
+	// The 3x3 basis spans three dimensions: no axis is degenerate and the three are not coplanar.
+	//
+	// is_affine is not this test and never was - it only looks at the perspective column, so it
+	// happily accepts a matrix with no rank at all. Resistance 2 handed one straight through: bone
+	// c30, basis rows [0 0 0.97707], [0 0 -0.040698], [0 0 0.20897], all three parallel to Z,
+	// determinant zero, affine=1. Every vertex through it lands on a line, which is the "long thin
+	// diagonal box" a character rendered as. That is the exploded-rather-than-missing case the
+	// skinning gate exists to prevent, so it is refused and counted instead.
+	//
+	// Scale-invariant by construction: the determinant is compared against the product of the three
+	// axis lengths, so a legitimately tiny uniform scale passes and a flattened basis does not.
+	bool has_usable_basis(const mat4& m, f32 tol = 1e-3f);
+
+	// Longest of the three basis axes, and the length of the translation. Magnitude rather than
+	// shape: has_usable_basis is scale-invariant by design (it answers "does this span three
+	// dimensions"), so neither it nor is_affine can tell a pose from a transform that inflates the
+	// mesh. These are what the per-draw sibling comparison in build_blend_skinning measures.
+	// Non-finite components come back as infinity so the caller's own finite test refuses them.
+	f32 basis_extent(const mat4& m);
+	f32 translation_extent(const mat4& m);
 
 	// ---------------------------------------------------------------------------------------
 	// Archetype B: split a fused view-projection into a view and a projection by unprojecting
@@ -599,6 +744,67 @@ namespace remix_rsx
 	// because such a draw renders in its bind pose or torn across the map.
 	bool draw_indexed_const();
 
+	// RPCS3_REMIX_INDEXEDWORLD=0: refuse every program that reads a constant palette through the
+	// address register, which is what the backend did up to and including ae94587. Measured there
+	// on Resistance 2 (NPEA00431), 8965 frames: draws=7588805 submitted=1412430, of which
+	// world_applied=1412430 world_fallback=2477524 world_refused=2477524, and the palette gate took
+	// skin_unrecognised=1481510 draws with skin_submitted=0 and skin_bones_max=0 - i.e. the gate
+	// had never once let a rig through, on any title. vp_hpos_indexed=30 counted the programs whose
+	// HPOS chain the register-indirection resolver could follow but was told not to.
+	//
+	// With it on, three things change together and none of them can be had separately: the
+	// indirection is offered to an indexed program, match_indexed_affine can express a 3-row
+	// indexed group with a post-matrix translation, and match_mad_chain will accept a partial
+	// writemask or a non-unit stride for an indexed group. Off restores all three at once.
+	bool indexed_world_enabled();
+
+	// RPCS3_REMIX_BONEBLEND=0: refuse every program that blends more than one palette entry per
+	// vertex, which is what the backend did up to and including ae94587. Measured there on
+	// Resistance 2 (NPEA00431): 16 vertex programs of this exact shape
+	//   1438eb79c0843fea 2f310e8120a344b2 333a616a4093f353 487c71da8d277fb0 6090af134d67ea65
+	//   6090af134e07aa65 731962646a64e3a4 7a4a57869f9c4a1f 8496b26338eb1e01 88fe4699c66df009
+	//   92e7472e1c0f58cd a3af6e3d5f0ac8e6 c0aeb056121c7061 ccfc2dd606adf833 dc56c444e5cc83e7
+	//   edb0911a4c3181d6
+	// took 541960 draws into skin_unrecognised, because audit_indexing sees a palette read through
+	// four components of a0 and (correctly, for a single-bone path) calls three of them
+	// foreign_indexed_reads. They are the character rigs; that is why the characters are absent.
+	//
+	// With it on, three things change together: match_blend_palette can express the three summed
+	// accumulators, resolve_bone_index can follow the x3 index scaling the blend programs build by
+	// repeated self-addition, and the indexing audit accepts the four matched address components
+	// (and only those - a read through a fifth still refuses the program whole). Off restores all
+	// three at once, so a run can attribute a regression to this work rather than to the milestone.
+	bool bone_blend_enabled();
+
+	// RPCS3_REMIX_BONESCALE=0: submit a blended draw even when one of its bones is orders of
+	// magnitude away from the median of the others in the same draw. The gate exists because a
+	// 3-row palette reaches Remix with no magnitude check at all - build_palette_matrix writes the
+	// perspective column itself, so is_affine inspects this code's own output, and has_usable_basis
+	// is scale-invariant by construction. Resistance 2's stalker turret exploded through both with
+	// skinblend_bone=0 and bone_degenerate=0. Off is the A/B that puts the explosion back.
+	bool bone_scale_gate_enabled();
+
+	// RPCS3_REMIX_BONEUNIFORM=0: refuse a blended draw whose palette entries are all the same
+	// matrix, instead of submitting it. Default on (submit), because such a palette blends to
+	// exactly that one matrix and the draw is a correct rigid draw - refusing deletes working
+	// geometry. Off is the one-run A/B for whether that population is implicated in an artifact:
+	// six of Resistance 2's eight blend rigs are in it, reporting eight identical bones at
+	// c32..c53 while the two that look like real skeletons report 24 with a genuine spread.
+	bool bone_uniform_allowed();
+
+	// RPCS3_REMIX_SKINREACH=<ratio>: how many times the median a skinned draw's furthest
+	// vertex-to-its-own-bone distance may be before audit_skin_extent reports it. Default 32, which
+	// is far above anything a skin produces (extremities run a few times the median) and far below
+	// an explosion. 0 disables the pass. Diagnostic only: nothing is ever refused on it.
+	f32 skin_reach_ratio();
+
+	// RPCS3_REMIX_WBUFFERZ=0: refuse a program that writes HPOS.z as its clip z premultiplied by
+	// its clip w, instead of recovering the matrix row that feeds the premultiply. The behaviour up
+	// to and including ae94587, where Resistance 2's 3152b710c603e12d - a 34679 x 0 x 32770 plane,
+	// so a ground or water surface and nothing else - reported 'no matrix chain into HPOS' and was
+	// never drawn, despite all four rows of its 4x4 being present and consecutive at c32..c35.
+	bool wbuffer_z_enabled();
+
 	// RPCS3_REMIX_NOALPHA=1: create materials with the alpha state M3 shipped (alphaTestType 7 /
 	// always-pass, useDrawCallAlphaState 1) instead of the title's own alpha test. The bisect
 	// knob for cutout foliage.
@@ -643,12 +849,71 @@ namespace remix_rsx
 	// ATTR3 for draws that resolved no material. The bisect knob for vertex-coloured geometry.
 	bool vertex_colour_disabled();
 
-	// RPCS3_REMIX_SKYEXTENT=<units>: a draw that binds no texture, writes no depth and spans at
-	// least this much in its widest axis is the title's sky dome, and is tagged SKY. Haze draws
-	// its sky as an 82-vertex, 10,000-unit vertex-coloured dome with depth writes off
-	// (vp=fc0fac8afccec49a); with no material it reached Remix as an opaque white shell enclosing
-	// the camera. 0 disables the detection. Default 2000.
+	// RPCS3_REMIX_SKYEXTENT=<units>: a draw that writes no depth, is anchored on the camera
+	// (sky_max_anchor) and spans at least this much in its widest axis *in world units* is the
+	// title's sky dome, and is tagged SKY. Haze draws its sky as an 82-vertex, 10,000-unit
+	// vertex-coloured dome with depth writes off (vp=fc0fac8afccec49a); with no material it reached
+	// Remix as an opaque white shell enclosing the camera. 0 disables the detection. Default 2000.
+	//
+	// "World units" is the correction made after ae94587. The extent used to be measured over the
+	// submitted vertex positions, which on Resistance 2 (NPEA00431) are raw quantised integers
+	// (attr0 type=5, w spanning -16511..16511) that the program decodes with a constant scale
+	// before its matrix - so every R2 mesh "spanned tens of thousands of units" and the test stopped
+	// filtering. Replaying the 157 dumped draws that carry a fused matrix: measured raw, 63 of them
+	// (40.1%) clear 2000; measured after the instance transform, the world extents of the decoded
+	// population collapse to 0.13..711 and only 27 clear it. Haze's dome only ever passed because
+	// its positions are already in world units.
 	f32 sky_min_extent();
+
+	// RPCS3_REMIX_SKYANCHOR=<units>: how far the draw's own origin may sit from the camera and
+	// still be a sky candidate. This is the signal that actually separates a dome from the rest of
+	// the scene, and extent alone is not - 27 of the 157 fused draws dumped for ae94587 clear
+	// sky_min_extent() with depth writes off, because R2's backdrops and water planes genuinely are
+	// thousands of units across. A sky dome is the only thing in a scene whose model origin *is*
+	// the camera:
+	//   Haze     fc0fac8afccec49a  82 vtx, extent 10000, anchor 0.000  (origin exactly at the eye)
+	//   R2       41c59a3a2bfc71bf  56 vtx, extent  3516, anchor 2.404  (origin 2.4 below the eye,
+	//   R2       c1781a2e32aba35d  88 vtx, extent  3037, anchor 2.404   i.e. on the ground under it)
+	// and the nearest draw that clears depth-write and extent but is not one of those sits at
+	// anchor 96.91 (9cd34d4f4003439e, extent 5109) - a 24x margin over the 4.0 default and 40x over
+	// the value R2 actually uses. Both gates are load-bearing: extent alone leaves 27 candidates,
+	// the anchor alone leaves 5 (it admits Haze's view-anchored 9f591b6a6b825612 and
+	// 15ad612980aca110, which are 4.4 and 0.11 units across). Together they leave 3, all domes.
+	//
+	// 0 disables the anchor requirement and restores the extent-only rule of ae94587 - the one that
+	// tagged cat_sky=825915 of 2038738 R2 draws and turned the scene blue. The distance is measured
+	// against the resolved camera, so a draw with no world transform is refused, not guessed.
+	f32 sky_max_anchor();
+
+	// RPCS3_REMIX_SKYBACKDROP=<0|1|2>: the *backdrop* rule, which is a different object from the
+	// sky-dome rule above and is deliberately not on by default.
+	//   0  off (default). Nothing measured, nothing tagged.
+	//   1  measure only. Counts sky_backdrop_hit / sky_backdrop_dw and changes nothing on screen.
+	//   2  measure and tag SKY.
+	//
+	// It exists because the sky-dome rule cannot see Resistance 2's actual backdrop. The live
+	// census (4759 frames) found it: c87769e09c995db9, a *4-vertex* quad 15,895 world units across
+	// with a 27-vertex sibling at 6,310, camera-filling, world-authored (raw 15,935 -> world
+	// 15,895, i.e. its decode is a translation not a scale) - and it writes depth, and its origin
+	// sits 82 units from the eye. Both of the dome rule's gates reject it, and neither can be
+	// relaxed on its own.
+	//
+	// The backdrop rule replaces both with three properties that draw actually has:
+	//   - world extent >= sky_min_extent(), as before;
+	//   - the camera is *inside* the draw's transformed bounding box. Not "the origin is on the
+	//     eye" - a backdrop card is not centred on the camera, it encloses it. In the census
+	//     c87769e09c995db9 sits at anchor/extent 0.005..0.015 while ca526d308f1650bb's 715-vertex
+	//     terrain is at 2.64 and its 502-vertex draw at 1.00, i.e. outside;
+	//   - at least s_sky_backdrop_min_units_per_vertex of extent per vertex. The census separates
+	//     cleanly on this: the backdrop runs 234..3974 units per vertex, and the largest thing that
+	//     is not it runs 27.9, with real terrain at 1.2..7.3.
+	//
+	// Why it ships off. Replaying the same rule over the 157 dumped draws from *earlier* scenes
+	// admits 27 of them, against 3 for the dome rule - and those 27 are records, not draws, so the
+	// number does not say what share of a frame they are. That is precisely the quantity the
+	// 40.5%-of-the-scene regression was made of, and mode 1 is how to get it before tagging
+	// anything: run once, read sky_backdrop_hit against draws_submitted, then decide.
+	u32 sky_backdrop_mode();
 
 	// RPCS3_REMIX_SKYTEXTURED=0: require a sky candidate to be untextured, the behaviour up to and
 	// including 9c73eb0. That requirement was written against Haze's vertex-coloured dome and does
@@ -656,10 +921,10 @@ namespace remix_rsx
 	// does: it is drawn with cloud and water detail, so albedo_texture_unit() resolves a material,
 	// the '!material' arm was never entered, and the dome was submitted as world geometry - a solid
 	// sphere standing inside the level that occluded the scene and turned with the camera without
-	// enclosing the player. The remaining two conditions carry the meaning: depth writes off, and a
-	// widest-axis extent past sky_min_extent(). On by default; set 0 to bisect a title where a large
-	// depth-write-off textured draw (a fog card, a full-screen effect) is being mis-tagged and so
-	// hidden from the world pass.
+	// enclosing the player. The remaining conditions carry the meaning: depth writes off, an origin
+	// on the camera (sky_max_anchor) and a world-unit extent past sky_min_extent(). On by default;
+	// set 0 to bisect a title where a large depth-write-off textured draw (a fog card, a full-screen
+	// effect) is being mis-tagged and so hidden from the world pass.
 	bool sky_allows_textured();
 
 	// Debug light knobs so a derived camera can be judged visually at all.

@@ -197,6 +197,12 @@ namespace remix_rsx
 		return env || g_cfg.video.remix.no_textures;
 	}
 
+	bool blend_state_enabled()
+	{
+		static const bool env = read_env_u32(L"RPCS3_REMIX_BLENDSTATE", 1) != 0;
+		return env;
+	}
+
 	u32 texture_budget()
 	{
 		// Read live so it can be tuned without a restart. A camera turn exposes many new
@@ -745,10 +751,27 @@ namespace remix_rsx
 		opaque.alphaIsThinFilmThickness = 0;
 		opaque.heightTexture = nullptr;
 		opaque.displaceIn = 0.f;
-		// 0, not 1: 1 means "read the alpha state from remixapi_InstanceInfoBlendEXT", which
-		// this backend does not chain onto its instances, so with 1 the two fields below were
-		// dead and every material was unconditionally opaque.
-		opaque.useDrawCallAlphaState = 0;
+		// 1 means "read the alpha state from remixapi_InstanceInfoBlendEXT", which as of this
+		// change the instance path does chain (RemixGSRender::submit_subdraw). It has to be 1
+		// for blending to exist at all: calculateAlphaState() only looks at
+		// DrawCallState::materialData.blendMode - the ext's landing site - when
+		// UseLegacyAlphaState is set (rtx_instance_manager.cpp:705-709), and
+		// remixapi_MaterialInfoOpaqueEXT has no blend-factor fields of its own to use instead.
+		//
+		// It also moves the alpha *test* to the instance (same option gates :687-693), which is
+		// strictly the better home for it: this material is cached per texture descriptor while
+		// alpha test is per draw. The two fields below stay populated because they are what the
+		// runtime falls back to with the knob off, and because entry.alpha_func/alpha_ref are
+		// still part of the cache key - a texture drawn with two different alpha funcs still
+		// makes two materials, which is now redundant but harmless.
+		//
+		// Translucency deliberately does NOT become remixapi_MaterialInfoTranslucentEXT: that
+		// type is refractive glass, and calculateAlphaState() returns early for it
+		// (rtx_instance_manager.cpp:659-667) without ever reading the draw's blend state. An
+		// opaque material plus a per-instance blend ext is what the runtime's own D3D9 path
+		// produces for an alpha-blended draw, so the per-texture material can stay per-texture
+		// and nothing about the blend state needs to enter the material key.
+		opaque.useDrawCallAlphaState = blend_state_enabled() ? 1u : 0u;
 		opaque.blendType_hasvalue = 0;
 		opaque.blendType_value = 0;
 		opaque.invertedBlend = 0;

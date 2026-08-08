@@ -172,6 +172,21 @@ namespace remix_rsx
 	u32 texture_budget();
 	bool textures_linear();
 
+	// RPCS3_REMIX_BLENDSTATE=0 restores the behaviour up to and including ae94587: every material
+	// declared its own alpha state (useDrawCallAlphaState = 0) and no remixapi_InstanceInfoBlendEXT
+	// was ever chained onto an instance, so every draw reached the runtime fully opaque regardless
+	// of NV4097_SET_BLEND_ENABLE. One Resistance 2 capture of 665 dumped draws had ~163 with
+	// blend=1 (104 depth_test=1/depth_write=0, 32 depth_write=1, 27 depth_test=0/depth_write=0) and
+	// all 163 shipped opaque - which is why its god rays were solid white walls, its sun card
+	// occluded the level and its world-space distance markers were black boxes.
+	//
+	// With the knob on (default) the material sets useDrawCallAlphaState = 1 and the per-draw blend
+	// *and* alpha-test state travels on the instance instead. It has to be one switch, not two:
+	// rtx_instance_manager.cpp calculateAlphaState() reads useLegacyAlphaState once and it gates
+	// both halves (alpha test at :687-693, alpha blend at :705-709), so a build that took blend
+	// from the instance and alpha test from the material is not expressible.
+	bool blend_state_enabled();
+
 	// RPCS3_REMIX_TEXBMP=1: write each unique decoded texture out as a BMP next to the executable.
 	bool dump_texture_images();
 	u32 texture_rehash_mode();
