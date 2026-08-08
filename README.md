@@ -86,8 +86,10 @@ draw list still dominates.*
 reads black because sky classification anchors to the camera and does not fire on every frame --
 a known gap, not an art choice.*
 
-<!-- video link: source clips are not committed -- a git repo is a poor video host. Upload
-     rpcs3__2026-08-08__06-36-55.mp4 and drop the URL here. -->
+**Video:** [Resistance 2 under the backend, 24 s, 14 MB](https://github.com/BRAGme/rpcs3-rtx/releases/download/remix-preview-1/rpcs3-rtx-remix-resistance-2.mp4)
+-- the same capture all three stills are from, so the same date and branch tip apply. It is a release
+asset rather than an embed, so the link downloads rather than streams. Audio is stripped: the source
+capture carries two tracks and one of them is a microphone.
 
 ---
 
