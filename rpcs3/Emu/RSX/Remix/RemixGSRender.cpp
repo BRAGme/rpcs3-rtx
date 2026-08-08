@@ -1490,6 +1490,35 @@ void RemixGSRender::submit_camera()
 		rsx_log.error("Remix: SetupCamera failed (%s)", remix_rsx::error_name(status));
 	}
 
+	// The sky camera, which nothing was registering. The dev menu's camera panel reads
+	// "SKY: Position: -" on every frame of a Haze capture, and that is not cosmetic: tagging
+	// an instance REMIXAPI_INSTANCE_CATEGORY_BIT_SKY makes convert::categoryToCameraType()
+	// resolve ExternalDrawState::cameraType to CameraType::Sky, and that field's whole job is
+	// to select which camera's matrices SceneManager::submitExternalDraw fetches. With no sky
+	// camera ever set up, every sky-tagged draw was being resolved against an unregistered
+	// camera - which is both why the dome has repeatedly landed a few feet in front of the
+	// player instead of around them, and why it lights the scene from a handful of angles and
+	// is black from the rest.
+	//
+	// Identical to the world camera, and that is the correct answer here rather than a
+	// convenient one. On the D3D9 path a sky camera differs from the main one because sky is
+	// rasterized separately into a cubemap by tryHandleSky(), which external draws never reach
+	// (rtx_remix_api.cpp says so outright). This backend submits the dome as an ordinary
+	// world-space mesh with a real world transform, so the matrices that place every other
+	// draw are exactly the matrices that place it.
+	if (remix_rsx::sky_camera_enabled())
+	{
+		camera_info.type = REMIXAPI_CAMERA_TYPE_SKY;
+
+		const u32 sky_status = remix_rsx::guarded_setup_camera(api.SetupCamera, &camera_info);
+
+		if (sky_status != REMIXAPI_ERROR_CODE_SUCCESS && !m_sky_camera_warned)
+		{
+			m_sky_camera_warned = true;
+			rsx_log.error("Remix: SetupCamera(sky) failed (%s)", remix_rsx::error_name(sky_status));
+		}
+	}
+
 	// The scene's readable light: one distant sun, created once, drawn every frame.
 	if (ensure_sun_light())
 	{
@@ -6802,6 +6831,43 @@ void RemixGSRender::submit_subdraw()
 		//
 		// NOCAM is exempt: per_draw_transform returns false unconditionally there because that
 		// mode *is* the all-identity milestone-1 path, and refusing would empty the scene.
+		// Which programs, and why. The counter has said "half the scene" for several runs without
+		// naming a single program, and "~20 programs still classified unknown" is an estimate
+		// carried in a comment rather than a measurement. One line per program, once, bounded -
+		// the same shape as the world-extent census. 'note' is the fingerprint's own account of
+		// what it could not resolve ("no HPOS write" and friends), which is the field that says
+		// whether the chain is absent, indexed, or simply unrecognised.
+		if (m_world_refused_seen.insert(m_current_vp_hash).second
+			&& m_world_refused_lines < s_max_world_refused_lines)
+		{
+			++m_world_refused_lines;
+
+			const std::string line = fmt::format(
+				"Remix world-refused: vp=%016llx arch=%s vtx=%u skinned=%d prescale=%d affine=%d "
+				"consts=%u chain=%u indexed=%d note=%s areason=%s | frame=%llu line=%u/%u",
+				m_current_vp_hash,
+				m_current_fingerprint ? remix_rsx::archetype_name(m_current_fingerprint->archetype) : "none",
+				vertex_count,
+				skinned ? 1 : 0,
+				(m_current_fingerprint && m_current_fingerprint->has_prescale) ? 1 : 0,
+				(m_current_fingerprint && m_current_fingerprint->has_const_affine) ? 1 : 0,
+				m_current_fingerprint ? m_current_fingerprint->distinct_consts : 0u,
+				m_current_fingerprint ? m_current_fingerprint->chain_instructions : 0u,
+				(m_current_fingerprint && m_current_fingerprint->indexed_const) ? 1 : 0,
+				m_current_fingerprint ? m_current_fingerprint->note : "no fingerprint",
+				m_current_fingerprint ? m_current_fingerprint->affine_reason : "",
+				m_frame_counter,
+				m_world_refused_lines,
+				s_max_world_refused_lines);
+
+			rsx_log.notice("%s", line);
+
+			if (fs::file out{ fs::get_executable_dir() + "remix_dump.log", fs::write + fs::create + fs::append })
+			{
+				out.write(line + '\n');
+			}
+		}
+
 		if (!remix_rsx::draw_without_world() && !remix_rsx::nocam_enabled())
 		{
 			++m_stats.world_refused;

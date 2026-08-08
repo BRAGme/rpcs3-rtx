@@ -1268,6 +1268,13 @@ private:
 	s32 m_pick_x = 0;
 	s32 m_pick_y = 0;
 	bool m_pick_button_down = false;
+	// One line per program that resolves no world transform, bounded. The population is half
+	// the scene and has never been named.
+	static constexpr u32 s_max_world_refused_lines = 128;
+	std::unordered_set<u64> m_world_refused_seen;
+	u32 m_world_refused_lines = 0;
+
+	bool m_sky_camera_warned = false;
 	bool m_pick_slot_warned = false;
 	bool m_pick_request_warned = false;
 

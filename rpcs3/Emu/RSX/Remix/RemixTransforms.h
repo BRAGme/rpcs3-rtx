@@ -757,6 +757,12 @@ namespace remix_rsx
 	// default; the cost is one pNext struct and one vector push per instance.
 	bool pick_enabled();
 
+	// RPCS3_REMIX_SKYCAM: register a REMIXAPI_CAMERA_TYPE_SKY camera each frame, carrying the same
+	// matrices as the world camera. Nothing registered one before, so every draw tagged SKY was
+	// resolved by submitExternalDraw against an unregistered camera. On by default; `0` restores
+	// the world-camera-only behaviour, which is the A/B for the dome placement and the lighting.
+	bool sky_camera_enabled();
+
 	bool sky_learn_dome_enabled();
 
 	// RPCS3_REMIX_RETRYUNSUP: let the albedo unit walk step past a unit that bind() refused for a
