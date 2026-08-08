@@ -64,21 +64,27 @@ All three stills are frames lifted from a screen capture on this branch. Capture
 this branch moves several times a day, so each is labelled with **when it was captured and what the
 branch tip was at that moment**.
 
-![Resistance 2, textured stone and concrete, path traced](docs/remix/README-assets/rpcs3-r2-concrete.jpg)
+![Resistance 2, a ravine below an Icelandic base, first-person arms in view](docs/remix/README-assets/rpcs3-r2-vista.jpg)
 
-*Resistance 2 (NPEA00431). Captured 2026-08-08 06:37; branch tip `148b467`. World geometry with
-albedo textures and path-traced lighting, 51.8 fps on the emulator's own overlay.*
+*Resistance 2 (NPEA00431). Captured 2026-08-08 06:38; branch tip `148b467`. Everything in this
+frame comes through the Remix API: world geometry placed by matrices recovered from the title's own
+vertex programs, albedo and lichen detail from texcoords decoded out of the same ucode, the
+first-person arms and shotgun shells skinned through `remixapi_MeshInfoSkinning`, and the distance
+marker composited by the 2D path. The white shards mid-frame are real -- a subset of draws still
+lands at runaway positions. 12.7 fps here; see the next frame for what a bounded view costs.*
 
-![Resistance 2, metal walkway and scaffolding](docs/remix/README-assets/rpcs3-r2-walkway.jpg)
+![Resistance 2, close view of lichen-covered rock](docs/remix/README-assets/rpcs3-r2-rock-detail.jpg)
 
-*Same capture. Texcoords decoded out of the vertex program, so tiling surfaces resolve correctly.*
+*Same capture, 55.5 fps. Texcoords resolved out of the vertex program, so tiling surfaces carry
+their detail. The gap between this and the frame above is view complexity, not a fixed cost --
+skipping the title's lighting passes took the frame from 45.8 ms to 17.5 ms, but a wide outdoor
+draw list still dominates.*
 
-![Resistance 2, first-person arms over a valley](docs/remix/README-assets/rpcs3-r2-viewmodel.jpg)
+![Resistance 2, a bridge and scaffolding over a gorge](docs/remix/README-assets/rpcs3-r2-bridge.jpg)
 
-*Same capture. The first-person arms and weapon at bottom right are skinned characters submitted
-through `remixapi_MeshInfoSkinning`. The washed-out translucency across the rock faces and the
-over-bright water are real, current artefacts -- this frame is included because it is honest about
-where the backend is, not because it is the prettiest one in the clip.*
+*Same capture. Structural geometry with per-draw blend state and path-traced shadowing. The sky
+reads black because sky classification anchors to the camera and does not fire on every frame --
+a known gap, not an art choice.*
 
 <!-- video link: source clips are not committed -- a git repo is a poor video host. Upload
      rpcs3__2026-08-08__06-36-55.mp4 and drop the URL here. -->
