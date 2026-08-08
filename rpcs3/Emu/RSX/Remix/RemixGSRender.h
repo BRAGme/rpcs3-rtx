@@ -258,6 +258,35 @@ private:
 		u64 skin_unrec_foreign = 0;
 		u64 skin_unrec_reads = 0;
 
+		// The other site that feeds skin_unrecognised: the indexed-const gate, which refuses a
+		// program that reads a constant palette the recogniser never turned into bone transforms.
+		// The three counters above only split the scan_vertex_program hardening path, so the two
+		// populations were indistinguishable in the aggregate - and on Resistance 2 (NPEA00431)
+		// the hardening path contributed nothing at all: all 119357 refusals in a 2m41s capture
+		// came through the gate. With this the four partition skin_unrecognised exactly.
+		u64 skin_unrec_indexed = 0;
+
+		// The two mechanisms that resolve an indexed-const refusal instead of taking it. Each is
+		// its own knob and each partitions exactly: considered = resolved + refused.
+		//
+		// 'idxuniform' is the draw-uniform address register (RPCS3_REMIX_INDEXEDUNIFORM): the whole
+		// program's indexing collapses to one constant row, so there is no palette to leave
+		// unapplied. Considered counts draws whose program proved uniform, refused counts those
+		// whose address did not read back inside the legal constants or whose matrix chain never
+		// reached the vertex attribute (mode 1).
+		//
+		// 'idxbias' is the forwarded post-matrix translation (RPCS3_REMIX_INDEXEDBIASREG): a group
+		// whose rows land in a different register than the translation. These draws reach the
+		// skinned_layered path, so refused is the same proven-or-nothing refusal the rest of that
+		// path uses - an index that does not evaluate, or a palette entry that is not a usable
+		// affine transform.
+		u64 idxuniform_considered = 0;
+		u64 idxuniform_resolved = 0;
+		u64 idxuniform_refused = 0;
+		u64 idxbias_considered = 0;
+		u64 idxbias_resolved = 0;
+		u64 idxbias_refused = 0;
+
 		u64 skip_vp = 0;
 		// Unique vertex programs, not draws: how the HPOS writer collection went
 		// (vp_fingerprint::hpos_indirect). 'recovered' is programs whose matrix chain was only
@@ -512,8 +541,67 @@ private:
 		// or no valid camera). Neither refuses anything - they are the over-tag alarm described
 		// on s_viewmodel_max_anchor. far > 0 with tagged small means the depth-range test found
 		// something that is not in front of the player's face.
+		//
+		// Only meaningful at viewmodel_camera_mode 0. The anchor reads the instance transform's
+		// translation, which was the draw's world origin only because the mismatched world
+		// reference left one there ([-4.048 15.241 -6.4505], anchor 0.446). Under a viewmodel
+		// reference the instance transform is the inter-frame camera delta and the bones carry the
+		// placement, so the translation is ~0 and the anchor degenerates to the distance from the
+		// world origin to the eye - about 17 on the measured frame, so vm_far tracks vm_tagged.
+		// That is the alarm losing its subject, not the arms moving.
 		u64 viewmodel_far = 0;
 		u64 viewmodel_noanchor = 0;
+
+		// Which reference each viewmodel draw was divided by (viewmodel_camera_mode). 'considered'
+		// is every viewmodel-range draw that reached per_draw_transform's reference branch, and the
+		// three below partition it exactly:
+		//
+		//   viewmodel_cam_considered == viewmodel_cam_applied
+		//                             + viewmodel_cam_fallback
+		//                             + viewmodel_cam_refused
+		//
+		// so an over-broad depth-range rule reads as a ratio here rather than as a missing weapon.
+		// applied is the fix working; fallback is mode 0 only (the 148b467 world reference);
+		// refused is mode 1, or mode 2 before any viewmodel reference has been latched.
+		//
+		// The tell: refused staying high through gameplay means viewmodel draws are being found but
+		// no viewmodel draw is winning the candidate, so read viewmodel_cam_diverted next - if that
+		// is also 0 the two populations disagree and the depth predicate is being applied to
+		// different registers in the two places, which is the one bug this shared predicate exists
+		// to make impossible.
+		//
+		// Under RPCS3_REMIX_DUMP the diagnostic path calls per_draw_transform a second time for
+		// every skinned_layered program it describes, which is the viewmodel archetype, so
+		// 'considered' runs a little ahead of vm_tagged on a dump run. The three-way split is
+		// unaffected - each of those calls still lands in exactly one bucket.
+		u64 viewmodel_cam_considered = 0;
+		u64 viewmodel_cam_applied = 0;
+		u64 viewmodel_cam_fallback = 0;
+		u64 viewmodel_cam_refused = 0;
+
+		// Draws routed to the viewmodel candidate instead of the world one, frames that latched a
+		// viewmodel reference, and flips that reference survived without a candidate of its own.
+		//
+		// diverted is also the alarm at the camera end: at 148b467 update_camera_candidate had no
+		// depth-range test at all, so a viewmodel draw could win the *world* camera. R2's viewmodel
+		// programs are skinned_layered, which takes the layered path and publishes
+		// has_reference = false, so a frame it won would move the whole world onto a different
+		// branch of per_draw_transform. diverted counts what used to be able to do that.
+		//
+		// conflict is the assumption the reference rests on, made into a number: how many diverted
+		// draws presented a view-projection differing from the one the frame already latched.
+		// Expected 0 - the two viewmodel programs dumped with a G0 carry identical matrices - and a
+		// non-zero reading says the population holds more than one camera and first-wins is
+		// choosing between them arbitrarily.
+		// unusable: diverted draws whose outer group is not the chain per_draw_transform would
+		// divide by, so they cannot serve as the reference. diverted > 0 with latched == 0 and
+		// unusable == diverted means every viewmodel program in the title is layered past one
+		// group, and the reference has to be built from the full chain instead.
+		u64 viewmodel_cam_diverted = 0;
+		u64 viewmodel_cam_unusable = 0;
+		u64 viewmodel_cam_conflict = 0;
+		u64 viewmodel_cam_latched = 0;
+		u64 viewmodel_cam_held = 0;
 
 		u64 cat_hidden = 0;
 		u64 cat_particle = 0;
@@ -842,6 +930,24 @@ private:
 	void report_viewmodel_census(viewmodel_outcome outcome, u32 vertex_count,
 		f32 scale_z, f32 offset_z, const remixapi_Transform& transform, f32 anchor, bool measured);
 
+	// The depth-range rule itself, reading the two viewport registers and returning which of the
+	// three buckets above this draw falls in. Shared rather than inlined because three places now
+	// have to agree on the same population - the tagging site in submit_subdraw, the candidate
+	// router in update_camera_candidate, and the reference choice in per_draw_transform - and two
+	// of those decide what a draw is *divided by*. A second copy that drifted would put the arms
+	// and the arms' camera in different populations, which is the failure this fix removes.
+	viewmodel_outcome classify_viewmodel_depth(f32& scale_z, f32& offset_z) const;
+
+	// One line per (vertex program, outcome) for the reference decision, once, under its own
+	// ceiling. Separate from report_viewmodel_census because that one names what the depth rule
+	// selects and this one names what the selection was then transformed by; a run where those two
+	// disagree is the thing worth reading.
+	void report_viewmodel_camera_census(const char* outcome_name);
+
+	std::unordered_set<u64> m_viewmodel_camera_census_seen;
+	u32 m_viewmodel_camera_census_lines = 0;
+	static constexpr u32 s_max_viewmodel_camera_census_lines = 16;
+
 	// Fills m_scratch_vertices' texcoords from the vertex attribute that feeds the albedo unit.
 	// Must run before the mesh content hash is taken: the texcoords are part of the vertex data
 	// the hash covers, and two draws that share positions but not UVs are different meshes.
@@ -1072,6 +1178,14 @@ private:
 	camera_candidate m_frame_candidate{};
 	camera_candidate m_active_camera{};
 
+	// The same pair for the viewmodel population, latched independently at the same flip. Only
+	// has_reference and reference_inverse are ever read off these: the anchor the census reports is
+	// deliberately still measured against m_active_camera.position, because the claim being tested
+	// is that the arms sit near the *world* eye.
+	camera_candidate m_frame_viewmodel_candidate{};
+	camera_candidate m_active_viewmodel{};
+	u32 m_viewmodel_camera_age = 0;
+
 	// Consecutive flips m_active_camera has survived without a candidate of its own. Zeroed every
 	// time a frame resolves one; once it passes remix_rsx::camera_hold_frames() the camera is
 	// dropped and submit_camera() goes back to the origin fallback.
@@ -1164,6 +1278,10 @@ private:
 	std::unordered_set<u64> m_world_extent_seen;
 	u32 m_world_extent_census_lines = 0;
 	static constexpr u32 s_max_world_extent_census_lines = 64;
+
+	// One basis-affine line per program. Unbounded by a line cap because it is keyed on the
+	// program hash and R2 has a few dozen programs, not thousands.
+	std::unordered_set<u64> m_basis_census_seen;
 
 	// One line per unrecognised rig, once per program, bounded - the same shape. The dump cannot
 	// answer this: it emitted 72 lines in the 4:50 capture and not one of them carried

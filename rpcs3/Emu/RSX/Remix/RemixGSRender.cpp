@@ -720,7 +720,29 @@ void RemixGSRender::flip(const rsx::display_flip_info_t& info)
 			m_camera_age = 0;
 		}
 
+		// The viewmodel reference latches on the same flip and holds under the same cap, so the
+		// arms and the world are never a frame apart. Held rather than cleared for the reason the
+		// world camera is: the viewmodel population is a handful of draws and a frame that shows no
+		// arms at all (a cutscene, a ladder, a reload that hides the mesh) would otherwise refuse
+		// every viewmodel draw in the frame after it.
+		if (m_frame_viewmodel_candidate.valid)
+		{
+			m_active_viewmodel = m_frame_viewmodel_candidate;
+			m_viewmodel_camera_age = 0;
+			++m_stats.viewmodel_cam_latched;
+		}
+		else if (m_active_viewmodel.valid && ++m_viewmodel_camera_age <= remix_rsx::camera_hold_frames())
+		{
+			++m_stats.viewmodel_cam_held;
+		}
+		else
+		{
+			m_active_viewmodel = camera_candidate{};
+			m_viewmodel_camera_age = 0;
+		}
+
 		m_frame_candidate = camera_candidate{};
+		m_frame_viewmodel_candidate = camera_candidate{};
 		m_split_attempts = 0;
 
 		// The scene scale the next frame's streak gate measures against. Taken at flip because the
@@ -1702,6 +1724,76 @@ void RemixGSRender::report_viewmodel_census(viewmodel_outcome outcome, u32 verte
 	// Mirrored into remix_dump.log for the same reason report_sky_census is: RPCS3.log is held
 	// under an exclusive lock while the emulator runs, and this census has to be readable against
 	// what is on screen during an ordinary run rather than only after it.
+	if (fs::file out{ fs::get_executable_dir() + "remix_dump.log", fs::write + fs::create + fs::append })
+	{
+		out.write(line + '\n');
+	}
+}
+
+RemixGSRender::viewmodel_outcome RemixGSRender::classify_viewmodel_depth(f32& scale_z, f32& offset_z) const
+{
+	scale_z = rsx::method_registers.viewport_scale_z();
+	offset_z = rsx::method_registers.viewport_offset_z();
+
+	// Ordered so the counters partition 'considered' exactly: the span test first, because it is
+	// the one that rejects the whole world, then the near-end test on what survives.
+	// std::isfinite guards a register that has never been seen unset but is guest-writable.
+	if (!std::isfinite(scale_z) || !(scale_z > 0.f) || scale_z >= s_viewmodel_max_depth_scale)
+	{
+		return viewmodel_outcome::reject_full_range;
+	}
+
+	if (!std::isfinite(offset_z) || std::abs(offset_z) > s_viewmodel_max_depth_offset)
+	{
+		return viewmodel_outcome::reject_offset;
+	}
+
+	return viewmodel_outcome::tagged;
+}
+
+void RemixGSRender::report_viewmodel_camera_census(const char* outcome_name)
+{
+	// Which reference each viewmodel program was actually divided by. The counters give the ratio;
+	// this gives the names, and vm_ref/world_ref on the line say whether both references were even
+	// available at the moment the draw was placed - which is what separates "the fix is off" from
+	// "the fix had nothing latched to apply".
+	//
+	// Keyed on the outcome's first character rather than an enum because the outcomes here are
+	// strings. The two REFUSED variants share a key, which is harmless: viewmodel_camera_mode()
+	// caches its env read in a function-local static, so a process can only ever produce one of
+	// them.
+	if (m_viewmodel_camera_census_lines >= s_max_viewmodel_camera_census_lines)
+	{
+		return;
+	}
+
+	const u64 key = m_current_vp_hash ^ (static_cast<u64>(static_cast<u8>(outcome_name[0])) << 56);
+
+	if (!m_viewmodel_camera_census_seen.insert(key).second)
+	{
+		return;
+	}
+
+	++m_viewmodel_camera_census_lines;
+
+	const std::string line = fmt::format(
+		"Remix viewmodel-camera: vp=%016llx %s vtx=%u | vm_ref=%d vm_age=%u world_ref=%d "
+		"world_arch=%s cam_age=%u | mode=%u frame=%llu line=%u/%u",
+		m_current_vp_hash,
+		outcome_name,
+		::size32(m_scratch_vertices),
+		m_active_viewmodel.has_reference ? 1 : 0,
+		m_viewmodel_camera_age,
+		m_active_camera.has_reference ? 1 : 0,
+		remix_rsx::archetype_name(m_active_camera.archetype),
+		m_camera_age,
+		remix_rsx::viewmodel_camera_mode(),
+		m_frame_counter,
+		m_viewmodel_camera_census_lines,
+		s_max_viewmodel_camera_census_lines);
+
+	rsx_log.notice("%s", line);
+
 	if (fs::file out{ fs::get_executable_dir() + "remix_dump.log", fs::write + fs::create + fs::append })
 	{
 		out.write(line + '\n');
@@ -4055,7 +4147,17 @@ bool RemixGSRender::audit_world_extent(const remixapi_Transform& transform, bool
 		// world untouched, which is the population the dumps report as prescale=0.
 		const f32 decode_scale = (model_extent > 1e-9f) ? (extent / model_extent) : 0.f;
 
-		rsx_log.notice("Remix: world-extent vp=%016llx arch=%s vtx=%u idx=%llu skinned=%d bones=%llu prescale=%d "
+		// 'affine' is the other half of decodes_position (has_prescale || has_const_affine), and
+		// without it this line cannot answer the only question it is asked. prescale=0 on its own
+		// is ambiguous three ways: no decode was recognised and the raw quantised attribute was
+		// submitted; the MUL/ADD form was recognised as const_affine and folded into the transform,
+		// so a large 'model' is expected and correct; or it was recognised and applied wrongly.
+		// The first reading is the vertex explosion, the second is healthy, and every refused draw
+		// in the first R2 capture read prescale=0. s/b are affine_has_scale / affine_has_bias: a
+		// bias-only affine cannot rescale a quantised range, so affine=1(s0,b1) with model ~1e4 is
+		// still an undecoded draw despite the flag being set.
+		rsx_log.notice("Remix: world-extent vp=%016llx arch=%s vtx=%u idx=%llu skinned=%d bones=%llu "
+			"prescale=%d affine=%d(s%d,b%d) areason=%s "
 			"wext=%.6g model=%.6g scale=%.4g median=%.6g ratio=%.4g nonfinite=%u refused=%d",
 			m_current_vp_hash,
 			remix_rsx::archetype_name(m_current_fingerprint->archetype),
@@ -4064,6 +4166,10 @@ bool RemixGSRender::audit_world_extent(const remixapi_Transform& transform, bool
 			blend ? 1 : 0,
 			static_cast<u64>(m_scratch_bone_transforms.size()),
 			m_current_fingerprint->has_prescale ? 1 : 0,
+			m_current_fingerprint->has_const_affine ? 1 : 0,
+			m_current_fingerprint->affine_has_scale ? 1 : 0,
+			m_current_fingerprint->affine_has_bias ? 1 : 0,
+			m_current_fingerprint->affine_reason,
 			static_cast<f64>(extent),
 			static_cast<f64>(model_extent),
 			static_cast<f64>(decode_scale),
@@ -4803,6 +4909,93 @@ void RemixGSRender::update_camera_candidate()
 		rsx::method_registers.viewport_scale_z(),
 		rsx::method_registers.viewport_offset_z());
 
+	// A draw in the viewmodel depth range is a candidate for the *viewmodel* reference and for
+	// nothing else. Both halves matter. It has to feed its own reference because dividing it by the
+	// world camera's is what collapses the basis to (0.491, 0.002, 1.150) - see
+	// viewmodel_camera_mode() - and it has to stop feeding the world's because R2's viewmodel
+	// programs are skinned_layered, so a frame one of them won would publish has_reference = false
+	// and move every world draw in the next frame onto a different branch of per_draw_transform.
+	//
+	// Neither scored nor split. Both of those exist to pick the scene camera out of a frame's worth
+	// of unrelated perspective draws - shadow cascades, cube faces - and the depth-range predicate
+	// has already done that selection. score_perspective would in fact return 0 for every draw
+	// here: it opens with classify_perspective, which rejects any matrix with |m[0][3]| > 0.02, and
+	// a *fused* view-projection carries the view forward vector in that slot - -0.393 on the
+	// viewmodel G0 dumped in bin\log\RPCS3.log. Scoring this population would latch nothing and
+	// turn the whole fix into a silent suppression.
+	//
+	// What the reference does have to be is a usable divisor: finite, not affine (a model matrix is
+	// not a projection), and invertible.
+	if (remix_rsx::viewmodel_camera_mode() >= 2)
+	{
+		f32 depth_scale = 0.f;
+		f32 depth_offset = 0.f;
+
+		if (classify_viewmodel_depth(depth_scale, depth_offset) == viewmodel_outcome::tagged)
+		{
+			++m_stats.viewmodel_cam_diverted;
+
+			if (!remix_rsx::mat4_is_finite(folded) || remix_rsx::is_affine(folded, 1e-4f))
+			{
+				return;
+			}
+
+			// 'folded' is the outer group alone, so it is only a valid divisor for draws whose
+			// chain per_draw_transform builds is that same group. It builds a longer one - the full
+			// G0..G(n-1) product - for a layered program with more than one group, and dividing a
+			// groups=1 draw by the outermost group of such a program would leave the view standing
+			// in the transform instead of cancelling it. Refused rather than reconstructed: the
+			// chain loop lives in per_draw_transform and duplicating it here is how the two drift.
+			// Dormant on R2, whose viewmodel programs are skinned_layered with group_count 1.
+			if (fp.is_layered() && fp.group_count > 1 && remix_rsx::full_chain_enabled())
+			{
+				++m_stats.viewmodel_cam_unusable;
+				return;
+			}
+
+			if (m_frame_viewmodel_candidate.valid)
+			{
+				// The viewmodel population is expected to share one view-projection, so the first
+				// valid draw of the frame wins and the rest only have to agree. Measured rather
+				// than assumed: the two programs dumped at [0,0.2] in that capture carry identical
+				// G0s, but the census tags five, and the other three were only ever dumped drawing
+				// world geometry at [0,1]. A non-zero conflict count means first-wins is picking
+				// arbitrarily and the population needs splitting further.
+				f32 delta = 0.f;
+				f32 norm = 0.f;
+
+				for (u32 i = 0; i < 4; ++i)
+				{
+					for (u32 j = 0; j < 4; ++j)
+					{
+						delta += std::abs(folded.m[i][j] - m_frame_viewmodel_candidate.projection.m[i][j]);
+						norm += std::abs(m_frame_viewmodel_candidate.projection.m[i][j]);
+					}
+				}
+
+				if (delta > 1e-3f * (norm + 1.f))
+				{
+					++m_stats.viewmodel_cam_conflict;
+				}
+
+				return;
+			}
+
+			remix_rsx::mat4 viewmodel_inverse{};
+			if (!remix_rsx::mat4_invert(folded, viewmodel_inverse))
+			{
+				return;
+			}
+
+			m_frame_viewmodel_candidate.valid = true;
+			m_frame_viewmodel_candidate.archetype = fp.archetype;
+			m_frame_viewmodel_candidate.projection = folded;
+			m_frame_viewmodel_candidate.has_reference = true;
+			m_frame_viewmodel_candidate.reference_inverse = viewmodel_inverse;
+			return;
+		}
+	}
+
 	if (fp.is_layered())
 	{
 		// The title already split its own transform: the outermost group is the projection,
@@ -4926,6 +5119,54 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 	// RPCS3_REMIX_WORLDVP probe at the tail; costs one stack slot otherwise.
 	const char* world_branch = "none";
 
+	// The object placement match_basis_affine found, composed from this draw's live constants and
+	// printed once per program - and deliberately NOT applied. It is the missing step between the
+	// palette and the outer group for R2's indexed-palette characters, so wiring it in moves 82190
+	// draws at once; this line is how the matrix gets read before that happens. A right-handed
+	// basis has row lengths near equal and det>0. Order is the composition order, not the ucode's:
+	// rows first, then the uniform scale, then the translation.
+	if (fp.has_basis_affine && m_basis_census_seen.insert(m_current_vp_hash).second)
+	{
+		f32 a[4]{}, b[4]{}, s[4]{};
+
+		if (remix_rsx::read_slot(fp.basis_row_slot[0], a)
+			&& remix_rsx::read_slot(fp.basis_row_slot[1], b)
+			&& remix_rsx::read_slot(fp.basis_scale_slot, s))
+		{
+			const f32 cross[3] = {
+				(a[1] * b[2]) - (a[2] * b[1]),
+				(a[2] * b[0]) - (a[0] * b[2]),
+				(a[0] * b[1]) - (a[1] * b[0]),
+			};
+
+			const auto len3 = [](const f32 v[3])
+			{
+				return std::sqrt((v[0] * v[0]) + (v[1] * v[1]) + (v[2] * v[2]));
+			};
+
+			const f32 av[3] = { a[0], a[1], a[2] };
+			const f32 bv[3] = { b[0], b[1], b[2] };
+
+			// det of the 3x3 whose rows are a, b, cross - i.e. |cross|^2 for a genuine cross
+			// product, so a negative or near-zero value says the basis is not what was matched.
+			const f32 det = (cross[0] * cross[0]) + (cross[1] * cross[1]) + (cross[2] * cross[2]);
+
+			rsx_log.notice("Remix: basis-affine vp=%016llx arch=%s rows=c%u,c%u scale=c%u.w bias=c%u.xyz "
+				"| a=[%.6g %.6g %.6g] |a|=%.6g | b=[%.6g %.6g %.6g] |b|=%.6g "
+				"| axb=[%.6g %.6g %.6g] |axb|=%.6g det=%.6g | w=%.6g bias=[%.6g %.6g %.6g] | applied=%d",
+				m_current_vp_hash,
+				remix_rsx::archetype_name(fp.archetype),
+				fp.basis_row_slot[0], fp.basis_row_slot[1], fp.basis_scale_slot, fp.basis_bias_slot,
+				static_cast<f64>(a[0]), static_cast<f64>(a[1]), static_cast<f64>(a[2]), static_cast<f64>(len3(av)),
+				static_cast<f64>(b[0]), static_cast<f64>(b[1]), static_cast<f64>(b[2]), static_cast<f64>(len3(bv)),
+				static_cast<f64>(cross[0]), static_cast<f64>(cross[1]), static_cast<f64>(cross[2]),
+				static_cast<f64>(len3(cross)), static_cast<f64>(det),
+				static_cast<f64>(s[3]),
+				static_cast<f64>(s[0]), static_cast<f64>(s[1]), static_cast<f64>(s[2]),
+				remix_rsx::basis_affine_enabled() ? 1 : 0);
+		}
+	}
+
 	// Everything the ucode applies between the vertex attribute and the outer group, in the order
 	// it applies it:
 	//     clip = ((attr * decode) * palette[a]) * outer
@@ -4936,6 +5177,48 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 	// draw leaves m_indexed_world_valid clear, because its palette travels as bone transforms.
 	const auto prepend_object_space = [&](remix_rsx::mat4& m)
 	{
+		// The object placement match_basis_affine found, applied first so it ends up between the
+		// palette and the outer group - which is where the ucode applies it:
+		//     clip = ((attr * decode) * palette[a]) * BASIS * outer
+		// Prepending to 'm' while 'm' is still the outer group yields BASIS*outer; the palette and
+		// decode prepends below then land in front of it, giving that order. Doing it after the
+		// palette would place the character relative to its own bone rather than the world.
+		//
+		// Verified before it was allowed to run: on ba93cfeb and f7576a48 the composed basis reads
+		// |a|=|b|=|axb|=1, a.b=0, det=1 - an orthonormal right-handed yaw about world up, with
+		// w=1 and a plausible level-coordinate translation. See the 'Remix: basis-affine' census,
+		// which still prints the same matrix and now reports applied=1.
+		// RPCS3_REMIX_BASISAFFINE=0 restores the previous behaviour, where these draws reached the
+		// outer group unplaced and landed at the camera group's origin - the floating, intersecting
+		// stalker and tank.
+		if (fp.has_basis_affine && remix_rsx::basis_affine_enabled())
+		{
+			f32 a[4]{}, b[4]{}, s[4]{};
+
+			if (remix_rsx::read_slot(fp.basis_row_slot[0], a)
+				&& remix_rsx::read_slot(fp.basis_row_slot[1], b)
+				&& remix_rsx::read_slot(fp.basis_scale_slot, s))
+			{
+				const f32 w = s[3];
+				const f32 cross[3] = {
+					(a[1] * b[2]) - (a[2] * b[1]),
+					(a[2] * b[0]) - (a[0] * b[2]),
+					(a[0] * b[1]) - (a[1] * b[0]),
+				};
+
+				// Row-vector convention, matching the rest of this file (row 3 is the translation,
+				// as the inverse-view camera position above relies on). out.x = dot(p, a) * w means
+				// column 0 carries a, so the rows below are the transpose of the ucode's DP3 rows.
+				remix_rsx::mat4 basis{};
+				basis.m[0][0] = a[0] * w; basis.m[0][1] = b[0] * w; basis.m[0][2] = cross[0] * w; basis.m[0][3] = 0.f;
+				basis.m[1][0] = a[1] * w; basis.m[1][1] = b[1] * w; basis.m[1][2] = cross[1] * w; basis.m[1][3] = 0.f;
+				basis.m[2][0] = a[2] * w; basis.m[2][1] = b[2] * w; basis.m[2][2] = cross[2] * w; basis.m[2][3] = 0.f;
+				basis.m[3][0] = s[0];     basis.m[3][1] = s[1];     basis.m[3][2] = s[2];         basis.m[3][3] = 1.f;
+
+				m = remix_rsx::mat4_multiply(basis, m);
+			}
+		}
+
 		if (m_indexed_world_valid)
 		{
 			m = remix_rsx::mat4_multiply(m_indexed_world, m);
@@ -5112,7 +5395,53 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 			rsx::method_registers.viewport_scale_z(),
 			rsx::method_registers.viewport_offset_z());
 
-		world = remix_rsx::mat4_multiply(fused, m_active_camera.reference_inverse);
+		// Which reference this draw is divided by. A viewmodel draw carries its own projection -
+		// fovx 60.001 / fovy 36.132 / near 0.0900 against the world's 72.000 / 44.634 - so composing
+		// it with the world camera's inverse leaves a matrix that is not a change of basis at all:
+		// replayed on the dumped G0s it comes out with m[3][3] = -1077 and, once :5135 normalises
+		// that away, a basis of (0.491, 0.002, 1.150). The translation survives intact, which is why
+		// this passed every audit that looked at origins - the census reads anchor=0.446 - while the
+		// mesh itself was being flattened 500x on Y and smeared across the screen.
+		//
+		// is_affine below cannot catch it: it tests column 3 only, so an anisotropic collapse is
+		// invisible to it. The gate is the reference, not the test after it.
+		// Counted in every mode, including 0, so the partition
+		// considered == applied + fallback + refused holds whatever the knob is set to and mode 0
+		// reads as all-fallback - which is the 148b467 behaviour stated as a number.
+		const remix_rsx::mat4* reference = &m_active_camera.reference_inverse;
+
+		f32 depth_scale = 0.f;
+		f32 depth_offset = 0.f;
+
+		if (classify_viewmodel_depth(depth_scale, depth_offset) == viewmodel_outcome::tagged)
+		{
+			const u32 vm_mode = remix_rsx::viewmodel_camera_mode();
+
+			++m_stats.viewmodel_cam_considered;
+
+			if (vm_mode == 0)
+			{
+				++m_stats.viewmodel_cam_fallback;
+				report_viewmodel_camera_census("FALLBACK:world");
+			}
+			else if (vm_mode >= 2 && m_active_viewmodel.has_reference)
+			{
+				reference = &m_active_viewmodel.reference_inverse;
+				++m_stats.viewmodel_cam_applied;
+				report_viewmodel_camera_census("APPLIED");
+			}
+			else
+			{
+				// Mode 1, or mode 2 with nothing latched yet. Refused rather than drawn with the
+				// world reference, on the rule the world gate two branches up already applies: a
+				// missing object is shippable, a smeared one is not.
+				++m_stats.viewmodel_cam_refused;
+				report_viewmodel_camera_census(vm_mode >= 2 ? "REFUSED:noref" : "REFUSED:mode1");
+				return false;
+			}
+		}
+
+		world = remix_rsx::mat4_multiply(fused, *reference);
 
 		// The layered branches above have prepended the decode since e9a7956; this one never did,
 		// so every title whose active camera is archetype 'fused' - which is R2's, on every frame
@@ -5680,6 +6009,15 @@ void RemixGSRender::submit_subdraw()
 		// that only ever touches one object is one matrix by definition.
 		bool rigid = false;
 
+		// Draws that only reached this path because the post-matrix translation was followed into
+		// another register. Counted here rather than in the matcher because what matters is how
+		// many draws it recovers, and because 'refused' has to be the same proven-or-nothing
+		// refusal every other rig on this path answers to.
+		if (fp.palette_bias_forwarded)
+		{
+			++m_stats.idxbias_considered;
+		}
+
 		// A blended rig is never offered to the rigid path. resolve_indexed_world reads one
 		// attribute component and asks whether it is uniform over the draw; on a blend program that
 		// component is bone 0's index only, so a draw whose bone 0 happens to be constant would be
@@ -5691,6 +6029,11 @@ void RemixGSRender::submit_subdraw()
 			&& remix_rsx::indexed_world_enabled() && resolve_indexed_world(first_vertex, vertex_count, rigid) && rigid)
 		{
 			++m_stats.indexed_world_rigid;
+
+			if (fp.palette_bias_forwarded)
+			{
+				++m_stats.idxbias_resolved;
+			}
 		}
 		else if (remix_rsx::noskin_enabled() || !m_remix.fork_features() || !build_skinning(first_vertex, vertex_count))
 		{
@@ -5698,12 +6041,23 @@ void RemixGSRender::submit_subdraw()
 			// with the palette unapplied - that is a mesh in its bind pose at the world origin.
 			++m_stats.skin_skipped;
 			++m_stats.indexed_world_refused;
+
+			if (fp.palette_bias_forwarded)
+			{
+				++m_stats.idxbias_refused;
+			}
+
 			return;
 		}
 		else
 		{
 			skinned = true;
 			++m_stats.indexed_world_skinned;
+
+			if (fp.palette_bias_forwarded)
+			{
+				++m_stats.idxbias_resolved;
+			}
 		}
 
 		// One line per program, once, at notice level: what the recogniser made of this rig and
@@ -5765,24 +6119,71 @@ void RemixGSRender::submit_subdraw()
 				blend += "]";
 			}
 
-			rsx_log.notice("Remix: indexed-world vp=%016llx base=c%u rows=%u stride=%u bias=%d attr=%u.%c abs=%d neg=%d rigid=%d vtx=%u%s",
+			rsx_log.notice("Remix: indexed-world vp=%016llx base=c%u rows=%u stride=%u bias=%d fwdbias=%d attr=%u.%c abs=%d neg=%d rigid=%d vtx=%u%s",
 				m_current_vp_hash, fp.palette_base, fp.palette_rows, fp.palette_stride,
-				fp.palette_has_bias ? 1 : 0, fp.bone_attribute, "xyzw"[fp.bone_component & 3],
+				fp.palette_has_bias ? 1 : 0, fp.palette_bias_forwarded ? 1 : 0,
+				fp.bone_attribute, "xyzw"[fp.bone_component & 3],
 				fp.bone_index_abs ? 1 : 0, fp.bone_index_negate ? 1 : 0,
 				rigid ? 1 : 0, vertex_count, blend);
 		}
 	}
 	else if (fp.indexed_const && !remix_rsx::draw_indexed_const())
 	{
+		// A program whose one ARL loads the address register from a *constant* indexes the same
+		// row for every vertex of the draw, so there is no palette here to leave unapplied - the
+		// reads are ordinary constant reads wearing an indexed encoding. Proving that is what
+		// makes the refusal below inapplicable; it is not a loosening of it. The address is
+		// resolved rather than assumed so that a mis-read ARL fails here instead of drawing.
+		//
+		// Off by default: the two Resistance 2 (NPEA00431) programs of this shape build their
+		// object-to-world step out of a constant basis - three DP3 rows against c47.xyz, c48.xyz
+		// and a third vector the ucode builds from those two in a temp, then a MAD by c46.w and
+		// c46.xyz - which no matcher here expresses, so their chain stops at the camera group and
+		// mode 2 draws them in the wrong place. Mode 1 refuses exactly that case. The indexing was
+		// never what blocked them. See indexed_uniform_mode.
+		const u32 uniform_mode = remix_rsx::indexed_uniform_mode();
+		bool released = false;
+		s32 uniform_offset = 0;
+		bool uniform_resolved = false;
+
+		if (uniform_mode != 0 && fp.indexed_addr_uniform)
+		{
+			++m_stats.idxuniform_considered;
+
+			uniform_resolved = remix_rsx::evaluate_uniform_address(fp, uniform_offset);
+			released = uniform_resolved && (uniform_mode > 1 || fp.inner_is_input);
+
+			if (released)
+			{
+				++m_stats.idxuniform_resolved;
+			}
+			else
+			{
+				++m_stats.idxuniform_refused;
+			}
+		}
+
 		// One line per program, once, at notice level - the same census shape the render-target
 		// gate uses. Without it this counter is a single number covering however many programs
 		// happen to land in it, and the first Haze run after the geometry fix had it at 2.6 M
 		// draws against 5.6 M submitted, i.e. it was silently eating a third of the scene.
+		//
+		// The uniform-address facts are on the same line because they are what the decision turns
+		// on, and because 'uniform=1 input=0' is the one combination that says the indexing was
+		// never the reason this program could not be placed.
 		if (m_indexed_census_seen.insert(m_current_vp_hash).second)
 		{
-			rsx_log.notice("Remix: indexed-const refusal vp=%016llx vtx=%u idx=%llu arch=%s",
+			rsx_log.notice("Remix: indexed-const refusal vp=%016llx vtx=%u idx=%llu arch=%s "
+				"uniform=%d addr=c%u.%c abs=%d neg=%d base=[c%u..c%u] a=%d input=%d released=%d",
 				m_current_vp_hash, vertex_count, static_cast<u64>(m_scratch_indices.size()),
-				remix_rsx::archetype_name(fp.archetype));
+				remix_rsx::archetype_name(fp.archetype),
+				fp.indexed_addr_uniform ? 1 : 0,
+				fp.addr_const_slot, "xyzw"[fp.addr_const_component & 3],
+				fp.addr_index_abs ? 1 : 0, fp.addr_index_negate ? 1 : 0,
+				fp.indexed_base_min, fp.indexed_base_max,
+				uniform_resolved ? uniform_offset : -1,
+				fp.inner_is_input ? 1 : 0,
+				released ? 1 : 0);
 		}
 
 		// The program reads a constant palette through an address register and the recogniser
@@ -5794,8 +6195,12 @@ void RemixGSRender::submit_subdraw()
 		// Note the '!fp.has_outer()' this replaces: once the outer group matches (which it now
 		// does for Haze, see the ADD-operand fix in match_mad_chain), 'has_outer()' is true and
 		// the old condition let exactly these draws through.
-		++m_stats.skin_unrecognised;
-		return;
+		if (!released)
+		{
+			++m_stats.skin_unrecognised;
+			++m_stats.skin_unrec_indexed;
+			return;
+		}
 	}
 
 	// --- multi-pass forward: keep the pass that establishes the surface -------------------
@@ -6427,29 +6832,25 @@ void RemixGSRender::submit_subdraw()
 	{
 		++m_stats.viewmodel_considered;
 
-		const f32 depth_scale = rsx::method_registers.viewport_scale_z();
-		const f32 depth_offset = rsx::method_registers.viewport_offset_z();
+		f32 depth_scale = 0.f;
+		f32 depth_offset = 0.f;
 
-		viewmodel_outcome outcome = viewmodel_outcome::tagged;
+		const viewmodel_outcome outcome = classify_viewmodel_depth(depth_scale, depth_offset);
 
-		// Ordered so the counters partition 'considered' exactly: the span test first, because it
-		// is the one that rejects the whole world, then the near-end test on what survives.
-		// std::isfinite guards a register that has never been seen unset but is guest-writable.
-		if (!std::isfinite(depth_scale) || !(depth_scale > 0.f) ||
-			depth_scale >= s_viewmodel_max_depth_scale)
+		switch (outcome)
 		{
-			outcome = viewmodel_outcome::reject_full_range;
+		case viewmodel_outcome::reject_full_range:
 			++m_stats.viewmodel_refused_full_range;
-		}
-		else if (!std::isfinite(depth_offset) || std::abs(depth_offset) > s_viewmodel_max_depth_offset)
-		{
-			outcome = viewmodel_outcome::reject_offset;
+			break;
+		case viewmodel_outcome::reject_offset:
 			++m_stats.viewmodel_refused_offset;
-		}
-		else
-		{
+			break;
+		case viewmodel_outcome::tagged:
 			is_viewmodel = true;
 			++m_stats.viewmodel_tagged;
+			break;
+		case viewmodel_outcome::count:
+			break;
 		}
 
 		// Measured for every draw the rule selects, reported and counted, never used to refuse.
@@ -7432,7 +7833,12 @@ void RemixGSRender::dump_vertex_program(u32 first_vertex, u32 vertex_count, u32 
 	}
 
 	const std::string line = fmt::format(
-		"Remix dump vp=%016llx arch=%s(%s) groups=%u input=%d prescale=%d(c%u.%u,c%u) consts=%u slice=%u ucode=%u inputs=0x%x | "
+		// 'basis' rides on the dump line rather than in per_draw_transform because the census that
+		// composes the matrix only runs for draws that survive the indexed-const gate - and those
+		// are exactly the draws a knob can switch off, which made the matcher's result unreadable
+		// in the first run that tried it. This fires at fingerprint time, so it reports whether
+		// match_basis_affine matched for every program regardless of what happens to the draw.
+		"Remix dump vp=%016llx arch=%s(%s) groups=%u input=%d prescale=%d(c%u.%u,c%u) basis=%d(c%u,c%u,c%u:%s) consts=%u slice=%u ucode=%u inputs=0x%x | "
 		"vtx=%u idx=%u prim=%u bbox=[%.4g %.4g %.4g]..[%.4g %.4g %.4g] | "
 		"vp_scale_z=%.6g vp_offset_z=%.6g clip=%ux%u depth_test=%d depth_write=%d blend=%d cull=%d |%s",
 		vp_hash,
@@ -7444,6 +7850,11 @@ void RemixGSRender::dump_vertex_program(u32 first_vertex, u32 vertex_count, u32 
 		fp.prescale_scale_slot,
 		fp.prescale_scale_component,
 		fp.prescale_bias_slot,
+		fp.has_basis_affine ? 1 : 0,
+		fp.basis_row_slot[0],
+		fp.basis_row_slot[1],
+		fp.basis_scale_slot,
+		fp.basis_reason,
 		fp.distinct_consts,
 		fp.chain_instructions,
 		current_vp_metadata.ucode_length,
@@ -7642,7 +8053,8 @@ void RemixGSRender::log_stats()
 		"vp_hpos_indirect=%llu vp_hpos_refused=%llu vp_hpos_indexed=%llu vp_wbuffer_z=%llu | "
 		"idxworld_rigid=%llu idxworld_skinned=%llu idxworld_refused=%llu vp_indexed_matched=%llu vp_indexed_unmatched=%llu bone_degenerate=%llu | "
 		"skin_submitted=%llu skin_skipped=%llu skin_unrecognised=%llu skin_bones_max=%llu "
-		"skin_unrec_arl=%llu skin_unrec_foreign=%llu skin_unrec_reads=%llu skin_unrec_census=%u | "
+		"skin_unrec_arl=%llu skin_unrec_foreign=%llu skin_unrec_reads=%llu skin_unrec_indexed=%llu skin_unrec_census=%u | "
+		"idxuniform=%llu/%llu/%llu idxbias=%llu/%llu/%llu | "
 		"skinblend_submitted=%llu skinblend_idx=%llu skinblend_weight=%llu skinblend_bone=%llu skinblend_palette=%llu skinblend_scale=%llu skinblend_uniform=%llu skinblend_rescaled=%llu skin_reach_flagged=%llu vtx_spread=%llu vtx_zero_split=%llu vtx_spread_submitted=%llu vtx_spread_refused=%llu | "
 		"wext_examined=%llu wext_exempt=%llu wext_nonfinite=%llu wext_refused=%llu wext_flagged_drawn=%llu "
 		"wext_median=%.6g wext_samples=%llu wext_max=%.6g wext_drawn=%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu | "
@@ -7653,6 +8065,9 @@ void RemixGSRender::log_stats()
 		"skyhash_rejected=%llu skyhash_tracked=%llu skyhash_census=%u skyhash_mode=%u | "
 		"vm_tagged=%llu vm_considered=%llu vm_fullrange=%llu vm_offset=%llu vm_far=%llu vm_noanchor=%llu "
 		"vm_census=%u vm_mode=%u | "
+		"vmcam_considered=%llu vmcam_applied=%llu vmcam_fallback=%llu vmcam_refused=%llu "
+		"vmcam_diverted=%llu vmcam_unusable=%llu vmcam_conflict=%llu vmcam_latched=%llu vmcam_held=%llu "
+		"vmcam_census=%u vmcam_mode=%u | "
 		"cat_hidden=%llu cat_particle=%llu cat_decal=%llu | "
 		"blend_chained=%llu blend_translucent=%llu blend_unmapped=%llu | "
 		"tex_bound=%llu tex_none=%llu tex_no_unit=%llu tex_unit_retry=%llu tex_albedo_ucode=%llu tex_albedo_guess=%llu tex_retry_refused=%llu tex_unit_substituted=%llu uv_applied=%llu uv_none=%llu uv_absent=%llu uv_layout=%llu uv_memory=%llu uv_fallback=%llu uv_ucode=%llu uv_heuristic=%llu uv_nonfinite=%llu vcol_applied=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_tombstone=%llu tex_rehashed=%llu tex_refreshed=%llu mat_created=%llu | "
@@ -7711,7 +8126,14 @@ void RemixGSRender::log_stats()
 		m_stats.skin_unrec_arl,
 		m_stats.skin_unrec_foreign,
 		m_stats.skin_unrec_reads,
+		m_stats.skin_unrec_indexed,
 		m_skin_unrec_census_lines,
+		m_stats.idxuniform_considered,
+		m_stats.idxuniform_resolved,
+		m_stats.idxuniform_refused,
+		m_stats.idxbias_considered,
+		m_stats.idxbias_resolved,
+		m_stats.idxbias_refused,
 		m_stats.skin_blend_submitted,
 		m_stats.skin_blend_refused_index,
 		m_stats.skin_blend_refused_weight,
@@ -7768,6 +8190,17 @@ void RemixGSRender::log_stats()
 		m_stats.viewmodel_noanchor,
 		m_viewmodel_census_lines,
 		remix_rsx::viewmodel_mode(),
+		m_stats.viewmodel_cam_considered,
+		m_stats.viewmodel_cam_applied,
+		m_stats.viewmodel_cam_fallback,
+		m_stats.viewmodel_cam_refused,
+		m_stats.viewmodel_cam_diverted,
+		m_stats.viewmodel_cam_unusable,
+		m_stats.viewmodel_cam_conflict,
+		m_stats.viewmodel_cam_latched,
+		m_stats.viewmodel_cam_held,
+		m_viewmodel_camera_census_lines,
+		remix_rsx::viewmodel_camera_mode(),
 		m_stats.cat_hidden,
 		m_stats.cat_particle,
 		m_stats.cat_decal,

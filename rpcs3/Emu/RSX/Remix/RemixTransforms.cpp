@@ -193,6 +193,10 @@ namespace remix_rsx
 			bool has_bias = false;
 			u32 bias_slot = 0;
 
+			// The translation wrote a different register than the rows did, so the group was only
+			// found by following it back one hop (match_indexed_affine).
+			bool bias_forwarded = false;
+
 			// For a 3-row group, the constant component the ucode moves into the operand's w. It is
 			// read back per draw and required to be 1: a 3x4 matrix only transforms a *point* when
 			// the fourth coordinate is one, and a group whose w is a scale factor is a different
@@ -1482,6 +1486,12 @@ namespace remix_rsx
 			u32 scale_slot = 0;
 			u8 scale_component[3] = { 0, 1, 2 };
 			u32 bias_slot = 0;
+			// Which test refused, for the world-extent census. The matcher has a dozen exits and
+			// every one of them reads as 'affine=0' from outside, which is not enough to tell a
+			// program whose decode is written in a shape this grammar does not cover from one that
+			// has no decode at all - and those want opposite fixes. Static storage duration only
+			// (string literals), copied by pointer onto the fingerprint.
+			const char* reason = "ok";
 		};
 
 		// The xyz source swizzle is the identity, i.e. the operand really is this vertex's own
@@ -1512,6 +1522,12 @@ namespace remix_rsx
 		{
 			out = const_affine_result{};
 
+			const auto refuse = [&out](const char* why)
+			{
+				out.reason = why;
+				return false;
+			};
+
 			// A scalar-half write into xyz is a term this walk never sees, so it has to be
 			// excluded for every temp the chase visits, not just the one it starts on.
 			const auto sca_touches_xyz = [&](u32 reg, u32 bound)
@@ -1529,7 +1545,7 @@ namespace remix_rsx
 
 			if (sca_touches_xyz(temp, before))
 			{
-				return false;
+				return refuse("sca-xyz");
 			}
 
 			std::vector<u32> writers;
@@ -1562,7 +1578,7 @@ namespace remix_rsx
 					{
 						// A partial xyz write means one axis is produced somewhere this walk is
 						// not looking. Refuse rather than fold two thirds of a decode.
-						return false;
+						return refuse("partial-xyz");
 					}
 
 					chosen = *it;
@@ -1571,14 +1587,17 @@ namespace remix_rsx
 
 				if (chosen == umax)
 				{
-					return false;
+					// Nothing writes this temp's xyz before the cursor. For the first hop that
+					// means the chain's innermost operand was never produced by a vec instruction
+					// this walk can read - the 'innermost operand is not an attribute' population.
+					return refuse(hop == 0 ? "no-writer" : "no-writer-mid");
 				}
 
 				const decoded_instr& in = prog[chosen];
 
 				if (in.d3.index_const)
 				{
-					return false;
+					return refuse("indexed-const");
 				}
 
 				switch (in.d1.vec_opcode)
@@ -1606,12 +1625,12 @@ namespace remix_rsx
 
 					if (const_slot == umax || other_slot == umax || out.has_bias)
 					{
-						return false;
+						return refuse(out.has_bias ? "add-twice" : "add-operands");
 					}
 
 					if (!is_identity_xyz_swizzle(in.src[const_slot]) || !is_identity_xyz_swizzle(in.src[other_slot]))
 					{
-						return false;
+						return refuse("add-swizzle");
 					}
 
 					out.has_bias = true;
@@ -1621,17 +1640,25 @@ namespace remix_rsx
 					{
 						// Terminal: 'attr + c[B]', no scale.
 						out.found = (u32{in.d1.input_src} == 0);
-						return out.found;
+
+						if (!out.found)
+						{
+							// A bias on some attribute other than ATTR0 - a decode of a vector this
+							// backend never submits as a position.
+							return refuse("add-not-attr0");
+						}
+
+						return true;
 					}
 
 					if (in.src[other_slot].reg_type != RSX_VP_REGISTER_TYPE_TEMP)
 					{
-						return false;
+						return refuse("add-src-not-temp");
 					}
 
 					if (sca_touches_xyz(in.src[other_slot].tmp_src, chosen))
 					{
-						return false;
+						return refuse("add-sca-xyz");
 					}
 
 					prog.collect_vec_writers(walk_target{ false, in.src[other_slot].tmp_src }, writers, chosen);
@@ -1656,17 +1683,39 @@ namespace remix_rsx
 						}
 					}
 
-					if (input_slot == umax || const_slot == umax || out.has_scale)
+					if (out.has_scale)
 					{
-						return false;
+						return refuse("mul-twice");
+					}
+
+					// Tested before the INPUT operand because it is the stronger statement: with no
+					// constant operand there is no constant scale to rebuild per draw, so this
+					// matcher cannot reach the program at all - it exists to fold 'attr * s + b'
+					// where s and b are transform constants. Every one of R2's scale~1.0
+					// vertex-explosion programs lands here. Ordering these the other way round
+					// reported them as 'mul-src', which reads as "wrong operand" and sent one
+					// round of work chasing a grammar widening that could never have matched them.
+					if (const_slot == umax)
+					{
+						return refuse("mul-no-const");
+					}
+
+					if (input_slot == umax)
+					{
+						return refuse("mul-src");
 					}
 
 					// ATTR0 only, and read straight: it is the one attribute this backend submits
 					// as a position, so a decode on any other input describes a vector we never
 					// send. The same rule match_wdivide states.
-					if (u32{in.d1.input_src} != 0 || !is_identity_xyz_swizzle(in.src[input_slot]))
+					if (u32{in.d1.input_src} != 0)
 					{
-						return false;
+						return refuse("mul-not-attr0");
+					}
+
+					if (!is_identity_xyz_swizzle(in.src[input_slot]))
+					{
+						return refuse("mul-swizzle");
 					}
 
 					const SRC& factor = in.src[const_slot];
@@ -1679,12 +1728,251 @@ namespace remix_rsx
 					out.found = true;
 					return true;
 				}
+				case RSX_VEC_OPCODE_MAD:
+				{
+					// 'attr * c[K].<swz> + temp'. R2's indexed-palette characters decode their
+					// position this way:
+					//     9:MAD>r1.xyz(I0.xyzx,C0.wwww,T1.xyzx)c45i0   attr * c45.w + palette
+					// which is the mirror of the shape match_prescale looks for - there the scale is
+					// a scalar temp and the addend is a constant, here the scale is the constant and
+					// the addend is a temp - so neither matcher expressed it and the raw quantised
+					// attribute reached the world untouched. Measured on ba93cfeb/f7576a48 with the
+					// basis already applied: model=3937, wext=4733, scale=1.202 against a scene
+					// median of 0.646, i.e. correctly oriented and placed but ~4000x too big.
+					// Before this arm existed the walk reached this instruction and refused with
+					// 'opcode', which is what named it.
+					//
+					// Only the scale is folded. A temp addend is the palette term and travels
+					// separately as the indexed world, so recording it as a bias would apply it
+					// twice; a constant addend is a genuine scale-and-bias and is taken.
+					if (out.has_scale)
+					{
+						return refuse("mad-twice");
+					}
+
+					if (in.src[0].reg_type != RSX_VP_REGISTER_TYPE_INPUT)
+					{
+						return refuse("mad-src0-not-input");
+					}
+
+					// ATTR0 only, read straight - the same rule the MUL arm and match_wdivide state.
+					if (u32{in.d1.input_src} != 0 || !is_identity_xyz_swizzle(in.src[0]))
+					{
+						return refuse("mad-not-attr0");
+					}
+
+					if (in.src[1].reg_type != RSX_VP_REGISTER_TYPE_CONSTANT)
+					{
+						return refuse("mad-scale-not-const");
+					}
+
+					if (in.src[0].neg || in.src[1].neg)
+					{
+						return refuse("mad-negated");
+					}
+
+					const SRC& factor = in.src[1];
+
+					out.has_scale = true;
+					out.scale_slot = in.d1.const_src;
+					out.scale_component[0] = static_cast<u8>(factor.swz_x);
+					out.scale_component[1] = static_cast<u8>(factor.swz_y);
+					out.scale_component[2] = static_cast<u8>(factor.swz_z);
+
+					if (in.src[2].reg_type == RSX_VP_REGISTER_TYPE_CONSTANT
+						&& is_identity_xyz_swizzle(in.src[2])
+						&& !in.src[2].neg)
+					{
+						out.has_bias = true;
+						out.bias_slot = in.d1.const_src;
+					}
+
+					out.found = true;
+					return true;
+				}
 				default:
-					return false;
+					// Some other vec opcode produces the position. MOV and DP4 land here, and they
+					// are different problems: a DP4 means the walk has run into the matrix rather
+					// than the decode.
+					return refuse("opcode");
 				}
 			}
 
-			return false;
+			return refuse("hop-limit");
+		}
+
+		// Resistance 2's indexed-palette character programs place the blended vertex with a
+		// rotation basis built from two transform constants and their cross product, then a
+		// uniform scale and a translation from a third:
+		//
+		//     out = ( dot(p, cA.xyz), dot(p, cB.xyz), dot(p, cross(cA,cB)) ) * cS.w + cS.xyz
+		//
+		// f7576a48e6289f83 writes it as (cA=c47, cB=c48, cS=c46):
+		//     5:MUL>r1.xyz(T0.zxyz,C0.yzxy)c48      r1 = cA.zxy * cB.yzx
+		//     6:MAD>r0.xyz(T0.yzxy,C0.zxyz,-T1)c48  r0 = cA.yzx * cB.zxy - r1   <- cross, note the '-'
+		//    11:DP3>r0.z(T0,T1)c0                   out.z = dot(p, cross)
+		//    12:DP3>r0.y(T1,C0.xyzx)c48             out.y = dot(p, cB)
+		//    13:DP3>r0.x(T1,C0.xyzx)c47             out.x = dot(p, cA)
+		//    14:MAD>r1.xyz(T0,C0.wwww,C0.xyzx)c46   out   = out * cS.w + cS.xyz
+		// ba93cfeb is the same shape with the basis at 8-9 and the MAD at 21.
+		//
+		// This is what the indexed-const refusal comment means by "a third vector the ucode builds
+		// from those two in a temp, then a MAD by c46.w and c46.xyz - which no matcher here
+		// expresses". Every operand is a transform constant, so the whole step rebuilds per draw.
+		//
+		// The negate on the cross term is load-bearing and was invisible until describe_output_slice
+		// learned to print SRC::neg: 'a.yzx*b.zxy + a.zxy*b.yzx' is a sum, and only the subtraction
+		// is a right-handed basis. It is verified here rather than assumed.
+		struct basis_affine_result
+		{
+			bool found = false;
+			u32 row_slot[2] = { 0, 0 };
+			u32 scale_slot = 0;
+			u32 bias_slot = 0;
+			const char* reason = "untried";
+		};
+
+		bool match_basis_affine(const program_walker& prog, basis_affine_result& out)
+		{
+			out = basis_affine_result{};
+
+			const auto refuse = [&out](const char* why)
+			{
+				out.reason = why;
+				return false;
+			};
+
+			const auto is_broadcast_w = [](const SRC& s)
+			{
+				return s.swz_x == 3 && s.swz_y == 3 && s.swz_z == 3 && s.swz_w == 3;
+			};
+
+			const auto is_xyz = [](const SRC& s)
+			{
+				return s.swz_x == 0 && s.swz_y == 1 && s.swz_z == 2;
+			};
+
+			// 1. The terminal 'temp * cS.w + cS.xyz'. One const slot per instruction, so both
+			//    operands necessarily name the same slot - which is what makes this signature
+			//    tight enough to search for directly instead of walking to it.
+			u32 mad_at = umax;
+			u32 rotated_tmp = s_no_temp;
+
+			for (u32 i = 0; i < static_cast<u32>(prog.size()); ++i)
+			{
+				const decoded_instr& in = prog[i];
+
+				if (in.d1.vec_opcode != RSX_VEC_OPCODE_MAD || vec_writemask(in) != 0x7 || in.d3.index_const)
+				{
+					continue;
+				}
+
+				if (in.src[0].reg_type != RSX_VP_REGISTER_TYPE_TEMP
+					|| in.src[1].reg_type != RSX_VP_REGISTER_TYPE_CONSTANT
+					|| in.src[2].reg_type != RSX_VP_REGISTER_TYPE_CONSTANT)
+				{
+					continue;
+				}
+
+				if (!is_broadcast_w(in.src[1]) || !is_xyz(in.src[2]) || !is_xyz(in.src[0]))
+				{
+					continue;
+				}
+
+				if (in.src[0].neg || in.src[1].neg || in.src[2].neg)
+				{
+					continue;
+				}
+
+				mad_at = i;
+				rotated_tmp = in.src[0].tmp_src;
+				out.scale_slot = in.d1.const_src;
+				out.bias_slot = in.d1.const_src;
+			}
+
+			if (mad_at == umax)
+			{
+				return refuse("no-scale-bias-mad");
+			}
+
+			// 2. The DP3 triple that produced that temp: x and y from a constant row each, z from
+			//    two temps (the position and the cross vector). Only writes before the MAD count.
+			u32 cross_tmp = s_no_temp;
+			bool have_row[3] = { false, false, false };
+
+			for (u32 i = 0; i < mad_at; ++i)
+			{
+				const decoded_instr& in = prog[i];
+
+				if (in.d1.vec_opcode != RSX_VEC_OPCODE_DP3 || in.d0.dst_tmp != rotated_tmp || in.d3.index_const)
+				{
+					continue;
+				}
+
+				const u32 mask = vec_writemask(in);
+
+				if (mask == 0x1 || mask == 0x2)
+				{
+					const u32 row = (mask == 0x1) ? 0u : 1u;
+
+					if (in.src[0].reg_type != RSX_VP_REGISTER_TYPE_CONSTANT
+						&& in.src[1].reg_type != RSX_VP_REGISTER_TYPE_CONSTANT)
+					{
+						return refuse("dp3-row-not-const");
+					}
+
+					out.row_slot[row] = in.d1.const_src;
+					have_row[row] = true;
+				}
+				else if (mask == 0x4)
+				{
+					if (in.src[0].reg_type != RSX_VP_REGISTER_TYPE_TEMP
+						|| in.src[1].reg_type != RSX_VP_REGISTER_TYPE_TEMP)
+					{
+						return refuse("dp3-z-not-temps");
+					}
+
+					// Either operand may be the cross; the other is the position. The cross is the
+					// one a MAD built, which step 3 decides.
+					cross_tmp = in.src[0].tmp_src;
+					have_row[2] = true;
+				}
+			}
+
+			if (!have_row[0] || !have_row[1] || !have_row[2])
+			{
+				return refuse("dp3-triple-incomplete");
+			}
+
+			if (out.row_slot[0] == out.row_slot[1])
+			{
+				return refuse("dp3-rows-same-slot");
+			}
+
+			// 3. Prove the z row really is cross(cA,cB): a MAD into the temp the z DP3 read, over
+			//    the same two row slots, with the second product negated. Without the negate this
+			//    is a sum and the basis would be mirrored, so a miss here is a refusal, not a
+			//    downgrade.
+			for (u32 i = 0; i < mad_at; ++i)
+			{
+				const decoded_instr& in = prog[i];
+
+				if (in.d1.vec_opcode != RSX_VEC_OPCODE_MAD || in.d0.dst_tmp != cross_tmp || vec_writemask(in) != 0x7)
+				{
+					continue;
+				}
+
+				const bool over_row_slot = (in.d1.const_src == out.row_slot[0]) || (in.d1.const_src == out.row_slot[1]);
+
+				if (over_row_slot && in.src[2].neg && in.src[2].reg_type == RSX_VP_REGISTER_TYPE_TEMP)
+				{
+					out.found = true;
+					out.reason = "ok";
+					return true;
+				}
+			}
+
+			return refuse("cross-not-proven");
 		}
 
 		// Which input attribute the ucode writes into output register 'output' xy. This is the
@@ -1974,6 +2262,97 @@ namespace remix_rsx
 			return resolved_any;
 		}
 
+		void prune_dead_writers(const program_walker& prog, u32 temp, u32 demand, const std::vector<writer_ref>& in, std::vector<writer_ref>& out);
+
+		// Whether every constant this program reads through the address register resolves to the same
+		// constant for every vertex. See vp_fingerprint::indexed_addr_uniform for the shape and for
+		// the two Resistance 2 programs that have it - the pair match_indexed_affine's census below
+		// counts as "2 index a single non-matrix row off a *constant*".
+		void scan_uniform_address(const program_walker& prog, vp_fingerprint& out)
+		{
+			u32 arl = umax;
+
+			for (u32 i = 0; i < static_cast<u32>(prog.size()); ++i)
+			{
+				if (prog[i].d1.vec_opcode != RSX_VEC_OPCODE_ARL)
+				{
+					continue;
+				}
+
+				if (arl != umax)
+				{
+					// Two ARLs are two uniform values, and which of them a given read used is a
+					// question this does not answer. Refused rather than guessed.
+					return;
+				}
+
+				arl = i;
+			}
+
+			if (arl == umax)
+			{
+				return;
+			}
+
+			const decoded_instr& load = prog[arl];
+
+			if (load.src[0].reg_type != RSX_VP_REGISTER_TYPE_CONSTANT || load.d3.index_const || is_conditional(load))
+			{
+				// An address loaded from an attribute is a real per-vertex palette and belongs to the
+				// skinning path; one loaded through the address register is self-referential.
+				return;
+			}
+
+			u32 component = 0;
+
+			if (!is_broadcast_swizzle(load.src[0], component))
+			{
+				// A per-component address vector would make the value depend on which component each
+				// read selects, and the ARL's write mask on top of that.
+				return;
+			}
+
+			const u32 addr_reg = u32{load.d0.dst_tmp} & 1u;
+			const index_audit audit = audit_indexing(prog, addr_reg, 0xf);
+
+			if (audit.arl_count != 1 || audit.foreign_reads != 0 || audit.indexed_reads == 0)
+			{
+				return;
+			}
+
+			// The span of base slots the program indexes, and the address components its reads
+			// select. A component the ARL did not write reads back as the register's initial zero,
+			// which is a different value than the one proven here.
+			u32 lo = umax;
+			u32 hi = 0;
+			u32 read_swz = 0;
+
+			for (u32 i = 0; i < static_cast<u32>(prog.size()); ++i)
+			{
+				const decoded_instr& in = prog[i];
+
+				if (in.d3.index_const && reads_constant(in))
+				{
+					lo = std::min(lo, u32{in.d1.const_src});
+					hi = std::max(hi, u32{in.d1.const_src});
+					read_swz |= 1u << (u32{in.d0.addr_swz} & 3);
+				}
+			}
+
+			if ((vec_writemask(load) & read_swz) != read_swz)
+			{
+				return;
+			}
+
+			out.indexed_addr_uniform = true;
+			out.addr_const_slot = load.d1.const_src;
+			out.addr_const_component = component;
+			out.addr_index_abs = load.d0.src0_abs;
+			out.addr_index_negate = load.src[0].neg;
+			out.indexed_base_min = lo;
+			out.indexed_base_max = hi;
+		}
+
 		// The object-to-world step Resistance 2 (NPEA00431) writes for every one of its indexed
 		// programs, and the reason 1481510 of its draws were counted skin_unrecognised at ae94587:
 		//
@@ -2002,7 +2381,13 @@ namespace remix_rsx
 		// Everything it cannot account for is refused: every writer of the target has to be one of
 		// the four roles below, or the whole match fails. A writer this does not understand is a term
 		// applied to the position that the backend would then silently drop.
-		bool match_indexed_affine(const program_walker& prog, const walk_target& target, const std::vector<writer_ref>& writers, chain_result& out)
+		//
+		// The 16 that match write their rows into the register the translation then reads back;
+		// f56d765aa4ea4cb8 writes them into another one and lets the translation move them
+		// ('16:ADD>r1.xyz(c18.xyz, r0.xyz)' against 6ee02187fb587944's '17:ADD>r1.xyz(c18.xyz,
+		// r1.xyz)'), which is the same transform under a different register allocation and is what
+		// 'forward_temp' follows. See indexed_bias_reg_enabled for the pair side by side.
+		bool match_indexed_affine(const program_walker& prog, const walk_target& target, const std::vector<writer_ref>& writers, chain_result& out, u32 depth = 0)
 		{
 			if (target.is_output || writers.empty())
 			{
@@ -2022,6 +2407,10 @@ namespace remix_rsx
 
 			u32 bias_instr = umax;
 			u32 bias_slot = 0;
+
+			// Set when the translation reads a temp other than the one it writes: the rows are in
+			// that register, not this one.
+			u32 forward_temp = umax;
 
 			u32 w_slot = umax;
 			u32 w_component = 0;
@@ -2154,12 +2543,23 @@ namespace remix_rsx
 					if (k.neg || t.neg || in.d0.src0_abs
 						|| k.swz_x != 0 || k.swz_y != 1 || k.swz_z != 2
 						|| t.swz_x != 0 || t.swz_y != 1 || t.swz_z != 2
-						|| t.reg_type != RSX_VP_REGISTER_TYPE_TEMP
-						|| u32{t.tmp_src} != target.index)
+						|| t.reg_type != RSX_VP_REGISTER_TYPE_TEMP)
 					{
-						// A bias accumulated out of some *other* temp would mean the rows this
-						// matched are not the thing being translated.
 						return false;
+					}
+
+					if (u32{t.tmp_src} != target.index)
+					{
+						// The translation moves the rows out of the register they were built in
+						// instead of translating them in place. Same transform, different register
+						// allocation, so the rows are looked for in that register below - a bias
+						// accumulated out of a temp that holds no rows still fails there.
+						if (depth != 0 || !indexed_bias_reg_enabled())
+						{
+							return false;
+						}
+
+						forward_temp = t.tmp_src;
 					}
 
 					bias_instr = w.instr;
@@ -2169,6 +2569,65 @@ namespace remix_rsx
 
 				// Anything else writing the target is a term this cannot express.
 				return false;
+			}
+
+			if (forward_temp != umax)
+			{
+				// Only the translation and the homogeneous 1 belong to this register; the group
+				// itself is one hop back. Rows on both registers would be two halves of a matrix
+				// that never existed as one.
+				if (row_instr[0] != umax || have_source
+					|| prog.has_sca_writer(walk_target{ false, forward_temp }, bias_instr))
+				{
+					// The SCA test is the one find_chain applies to every target it walks: a scalar
+					// op writing the row register is a definition none of the roles below can see.
+					return false;
+				}
+
+				std::vector<u32> row_writers;
+				prog.collect_vec_writers(walk_target{ false, forward_temp }, row_writers, bias_instr);
+
+				std::vector<writer_ref> refs;
+				refs.reserve(row_writers.size());
+
+				for (const u32 i : row_writers)
+				{
+					refs.push_back(writer_ref{ i, vec_writemask(prog[i]) });
+				}
+
+				// Only the components the translation actually reads. Resistance 2's
+				// f56d765aa4ea4cb8 parks SSG(attr0.w) - the sign flag its index attribute packs -
+				// in the row register's w, and refusing the whole group over a component nothing
+				// downstream reads is the second half of why that program never matched.
+				std::vector<writer_ref> live;
+				prune_dead_writers(prog, forward_temp, 0x7, refs, live);
+
+				chain_result inner{};
+
+				if (live.empty() || !match_indexed_affine(prog, walk_target{ false, forward_temp }, live, inner, depth + 1))
+				{
+					return false;
+				}
+
+				if (inner.has_bias)
+				{
+					return false;
+				}
+
+				out = inner;
+				out.has_bias = true;
+				out.bias_slot = bias_slot;
+				out.bias_forwarded = true;
+
+				if (w_slot != umax)
+				{
+					out.w_slot = w_slot;
+					out.w_component = w_component;
+				}
+
+				// The homogeneous 1 is written on this register rather than the row one, so the
+				// three-row proof is completed here.
+				return out.rows == 4 || out.w_slot != umax;
 			}
 
 			u32 rows = 0;
@@ -2185,8 +2644,9 @@ namespace remix_rsx
 
 			// Three rows plus a proven w, or all four. A group holding x and z but not y counts 1
 			// here (the scan stops at the first gap) and is refused: it is not a matrix however its
-			// slots are laid out.
-			if (rows < 3 || (rows == 3 && w_slot == umax))
+			// slots are laid out. At depth the w is written on the register the translation lands
+			// in, so the caller completes the proof instead.
+			if (rows < 3 || (rows == 3 && w_slot == umax && depth == 0))
 			{
 				return false;
 			}
@@ -3948,6 +4408,25 @@ namespace remix_rsx
 
 		const program_walker prog(vp);
 
+		// Detected before any early return, and independently of the chain walk: this step sits
+		// between the bone palette and the outer group, so a program can carry it while still
+		// reporting 'innermost operand is not an attribute'. Purely recorded here - nothing reads
+		// these fields yet, see vp_fingerprint.
+		{
+			basis_affine_result basis{};
+			const bool matched = match_basis_affine(prog, basis);
+			result.basis_reason = basis.reason;
+
+			if (matched)
+			{
+				result.has_basis_affine = true;
+				result.basis_row_slot[0] = basis.row_slot[0];
+				result.basis_row_slot[1] = basis.row_slot[1];
+				result.basis_scale_slot = basis.scale_slot;
+				result.basis_bias_slot = basis.bias_slot;
+			}
+		}
+
 		// Read the texcoord attributes out of the ucode before any early return: a screen_space or
 		// unknown program still draws through composite_ui_draw, which resolves texcoords the same
 		// way. Once per program, not per draw - the fingerprint is cached by program hash.
@@ -3960,6 +4439,11 @@ namespace remix_rsx
 		}
 
 		slice_position(prog, 0, result.distinct_consts, result.chain_instructions, result.indexed_const);
+
+		if (result.indexed_const)
+		{
+			scan_uniform_address(prog, result);
+		}
 
 		if (result.chain_instructions == 0)
 		{
@@ -4023,6 +4507,7 @@ namespace remix_rsx
 				result.palette_bias_slot = chain.bias_slot;
 				result.palette_w_slot = chain.w_slot;
 				result.palette_w_component = chain.w_component;
+				result.palette_bias_forwarded = chain.bias_forwarded;
 
 				result.skin_blended = chain.blended;
 				result.blend_bones = chain.blend_bones;
@@ -4208,7 +4693,15 @@ namespace remix_rsx
 			// ...or with the same constant scale and bias spelled out as separate instructions,
 			// which is how Resistance 2 writes it. Tried last so a program that matches either of
 			// the older, tighter shapes keeps matching it.
-			if (const_affine_result affine{}; match_const_affine(prog, source.index, chain.first_instruction, affine))
+			// The reason is recorded whether or not the match succeeds - a refusal is the case the
+			// census exists to explain, and it is the only path that does not reach the assignments
+			// below. Recorded per hop, so what survives is the reason from the innermost operand
+			// the walk actually got to.
+			const_affine_result affine{};
+			const bool affine_matched = match_const_affine(prog, source.index, chain.first_instruction, affine);
+			result.affine_reason = affine.reason;
+
+			if (affine_matched)
 			{
 				result.has_const_affine = true;
 				result.affine_has_scale = affine.has_scale;
@@ -4382,6 +4875,66 @@ namespace remix_rsx
 		}
 
 		out = static_cast<u32>(truncated);
+		return true;
+	}
+
+	bool evaluate_uniform_address(const vp_fingerprint& fp, s32& out_offset)
+	{
+		out_offset = 0;
+
+		if (!fp.indexed_addr_uniform)
+		{
+			return false;
+		}
+
+		f32 slot[4]{};
+
+		if (!read_slot(fp.addr_const_slot, slot))
+		{
+			return false;
+		}
+
+		f32 v = slot[fp.addr_const_component];
+
+		// The ARL's own source modifiers, in the hardware's order: abs, then negate. The same
+		// order evaluate_bone_offset applies, and for the same reason - reading them the other way
+		// round selects a different constant row.
+		if (fp.addr_index_abs)
+		{
+			v = std::abs(v);
+		}
+
+		if (fp.addr_index_negate)
+		{
+			v = -v;
+		}
+
+		if (!std::isfinite(v))
+		{
+			return false;
+		}
+
+		// ARL truncates toward zero, and unlike a palette offset the result may legitimately be
+		// negative: it is an offset applied to a base slot, not a slot itself.
+		const f32 truncated = std::trunc(v);
+
+		if (std::abs(truncated) >= static_cast<f32>(s_legal_constant_slots))
+		{
+			return false;
+		}
+
+		const s32 offset = static_cast<s32>(truncated);
+
+		// Every read the program makes has to land inside the legal constants. An ARL this code
+		// read wrong shows up here as a row outside them, and a row outside them is garbage
+		// geometry rather than a refusal.
+		if (static_cast<s64>(fp.indexed_base_min) + offset < 0
+			|| static_cast<s64>(fp.indexed_base_max) + offset >= s_legal_constant_slots)
+		{
+			return false;
+		}
+
+		out_offset = offset;
 		return true;
 	}
 
@@ -5037,12 +5590,18 @@ namespace remix_rsx
 
 			const char comps[] = "xyzw";
 
-			fmt::append(out, "(%s%u.%c%c%c%c,%s%u.%c%c%c%c,%s%u.%c%c%c%c)",
-				source_kind(in.src[0]), u32{in.src[0].tmp_src},
+			// The '-' is SRC::neg, and it is not cosmetic: 'a.yzx*b.zxy + a.zxy*b.yzx' and
+			// 'a.yzx*b.zxy - a.zxy*b.yzx' are a sum and a cross product, and only the second is a
+			// rotation basis. Without this the two read identically here, so a matcher written
+			// against the printed slice would pick the wrong handedness and mirror the geometry.
+			const auto sign = [](const SRC& s) { return s.neg ? "-" : ""; };
+
+			fmt::append(out, "(%s%s%u.%c%c%c%c,%s%s%u.%c%c%c%c,%s%s%u.%c%c%c%c)",
+				sign(in.src[0]), source_kind(in.src[0]), u32{in.src[0].tmp_src},
 				comps[in.src[0].swz_x], comps[in.src[0].swz_y], comps[in.src[0].swz_z], comps[in.src[0].swz_w],
-				source_kind(in.src[1]), u32{in.src[1].tmp_src},
+				sign(in.src[1]), source_kind(in.src[1]), u32{in.src[1].tmp_src},
 				comps[in.src[1].swz_x], comps[in.src[1].swz_y], comps[in.src[1].swz_z], comps[in.src[1].swz_w],
-				source_kind(in.src[2]), u32{in.src[2].tmp_src},
+				sign(in.src[2]), source_kind(in.src[2]), u32{in.src[2].tmp_src},
 				comps[in.src[2].swz_x], comps[in.src[2].swz_y], comps[in.src[2].swz_z], comps[in.src[2].swz_w]);
 
 			fmt::append(out, "c%u", u32{in.d1.const_src});
@@ -5813,6 +6372,28 @@ namespace remix_rsx
 		return value != 0;
 	}
 
+	bool indexed_bias_reg_enabled()
+	{
+		static const bool value = env_flag(L"RPCS3_REMIX_INDEXEDBIASREG");
+		return value;
+	}
+
+	u32 indexed_uniform_mode()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_INDEXEDUNIFORM", 0);
+		return value;
+	}
+
+	bool basis_affine_enabled()
+	{
+		// env_u32 rather than env_flag: the useful setting is the off one, and env_flag cannot tell
+		// "set to 0" from "not set at all". On by default - a program that matches carries a proven
+		// orthonormal right-handed basis (match_basis_affine refuses anything it cannot prove is a
+		// cross product), and without it these draws reach the outer group unplaced.
+		static const u32 value = env_u32(L"RPCS3_REMIX_BASISAFFINE", 1);
+		return value != 0;
+	}
+
 	bool bone_blend_enabled()
 	{
 		// env_u32 rather than env_flag: the useful setting here is the *off* one, and env_flag
@@ -6026,8 +6607,20 @@ namespace remix_rsx
 		// maps bits 0..24 by name under a static_assert on InstanceCategories::Count == 25).
 		// Shipping it at 1 would therefore buy nothing and leave the backend needing a code
 		// change on the day the fork gains the bit, which is precisely when it should already
-		// be measured. RPCS3_REMIX_VIEWMODEL=0 restores 81af315 exactly.
+		// be measured. RPCS3_REMIX_VIEWMODEL=0 restores 81af315's *tagging* exactly; it no longer
+		// restores 81af315, because viewmodel_camera_mode does not consult this knob and decides
+		// the reference on its own. Both have to be 0 to get the old behaviour whole.
 		static const u32 value = env_u32(L"RPCS3_REMIX_VIEWMODEL", 2);
+		return value;
+	}
+
+	u32 viewmodel_camera_mode()
+	{
+		// Default 2 (transform). See the declaration for the replay that justifies it: at 148b467 a
+		// viewmodel draw was composed against the *world* camera's reference and came out with a
+		// basis of (0.491, 0.002, 1.150) - a 500x collapse on Y - which is what smears the arms
+		// across the screen. RPCS3_REMIX_VIEWMODELCAM=0 restores 148b467.
+		static const u32 value = env_u32(L"RPCS3_REMIX_VIEWMODELCAM", 2);
 		return value;
 	}
 

@@ -172,6 +172,25 @@ namespace remix_rsx
 		u32 affine_scale_slot = 0;
 		u8 affine_scale_component[3] = { 0, 1, 2 };
 		u32 affine_bias_slot = 0;
+		// Which match_const_affine test refused, kept whether or not the match succeeded. A dozen
+		// separate exits all read as 'affine=0' from the census, and "this decode is written in a
+		// shape the grammar does not cover" and "this program has no decode" want opposite fixes.
+		// String literal, so this is a borrowed pointer with static lifetime, never freed.
+		const char* affine_reason = "untried";
+
+		// The object placement R2's indexed-palette character programs apply between the bone
+		// palette and the outer group, which nothing expressed before:
+		//     pos = (dot(p,cA), dot(p,cB), dot(p,cross(cA,cB))) * cS.w + cS.xyz
+		// row_slot[0]=cA, row_slot[1]=cB, scale_slot=bias_slot=cS. See match_basis_affine.
+		//
+		// NOT YET APPLIED. per_draw_transform does not read these - the fields and the census line
+		// exist so the composed matrix can be checked against a drawn frame before it is allowed to
+		// move 82190 draws. Wiring it in is the next step, not this one.
+		bool has_basis_affine = false;
+		u32 basis_row_slot[2] = { 0, 0 };
+		u32 basis_scale_slot = 0;
+		u32 basis_bias_slot = 0;
+		const char* basis_reason = "untried";
 
 		// A 2D transform into HPOS.xy only. match_dp4_chain needs four writers, one per HPOS
 		// component, over four consecutive slots - which a 3D 4x4 always has. A 2D ortho does
@@ -267,6 +286,13 @@ namespace remix_rsx
 		u32 palette_w_slot = 0xffffffff;
 		u32 palette_w_component = 0;
 
+		// The group's rows were written into one register and moved into another by the post-matrix
+		// translation ('r1.xyz = c18.xyz + r0.xyz'), rather than translated in place. Same
+		// instructions, same constants, different register allocation - Resistance 2 (NPEA00431)
+		// writes both, and only the in-place form was expressible up to this change. Recorded so a
+		// program that resolves only through the relaxed rule is identifiable in a capture.
+		bool palette_bias_forwarded = false;
+
 		// The attribute component that feeds the address register, and how.
 		u32 bone_attribute = 0;
 		u32 bone_component = 0;
@@ -327,6 +353,29 @@ namespace remix_rsx
 		u32 distinct_consts = 0;
 		u32 chain_instructions = 0;
 		bool indexed_const = false;
+
+		// Every constant this program reads through the address register resolves to the *same*
+		// constant for every vertex of the draw, because the one ARL in the ucode loads the address
+		// from a constant slot rather than from an attribute. 'a' is then a draw-uniform value that
+		// can be read out of the transform constants at submit time, and c[K + a] is an ordinary
+		// constant read wearing an indexed encoding - there is no palette, so the indexed-const
+		// refusal's stated hazard (the palette silently not applied) cannot arise.
+		//
+		// Resistance 2 (NPEA00431) f7576a48e6289f83 and ba93cfebcefde22f are that shape:
+		//   3:ARL>r0.x(C0.wwww,...)c47i0     7:MUL>r1.xyz(C0.xyzx,T0.wwww,...)c52[a]i0
+		// The indexed read is a fixed direction the ucode scales by attr1.z, not a transform.
+		//
+		// addr_const_* is where the address comes from and how the ARL reads it (abs first, then
+		// negate, then truncate toward zero); indexed_base_* is the span of base slots the program
+		// indexes, so the resolved offset can be range-checked against every read rather than one.
+		bool indexed_addr_uniform = false;
+		u32 addr_const_slot = 0;
+		u32 addr_const_component = 0;
+		bool addr_index_abs = false;
+		bool addr_index_negate = false;
+		u32 indexed_base_min = 0;
+		u32 indexed_base_max = 0;
+
 		const char* note = "";
 		const char* skin_note = "";
 
@@ -758,6 +807,58 @@ namespace remix_rsx
 	// writemask or a non-unit stride for an indexed group. Off restores all three at once.
 	bool indexed_world_enabled();
 
+	// RPCS3_REMIX_INDEXEDBIASREG=1: let match_indexed_affine express an indexed group whose rows are
+	// written into one register and moved into another by the post-matrix translation, instead of
+	// requiring the translation to be in place. Default off, so the shape stays refused until a run
+	// says what it recovers.
+	//
+	// The counter that justified it is skin_unrecognised, 119357 draws on Resistance 2 (NPEA00431)
+	// in a 2m41s capture, every one of them through the indexed-const gate. f56d765aa4ea4cb8 is in
+	// that population and is instruction-for-instruction the program 6ee02187fb587944 - same mesh
+	// (vtx=174 idx=936, same bbox), same c18.w dequantisation, same c31/c32/c33 rows, same ATTR0.w
+	// index, same c18.xyz translation, same c8..c11 outer group - differing only in that its rows
+	// land in r0 and the translation moves them to r1:
+	//   6ee02187fb587944   8..10:DP4>r1.{zyx} c33/c32/c31[a]   17:ADD>r1.xyz(c18.xyz, r1.xyz)
+	//   f56d765aa4ea4cb8   7..9:DP4>r0.{zyx}  c33/c32/c31[a]   16:ADD>r1.xyz(c18.xyz, r0.xyz)
+	// The first resolves and draws; the second reports arch=fused "innermost operand is not an
+	// attribute" and every draw is refused. Same class as has_ortho2d, hpos_indirect and the ADD
+	// src2 operand scan: a structural assumption about how a transform is written rejecting a
+	// legitimate one.
+	//
+	// Nothing downstream is loosened. A program this matches still has to pass the indexing audit,
+	// resolve its bone index, and produce a palette entry that is affine with a usable basis before
+	// anything is drawn.
+	bool indexed_bias_reg_enabled();
+
+	// RPCS3_REMIX_INDEXEDUNIFORM: submit a draw whose indexed constant reads are provably the same
+	// constant for every vertex (vp_fingerprint::indexed_addr_uniform) instead of refusing it.
+	//   0  off - the behaviour this replaces (default).
+	//   1  release only programs whose matrix chain also reaches the vertex attribute.
+	//   2  release every program with a uniform address register.
+	//
+	// The counter that justified it is skin_unrecognised, 119357 draws on Resistance 2 (NPEA00431).
+	// Default off because proving the *index* uniform does not prove the *transform*: R2's two
+	// programs of this shape (f7576a48e6289f83, ba93cfebcefde22f) build their object-to-world step
+	// out of a constant basis - rows c47.xyz, c48.xyz and the cross product of the two, held in a
+	// temp - which no matcher here can express, so they come back arch=fused with the chain stopping
+	// at the camera group. Mode 1 refuses exactly those; mode 2 draws them at whatever the fused
+	// derivation gives, which is the wrong place. See indexed-const refusal in RemixGSRender.cpp.
+	u32 indexed_uniform_mode();
+
+	// RPCS3_REMIX_BASISAFFINE=0: stop applying the object placement match_basis_affine recognises,
+	// restoring the behaviour where R2's indexed-palette characters reached the outer group with no
+	// placement and landed at the camera group's origin - visible as the stalker and the tank
+	// floating in the air inside one another. On by default. This is the A/B for that symptom.
+	bool basis_affine_enabled();
+
+	// The concrete value of 'a' for this draw. Reads the address constant back out of the transform
+	// constants and applies the modifiers in the hardware's order - absolute value, then negate,
+	// then truncate toward zero (VertexProgramDecompiler.cpp:151-163 for the modifiers,
+	// RSX_VEC_OPCODE_ARL -> ivec4() for the truncate). False when the program's address is not
+	// uniform, the constant does not read back, or the offset moves one of the program's indexed
+	// reads outside the legal constants - which is what a mis-read ARL looks like from here.
+	bool evaluate_uniform_address(const vp_fingerprint& fp, s32& out_offset);
+
 	// RPCS3_REMIX_BONEBLEND=0: refuse every program that blends more than one palette entry per
 	// vertex, which is what the backend did up to and including ae94587. Measured there on
 	// Resistance 2 (NPEA00431): 16 vertex programs of this exact shape
@@ -1040,6 +1141,36 @@ namespace remix_rsx
 	// before it means anything. Mode 1 is there for the day that changes and the ratio needs
 	// reading before the image does.
 	u32 viewmodel_mode();
+
+	// RPCS3_REMIX_VIEWMODELCAM. Which reference per_draw_transform divides a viewmodel draw by.
+	//   0  off. Exactly 148b467: the world camera's reference, for every draw.
+	//   1  refuse. Viewmodel draws are counted and dropped, nothing else changes.
+	//   2  transform (default). A reference latched from the viewmodel population itself, with
+	//      refusal when none has been latched yet.
+	//
+	// viewmodel_mode() names the population; this decides what to do with it. They are separate
+	// knobs because the detection was measured at 148b467 and this was not.
+	//
+	// The fault, replayed on the G0 matrices dumped in bin\log\RPCS3.log (frame 4077, the capture
+	// that recorded vm_tagged=7986 of vm_considered=1851953). R2's active camera is arch=fused with
+	// has_reference, and the tagged programs dump as skinned_layered groups=1, so every one of them
+	// takes per_draw_transform's ref/outer branch:
+	//     world = fold_viewport_z(G0_draw, 0.2, 0) * inverse(fold_viewport_z(G0_camera, 1, 0))
+	// The two matrices do not carry the same projection. Recovered from those same dumps:
+	//     viewmodel  fovx 60.001  fovy 36.132  near 0.0900
+	//     world      fovx 72.000  fovy 44.634  near ~0.08
+	// so the composition never cancels. Evaluating it on the real numbers gives m[3][3] = -1077,
+	// and after :5135 divides that out the basis is (0.491, 0.002, 1.150) - Y crushed ~500x, i.e.
+	// the mesh flattened to a sheet - with a perspective residue of 0.029 and -0.068 sitting on
+	// the 0.02 affine tolerance. The translation survives: the replay puts it at
+	// [-4.03 15.24 -6.47] against the census line's origin=[-4.048 15.241 -6.4505], which is what
+	// proves the code really took this path with this reference. A correct origin and a collapsed
+	// basis is exactly a streak, and it swings with the melee animation because the bones move.
+	//
+	// Dividing the same draw by a *viewmodel* reference instead returns the identity to 1e-16
+	// (basis 1.000, 1.000, 1.000; translation 0), because the viewmodel programs all share one G0
+	// and the bones already carry the mesh into world space. That is the whole of the fix.
+	u32 viewmodel_camera_mode();
 
 	// Debug light knobs so a derived camera can be judged visually at all.
 	f32 debug_light_radius();
