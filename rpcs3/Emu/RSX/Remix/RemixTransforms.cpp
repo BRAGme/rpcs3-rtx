@@ -1752,40 +1752,11 @@ namespace remix_rsx
 
 					if (in.src[0].reg_type != RSX_VP_REGISTER_TYPE_INPUT)
 					{
-						// ...unless this is the placement MAD match_basis_affine already expresses:
-						// 'temp * cS.w + cS.xyz', both constants necessarily naming the same slot.
-						// It sits between the palette and the outer group and is applied separately
-						// in prepend_object_space, so the walk steps through it - the decode it is
-						// looking for is below it. On ba93cfeb/f7576a48 that decode is
-						//     9:MAD>r1.xyz(I0.xyzx,C0.wwww,T1.xyzx)c45i0
-						// and before this step-through the walk stopped one instruction short of it
-						// at the basis MAD and refused with 'mad-src0-not-input'.
-						//
-						// Gated on the same knob that applies the basis, so the two can never
-						// disagree about whether that step is handled: with the knob off nothing
-						// applies the placement, and stepping through it here would silently drop
-						// it from the transform rather than merely leaving it unexpressed.
-						const bool basis_shape =
-							in.src[0].reg_type == RSX_VP_REGISTER_TYPE_TEMP
-							&& in.src[1].reg_type == RSX_VP_REGISTER_TYPE_CONSTANT
-							&& in.src[2].reg_type == RSX_VP_REGISTER_TYPE_CONSTANT
-							&& in.src[1].swz_x == 3 && in.src[1].swz_y == 3 && in.src[1].swz_z == 3
-							&& is_identity_xyz_swizzle(in.src[2])
-							&& is_identity_xyz_swizzle(in.src[0])
-							&& !in.src[0].neg && !in.src[1].neg && !in.src[2].neg;
-
-						if (basis_shape && basis_affine_enabled())
-						{
-							if (sca_touches_xyz(in.src[0].tmp_src, chosen))
-							{
-								return refuse("basis-step-sca-xyz");
-							}
-
-							prog.collect_vec_writers(walk_target{ false, in.src[0].tmp_src }, writers, chosen);
-							cursor = chosen;
-							break;
-						}
-
+						// The placement MAD lands here. The walk does not try to cross it: the
+						// basis below it is three single-component DP3 writes, which this walk
+						// refuses as 'partial-xyz' by a rule worth keeping. match_basis_affine
+						// parses that whole construction already and hands its input temp to
+						// scan_vertex_program, which runs this matcher from there instead.
 						return refuse("mad-src0-not-input");
 					}
 
@@ -1863,6 +1834,12 @@ namespace remix_rsx
 			u32 row_slot[2] = { 0, 0 };
 			u32 scale_slot = 0;
 			u32 bias_slot = 0;
+			// The vertex the basis rotates - the other operand of the x-row DP3 - and the
+			// instruction it was read at. This is where the position decode lives, and handing it
+			// out is what lets the decode be found without teaching the generic chain walk to
+			// cross a basis it cannot represent.
+			u32 position_tmp = s_no_temp;
+			u32 position_before = 0;
 			const char* reason = "untried";
 		};
 
@@ -1949,14 +1926,37 @@ namespace remix_rsx
 				{
 					const u32 row = (mask == 0x1) ? 0u : 1u;
 
-					if (in.src[0].reg_type != RSX_VP_REGISTER_TYPE_CONSTANT
-						&& in.src[1].reg_type != RSX_VP_REGISTER_TYPE_CONSTANT)
+					bool row_has_const = false;
+					u32 rotated = s_no_temp;
+
+					for (u32 s = 0; s < 2; ++s)
+					{
+						if (in.src[s].reg_type == RSX_VP_REGISTER_TYPE_CONSTANT)
+						{
+							row_has_const = true;
+						}
+						else if (in.src[s].reg_type == RSX_VP_REGISTER_TYPE_TEMP)
+						{
+							rotated = in.src[s].tmp_src;
+						}
+					}
+
+					if (!row_has_const)
 					{
 						return refuse("dp3-row-not-const");
 					}
 
 					out.row_slot[row] = in.d1.const_src;
 					have_row[row] = true;
+
+					// The non-constant operand is the vertex being rotated, i.e. the palette-blended
+					// position - and the thing the decode is applied to. Taken from the x row; the
+					// y row reads the same temp, so either would do.
+					if (row == 0 && rotated != s_no_temp)
+					{
+						out.position_tmp = rotated;
+						out.position_before = i;
+					}
 				}
 				else if (mask == 0x4)
 				{
@@ -4458,6 +4458,36 @@ namespace remix_rsx
 				result.basis_row_slot[1] = basis.row_slot[1];
 				result.basis_scale_slot = basis.scale_slot;
 				result.basis_bias_slot = basis.bias_slot;
+
+				// The position decode sits below the basis, and the chain walk below cannot reach
+				// it: the basis rows are three single-component DP3 writes and that walk refuses a
+				// partial xyz write - correctly, since an axis produced somewhere it is not looking
+				// is exactly what it must not fold. So the search runs from the basis's own input
+				// instead, which is the temp the decode writes. On ba93cfeb/f7576a48 that lands
+				// directly on
+				//     9:MAD>r1.xyz(I0.xyzx,C0.wwww,T1.xyzx)c45i0
+				// and the MAD arm folds c45.w. Two earlier attempts taught the chain walk to step
+				// across the basis piece by piece; this replaces both, because the matcher that
+				// parses the basis already knows where it starts.
+				if (basis.position_tmp != s_no_temp)
+				{
+					const_affine_result decode{};
+					const bool decoded = match_const_affine(prog, basis.position_tmp, basis.position_before, decode);
+
+					result.affine_reason = decode.reason;
+
+					if (decoded)
+					{
+						result.has_const_affine = true;
+						result.affine_has_scale = decode.has_scale;
+						result.affine_has_bias = decode.has_bias;
+						result.affine_scale_slot = decode.scale_slot;
+						result.affine_scale_component[0] = decode.scale_component[0];
+						result.affine_scale_component[1] = decode.scale_component[1];
+						result.affine_scale_component[2] = decode.scale_component[2];
+						result.affine_bias_slot = decode.bias_slot;
+					}
+				}
 			}
 		}
 
@@ -4731,6 +4761,15 @@ namespace remix_rsx
 			// census exists to explain, and it is the only path that does not reach the assignments
 			// below. Recorded per hop, so what survives is the reason from the innermost operand
 			// the walk actually got to.
+			// Skipped entirely once the basis path has resolved the decode from the basis's own
+			// input: this walk cannot reach past a basis and would only overwrite a good result
+			// with its own 'partial-xyz' refusal.
+			if (result.has_const_affine)
+			{
+				reached_input = true;
+				break;
+			}
+
 			const_affine_result affine{};
 			const bool affine_matched = match_const_affine(prog, source.index, chain.first_instruction, affine);
 			result.affine_reason = affine.reason;
@@ -6323,6 +6362,14 @@ namespace remix_rsx
 		// env_u32 rather than env_flag, same reason texcoord_from_ucode gives: the useful setting is
 		// the off one.
 		static const u32 value = env_u32(L"RPCS3_REMIX_FPALBEDO", 1);
+		return value != 0;
+	}
+
+	bool sky_learn_dome_enabled()
+	{
+		// On by default and the useful setting is the off one, so env_u32 rather than env_flag -
+		// same reasoning fp_albedo_enabled gives.
+		static const u32 value = env_u32(L"RPCS3_REMIX_SKYLEARN", 1);
 		return value != 0;
 	}
 

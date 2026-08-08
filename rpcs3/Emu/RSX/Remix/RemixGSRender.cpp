@@ -6688,6 +6688,37 @@ void RemixGSRender::submit_subdraw()
 			is_sky = true;
 		}
 
+		// --- learned-dome rule ---------------------------------------------------------------
+		// A tessellated dome is not one draw, it is a stack of latitude bands, and only the
+		// widest of them clears sky_min_extent(). Haze's (vp=fc0fac8afccec49a, radius 5000) is
+		// three or more: the horizon band spans [-5000 0 -5000]..[5000 398 5000] (extent 10000,
+		// tagged), then [y 4939..4984] at extent 1558, then the zenith cap [y 4984..5000] at
+		// extent 797. Lowering the floor only moves the cut - measured directly: at minext=2000
+		// the refusal is the 1558 band, at minext=1200 it is the 797 cap. Every ring is the same
+		// vertex program, camera-locked (origin=[0 0 0]), depth-write-off and materialless, so
+		// the program is the discriminator the extent cannot be.
+		//
+		// Same shape as the SKYHASH rule - learn an identity from draws that already passed on
+		// their own, then admit its siblings - but keyed on the vertex program instead of the
+		// albedo hash, because a vertex-coloured dome has albedo=0 and SKYHASH structurally
+		// cannot see it. The guards are what keep this from generalising into world geometry: a
+		// ring must come from an armed program, write no depth, resolve no material, and still
+		// have failed *only* on extent. Anything that writes depth or binds a texture is refused
+		// by the rule above and never reaches here.
+		if (is_sky && m_current_vp_hash)
+		{
+			m_sky_dome_programs.insert(m_current_vp_hash);
+		}
+		else if (outcome == sky_outcome::reject_extent
+			&& remix_rsx::sky_learn_dome_enabled()
+			&& !material
+			&& m_current_vp_hash
+			&& m_sky_dome_programs.count(m_current_vp_hash) != 0)
+		{
+			is_sky = true;
+			++m_stats.sky_learned_ring;
+		}
+
 		// --- backdrop rule, evaluated independently of everything above ---------------------
 		// R2's visible backdrop is refused twice over by the dome rule: it writes depth, and its
 		// origin is 82 units from the eye. Relaxing either gate on its own does not reach it, and
@@ -8079,7 +8110,7 @@ void RemixGSRender::log_stats()
 		"wext_median=%.6g wext_samples=%llu wext_max=%.6g wext_drawn=%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu | "
 		"skip_lighting_pass=%llu | "
 		"cat_sky=%llu sky_cand=%llu sky_noworld=%llu sky_extent=%llu sky_anchor=%llu sky_anchor_held=%llu sky_census=%u "
-		"sky_backdrop_hit=%llu sky_backdrop_dw=%llu sky_backdrop_mode=%u | "
+		"sky_backdrop_hit=%llu sky_backdrop_dw=%llu sky_backdrop_mode=%u sky_learned_ring=%llu | "
 		"skyhash_considered=%llu skyhash_dome=%llu skyhash_matched=%llu skyhash_tagged=%llu "
 		"skyhash_rejected=%llu skyhash_tracked=%llu skyhash_census=%u skyhash_mode=%u | "
 		"vm_tagged=%llu vm_considered=%llu vm_fullrange=%llu vm_offset=%llu vm_far=%llu vm_noanchor=%llu "
@@ -8193,6 +8224,7 @@ void RemixGSRender::log_stats()
 		m_stats.sky_backdrop_hit,
 		m_stats.sky_backdrop_dw,
 		remix_rsx::sky_backdrop_mode(),
+		m_stats.sky_learned_ring,
 		m_stats.sky_hash_considered,
 		m_stats.sky_hash_dome,
 		m_stats.sky_hash_matched,

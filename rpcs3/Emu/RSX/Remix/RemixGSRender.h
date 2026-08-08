@@ -466,6 +466,12 @@ private:
 		u64 sky_refused_extent = 0;
 		u64 sky_refused_anchor = 0;
 
+		// Latitude bands of an already-recognised dome, admitted by the learned-dome rule after
+		// failing on extent alone. Reads against sky_refused_extent: on a title whose dome is one
+		// draw this stays 0, and on Haze it should absorb most of that population. High here with
+		// no visible sky improvement means the rule is admitting something that is not a ring.
+		u64 sky_learned_ring = 0;
+
 		// The subset of sky_refused_anchor measured against a *held* camera - a frame that resolved
 		// no candidate of its own and reused the previous frame's (m_camera_age != 0). Those are the
 		// only frames on which the anchor can be measured against a camera that is not the one the
@@ -1168,6 +1174,13 @@ private:
 
 	std::unordered_map<u64, remix_rsx::vp_fingerprint> m_vp_fingerprints;
 	std::unordered_map<u64, remix_rsx::fp_fingerprint> m_fp_fingerprints;
+	// Vertex programs that have produced a sky-tagged draw on their own merits. A tessellated
+	// dome's narrower latitude bands are then admitted by sky_learn_dome_enabled() even though
+	// their extent alone would refuse them. Armed only, never disarmed: a program that draws a
+	// dome does not later draw a wall, and the per-draw guards (no depth write, no material,
+	// refused on extent alone) carry the real weight.
+	std::unordered_set<u64> m_sky_dome_programs;
+
 	std::unordered_set<u64> m_vp_dumped;
 	std::unordered_set<u64> m_fp_dumped;
 	std::unordered_set<u64> m_dumped_textures;

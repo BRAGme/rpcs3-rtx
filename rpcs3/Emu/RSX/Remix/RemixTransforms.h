@@ -716,6 +716,14 @@ namespace remix_rsx
 	// default; the bisect knob for reading the colour source out of the fragment program.
 	bool fp_albedo_enabled();
 
+	// RPCS3_REMIX_SKYLEARN: admit the narrower latitude bands of a dome whose vertex program has
+	// already produced a sky-tagged draw. A tessellated dome is a stack of bands and only the
+	// widest clears sky_min_extent(); Haze's radius-5000 dome measures 10000 / 1558 / 797 across
+	// three of them, so lowering the floor only moves the cut instead of closing it. Guarded to
+	// draws that come from an armed program, write no depth, resolve no material, and failed on
+	// extent alone. On by default; `0` restores extent-only. Counter: sky_learned_ring.
+	bool sky_learn_dome_enabled();
+
 	// RPCS3_REMIX_RETRYUNSUP: let the albedo unit walk step past a unit that bind() refused for a
 	// permanent format reason, instead of stopping on fp_albedo_enabled's guard. That guard exists
 	// to stop a normal map being substituted for a diffuse map, which cannot be what is happening
