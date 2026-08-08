@@ -147,10 +147,10 @@ which is not the same as broken.
   checking against a drawn frame first.
 - **Lighting is largely the path tracer's, not the game's.** Reconstructing PS3 light sources is
   not attempted.
-- **A binary build is available** -- see [Releases](https://github.com/BRAGme/rpcs3-rtx/releases),
-  marked prerelease because everything above is still true of it. It ships neither the Remix Plus
-  runtime nor PS3 firmware; the zip's `SETUP.txt` says where to get both. Building from source is
-  still documented below, and the packaging list is `tools/package-release.sh`.
+- **A binary build is available** -- see [Releases](https://github.com/BRAGme/rpcs3-rtx/releases).
+  Everything above is still true of it: it is a research build, not a finished one. It ships neither
+  the Remix Plus runtime nor PS3 firmware; the zip's `SETUP.txt` says where to get both. Building
+  from source is still documented below, and the packaging list is `tools/package-release.sh`.
 
 ---
 
