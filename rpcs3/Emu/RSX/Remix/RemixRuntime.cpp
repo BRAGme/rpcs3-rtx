@@ -28,9 +28,12 @@
 //                   For this exact binary log_dll_identity prints
 //                   "size=240655872 fnv1a=4567ee3a10da2838", so a run's log line can be
 //                   compared against this block character for character, with no rehashing
-//                   and no access to the build tree. FNV-1a is not collision-resistant and is
-//                   only meant to answer "is this the binary the comment describes"; the
-//                   SHA-256 above stays the identity for anything stronger. Built from a dirty
+//                   and no access to the build tree. Both values are mirrored below in
+//                   vendored_runtime_size / vendored_runtime_fnv1a, which warn at load if the
+//                   DLL is a different one -- change them here and there in the same commit.
+//                   FNV-1a is not collision-resistant and is only meant to answer "is this the
+//                   binary the comment describes"; the SHA-256 above stays the identity for
+//                   anything stronger. Built from a dirty
 //                   tree (12 files modified, none of them remix_c.h or the API implementation,
 //                   so the surface still matches the header above), which means the commit
 //                   alone does not reproduce it -- identify the binary by hash.
@@ -108,6 +111,12 @@ namespace remix_rsx
 			return result;
 		}
 
+		// The runtime described by the provenance block at the top of this file. Kept next to the
+		// check that uses them so the two cannot drift apart; both must be updated whenever
+		// bin\remix\ is redeployed, in the same commit as the re-vendored remix_c.h.
+		constexpr u64 vendored_runtime_size  = 240655872;
+		constexpr u64 vendored_runtime_fnv1a = 0x4567ee3a10da2838;
+
 		// Identity of the DLL actually loaded, so a report can say which binary produced a run.
 		void log_dll_identity(const std::wstring& path)
 		{
@@ -130,6 +139,17 @@ namespace remix_rsx
 			}
 
 			rsx_log.notice("Remix: runtime DLL '%s' size=%llu fnv1a=%016llx", narrow_path, size, static_cast<u64>(hash));
+
+			if (size != vendored_runtime_size || static_cast<u64>(hash) != vendored_runtime_fnv1a)
+			{
+				// Deliberately not fatal. An incompatible ABI is already rejected by the version
+				// gate in initialize(), and pointing RPCS3_REMIX_DLL at another build is a thing
+				// worth doing. This covers only what the gate cannot see: a runtime on the same
+				// API minor whose interface layout has moved out from under the vendored header.
+				rsx_log.warning("Remix: runtime DLL is not the build this source was vendored against "
+					"(expected size=%llu fnv1a=%016llx) -- header and runtime may have come apart",
+					vendored_runtime_size, vendored_runtime_fnv1a);
+			}
 		}
 	}
 
