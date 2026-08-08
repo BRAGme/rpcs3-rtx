@@ -1268,6 +1268,8 @@ private:
 	s32 m_pick_x = 0;
 	s32 m_pick_y = 0;
 	bool m_pick_button_down = false;
+	bool m_pick_slot_warned = false;
+	bool m_pick_request_warned = false;
 
 	// Ctrl+Click in the game window, polled once per flip. Deliberately not routed through
 	// rpcs3's input system: that would mean touching a pad handler, and the mouse is not

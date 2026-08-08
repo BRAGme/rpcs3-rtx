@@ -654,6 +654,31 @@ void RemixGSRender::pick_callback(const u32* values, u32 count, void* user)
 
 	std::lock_guard lock(self->m_pick_mutex);
 
+	// Logged before anything is filtered, because "the callback never fired" and "it fired and
+	// every pixel read 0" and "it fired and the values are past the end of the table" are three
+	// different faults with one symptom - no output at all - and guessing between them costs a
+	// run each. nonzero=0 means the runtime is not writing objectPickingValue for our instances;
+	// max past 'table' means the snapshot is the wrong frame's.
+	u32 nonzero = 0;
+	u32 highest = 0;
+
+	for (u32 i = 0; i < count; ++i)
+	{
+		nonzero += (values[i] != 0) ? 1 : 0;
+		highest = std::max(highest, values[i]);
+	}
+
+	{
+		const std::string line = fmt::format(
+			"Remix pick-readback: count=%u nonzero=%u max=%u table=%llu",
+			count, nonzero, highest, static_cast<u64>(self->m_pick_snapshot.size()));
+
+		if (fs::file out{ fs::get_executable_dir() + "remix_dump.log", fs::write + fs::create + fs::append })
+		{
+			out.write(line + '\n');
+		}
+	}
+
 	// Distinct values only. A rect a few pixels across over one surface reads the same value
 	// many times, and the interesting case - two surfaces stacked at the cursor - is exactly
 	// what the duplicates would bury.
@@ -712,6 +737,19 @@ void RemixGSRender::poll_pick_request()
 
 	if (!api.pick_RequestObjectPicking)
 	{
+		// Once: a runtime without the slot can never answer a click, and silently doing nothing
+		// looks identical to a click that missed.
+		if (!m_pick_slot_warned)
+		{
+			m_pick_slot_warned = true;
+			rsx_log.error("Remix: pick_RequestObjectPicking is null - runtime too old for click-to-identify");
+
+			if (fs::file out{ fs::get_executable_dir() + "remix_dump.log", fs::write + fs::create + fs::append })
+			{
+				out.write(std::string("Remix pick: unavailable (pick_RequestObjectPicking is null)\n"));
+			}
+		}
+
 		return;
 	}
 
@@ -724,14 +762,40 @@ void RemixGSRender::poll_pick_request()
 	{
 		POINT pt{};
 
-		if (GetCursorPos(&pt) && ScreenToClient(m_frame->handle(), &pt))
+		const HWND hwnd = m_frame->handle();
+		RECT client{};
+
+		if (GetCursorPos(&pt) && ScreenToClient(hwnd, &pt) && GetClientRect(hwnd, &client))
 		{
 			m_pick_x = pt.x;
 			m_pick_y = pt.y;
 			m_pick_frames_left = 8;
 
-			std::lock_guard lock(m_pick_mutex);
-			m_pick_snapshot = m_pick_table;
+			usz table = 0;
+			{
+				std::lock_guard lock(m_pick_mutex);
+				m_pick_snapshot = m_pick_table;
+				table = m_pick_snapshot.size();
+			}
+
+			// The click itself is reported, separately from any readback. Without this a click
+			// that was never seen - wrong window, cursor owned by the dev menu, Ctrl not held -
+			// is indistinguishable from one that was seen and found nothing, and the pixelRegion
+			// is documented against the *output* size while these are client pixels, so the
+			// client extent is printed to make a scaling mismatch visible rather than inferred.
+			const std::string line = fmt::format(
+				"Remix pick: click at %d,%d client=%dx%d table=%llu",
+				m_pick_x, m_pick_y,
+				static_cast<s32>(client.right - client.left),
+				static_cast<s32>(client.bottom - client.top),
+				static_cast<u64>(table));
+
+			rsx_log.success("%s", line);
+
+			if (fs::file out{ fs::get_executable_dir() + "remix_dump.log", fs::write + fs::create + fs::append })
+			{
+				out.write(line + '\n');
+			}
 		}
 	}
 
@@ -755,7 +819,20 @@ void RemixGSRender::poll_pick_request()
 		m_pick_x + radius,
 		m_pick_y + radius };
 
-	api.pick_RequestObjectPicking(&region, &RemixGSRender::pick_callback, this);
+	const u32 status = api.pick_RequestObjectPicking(&region, &RemixGSRender::pick_callback, this);
+
+	if (status != REMIXAPI_ERROR_CODE_SUCCESS && !m_pick_request_warned)
+	{
+		m_pick_request_warned = true;
+
+		const std::string line = fmt::format("Remix pick: request rejected (%s)", remix_rsx::error_name(status));
+		rsx_log.error("%s", line);
+
+		if (fs::file out{ fs::get_executable_dir() + "remix_dump.log", fs::write + fs::create + fs::append })
+		{
+			out.write(line + '\n');
+		}
+	}
 }
 
 void RemixGSRender::flip(const rsx::display_flip_info_t& info)
