@@ -8405,7 +8405,12 @@ void RemixGSRender::dump_vertex_program(u32 first_vertex, u32 vertex_count, u32 
 		// are exactly the draws a knob can switch off, which made the matcher's result unreadable
 		// in the first run that tried it. This fires at fingerprint time, so it reports whether
 		// match_basis_affine matched for every program regardless of what happens to the draw.
-		"Remix dump vp=%016llx arch=%s(%s) groups=%u input=%d prescale=%d(c%u.%u,c%u) basis=%d(c%u,c%u,c%u:%s) consts=%u slice=%u ucode=%u inputs=0x%x | "
+		// The affine reason is on this line as well as on 'world-refused', because that line is only
+		// emitted for a draw the world-extent census actually refused. A program whose decode does
+		// not match but which resolves a camera and passes the extent test never appears there, so
+		// its 'prescale=0' had no reason attached anywhere - which is exactly the population this
+		// instrument was added to explain. This line is per unique vertex program and unconditional.
+		"Remix dump vp=%016llx arch=%s(%s) groups=%u input=%d prescale=%d(c%u.%u,c%u:%s) basis=%d(c%u,c%u,c%u:%s) consts=%u slice=%u ucode=%u inputs=0x%x | "
 		"vtx=%u idx=%u prim=%u bbox=[%.4g %.4g %.4g]..[%.4g %.4g %.4g] | "
 		"vp_scale_z=%.6g vp_offset_z=%.6g clip=%ux%u depth_test=%d depth_write=%d blend=%d cull=%d |%s",
 		vp_hash,
@@ -8417,6 +8422,7 @@ void RemixGSRender::dump_vertex_program(u32 first_vertex, u32 vertex_count, u32 
 		fp.prescale_scale_slot,
 		fp.prescale_scale_component,
 		fp.prescale_bias_slot,
+		fp.affine_reason,
 		fp.has_basis_affine ? 1 : 0,
 		fp.basis_row_slot[0],
 		fp.basis_row_slot[1],
