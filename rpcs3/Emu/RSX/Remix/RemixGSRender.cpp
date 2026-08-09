@@ -532,15 +532,32 @@ namespace
 	// still occlude. The table is mirrored here so the census can name the pair the runtime is
 	// dropping rather than leave it to be inferred from the picture.
 	//
-	// ONE/ZERO is deliberately false: the runtime calls it the "Opaque Alias" and disables
-	// blending for it on purpose (:717-719). It is this backend's own rest state, so it is the
-	// one false that means "correctly opaque" rather than "silently dropped", and the census
-	// keys it separately.
-	bool runtime_keeps_blend(u32 src, u32 dst, u32 op)
+	// Three outcomes, not two. The first version of this returned a bool and counted ONE/ZERO as
+	// a rejection, which put 5921 perfectly correct draws into blend_rtopaque and would have
+	// buried a real rejection had there been one.
+	enum class blend_verdict
 	{
+		kept,          // survives as a translucent, colour or emissive blend
+		opaque_alias,  // ONE/ZERO/ADD - the runtime disables blending on purpose (:717-719)
+		dropped,       // translated fine, not in the table, silently raytraced opaque
+	};
+
+	blend_verdict classify_blend(u32 src, u32 dst, u32 op)
+	{
+		// ONE/ZERO/ADD is also bit-for-bit the RSX reset state (rsx_methods.cpp:339-341:
+		// SFACTOR 0x10001, DFACTOR 0x0, EQUATION 0x80068006), so this arm covers both "the game
+		// asked for a no-op blend" and "the game enabled blending without ever setting a
+		// factor". The runtime is right to call either opaque; what the two cases mean for a
+		// draw that should have been translucent is a question for the per-draw line, not for
+		// a counter of runtime rejections.
+		if (op == 0 && src == 1 && dst == 0)
+		{
+			return blend_verdict::opaque_alias;
+		}
+
 		if (op != 0) // VK_BLEND_OP_ADD; MIN/MAX/SUBTRACT all reach :805-807
 		{
-			return false;
+			return blend_verdict::dropped;
 		}
 
 		switch ((src << 8) | dst)
@@ -561,11 +578,25 @@ namespace
 		case (4u << 8) | 0u: // DST_COLOR / ZERO                  multiplicative
 		case (0u << 8) | 2u: // ZERO / SRC_COLOR                  multiplicative
 		case (4u << 8) | 2u: // DST_COLOR / SRC_COLOR             double multiplicative
-			return true;
+			return blend_verdict::kept;
 		default: break;
 		}
 
-		return false;
+		return blend_verdict::dropped;
+	}
+
+	// "6/7/0" reads as SRC_ALPHA / ONE_MINUS_SRC_ALPHA / ADD. Suffixed with what the runtime
+	// will do with it so the pair does not have to be looked up against the table by hand.
+	const char* blend_verdict_mark(blend_verdict v)
+	{
+		switch (v)
+		{
+		case blend_verdict::kept:         return "";
+		case blend_verdict::opaque_alias: return "~";
+		case blend_verdict::dropped:      return "*";
+		}
+
+		return "?";
 	}
 }
 
@@ -7830,7 +7861,10 @@ void RemixGSRender::submit_subdraw()
 				// whether or not they survive.
 				census_blend(blend_state.srcColorBlendFactor, blend_state.dstColorBlendFactor, blend_state.colorBlendOp);
 
-				if (!runtime_keeps_blend(blend_state.srcColorBlendFactor, blend_state.dstColorBlendFactor, blend_state.colorBlendOp))
+				// Only a genuine rejection counts. The opaque alias is the runtime agreeing with
+				// the draw, not overruling it.
+				if (classify_blend(blend_state.srcColorBlendFactor, blend_state.dstColorBlendFactor, blend_state.colorBlendOp)
+					== blend_verdict::dropped)
 				{
 					++m_stats.blend_runtime_opaque;
 				}
@@ -8737,6 +8771,25 @@ void RemixGSRender::dump_vertex_program(u32 first_vertex, u32 vertex_count, u32 
 			static_cast<u32>(rsx::method_registers.surface_depth_fmt()));
 	}
 
+	// The factor pair this program draws with, in the same src/dst/op form the stats census
+	// uses and carrying the same verdict mark. The run-wide census can say Resistance 2 uses
+	// four blend setups but not which one a given program lands on, and for a sprite that
+	// renders opaque when it should glow that is the entire question: an emissive pair here
+	// means blending is classified correctly and the fault is elsewhere, whereas the ONE/ZERO
+	// alias means the draw reached submission with the blend registers untouched.
+	std::string blend_note;
+	{
+		bool blend_mapped = true;
+
+		const u32 bsrc = vk_blend_factor_from_gcm(rsx::method_registers.blend_func_sfactor_rgb(), blend_mapped);
+		const u32 bdst = vk_blend_factor_from_gcm(rsx::method_registers.blend_func_dfactor_rgb(), blend_mapped);
+		const u32 bop = vk_blend_op_from_gcm(rsx::method_registers.blend_equation_rgb(), blend_mapped);
+
+		fmt::append(blend_note, "%u/%u/%u%s%s", bsrc, bdst, bop,
+			blend_verdict_mark(classify_blend(bsrc, bdst, bop)),
+			blend_mapped ? "" : "!");
+	}
+
 	const std::string line = fmt::format(
 		// 'basis' rides on the dump line rather than in per_draw_transform because the census that
 		// composes the matrix only runs for draws that survive the indexed-const gate - and those
@@ -8750,7 +8803,7 @@ void RemixGSRender::dump_vertex_program(u32 first_vertex, u32 vertex_count, u32 
 		// instrument was added to explain. This line is per unique vertex program and unconditional.
 		"Remix dump vp=%016llx arch=%s(%s) groups=%u input=%d prescale=%d(c%u.%u,c%u:%s) basis=%d(c%u,c%u,c%u:%s) consts=%u slice=%u ucode=%u inputs=0x%x | "
 		"vtx=%u idx=%u prim=%u bbox=[%.4g %.4g %.4g]..[%.4g %.4g %.4g] | "
-		"vp_scale_z=%.6g vp_offset_z=%.6g clip=%ux%u depth_test=%d depth_write=%d blend=%d cull=%d |%s",
+		"vp_scale_z=%.6g vp_offset_z=%.6g clip=%ux%u depth_test=%d depth_write=%d blend=%d(%s) cull=%d |%s",
 		vp_hash,
 		remix_rsx::archetype_name(fp.archetype),
 		fp.note,
@@ -8782,6 +8835,7 @@ void RemixGSRender::dump_vertex_program(u32 first_vertex, u32 vertex_count, u32 
 		rsx::method_registers.depth_test_enabled() ? 1 : 0,
 		rsx::method_registers.depth_write_enabled() ? 1 : 0,
 		rsx::method_registers.blend_enabled() ? 1 : 0,
+		blend_note,
 		rsx::method_registers.cull_face_enabled() ? 1 : 0,
 		groups);
 
@@ -8960,7 +9014,8 @@ void RemixGSRender::log_stats()
 	// Distinct blend setups the run has submitted, "src/dst/op=count", ordered by count so the
 	// dominant ones lead. A trailing * marks a pair calculateAlphaState() drops to opaque - that
 	// is the set worth reading, because those draws asked for blending, translated cleanly, and
-	// will still occlude. Factor numbers are Vulkan enum values (1=ONE, 6=SRC_ALPHA, ...).
+	// will still occlude. A trailing ~ is the ONE/ZERO opaque alias, which is correctly opaque
+	// and is not a rejection. Factor numbers are Vulkan enums (1=ONE, 6=SRC_ALPHA, ...).
 	std::string blend_pairs;
 	{
 		std::array<u32, s_max_blend_census> order{};
@@ -8981,7 +9036,7 @@ void RemixGSRender::log_stats()
 			const u32 op = key & 0xFFu;
 
 			fmt::append(blend_pairs, "%s%u/%u/%u=%llu%s", i ? " " : "", src, dst, op,
-				m_blend_census_count[order[i]], runtime_keeps_blend(src, dst, op) ? "" : "*");
+				m_blend_census_count[order[i]], blend_verdict_mark(classify_blend(src, dst, op)));
 		}
 
 		if (m_blend_census_overflow)

@@ -674,8 +674,13 @@ private:
 		// The lower bound the comment above asks for, measured instead of inferred: draws that
 		// translated cleanly (so blend_unmapped did not see them), reached the runtime with
 		// alphaBlendEnabled = 1, and will still be raytraced opaque because their factor pair is
-		// not in calculateAlphaState()'s table. blend_translucent - blend_runtime_opaque is the
-		// count that actually survives as translucent.
+		// not in calculateAlphaState()'s table.
+		//
+		// Excludes the ONE/ZERO opaque alias, which is the runtime agreeing with the draw rather
+		// than overruling it. The first version of this counter did not, and reported 5921 on a
+		// Resistance 2 run that had no genuine rejections at all - the game uses exactly four
+		// blend setups (ONE/ZERO, SRC_ALPHA/ONE_MINUS_SRC_ALPHA, ONE/ONE, SRC_ALPHA/ONE) and the
+		// table accepts every one of them. A non-zero value here now means a real rejection.
 		u64 blend_runtime_opaque = 0;
 	};
 
