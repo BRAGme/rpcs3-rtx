@@ -3752,11 +3752,13 @@ bool RemixGSRender::resolve_indexed_world(u32 first_vertex, u32 vertex_count, bo
 	// draws the whole mesh as a line.
 	if (!remix_rsx::is_affine(palette, s_world_affine_tolerance))
 	{
+		++m_bone_fail_counts[3];
 		return false;
 	}
 
 	if (!remix_rsx::has_usable_basis(palette, s_bone_basis_tolerance))
 	{
+		++m_bone_fail_counts[4];
 		++m_stats.bone_degenerate;
 		return false;
 	}
@@ -4900,7 +4902,7 @@ bool RemixGSRender::build_blend_skinning(u32 first_vertex, u32 vertex_count)
 					bone = remix_rsx::mat4_multiply(prescale, bone);
 				}
 
-				if (!remix_rsx::mat4_is_finite(bone) || !remix_rsx::is_affine(bone, s_world_affine_tolerance))
+				if (bone_rejected(bone))
 				{
 					++m_stats.skin_blend_refused_bone;
 					return false;
@@ -4912,6 +4914,7 @@ bool RemixGSRender::build_blend_skinning(u32 first_vertex, u32 vertex_count)
 				// character-as-a-collapsed-box artifact this whole gate exists to refuse.
 				if (!remix_rsx::has_usable_basis(bone, s_bone_basis_tolerance))
 				{
+					++m_bone_fail_counts[2];
 					++m_stats.bone_degenerate;
 					++m_stats.skin_blend_refused_bone;
 					return false;
@@ -5105,7 +5108,7 @@ bool RemixGSRender::build_skinning(u32 first_vertex, u32 vertex_count)
 
 			// A bone that is not a plain affine transform is not a bone; refusing it here is
 			// what keeps a mis-read palette from smearing geometry across the world.
-			if (!remix_rsx::mat4_is_finite(bone) || !remix_rsx::is_affine(bone, s_world_affine_tolerance))
+			if (bone_rejected(bone))
 			{
 				return false;
 			}
@@ -5387,6 +5390,45 @@ void RemixGSRender::update_camera_candidate()
 		m_frame_candidate.position[1] = view_to_world.m[3][1];
 		m_frame_candidate.position[2] = view_to_world.m[3][2];
 	}
+}
+
+// Splits the one condition that refused every bad bone into the three faults it actually
+// covers. The world gate taught this: fourteen exits behind one counter cost three sessions of
+// guessing, and the split answered it in one run. Here the three have unrelated causes - a
+// non-finite bone is arithmetic that already went wrong upstream, a perspective residue means
+// the bone was never an object-to-world matrix in the first place, and a collapsed basis is a
+// matrix that is affine and still draws the mesh as a line.
+//
+// The residue is bucketed for the same reason the world one is. Barrels are stable and skinned
+// meshes shake, so if the bone residues sit just over the tolerance this gate is refusing poses
+// it should accept and the fix is the same shape as AFFINETOL; if they are large, these are not
+// bone matrices and no tolerance will make them into any.
+bool RemixGSRender::bone_rejected(const remix_rsx::mat4& bone)
+{
+	if (!remix_rsx::mat4_is_finite(bone))
+	{
+		++m_bone_fail_counts[0];
+		return true;
+	}
+
+	if (!remix_rsx::is_affine(bone, s_world_affine_tolerance))
+	{
+		const f32 residue = std::abs(bone.m[0][3]) + std::abs(bone.m[1][3])
+			+ std::abs(bone.m[2][3]) + std::abs(bone.m[3][3] - 1.f);
+
+		m_bone_residue_max = std::max(m_bone_residue_max, residue);
+
+		++m_bone_residue_buckets[
+			residue < 0.05f ? 0 :
+			residue < 0.2f  ? 1 :
+			residue < 1.f   ? 2 :
+			residue < 10.f  ? 3 : 4];
+
+		++m_bone_fail_counts[1];
+		return true;
+	}
+
+	return false;
 }
 
 bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
@@ -8922,6 +8964,24 @@ void RemixGSRender::log_stats()
 			static_cast<u64>(m_meshes.size()),
 			m_stats.meshes_destroyed,
 			m_frame_counter);
+
+		std::string bones = fmt::format(
+			"Remix bone-fail: max=%.6g <0.05=%llu <0.2=%llu <1=%llu <10=%llu >=10=%llu |",
+			static_cast<f64>(m_bone_residue_max),
+			m_bone_residue_buckets[0], m_bone_residue_buckets[1], m_bone_residue_buckets[2],
+			m_bone_residue_buckets[3], m_bone_residue_buckets[4]);
+
+		for (usz i = 0; i < std::size(s_bone_fail_names); ++i)
+		{
+			fmt::append(bones, " %s=%llu", s_bone_fail_names[i], m_bone_fail_counts[i]);
+		}
+
+		bones += '\n';
+
+		if (fs::file out{ fs::get_executable_dir() + "remix_dump.log", fs::write + fs::create + fs::append })
+		{
+			out.write(bones);
+		}
 
 		std::string fails = fmt::format(
 			"Remix affine-residue: tol=%.4g max=%.6g <0.05=%llu <0.2=%llu <1=%llu <10=%llu >=10=%llu\n",

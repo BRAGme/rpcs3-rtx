@@ -1300,6 +1300,16 @@ private:
 
 	// How far past the affinity tolerance the refused draws actually sit. Buckets are
 	// <0.05, <0.2, <1, <10, >=10 against a tolerance of 0.02.
+	static constexpr const char* s_bone_fail_names[] = {
+		"nonfinite", "affine", "basis", "palette_affine", "palette_basis" };
+
+	u64 m_bone_fail_counts[std::size(s_bone_fail_names)] = {};
+	f32 m_bone_residue_max = 0.f;
+	u64 m_bone_residue_buckets[5] = {};
+
+	// True when this bone must not enter the blend, counting which of the three faults it was.
+	bool bone_rejected(const remix_rsx::mat4& bone);
+
 	f32 m_affine_residue_max = 0.f;
 	u64 m_affine_residue_buckets[5] = {};
 
