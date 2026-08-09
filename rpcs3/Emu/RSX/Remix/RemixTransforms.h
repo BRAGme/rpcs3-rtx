@@ -750,6 +750,13 @@ namespace remix_rsx
 	// which is the A/B against uv_scale_ucode / uv_scale_fixed.
 	bool texcoord_scale_temp_form();
 
+	// RPCS3_REMIX_UVSCALEMAD: also accept the scale when it is stated as a MAD - scale and bias in
+	// one instruction - rather than a bare MUL. Only src0*src1 is examined; src2 is the bias and is
+	// usually a constant too, so scanning it would make every MAD ambiguous. The bias is not
+	// applied, only the scale: a bias shifts the coordinate, a wrong scale tiles the texture.
+	// On by default; `0` restores MUL-only. Read the effect on uv_scale_fixed / uv_scale_ucode.
+	bool texcoord_scale_mad_form();
+
 	// RPCS3_REMIX_PICK: number every submitted instance and answer Ctrl+Click in the game window
 	// with the vertex-program hash, albedo hash and sky/viewmodel verdict of whatever is under the
 	// cursor, logged at 'Remix: picked'. Exists because Remix's own dev-menu picker is blank for

@@ -2194,7 +2194,16 @@ namespace remix_rsx
 					break;
 				}
 
-				if (in.d1.vec_opcode != RSX_VEC_OPCODE_MUL || in.d3.index_const)
+				// MAD is the third form, and the one carrying most of this title's texcoords:
+				// 'MAD o7.xy(attr, cScale, cBias)' states scale and bias in one instruction, so a
+				// program that biases its UVs at all never emits the bare MUL both passes above
+				// were looking for. Measured at 58% of S32K draws falling back to the fixed
+				// divisor in the later areas against 21% in the first, which is the same content
+				// drawn by programs that happen to bias.
+				const bool is_mad = in.d1.vec_opcode == RSX_VEC_OPCODE_MAD
+					&& texcoord_scale_mad_form();
+
+				if ((in.d1.vec_opcode != RSX_VEC_OPCODE_MUL && !is_mad) || in.d3.index_const)
 				{
 					continue;
 				}
@@ -2209,7 +2218,15 @@ namespace remix_rsx
 				u32 input_slot = umax;
 				u32 const_slot = umax;
 
-				for (u32 s = 0; s < 3; ++s)
+				// MAD computes src0 * src1 + src2. Only the product is the scale; src2 is the
+				// bias and is itself typically a constant, so scanning all three sources would
+				// find two constants and refuse the program as ambiguous - turning the form this
+				// is meant to recognise into a guaranteed refusal. The bias is not reproduced,
+				// for the reason the header already gives: a bias shifts the coordinate, a wrong
+				// scale tiles the texture, and only the second is what this exists to fix.
+				const u32 scan = is_mad ? 2u : 3u;
+
+				for (u32 s = 0; s < scan; ++s)
 				{
 					if (!(sources & (1u << s)))
 					{
@@ -6606,6 +6623,12 @@ namespace remix_rsx
 	bool texcoord_scale_temp_form()
 	{
 		static const u32 value = env_u32(L"RPCS3_REMIX_UVSCALETEMP", 1);
+		return value != 0;
+	}
+
+	bool texcoord_scale_mad_form()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_UVSCALEMAD", 1);
 		return value != 0;
 	}
 
