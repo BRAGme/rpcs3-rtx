@@ -64,6 +64,11 @@ private:
 		u64 skip_decode = 0;
 		u64 skip_poisoned = 0;
 		u64 skip_screen_space = 0;
+		// Draws that found their mesh already in the cache. Read against meshes_created: the ratio
+		// is how stable the geometry key is, and per-flip creations are the number that says whether
+		// Remix is seeing one object move or a new object every frame.
+		u64 meshes_reused = 0;
+
 		u64 meshes_created = 0;
 		u64 meshes_destroyed = 0;
 		u64 cam_resolved = 0;

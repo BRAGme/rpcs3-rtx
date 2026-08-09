@@ -6821,6 +6821,18 @@ void RemixGSRender::submit_subdraw()
 
 	auto it = m_meshes.find(hash);
 
+	if (it != m_meshes.end())
+	{
+		// The cache hit. Counted against meshes_created so the pair reads as a key-stability
+		// measure and not just a memory statistic: a scene drawn from stable geometry hits this
+		// on nearly every draw after the first frame, because the same object hashes to the same
+		// key every time it is submitted. Creations that keep pace with the draw count instead
+		// mean the key is churning - Remix is being handed brand new geometry every frame where
+		// it should be handed the same geometry moving, which is what the instance-coloured debug
+		// view showed as a ground plane that fragments and reassembles between frames.
+		++m_stats.meshes_reused;
+	}
+
 	if (it == m_meshes.end())
 	{
 		remixapi_MeshInfoSurfaceTriangles surface{};
@@ -8890,7 +8902,8 @@ void RemixGSRender::log_stats()
 		const std::string line = fmt::format(
 			"Remix live: seen=%llu submitted=%llu | uv_applied=%llu uv_scale_ucode=%llu uv_scale_fixed=%llu | "
 			"tex_bound=%llu tex_none=%llu | world_refused=%llu wext_refused=%llu | "
-			"cam_resolved=%llu cam_fallback=%llu cam_held=%llu world_refused_nocam=%llu",
+			"cam_resolved=%llu cam_fallback=%llu cam_held=%llu world_refused_nocam=%llu | "
+			"mesh_created=%llu mesh_reused=%llu mesh_live=%llu mesh_destroyed=%llu flips=%llu",
 			m_stats.draws_seen,
 			m_stats.draws_submitted,
 			m_stats.uv_applied,
@@ -8903,7 +8916,12 @@ void RemixGSRender::log_stats()
 			m_stats.cam_resolved,
 			m_stats.cam_fallback,
 			m_stats.cam_held,
-			m_stats.world_refused_nocam);
+			m_stats.world_refused_nocam,
+			m_stats.meshes_created,
+			m_stats.meshes_reused,
+			static_cast<u64>(m_meshes.size()),
+			m_stats.meshes_destroyed,
+			m_frame_counter);
 
 		std::string fails = fmt::format(
 			"Remix affine-residue: tol=%.4g max=%.6g <0.05=%llu <0.2=%llu <1=%llu <10=%llu >=10=%llu\n",
