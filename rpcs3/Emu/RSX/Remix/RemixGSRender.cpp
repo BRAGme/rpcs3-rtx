@@ -3912,6 +3912,12 @@ void RemixGSRender::audit_vertex_extent(u32 first_vertex, u32 vertex_count, cons
 
 	u32 zeros = 0;
 	u32 nonfinite = 0;
+	// Which vertex is the first at the origin, so the census can print its bytes as it already does
+	// for the worst-spread one. A subset pinned at exactly (0,0,0) while the rest of the mesh is
+	// thousands of units away is what draws a fan of slivers converging on the object origin, and
+	// 'zeros=1/269' alone cannot say whether the guest data really holds a zero there or whether the
+	// fetch produced one - which are opposite faults. umax means none.
+	u32 first_zero = umax;
 
 	for (u32 i = 0; i < vertex_count; ++i)
 	{
@@ -3924,6 +3930,11 @@ void RemixGSRender::audit_vertex_extent(u32 first_vertex, u32 vertex_count, cons
 		else if (p[0] == 0.f && p[1] == 0.f && p[2] == 0.f)
 		{
 			++zeros;
+
+			if (first_zero == umax)
+			{
+				first_zero = i;
+			}
 		}
 	}
 
@@ -4142,6 +4153,25 @@ void RemixGSRender::audit_vertex_extent(u32 first_vertex, u32 vertex_count, cons
 	remix_rsx::decode_position(positions.at(worst_vertex), positions.type, positions.size, decoded);
 	remix_rsx::decode_attribute_raw(positions.at(worst_vertex), positions.type, positions.size, raw_attr);
 
+	// Same treatment for the first origin-pinned vertex. All-zero bytes mean the guest buffer really
+	// holds a zero there (or the fetch read memory that was never written); non-zero bytes with a
+	// zero result mean the decode collapsed a real vertex, which is this backend's fault rather than
+	// the title's. The two want opposite fixes, and nothing printed so far distinguishes them.
+	std::string zero_bytes;
+	f32 zero_decoded[4] = {};
+
+	if (first_zero != umax && attr_bytes != 0)
+	{
+		const u8* zsrc = positions.at(first_zero);
+
+		for (u32 b = 0; b < attr_bytes && b < 16; ++b)
+		{
+			fmt::append(zero_bytes, "%02x", zsrc[b]);
+		}
+
+		remix_rsx::decode_position(zsrc, positions.type, positions.size, zero_decoded);
+	}
+
 	// Which decode the ucode applies before its first matrix, and the matrix it rebuilds to. This
 	// travels in the instance transform (or, for a blended rig, in the bone matrices), so it is not
 	// applied to the numbers above - but a draw whose decode cannot be read back is a draw whose
@@ -4180,6 +4210,7 @@ void RemixGSRender::audit_vertex_extent(u32 first_vertex, u32 vertex_count, cons
 	rsx_log.notice("Remix: vtx-spread frame=%llu vp=%016llx arch=%s vtx=%u ratio=%.4g worst=%.6g median=%.6g p90=%.6g "
 		"| zeros=%u/%u nonfinite=%u outliers=%u%s | centre=[%.6g %.6g %.6g]%s "
 		"| worst=v%u raw=%s decoded=[%.6g %.6g %.6g %.6g] stored=[%.6g %.6g %.6g %.6g] "
+		"| zero=v%d raw=%s decoded=[%.6g %.6g %.6g %.6g] "
 		"| attr0 type=%u size=%u stride=%u off=%u first_vertex=%u wdiv=%d | decode %s",
 		m_frame_counter,
 		m_current_vp_hash,
@@ -4197,6 +4228,9 @@ void RemixGSRender::audit_vertex_extent(u32 first_vertex, u32 vertex_count, cons
 		raw_bytes.empty() ? "?" : raw_bytes.c_str(),
 		static_cast<f64>(decoded[0]), static_cast<f64>(decoded[1]), static_cast<f64>(decoded[2]), static_cast<f64>(decoded[3]),
 		static_cast<f64>(raw_attr[0]), static_cast<f64>(raw_attr[1]), static_cast<f64>(raw_attr[2]), static_cast<f64>(raw_attr[3]),
+		(first_zero == umax) ? -1 : static_cast<s32>(first_zero),
+		zero_bytes.empty() ? "?" : zero_bytes.c_str(),
+		static_cast<f64>(zero_decoded[0]), static_cast<f64>(zero_decoded[1]), static_cast<f64>(zero_decoded[2]), static_cast<f64>(zero_decoded[3]),
 		static_cast<u32>(positions.type), positions.size, positions.stride, positions.offset,
 		first_vertex, w_divide ? 1 : 0,
 		decode);
