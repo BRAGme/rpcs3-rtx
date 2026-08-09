@@ -235,6 +235,7 @@ struct cfg_root : cfg::node
 			cfg::_bool cull_from_rsx{ this, "Use RSX Backface Culling", false };            // RPCS3_REMIX_CULL
 			cfg::_bool no_vertex_colour{ this, "Ignore Vertex Colours", false };            // RPCS3_REMIX_NOVCOL
 			cfg::_bool no_alpha_test{ this, "Ignore Alpha Test", false };                   // RPCS3_REMIX_NOALPHA
+			cfg::_bool smooth_normals{ this, "Generate Smooth Normals", false, true };      // RPCS3_REMIX_SMOOTHNORMALS
 			cfg::uint<0, 65536> render_target_verts{ this, "Post-process Quad Vertex Limit", 32 }; // RPCS3_REMIX_RTVERTS
 			cfg::_float<0, 1000000> sky_extent{ this, "Sky Detection Extent", 2000, true }; // RPCS3_REMIX_SKYEXTENT
 			cfg::uint<0, 1000000> mesh_cap{ this, "Live Mesh Cap", 0 };                     // RPCS3_REMIX_MESHCAP, 0 = uncapped

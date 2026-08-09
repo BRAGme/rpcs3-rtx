@@ -645,6 +645,9 @@ private:
 		u64 cat_hidden = 0;
 		u64 cat_particle = 0;
 		u64 cat_decal = 0;
+		// Not a hash-list category: this is the global "Generate Smooth Normals" toggle, so in a
+		// normal run it equals the number of world draws submitted rather than a subset of them.
+		u64 cat_smooth_normals = 0;
 
 		// Alpha blending, added after ae94587. blend_chained is every instance that carried a
 		// remixapi_InstanceInfoBlendEXT (i.e. every submitted draw while RPCS3_REMIX_BLENDSTATE

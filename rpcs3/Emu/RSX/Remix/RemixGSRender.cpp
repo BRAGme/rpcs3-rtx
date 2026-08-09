@@ -1427,12 +1427,22 @@ bool RemixGSRender::ensure_sun_light()
 
 u32 RemixGSRender::classify_draw(u64 albedo_hash)
 {
-	if (!albedo_hash || !remix_rsx::any_category_listed())
+	u32 flags = 0;
+
+	if (remix_rsx::smooth_normals_enabled())
 	{
-		return 0;
+		// Ahead of the hash-list gate below rather than inside it. This is a global toggle and has
+		// nothing to do with whether any texture category list is populated - behind that early
+		// return it would be silently dead for everyone who never filled one in, which is the
+		// default state.
+		flags |= REMIXAPI_INSTANCE_CATEGORY_BIT_SMOOTH_NORMALS;
+		++m_stats.cat_smooth_normals;
 	}
 
-	u32 flags = 0;
+	if (!albedo_hash || !remix_rsx::any_category_listed())
+	{
+		return flags;
+	}
 
 	if (remix_rsx::hash_in_category(remix_rsx::draw_category::sky, albedo_hash))
 	{
@@ -8625,7 +8635,7 @@ void RemixGSRender::log_stats()
 		"vmcam_considered=%llu vmcam_applied=%llu vmcam_fallback=%llu vmcam_refused=%llu "
 		"vmcam_diverted=%llu vmcam_unusable=%llu vmcam_conflict=%llu vmcam_latched=%llu vmcam_held=%llu "
 		"vmcam_census=%u vmcam_mode=%u | "
-		"cat_hidden=%llu cat_particle=%llu cat_decal=%llu | "
+		"cat_hidden=%llu cat_particle=%llu cat_decal=%llu cat_smoothnormals=%llu | "
 		"blend_chained=%llu blend_translucent=%llu blend_unmapped=%llu | "
 		"tex_bound=%llu tex_none=%llu tex_no_unit=%llu tex_unit_retry=%llu tex_albedo_ucode=%llu tex_albedo_guess=%llu tex_retry_refused=%llu tex_unit_substituted=%llu uv_applied=%llu uv_none=%llu uv_absent=%llu uv_layout=%llu uv_memory=%llu uv_fallback=%llu uv_ucode=%llu uv_heuristic=%llu uv_nonfinite=%llu vcol_applied=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_tombstone=%llu tex_rehashed=%llu tex_refreshed=%llu mat_created=%llu tex_retry_unsupported=%llu mat_untested=%llu uv_scale_ucode=%llu uv_scale_fixed=%llu | "
 		"ui_draws=%llu ui_skipped=%llu ui_no_colour=%llu ui_rt=%llu ui_prims=%llu ui_frames=%llu ui_ndc=%llu ui_unit=%llu ui_pixel=%llu ui_nospace=%llu ui_ortho2d=%llu "
@@ -8762,6 +8772,7 @@ void RemixGSRender::log_stats()
 		m_stats.cat_hidden,
 		m_stats.cat_particle,
 		m_stats.cat_decal,
+		m_stats.cat_smooth_normals,
 		m_stats.blend_chained,
 		m_stats.blend_translucent,
 		m_stats.blend_unmapped,

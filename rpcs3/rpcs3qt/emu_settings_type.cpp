@@ -141,6 +141,7 @@ const std::map<emu_settings_type, cfg_location> settings_location =
 	{ emu_settings_type::RemixCullFromRSX,                 get_cfg_location(local_cfg.video.remix.cull_from_rsx) },
 	{ emu_settings_type::RemixNoVertexColour,              get_cfg_location(local_cfg.video.remix.no_vertex_colour) },
 	{ emu_settings_type::RemixNoAlphaTest,                 get_cfg_location(local_cfg.video.remix.no_alpha_test) },
+	{ emu_settings_type::RemixSmoothNormals,               get_cfg_location(local_cfg.video.remix.smooth_normals) },
 	{ emu_settings_type::RemixRenderTargetVerts,           get_cfg_location(local_cfg.video.remix.render_target_verts) },
 	{ emu_settings_type::RemixSkyExtent,                   get_cfg_location(local_cfg.video.remix.sky_extent) },
 	{ emu_settings_type::RemixMeshCap,                     get_cfg_location(local_cfg.video.remix.mesh_cap) },

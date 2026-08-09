@@ -79,6 +79,7 @@ an `Emu/system_config.h` entry, the config default is what is listed.
 | `RPCS3_REMIX_INDEXEDUNIFORM` | `0` (off) | Submit a draw whose indexed constant reads are provably the same constant for every vertex. `0` off; `1` release only programs whose matrix chain also reaches the vertex attribute; `2` release every program with a uniform address register. | |
 | `RPCS3_REMIX_DRAWINDEXED` | off | Submit draws whose position chain really does read a constant through an address register instead of refusing them. Diagnostic -- the refusal exists because such a draw renders in its bind pose or torn across the map. | |
 | `RPCS3_REMIX_CULL` | off | Submit `doubleSided=0` for draws whose RSX cull state is enabled, instead of forcing every instance double-sided. Off by default because a wrong winding in the strip/fan/quad expansion turns a single-sided surface invisible. | yes |
+| `RPCS3_REMIX_SMOOTHNORMALS` | off | Tag every submitted world instance `SMOOTH_NORMALS`, which has Remix recompute the normal buffer on the GPU as an area-weighted average over the mesh's own triangles (`RtxGeometryUtils::dispatchSmoothNormals`, on BLAS build and update only). This backend never recovers the game's normals -- it submits a constant `(0,0,1)` on every vertex -- so with this off the whole scene is lit off one direction. Cheap here because that placeholder buffer already exists: `forceNormals` stays false, the interleaved fast path survives, and the compute pass overwrites in place. Read live. Counter: `cat_smoothnormals`. | yes |
 | `RPCS3_REMIX_MESHCAP` | `0` (uncapped) | Cap the live mesh-handle cache at N entries with LRU eviction. `0` leaves it unbounded, which is what the idle-frame rule alone gives. | yes |
 | `RPCS3_REMIX_MESHIDLE` | `300` | How many frames a mesh handle survives after the last draw that referenced it before `reap_idle_meshes` destroys it. Raising it trades residency against repeated BLAS builds. `0` reaps a mesh the first frame it goes unreferenced. | yes |
 | `RPCS3_REMIX_VTXSPREAD` | `64` | How many times the median a draw's furthest decoded vertex may sit from the draw's own median position before `audit_vertex_extent` reports it. `0` disables the pass. Diagnostic only. | |
@@ -145,6 +146,11 @@ does nothing for this backend.
 | `RPCS3_REMIX_CAT_HIDE` | empty | Tag the listed hashes HIDDEN. (IGNORE is a no-op for API draws and is not used.) | yes |
 | `RPCS3_REMIX_CAT_PARTICLE` | empty | Tag the listed hashes PARTICLE. | yes |
 | `RPCS3_REMIX_CAT_DECAL` | empty | Tag the listed hashes DECAL_STATIC. | yes |
+
+One further category is set at submit time but is not a hash list:
+`RPCS3_REMIX_SMOOTHNORMALS` (see *Geometry and world placement*) tags every world instance
+`SMOOTH_NORMALS`. It is global because the backend fabricates the normal on every vertex of
+every mesh, so a hash list would mean hunting hashes before any lighting improved at all.
 
 ## Lighting
 

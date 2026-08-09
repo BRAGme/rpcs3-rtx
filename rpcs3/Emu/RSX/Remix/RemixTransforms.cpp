@@ -7105,6 +7105,12 @@ namespace remix_rsx
 		return env || g_cfg.video.remix.no_vertex_colour;
 	}
 
+	bool smooth_normals_enabled()
+	{
+		static const bool env = env_flag(L"RPCS3_REMIX_SMOOTHNORMALS");
+		return env || g_cfg.video.remix.smooth_normals;
+	}
+
 	// The environment variable is latched once and wins when set; otherwise the value is read
 	// live from the emulator config, so these take effect without a restart. A negative sentinel
 	// distinguishes "unset" from a legitimate zero, which several of these accept.

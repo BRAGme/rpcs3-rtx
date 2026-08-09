@@ -1065,6 +1065,24 @@ namespace remix_rsx
 	// ATTR3 for draws that resolved no material. The bisect knob for vertex-coloured geometry.
 	bool vertex_colour_disabled();
 
+	// RPCS3_REMIX_SMOOTHNORMALS=1: tag every submitted world instance
+	// REMIXAPI_INSTANCE_CATEGORY_BIT_SMOOTH_NORMALS, which makes Remix recompute the normal buffer
+	// on the GPU as an area-weighted average over each mesh's own triangles
+	// (RtxGeometryUtils::dispatchSmoothNormals, dispatched from RtxSceneManager on BVH build and
+	// update only - static geometry pays once).
+	//
+	// This is not a refinement of the game's normals: this backend never recovers them. Every
+	// vertex is submitted with a constant (0,0,1) normal, so with this off the whole scene is lit
+	// off one direction that happens to be right for nothing. That is also what makes it cheap
+	// here - the normal buffer already exists, so RtxSceneManager's forceNormals stays false, the
+	// interleaved fast path survives, and the compute pass overwrites the constants in place.
+	//
+	// A global toggle rather than the comma-separated hash list the other categories use: those
+	// four (sky/hidden/particle/decal) are per-material decisions, and a hash list here would mean
+	// hunting hashes before any lighting improved at all. Dynamic - Remix promotes an instance to
+	// kUpdateBVH when the category is added or removed, so toggling mid-frame is handled.
+	bool smooth_normals_enabled();
+
 	// RPCS3_REMIX_SKYEXTENT=<units>: a draw that writes no depth, is anchored on the camera
 	// (sky_max_anchor) and spans at least this much in its widest axis *in world units* is the
 	// title's sky dome, and is tagged SKY. Haze draws its sky as an 82-vertex, 10,000-unit

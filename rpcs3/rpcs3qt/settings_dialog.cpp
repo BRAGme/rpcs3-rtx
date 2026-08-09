@@ -750,6 +750,8 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 			tr("Submits every vertex as white."));
 		add_check(emu_settings_type::RemixNoAlphaTest, tr("Ignore alpha test (restart)"),
 			tr("Makes every material opaque. Alpha-cutout foliage will render as solid cards."));
+		add_check(emu_settings_type::RemixSmoothNormals, tr("Generate smooth normals"),
+			tr("Has Remix compute area-weighted smooth normals on the GPU from each mesh's own triangles. This backend does not recover the game's normals - it submits a constant one on every vertex - so without this every surface is lit as if it faced the same direction. Costs a compute dispatch whenever a mesh's acceleration structure is built or updated."));
 		add_int(emu_settings_type::RemixRenderTargetVerts, tr("Post-process quad vertex limit (restart)"),
 			tr("A draw sampling a render target is treated as a post-process blit and refused when it has no more vertices than this. Shadow maps and probes are also render targets, so the limit is what separates them."));
 		add_double(emu_settings_type::RemixSkyExtent, tr("Sky detection extent"),

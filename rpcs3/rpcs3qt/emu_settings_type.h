@@ -133,6 +133,7 @@ enum class emu_settings_type
 	RemixCullFromRSX,
 	RemixNoVertexColour,
 	RemixNoAlphaTest,
+	RemixSmoothNormals,
 	RemixRenderTargetVerts,
 	RemixSkyExtent,
 	RemixMeshCap,
