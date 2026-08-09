@@ -6927,7 +6927,13 @@ namespace remix_rsx
 
 	bool texcoord_scale_mad_form()
 	{
-		static const u32 value = env_u32(L"RPCS3_REMIX_UVSCALEMAD", 1);
+		// Measured at 0. Same route twice, scored off the knob echo: uvmad=1 resolved 50.9% of
+		// the S32K population and uvmad=0 resolved 53.2%, i.e. the form contributed nothing and
+		// the small gap the wrong way is inside the area-to-area variation this title shows.
+		// Kept because the search is correct and a title that does state its scale as a MAD will
+		// need it, but off until one is measured - shipping it on would be asserting a result the
+		// A/B refused to give.
+		static const u32 value = env_u32(L"RPCS3_REMIX_UVSCALEMAD", 0);
 		return value != 0;
 	}
 
