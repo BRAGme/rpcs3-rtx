@@ -4294,6 +4294,15 @@ bool RemixGSRender::audit_world_extent(const remixapi_Transform& transform, bool
 
 	f32 lo[3] = { +3.4e38f, +3.4e38f, +3.4e38f };
 	f32 hi[3] = { -3.4e38f, -3.4e38f, -3.4e38f };
+
+	// The same box on the submitted positions, before the bones and before the instance transform.
+	// The decode this backend recognises never touches these numbers - it travels in the instance
+	// transform, or in the bone matrices for a blended rig - so world/raw is the effective linear
+	// scale the draw actually received. That ratio separates "genuinely large mesh" from "mesh
+	// arrived undecoded": it should land near the decode constant the dump line reports, and a
+	// ratio near 1 on a quantised attribute means the decode never reached the draw.
+	f32 rlo[3] = { +3.4e38f, +3.4e38f, +3.4e38f };
+	f32 rhi[3] = { -3.4e38f, -3.4e38f, -3.4e38f };
 	u32 nonfinite = 0;
 	u32 counted = 0;
 
@@ -4317,6 +4326,15 @@ bool RemixGSRender::audit_world_extent(const remixapi_Transform& transform, bool
 
 		const f32* src = m_scratch_vertices[i].position;
 		f32 p[3] = { src[0], src[1], src[2] };
+
+		for (u32 r = 0; r < 3; ++r)
+		{
+			if (std::isfinite(src[r]))
+			{
+				rlo[r] = std::min(rlo[r], src[r]);
+				rhi[r] = std::max(rhi[r], src[r]);
+			}
+		}
 
 		if (blend)
 		{
@@ -4393,13 +4411,20 @@ bool RemixGSRender::audit_world_extent(const remixapi_Transform& transform, bool
 	}
 
 	f32 extent = 0.f;
+	f32 raw_extent = 0.f;
 
 	for (u32 r = 0; r < 3; ++r)
 	{
 		extent = std::max(extent, hi[r] - lo[r]);
+
+		if (rhi[r] >= rlo[r])
+		{
+			raw_extent = std::max(raw_extent, rhi[r] - rlo[r]);
+		}
 	}
 
 	m_streak_extent = extent;
+	m_streak_raw_extent = raw_extent;
 	m_streak_measured = true;
 
 	if (exempt)
@@ -7681,6 +7706,47 @@ void RemixGSRender::submit_subdraw()
 
 		++m_stats.wext_drawn[decade];
 		m_stats.wext_drawn_max = std::max(m_stats.wext_drawn_max, m_streak_extent);
+
+		// Which program drew it. wext_drawn above says a decade is occupied but not by what, and
+		// every other extent census in this file reports only draws that were *refused* - so a mesh
+		// that reaches the scene several times larger than it should be has, until now, produced no
+		// line naming it anywhere. That is the measurement gap a character-scale explosion falls
+		// through: too small for STREAKGATE at 128x, and audit_vertex_extent's flags all landed on
+		// draws that were dropped later (vtx_spread_submitted = 0 across a full session).
+		const f32 drawn_limit = remix_rsx::drawn_extent_ratio();
+
+		if (drawn_limit > 0.f && m_world_extent_median > 0.f)
+		{
+			const f32 drawn_ratio = m_streak_extent / m_world_extent_median;
+
+			if (drawn_ratio > drawn_limit && m_drawn_extent_seen.insert(m_current_vp_hash).second)
+			{
+				// applied = world/raw is the linear scale the draw actually received, decode
+				// included. Compare it against the decode constant on this program's dump line:
+				// agreement means the decode reached the draw, and 'applied' near 1 on a quantised
+				// attribute means it did not and the mesh is in the scene at raw scale.
+				const f32 applied = (m_streak_raw_extent > 1e-9f)
+					? (m_streak_extent / m_streak_raw_extent)
+					: 0.f;
+
+				rsx_log.notice("Remix: drawn-extent vp=%016llx arch=%s skinned=%d vtx=%u "
+					"extent=%.6g rawext=%.6g applied=%.6g median=%.6g ratio=%.4g "
+					"prescale=%d affine=%d albedo=%016llX | frame=%llu",
+					m_current_vp_hash,
+					m_current_fingerprint ? remix_rsx::archetype_name(m_current_fingerprint->archetype) : "?",
+					skinned ? 1 : 0,
+					vertex_count,
+					static_cast<f64>(m_streak_extent),
+					static_cast<f64>(m_streak_raw_extent),
+					static_cast<f64>(applied),
+					static_cast<f64>(m_world_extent_median),
+					static_cast<f64>(drawn_ratio),
+					(m_current_fingerprint && m_current_fingerprint->has_prescale) ? 1 : 0,
+					(m_current_fingerprint && m_current_fingerprint->has_const_affine) ? 1 : 0,
+					albedo_hash,
+					m_frame_counter);
+			}
+		}
 	}
 
 	if (m_streak_flagged)

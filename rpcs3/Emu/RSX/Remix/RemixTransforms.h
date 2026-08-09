@@ -1014,6 +1014,18 @@ namespace remix_rsx
 	// uses in model space, because a terrain chunk really is tens of times a character.
 	f32 streak_extent_ratio();
 
+	// RPCS3_REMIX_DRAWNEXT=<ratio>: report, once per vertex program, a draw whose world extent
+	// exceeds this many times the frame's median *and which was actually drawn*. 0 disables it.
+	//
+	// This exists because nothing else measures that. The streak census only fires for draws it
+	// refuses (ratio > STREAKGATE, default 128); wext_drawn is an anonymous histogram; and
+	// audit_vertex_extent runs before the world transform and, measured over one R2 session,
+	// reported vtx_spread_submitted = 0 - every draw it flagged was dropped by a later gate. So a
+	// mesh that comes apart in world space while staying under 128x the median is invisible to all
+	// three, which is exactly the band a character-sized artifact lands in: a 2-unit character
+	// spread to 500 units is glaring on screen and clears the gate with room to spare.
+	f32 drawn_extent_ratio();
+
 	// RPCS3_REMIX_WBUFFERZ=0: refuse a program that writes HPOS.z as its clip z premultiplied by
 	// its clip w, instead of recovering the matrix row that feeds the premultiply. The behaviour up
 	// to and including ae94587, where Resistance 2's 3152b710c603e12d - a 34679 x 0 x 32770 plane,

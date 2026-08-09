@@ -7024,6 +7024,12 @@ namespace remix_rsx
 		return static_cast<f32>(value);
 	}
 
+	f32 drawn_extent_ratio()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_DRAWNEXT", 8);
+		return static_cast<f32>(value);
+	}
+
 	bool wbuffer_z_enabled()
 	{
 		static const u32 value = env_u32(L"RPCS3_REMIX_WBUFFERZ", 1);

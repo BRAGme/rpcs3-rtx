@@ -1415,6 +1415,9 @@ private:
 
 	// Vertex programs already reported by audit_vertex_extent, same once-per-shape rule.
 	std::unordered_set<u64> m_vertex_spread_seen;
+	// One drawn-extent census line per vertex program. Separate from m_vertex_spread_seen because
+	// that set is keyed on a pre-transform measurement and a program can trip one without the other.
+	std::unordered_set<u64> m_drawn_extent_seen;
 
 	// Reused by audit_vertex_extent for its per-axis and per-distance median selection. A member so
 	// a pass that runs on every draw does not allocate on every draw.
@@ -1431,6 +1434,9 @@ private:
 	// the point DrawInstance succeeded - which is what keeps 'examined' and 'drawn' separate
 	// counters rather than one number that has to be interpreted.
 	f32 m_streak_extent = 0.f;
+	// The same draw's extent measured before bones and instance transform, so the drawn-extent
+	// census can report the scale the draw actually received rather than only its final size.
+	f32 m_streak_raw_extent = 0.f;
 	bool m_streak_flagged = false;
 	bool m_streak_measured = false;
 
