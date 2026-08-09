@@ -1469,10 +1469,28 @@ void RemixGSRender::submit_camera()
 	if (!m_active_camera.valid || remix_rsx::nocam_enabled())
 	{
 		++m_stats.cam_fallback;
-		submit_debug_scene();
+
+		// The stage-A debug triangle is the milestone-1 fallback: it proves init/camera/present
+		// independently of anything the RSX produces, which is exactly what is wanted before a
+		// title has ever resolved a camera. After one has, it is a regression - standing still in
+		// the ship long enough for the hold to lapse replaces the entire scene with a hardcoded
+		// triangle on a hardcoded camera, which is what "sometimes it just shows the render
+		// triangle" is. Submitting nothing keeps the last presented frame instead of overwriting
+		// the world with a test pattern.
+		//
+		// Deliberately not fixed by extending the hold. The hold is bounded on purpose (the
+		// image-exactness argument only covers arch=fused with has_reference), and a title that
+		// stops resolving a camera for minutes at a time is a separate fault that this must not
+		// paper over - cam_fallback still counts every frame it happens.
+		if (!m_camera_ever_valid || remix_rsx::nocam_enabled())
+		{
+			submit_debug_scene();
+		}
+
 		return;
 	}
 
+	m_camera_ever_valid = true;
 	++m_stats.cam_resolved;
 
 	const auto& api = m_remix.api();

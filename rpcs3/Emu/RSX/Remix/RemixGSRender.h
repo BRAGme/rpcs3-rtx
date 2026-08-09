@@ -1311,6 +1311,10 @@ private:
 	}
 
 
+	// True once any frame has resolved a camera of the title's own. Gates the stage-A debug
+	// triangle so it stays a pre-first-camera fallback and never replaces a running scene.
+	bool m_camera_ever_valid = false;
+
 	bool m_sky_camera_warned = false;
 	bool m_pick_slot_warned = false;
 	bool m_pick_request_warned = false;
