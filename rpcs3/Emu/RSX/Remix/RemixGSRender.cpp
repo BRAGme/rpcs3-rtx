@@ -3732,12 +3732,6 @@ bool RemixGSRender::resolve_indexed_world(u32 first_vertex, u32 vertex_count, bo
 			return false;
 		}
 
-		// Same bound as the single-bone path, and for the same reason.
-		if (!track_bone_offset(fp, slot))
-		{
-			return false;
-		}
-
 		if (first_slot == umax)
 		{
 			first_slot = slot;
@@ -3833,6 +3827,10 @@ bool RemixGSRender::resolve_indexed_world(u32 first_vertex, u32 vertex_count, bo
 // can say what a real rig's spread looks like before any bound is chosen.
 bool RemixGSRender::track_bone_offset(const remix_rsx::vp_fingerprint& fp, u32 slot)
 {
+	m_scratch_palette_base = fp.palette_base;
+	m_scratch_palette_rows = fp.palette_rows;
+	m_scratch_palette_stride = fp.palette_stride;
+
 	const s32 off = static_cast<s32>(slot) - static_cast<s32>(fp.palette_base);
 
 	m_scratch_bone_off_min = std::min(m_scratch_bone_off_min, off);
@@ -4825,6 +4823,24 @@ void RemixGSRender::dump_bone_palette(u32 vertex_count, const char* path)
 		return;
 	}
 
+	// Every slot the rig's indices actually resolved to, as offsets from palette_base and in the
+	// order they were discovered. min..max cannot distinguish "n bones laid out on the stride the
+	// palette declares" from "n bones plus one landing between two of them", and it was that
+	// distinction the single-bone census left open: bones=3 spanning 0..7 is either {0,3,6} plus a
+	// stray, or a layout this code has the stride wrong for. The list says which outright.
+	std::string offsets;
+
+	for (usz b = 0; b < m_scratch_bone_slots.size() && b < 24; ++b)
+	{
+		fmt::append(offsets, "%s%d", b ? "," : "",
+			static_cast<s32>(m_scratch_bone_slots[b]) - static_cast<s32>(m_scratch_palette_base));
+	}
+
+	if (m_scratch_bone_slots.size() > 24)
+	{
+		fmt::append(offsets, ",+%llu", static_cast<u64>(m_scratch_bone_slots.size() - 24));
+	}
+
 	std::string palette;
 
 	for (usz b = 0; b < m_scratch_bone_transforms.size() && b < 4; ++b)
@@ -4842,7 +4858,7 @@ void RemixGSRender::dump_bone_palette(u32 vertex_count, const char* path)
 			static_cast<f64>(m[2][0]), static_cast<f64>(m[2][1]), static_cast<f64>(m[2][2]), static_cast<f64>(m[2][3]));
 	}
 
-	rsx_log.notice("Remix: bone-palette vp=%016llx path=%s bones=%llu pervtx=%u folded=%d vtx=%u idxoff=[%d..%d]%s",
+	rsx_log.notice("Remix: bone-palette vp=%016llx path=%s bones=%llu pervtx=%u folded=%d vtx=%u idxoff=[%d..%d] rows=%u stride=%u off={%s}%s",
 		m_current_vp_hash,
 		path,
 		static_cast<u64>(m_scratch_bone_transforms.size()),
@@ -4851,6 +4867,9 @@ void RemixGSRender::dump_bone_palette(u32 vertex_count, const char* path)
 		vertex_count,
 		m_scratch_bone_off_min,
 		m_scratch_bone_off_max,
+		m_scratch_palette_rows,
+		m_scratch_palette_stride,
+		offsets.c_str(),
 		palette.c_str());
 }
 
@@ -5006,6 +5025,15 @@ bool RemixGSRender::build_blend_skinning(u32 first_vertex, u32 vertex_count)
 			if (!remix_rsx::evaluate_palette_slot(fp, chain, index_value, slot))
 			{
 				++m_stats.skin_blend_refused_index;
+				return false;
+			}
+
+			// Per blend bone, which is the only place this rig's indices actually resolve. The
+			// probe first sat on the one-slot consistency check further up and reported [0..0] for
+			// every blend rig including the 44-bone ones - a value that says nothing, because that
+			// site never sees the four address components a blend vertex reads through.
+			if (!track_bone_offset(fp, slot))
+			{
 				return false;
 			}
 

@@ -1392,6 +1392,10 @@ private:
 	// Widest bone-index offset either side of palette_base seen in the draw being built. The
 	// palette dump reports it so a rig that indexes outside its own palette is visible without
 	// having to refuse anything first.
+	// palette_base of the rig being built, so the dump can print discovered slots as offsets.
+	u32 m_scratch_palette_base = 0;
+	u32 m_scratch_palette_rows = 0;
+	u32 m_scratch_palette_stride = 0;
 	s32 m_scratch_bone_off_min = 0;
 	s32 m_scratch_bone_off_max = 0;
 	std::vector<f32> m_scratch_bone_raw;
