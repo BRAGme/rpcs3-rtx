@@ -523,6 +523,50 @@ namespace
 		mapped = false;
 		return 0;
 	}
+
+	// calculateAlphaState() keeps a draw blended only when colorBlendOp is ADD *and* the colour
+	// factor pair is one of the combinations it enumerates; anything else falls out of the chain
+	// at rtx_instance_manager.cpp:802-807 with blendEnabled = false and the draw is raytraced
+	// fully opaque. That rejection is invisible from this side - the factors translated fine, so
+	// blend_unmapped stays 0 - which is why a sprite can arrive with alphaBlendEnabled = 1 and
+	// still occlude. The table is mirrored here so the census can name the pair the runtime is
+	// dropping rather than leave it to be inferred from the picture.
+	//
+	// ONE/ZERO is deliberately false: the runtime calls it the "Opaque Alias" and disables
+	// blending for it on purpose (:717-719). It is this backend's own rest state, so it is the
+	// one false that means "correctly opaque" rather than "silently dropped", and the census
+	// keys it separately.
+	bool runtime_keeps_blend(u32 src, u32 dst, u32 op)
+	{
+		if (op != 0) // VK_BLEND_OP_ADD; MIN/MAX/SUBTRACT all reach :805-807
+		{
+			return false;
+		}
+
+		switch ((src << 8) | dst)
+		{
+		case (6u << 8) | 7u: // SRC_ALPHA / ONE_MINUS_SRC_ALPHA   standard alpha
+		case (7u << 8) | 6u: // ONE_MINUS_SRC_ALPHA / SRC_ALPHA   inverted alpha
+		case (6u << 8) | 1u: // SRC_ALPHA / ONE                   emissive alpha
+		case (7u << 8) | 1u: // ONE_MINUS_SRC_ALPHA / ONE         inverted emissive alpha
+		case (1u << 8) | 6u: // ONE / SRC_ALPHA                   reverse emissive alpha
+		case (1u << 8) | 7u: // ONE / ONE_MINUS_SRC_ALPHA         premultiplied vs inv. reverse
+		case (2u << 8) | 3u: // SRC_COLOR / ONE_MINUS_SRC_COLOR   standard colour
+		case (3u << 8) | 2u: // ONE_MINUS_SRC_COLOR / SRC_COLOR   inverted colour
+		case (2u << 8) | 1u: // SRC_COLOR / ONE                   emissive colour
+		case (3u << 8) | 1u: // ONE_MINUS_SRC_COLOR / ONE         inverted emissive colour
+		case (1u << 8) | 2u: // ONE / SRC_COLOR                   reverse emissive colour
+		case (1u << 8) | 3u: // ONE / ONE_MINUS_SRC_COLOR         emissive colour
+		case (1u << 8) | 1u: // ONE / ONE                         emissive
+		case (4u << 8) | 0u: // DST_COLOR / ZERO                  multiplicative
+		case (0u << 8) | 2u: // ZERO / SRC_COLOR                  multiplicative
+		case (4u << 8) | 2u: // DST_COLOR / SRC_COLOR             double multiplicative
+			return true;
+		default: break;
+		}
+
+		return false;
+	}
 }
 
 #endif
@@ -3845,6 +3889,33 @@ bool RemixGSRender::track_bone_offset(const remix_rsx::vp_fingerprint& fp, u32 s
 	}
 
 	return true;
+}
+
+// Records one blended draw's colour factor pair so the run can be asked which setups the title
+// actually uses. Linear scan: the table is a couple of dozen entries and a title uses a handful,
+// so the loop ends on the first or second compare in the steady state.
+void RemixGSRender::census_blend(u32 src, u32 dst, u32 op)
+{
+	const u32 key = (src << 16) | (dst << 8) | op;
+
+	for (u32 i = 0; i < m_blend_census_used; ++i)
+	{
+		if (m_blend_census_key[i] == key)
+		{
+			++m_blend_census_count[i];
+			return;
+		}
+	}
+
+	if (m_blend_census_used == s_max_blend_census)
+	{
+		++m_blend_census_overflow;
+		return;
+	}
+
+	m_blend_census_key[m_blend_census_used] = key;
+	m_blend_census_count[m_blend_census_used] = 1;
+	++m_blend_census_used;
 }
 
 bool RemixGSRender::bones_consistent()
@@ -7753,6 +7824,16 @@ void RemixGSRender::submit_subdraw()
 			if (mapped)
 			{
 				++m_stats.blend_translucent;
+
+				// Translating the pair is not the same as the runtime accepting it, and until
+				// now nothing measured the difference. Census first, so the pairs are on record
+				// whether or not they survive.
+				census_blend(blend_state.srcColorBlendFactor, blend_state.dstColorBlendFactor, blend_state.colorBlendOp);
+
+				if (!runtime_keeps_blend(blend_state.srcColorBlendFactor, blend_state.dstColorBlendFactor, blend_state.colorBlendOp))
+				{
+					++m_stats.blend_runtime_opaque;
+				}
 			}
 			else
 			{
@@ -8876,6 +8957,39 @@ void RemixGSRender::log_stats()
 
 	const remix_rsx::texture_stats& tex = m_textures.stats();
 
+	// Distinct blend setups the run has submitted, "src/dst/op=count", ordered by count so the
+	// dominant ones lead. A trailing * marks a pair calculateAlphaState() drops to opaque - that
+	// is the set worth reading, because those draws asked for blending, translated cleanly, and
+	// will still occlude. Factor numbers are Vulkan enum values (1=ONE, 6=SRC_ALPHA, ...).
+	std::string blend_pairs;
+	{
+		std::array<u32, s_max_blend_census> order{};
+
+		for (u32 i = 0; i < m_blend_census_used; ++i)
+		{
+			order[i] = i;
+		}
+
+		std::sort(order.begin(), order.begin() + m_blend_census_used,
+			[this](u32 a, u32 b) { return m_blend_census_count[a] > m_blend_census_count[b]; });
+
+		for (u32 i = 0; i < m_blend_census_used; ++i)
+		{
+			const u32 key = m_blend_census_key[order[i]];
+			const u32 src = (key >> 16) & 0xFFu;
+			const u32 dst = (key >> 8) & 0xFFu;
+			const u32 op = key & 0xFFu;
+
+			fmt::append(blend_pairs, "%s%u/%u/%u=%llu%s", i ? " " : "", src, dst, op,
+				m_blend_census_count[order[i]], runtime_keeps_blend(src, dst, op) ? "" : "*");
+		}
+
+		if (m_blend_census_overflow)
+		{
+			fmt::append(blend_pairs, " +%llu", m_blend_census_overflow);
+		}
+	}
+
 	rsx_log.notice(
 		"Remix stats: frame=%llu draws=%llu submitted=%llu meshes_live=%llu created=%llu destroyed=%llu poisoned=%llu | "
 		"cam_resolved=%llu cam_fallback=%llu cam_held=%llu split_attempted=%llu split_failed=%llu arch=%s world_applied=%llu world_fallback=%llu world_refused=%llu world_layered_ref=%llu | "
@@ -8899,7 +9013,7 @@ void RemixGSRender::log_stats()
 		"vmcam_diverted=%llu vmcam_unusable=%llu vmcam_conflict=%llu vmcam_latched=%llu vmcam_held=%llu "
 		"vmcam_census=%u vmcam_mode=%u | "
 		"cat_hidden=%llu cat_particle=%llu cat_decal=%llu cat_smoothnormals=%llu | "
-		"blend_chained=%llu blend_translucent=%llu blend_unmapped=%llu | "
+		"blend_chained=%llu blend_translucent=%llu blend_unmapped=%llu blend_rtopaque=%llu blend_pairs={%s} | "
 		"tex_bound=%llu tex_none=%llu tex_no_unit=%llu tex_unit_retry=%llu tex_albedo_ucode=%llu tex_albedo_guess=%llu tex_retry_refused=%llu tex_unit_substituted=%llu uv_applied=%llu uv_none=%llu uv_absent=%llu uv_layout=%llu uv_memory=%llu uv_fallback=%llu uv_ucode=%llu uv_heuristic=%llu uv_nonfinite=%llu vcol_applied=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_tombstone=%llu tex_rehashed=%llu tex_refreshed=%llu mat_created=%llu tex_retry_unsupported=%llu mat_untested=%llu uv_scale_ucode=%llu uv_scale_fixed=%llu | "
 		"ui_draws=%llu ui_skipped=%llu ui_no_colour=%llu ui_rt=%llu ui_prims=%llu ui_frames=%llu ui_ndc=%llu ui_unit=%llu ui_pixel=%llu ui_nospace=%llu ui_ortho2d=%llu "
 		"ui_vpydown=%llu ui_vpyup=%llu ui_vpfallback=%llu ui_vflip_ndc=%llu/%llu ui_vflip_pixel=%llu/%llu ui_vflip_abstain=%llu | "
@@ -9039,6 +9153,8 @@ void RemixGSRender::log_stats()
 		m_stats.blend_chained,
 		m_stats.blend_translucent,
 		m_stats.blend_unmapped,
+		m_stats.blend_runtime_opaque,
+		blend_pairs.c_str(),
 		m_stats.tex_bound,
 		m_stats.tex_none,
 		m_stats.tex_no_unit,

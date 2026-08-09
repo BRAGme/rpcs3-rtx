@@ -671,6 +671,12 @@ private:
 		u64 blend_chained = 0;
 		u64 blend_translucent = 0;
 		u64 blend_unmapped = 0;
+		// The lower bound the comment above asks for, measured instead of inferred: draws that
+		// translated cleanly (so blend_unmapped did not see them), reached the runtime with
+		// alphaBlendEnabled = 1, and will still be raytraced opaque because their factor pair is
+		// not in calculateAlphaState()'s table. blend_translucent - blend_runtime_opaque is the
+		// count that actually survives as translucent.
+		u64 blend_runtime_opaque = 0;
 	};
 
 	// Wall-clock breakdown of the RSX thread's frame, in microseconds, accumulated over one
@@ -1274,6 +1280,19 @@ private:
 		bool skinned = false;
 		const char* affine_reason = "";
 	};
+
+	// Census of the distinct (srcColor, dstColor, colorBlendOp) triples blended draws submit,
+	// packed src<<16 | dst<<8 | op. A title uses a handful of blend setups, so a small fixed
+	// table holds all of them; anything past the end is counted in the overflow rather than
+	// silently dropped. Kept for the whole run rather than per stats window - the interesting
+	// pairs are the rare ones, and a window boundary would split them.
+	static constexpr u32 s_max_blend_census = 24;
+	std::array<u32, s_max_blend_census> m_blend_census_key{};
+	std::array<u64, s_max_blend_census> m_blend_census_count{};
+	u32 m_blend_census_used = 0;
+	u64 m_blend_census_overflow = 0;
+
+	void census_blend(u32 src, u32 dst, u32 op);
 
 	// A frame that submits more draws than this stops numbering them rather than growing
 	// without bound. Haze peaks around 1500 instances a frame, so this is slack, not a cut.
