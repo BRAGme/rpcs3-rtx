@@ -78,6 +78,17 @@ namespace remix_rsx
 		u8 alpha_func = 7;
 		u8 alpha_ref = 0;
 
+		// Range of the decoded alpha channel, measured once at upload. The instance blend ext
+		// tells Remix that surface alpha is the albedo texture's alpha channel
+		// (textureAlphaOperation = SelectArg1, arg1 = Texture), which is a D3D9 fixed-function
+		// assumption: an RSX title computes alpha in its fragment program and may not put it in
+		// the texture at all. min == max says this texture cannot be what cuts a sprite's
+		// backing out, and min == max == 255 in particular means an alpha-blended draw using it
+		// is fully opaque however the blend factors are set. DXT1 can only ever produce 255 or
+		// a hard 0 (bcdec.hpp:157-159 decodes it with onlyOpaqueMode false), never a gradient.
+		u8 alpha_min = 255;
+		u8 alpha_max = 0;
+
 		// Decoded BGRA8, kept so the UI compositor can sample it CPU-side.
 		std::vector<u8> pixels;
 

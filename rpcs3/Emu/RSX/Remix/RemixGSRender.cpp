@@ -7890,6 +7890,23 @@ void RemixGSRender::submit_subdraw()
 		++m_stats.blend_chained;
 	}
 
+	// Which texture a program actually draws with. dump_vertex_program runs before the texture
+	// is resolved, so its line cannot carry this, and object picking answers it only for
+	// geometry the user has clicked. One line per program, from the submit path where the hash
+	// exists: enough to join a vp= line to its 'Remix tex=' line and read that texture's acov.
+	if (remix_rsx::dump_enabled() && m_dumped_vp_albedo.insert(m_current_vp_hash).second)
+	{
+		const std::string line = fmt::format("Remix vptex vp=%016llx albedo=%016llX blend=%d",
+			m_current_vp_hash, albedo_hash, rsx::method_registers.blend_enabled() ? 1 : 0);
+
+		rsx_log.notice("%s", line);
+
+		if (fs::file out{ fs::get_executable_dir() + "remix_dump.log", fs::write + fs::create + fs::append })
+		{
+			out.write(line + '\n');
+		}
+	}
+
 	// Numbered last, so the value identifies a draw that actually reached DrawInstance and the
 	// table cannot name geometry that was refused somewhere above. Declared at this scope
 	// because the runtime reads the chain during the call below.
@@ -8852,7 +8869,10 @@ void RemixGSRender::dump_vertex_program(u32 first_vertex, u32 vertex_count, u32 
 void RemixGSRender::dump_texture(const remix_rsx::texture_entry& entry, const rsx::fragment_texture& tex, u32 unit)
 {
 	const std::string line = fmt::format(
-		"Remix tex=%016llX fmt=%02x %ux%u unit=%u mips=%u swizzled=%d pitch=%u loc=%u offset=0x%x wrap=%u,%u alpha=%u/%u",
+		// 'acov' is the decoded alpha range. acov=255..255 on a texture bound to an
+		// alpha-blended draw means that draw is opaque no matter what the blend factors say,
+		// because the blend ext tells Remix to take surface alpha from this channel.
+		"Remix tex=%016llX fmt=%02x %ux%u unit=%u mips=%u swizzled=%d pitch=%u loc=%u offset=0x%x wrap=%u,%u alpha=%u/%u acov=%u..%u",
 		entry.content_hash,
 		u32{tex.format()} & ~(CELL_GCM_TEXTURE_LN | CELL_GCM_TEXTURE_UN),
 		entry.width,
@@ -8866,7 +8886,9 @@ void RemixGSRender::dump_texture(const remix_rsx::texture_entry& entry, const rs
 		u32{entry.wrap_u},
 		u32{entry.wrap_v},
 		u32{entry.alpha_func},
-		u32{entry.alpha_ref});
+		u32{entry.alpha_ref},
+		u32{entry.alpha_min},
+		u32{entry.alpha_max});
 
 	rsx_log.notice("%s", line);
 

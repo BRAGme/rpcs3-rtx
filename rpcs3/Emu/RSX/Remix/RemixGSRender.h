@@ -1451,6 +1451,10 @@ private:
 	// gates already use: what the recogniser made of it and what its indices actually were.
 	std::unordered_set<u64> m_indexed_world_seen;
 
+	// Vertex programs whose bound albedo has been reported once. Joins a 'Remix dump vp=' line
+	// to the 'Remix tex=' line for the texture it draws with, which no existing line does.
+	std::unordered_set<u64> m_dumped_vp_albedo;
+
 	// Vertex programs already reported by audit_skin_extent. The flag describes a shape, and a
 	// shape repeats every frame the rig is on screen; skin_reach_flagged carries the per-draw count.
 	std::unordered_set<u64> m_skin_reach_seen;

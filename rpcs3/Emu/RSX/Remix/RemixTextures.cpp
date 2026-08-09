@@ -742,6 +742,24 @@ namespace remix_rsx
 			? REMIXAPI_FORMAT_B8G8R8A8_UNORM
 			: REMIXAPI_FORMAT_B8G8R8A8_SRGB;
 
+		// Measured here rather than in the decoders: every format path converges on this buffer,
+		// so one pass covers BC, direct, B8 and the 16-bit expansions without touching any of
+		// them. Once per upload, not per draw.
+		{
+			u8 lo = 255;
+			u8 hi = 0;
+
+			for (usz i = 3; i < entry.pixels.size(); i += 4)
+			{
+				const u8 a = entry.pixels[i];
+				lo = std::min(lo, a);
+				hi = std::max(hi, a);
+			}
+
+			entry.alpha_min = lo;
+			entry.alpha_max = hi;
+		}
+
 		remixapi_TextureInfo info{};
 		info.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_INFO;
 		info.pNext = nullptr;
