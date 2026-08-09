@@ -629,6 +629,10 @@ namespace remix_rsx
 	bool dump_enabled();
 	bool keep_ui_enabled();
 	bool nocam_enabled();
+
+	// RPCS3_REMIX_SKINSPAN: how far either side of palette_base a bone index may land before the
+	// draw is refused. 0 = measure only, which is the default.
+	u32 skin_index_span();
 	bool noskin_enabled();
 
 	// RPCS3_REMIX_CAMHOLD=<frames>: how many consecutive flips the last resolved camera is kept

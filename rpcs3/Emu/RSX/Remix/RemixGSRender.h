@@ -63,6 +63,10 @@ private:
 		u64 skip_memory = 0;
 		u64 skip_decode = 0;
 		u64 skip_poisoned = 0;
+		// Vertices whose bone index resolved further from palette_base than RPCS3_REMIX_SKINSPAN
+		// allows. Stays 0 at the default span - see skin_index_span.
+		u64 skin_index_out_of_range = 0;
+
 		u64 skip_screen_space = 0;
 		// Draws that found their mesh already in the cache. Read against meshes_created: the ratio
 		// is how stable the geometry key is, and per-flip creations are the number that says whether
@@ -1050,6 +1054,7 @@ private:
 	// True when every bone this draw assembled is plausible next to the others in the same draw.
 	// The only magnitude test on the skinning path; see the definition for why nothing else can be
 	// one. Reads m_scratch_bone_axis / m_scratch_bone_offset, so it runs after the bones are built.
+	bool track_bone_offset(const remix_rsx::vp_fingerprint& fp, u32 slot);
 	bool bones_consistent();
 
 	// Reproduces the blend Remix is about to perform and reports draws whose result travels far
@@ -1383,6 +1388,12 @@ private:
 	std::vector<u32> m_scratch_bone_indices;
 	std::vector<f32> m_scratch_bone_weights;
 	std::vector<u32> m_scratch_bone_slots;
+
+	// Widest bone-index offset either side of palette_base seen in the draw being built. The
+	// palette dump reports it so a rig that indexes outside its own palette is visible without
+	// having to refuse anything first.
+	s32 m_scratch_bone_off_min = 0;
+	s32 m_scratch_bone_off_max = 0;
 	std::vector<f32> m_scratch_bone_raw;
 	std::vector<remixapi_Transform> m_scratch_bone_transforms;
 

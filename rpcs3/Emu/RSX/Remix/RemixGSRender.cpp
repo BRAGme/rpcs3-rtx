@@ -3732,6 +3732,12 @@ bool RemixGSRender::resolve_indexed_world(u32 first_vertex, u32 vertex_count, bo
 			return false;
 		}
 
+		// Same bound as the single-bone path, and for the same reason.
+		if (!track_bone_offset(fp, slot))
+		{
+			return false;
+		}
+
 		if (first_slot == umax)
 		{
 			first_slot = slot;
@@ -3821,6 +3827,28 @@ bool RemixGSRender::resolve_indexed_world(u32 first_vertex, u32 vertex_count, bo
 // Shared by both skinned paths - the blend rig and the single-bone rig have the same palette and
 // the same hole - so the two can never disagree about what a plausible bone is.
 // RPCS3_REMIX_BONESCALE=0 disables it and puts the explosion back.
+// Records how far a resolved palette slot sits from palette_base, and refuses the draw when that
+// exceeds RPCS3_REMIX_SKINSPAN. Returns true when the draw may continue - which, at the default
+// span of 0, is always: the offsets are measured and reported, nothing is refused, so the census
+// can say what a real rig's spread looks like before any bound is chosen.
+bool RemixGSRender::track_bone_offset(const remix_rsx::vp_fingerprint& fp, u32 slot)
+{
+	const s32 off = static_cast<s32>(slot) - static_cast<s32>(fp.palette_base);
+
+	m_scratch_bone_off_min = std::min(m_scratch_bone_off_min, off);
+	m_scratch_bone_off_max = std::max(m_scratch_bone_off_max, off);
+
+	const u32 span = remix_rsx::skin_index_span();
+
+	if (span != 0 && static_cast<u32>(std::abs(off)) > span)
+	{
+		++m_stats.skin_index_out_of_range;
+		return false;
+	}
+
+	return true;
+}
+
 bool RemixGSRender::bones_consistent()
 {
 	if (!remix_rsx::bone_scale_gate_enabled() || m_scratch_bone_axis.size() < 3)
@@ -4814,13 +4842,15 @@ void RemixGSRender::dump_bone_palette(u32 vertex_count, const char* path)
 			static_cast<f64>(m[2][0]), static_cast<f64>(m[2][1]), static_cast<f64>(m[2][2]), static_cast<f64>(m[2][3]));
 	}
 
-	rsx_log.notice("Remix: bone-palette vp=%016llx path=%s bones=%llu pervtx=%u folded=%d vtx=%u%s",
+	rsx_log.notice("Remix: bone-palette vp=%016llx path=%s bones=%llu pervtx=%u folded=%d vtx=%u idxoff=[%d..%d]%s",
 		m_current_vp_hash,
 		path,
 		static_cast<u64>(m_scratch_bone_transforms.size()),
 		m_scratch_bones_per_vertex,
 		m_scratch_bone_prescale_folded ? 1 : 0,
 		vertex_count,
+		m_scratch_bone_off_min,
+		m_scratch_bone_off_max,
 		palette.c_str());
 }
 
@@ -4883,6 +4913,8 @@ bool RemixGSRender::build_blend_skinning(u32 first_vertex, u32 vertex_count)
 	m_scratch_bone_raw.clear();
 	m_scratch_bone_raw.resize(tuples);
 	m_scratch_bone_slots.clear();
+	m_scratch_bone_off_min = 0;
+	m_scratch_bone_off_max = 0;
 	m_scratch_bone_transforms.clear();
 	m_scratch_bone_axis.clear();
 	m_scratch_bone_offset.clear();
@@ -5152,6 +5184,8 @@ bool RemixGSRender::build_skinning(u32 first_vertex, u32 vertex_count)
 	m_scratch_bone_raw.clear();
 	m_scratch_bone_raw.resize(vertex_count);
 	m_scratch_bone_slots.clear();
+	m_scratch_bone_off_min = 0;
+	m_scratch_bone_off_max = 0;
 	// The decode has to be composed into these matrices exactly as build_blend_skinning does it,
 	// and for the same reason: the title's *blend* palettes arrive with dequantisation already
 	// baked in, but the constants this path reads do not. Measured across one R2 session, every
@@ -5206,6 +5240,15 @@ bool RemixGSRender::build_skinning(u32 first_vertex, u32 vertex_count)
 		// this change the two are the same number plus palette_base, so the dense remap below is
 		// keyed on exactly the same distinctions it was.
 		if (!remix_rsx::evaluate_palette_slot(fp, index_value, slot))
+		{
+			return false;
+		}
+
+		// evaluate_palette_slot proved the slot is inside the constant file; it did not prove it is
+		// inside *this rig's* palette. An index landing past the palette reads whatever the previous
+		// draw left in those constants - a bone nothing authored - and the vertices weighted to it
+		// are exactly the streaks that come off an otherwise correctly textured mesh.
+		if (!track_bone_offset(fp, slot))
 		{
 			return false;
 		}
@@ -9148,7 +9191,13 @@ void RemixGSRender::log_stats()
 			"Remix live: seen=%llu submitted=%llu | uv_applied=%llu uv_scale_ucode=%llu uv_scale_fixed=%llu | "
 			"tex_bound=%llu tex_none=%llu | world_refused=%llu wext_refused=%llu | "
 			"cam_resolved=%llu cam_fallback=%llu cam_held=%llu world_refused_nocam=%llu | "
-			"mesh_created=%llu mesh_reused=%llu mesh_live=%llu mesh_destroyed=%llu flips=%llu",
+			"mesh_created=%llu mesh_reused=%llu mesh_live=%llu mesh_destroyed=%llu flips=%llu | "
+			// Every knob that changes what the counters above mean, echoed beside them. The
+			// affine tolerance already printed itself and that is the only reason an
+			// AFFINETOL run that silently did not apply was caught instead of being read as a
+			// result. The UV knobs had no such echo, so a run cannot be told from its own log -
+			// which is exactly what blocked the MAD A/B.
+			"knobs: affinetol=%.4g uvucode=%d uvtemp=%d uvmad=%d skycam=%d",
 			m_stats.draws_seen,
 			m_stats.draws_submitted,
 			m_stats.uv_applied,
@@ -9166,7 +9215,12 @@ void RemixGSRender::log_stats()
 			m_stats.meshes_reused,
 			static_cast<u64>(m_meshes.size()),
 			m_stats.meshes_destroyed,
-			m_frame_counter);
+			m_frame_counter,
+			static_cast<f64>(remix_rsx::world_affine_tolerance()),
+			remix_rsx::texcoord_scale_from_ucode() ? 1 : 0,
+			remix_rsx::texcoord_scale_temp_form() ? 1 : 0,
+			remix_rsx::texcoord_scale_mad_form() ? 1 : 0,
+			remix_rsx::sky_camera_enabled() ? 1 : 0);
 
 		std::string bones = fmt::format(
 			"Remix bone-fail: max=%.6g <0.05=%llu <0.2=%llu <1=%llu <10=%llu >=10=%llu |",

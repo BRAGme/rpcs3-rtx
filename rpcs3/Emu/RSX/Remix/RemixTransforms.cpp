@@ -7128,6 +7128,19 @@ namespace remix_rsx
 		return static_cast<f32>(value);
 	}
 
+	u32 skin_index_span()
+	{
+		// Slots either side of palette_base a bone index may land on before the draw is refused.
+		// 0 (the default) measures without refusing: evaluate_palette_slot already proves the slot
+		// is inside the constant file, so an index past the rig's own palette is still legal to
+		// read and silently pulls in whatever the previous draw left there - a garbage bone, which
+		// is what a correctly-textured mesh with a few vertices flung into streaks looks like.
+		// Measure first and pick a span from what the census reports; refusing on a guessed bound
+		// drops the mesh instead of streaking it, which is not obviously the better failure.
+		static const u32 value = env_u32(L"RPCS3_REMIX_SKINSPAN", 0);
+		return value;
+	}
+
 	f32 drawn_extent_ratio()
 	{
 		static const u32 value = env_u32(L"RPCS3_REMIX_DRAWNEXT", 8);
