@@ -6621,6 +6621,13 @@ namespace remix_rsx
 		return value != 0;
 	}
 
+	f32 world_affine_tolerance()
+	{
+		// Scaled by 1000 so it can travel as an integer env var: 20 is the historical 0.02.
+		static const u32 milli = env_u32(L"RPCS3_REMIX_AFFINETOL", 20);
+		return static_cast<f32>(milli) / 1000.f;
+	}
+
 	bool sky_learn_dome_enabled()
 	{
 		// On by default and the useful setting is the off one, so env_u32 rather than env_flag -

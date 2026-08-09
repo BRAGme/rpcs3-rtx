@@ -5797,8 +5797,33 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 		}
 	}
 
-	if (!remix_rsx::is_affine(world, s_world_affine_tolerance))
+	if (!remix_rsx::is_affine(world, remix_rsx::world_affine_tolerance()))
 	{
+		// 97.6% of every world refusal lands here - 623183 of 638630 in one Haze run, roughly a
+		// third of the scene. The matrix chain resolved: this draw has a world transform, it just
+		// carries a perspective row that did not cancel.
+		//
+		// That is a specific claim about the reference. world = fused * reference_inverse cancels
+		// the projection only when the draw's projection is the reference camera's; a title that
+		// draws through a second projection - a different FOV for a scope, a HUD, a cutscene rig -
+		// leaves a residue proportional to how far the two disagree. So the residue distribution
+		// separates the two possible fixes and no argument can: bucketed just over the tolerance
+		// means one reference is right and the gate is merely too tight, while a residue orders of
+		// magnitude over means these draws need a reference of their own and raising the tolerance
+		// would only flatten them into the wrong place quietly.
+		const f32 residue = std::abs(world.m[0][3]) + std::abs(world.m[1][3])
+			+ std::abs(world.m[2][3]) + std::abs(world.m[3][3] - 1.f);
+
+		m_affine_residue_max = std::max(m_affine_residue_max, residue);
+
+		const usz bucket =
+			residue < 0.05f ? 0 :
+			residue < 0.2f  ? 1 :
+			residue < 1.f   ? 2 :
+			residue < 10.f  ? 3 : 4;
+
+		++m_affine_residue_buckets[bucket];
+
 		note_world_fail(13);
 		return false;
 	}
@@ -8861,7 +8886,14 @@ void RemixGSRender::log_stats()
 			m_stats.cam_held,
 			m_stats.world_refused_nocam);
 
-		std::string fails = "Remix world-fail:";
+		std::string fails = fmt::format(
+			"Remix affine-residue: tol=%.4g max=%.6g <0.05=%llu <0.2=%llu <1=%llu <10=%llu >=10=%llu\n",
+			static_cast<f64>(remix_rsx::world_affine_tolerance()),
+			static_cast<f64>(m_affine_residue_max),
+			m_affine_residue_buckets[0], m_affine_residue_buckets[1], m_affine_residue_buckets[2],
+			m_affine_residue_buckets[3], m_affine_residue_buckets[4]);
+
+		fails += "Remix world-fail:";
 
 		for (usz i = 0; i < std::size(s_world_fail_names); ++i)
 		{

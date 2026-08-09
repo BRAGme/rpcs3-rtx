@@ -1290,6 +1290,11 @@ private:
 		"nocam", "idxworld", "sl_group", "sl_bone", "lay_group", "lay_ref", "fused_vpi",
 		"lay_other", "ref_group", "ref_bone", "ref_vm", "ref_none", "no_reference", "tail" };
 
+	// How far past the affinity tolerance the refused draws actually sit. Buckets are
+	// <0.05, <0.2, <1, <10, >=10 against a tolerance of 0.02.
+	f32 m_affine_residue_max = 0.f;
+	u64 m_affine_residue_buckets[5] = {};
+
 	const char* m_world_fail = "";
 
 	// Per *draw*, not per program. The first cut of this printed one census line the first time

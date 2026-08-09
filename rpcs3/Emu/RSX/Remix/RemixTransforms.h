@@ -763,6 +763,15 @@ namespace remix_rsx
 	// the world-camera-only behaviour, which is the A/B for the dome placement and the lighting.
 	bool sky_camera_enabled();
 
+	// RPCS3_REMIX_AFFINETOL: how much perspective residue a resolved world matrix may carry before
+	// per_draw_transform refuses the draw. Default 0.02, which is the value that has always been
+	// hardcoded - and which refuses 97.6% of all world refusals, about a third of a Haze scene.
+	// Raising it does not make a wrong matrix right: to_remix_transform drops the perspective row
+	// outright, so a draw admitted here is flattened, and that is only correct when the residue is
+	// small enough to be numerical rather than a second projection. Read against the
+	// "Remix affine-residue:" histogram before changing it.
+	f32 world_affine_tolerance();
+
 	bool sky_learn_dome_enabled();
 
 	// RPCS3_REMIX_RETRYUNSUP: let the albedo unit walk step past a unit that bind() refused for a
