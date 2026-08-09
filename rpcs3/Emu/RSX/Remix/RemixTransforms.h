@@ -148,6 +148,18 @@ namespace remix_rsx
 		u32 group_base[max_transform_groups] = {};
 		chain_shape group_shape[max_transform_groups] = {};
 
+		// Rows the group actually supplies: 4, or 3 with the homogeneous w written separately as
+		// 'MOV r.w, c[K].c'. The same "three rows plus a proven w, or all four" rule the palette
+		// (match_indexed_affine) and the blend path already apply - the plain object matrix was the
+		// one shape that still demanded four DP4s, which is why 716b0c260da02533 walks back from
+		// HPOS, matches c8..c11, then fails to see the c32..c34 object matrix behind it and draws
+		// object space straight into the world.
+		// Read through read_group_matrix, never read_slot_block directly: a 3-row group's fourth
+		// slot is an unrelated constant, and the row it stands in for is (0,0,0,1).
+		u32 group_rows[max_transform_groups] = {};
+		u32 group_w_slot[max_transform_groups] = {};
+		u32 group_w_component[max_transform_groups] = {};
+
 		// The innermost group's operand resolved to a vertex attribute. When false the
 		// vertices we submit are not in the space the innermost group expects.
 		bool inner_is_input = false;
@@ -490,6 +502,14 @@ namespace remix_rsx
 
 	// Slots to the row-vector matrix the rest of this file works in.
 	mat4 slots_to_matrix(const slot_block& slots, chain_shape shape);
+
+	// Group i of the fingerprint as a row-vector matrix: read_slot_block + slots_to_matrix, plus
+	// the (0,0,0,1) row a 3-row group leaves implicit. Every reader of group_base goes through
+	// this - reading the block directly takes the slot above the group as its fourth row.
+	// False when the block is out of range, or when a 3-row group's homogeneous w is not 1: the
+	// substituted row is only the right one if the ucode's constant w really is the homogeneous 1
+	// (the check build_palette_matrix already makes for the same reason).
+	bool read_group_matrix(const vp_fingerprint& fp, u32 group, mat4& out);
 
 	// The 'pos * s + b' step described by the fingerprint, as a row-vector affine matrix.
 	bool build_prescale(const vp_fingerprint& fp, mat4& out);

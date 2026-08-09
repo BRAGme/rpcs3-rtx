@@ -180,8 +180,11 @@ namespace remix_rsx
 
 			// How many of the four rows the group actually supplies, the slot step between them,
 			// and whether each row only carries xyz. A 4/1/false group is the shape every matcher
-			// produced up to ae94587; the other combinations only arise for an indexed group and
-			// exist so a 3-row or strided palette can be rebuilt exactly as the ucode reads it.
+			// produced up to ae94587; a strided one only arises for an indexed palette. rows == 3
+			// now also comes from the plain non-indexed DP4 matcher, which is the ordinary way a
+			// game writes an object matrix - three DP4 rows and a 'MOV r.w, c[K].c' for the
+			// homogeneous coordinate. Read those back through read_group_matrix, which substitutes
+			// the (0,0,0,1) the ucode leaves implicit instead of taking c[base + 3].
 			u32 rows = 4;
 			u32 stride = 1;
 			bool xyz_only = false;
@@ -402,10 +405,18 @@ namespace remix_rsx
 			return src;
 		}
 
-		// 4 x DP4/DPH, one per component of the target, c[base+i] feeding component i.
+		// DP4/DPH one per component of the target, c[base+i] feeding component i: all four, or
+		// three with the homogeneous w moved in from a constant instead.
 		bool match_dp4_chain(const program_walker& prog, const std::vector<writer_ref>& writers, chain_result& out)
 		{
-			if (writers.size() != 4)
+			// Three rows plus a separately-written homogeneous w, or all four - the rule
+			// match_indexed_affine and the blend path already state. A 3-row object matrix with
+			// 'MOV r.w, c[K].c' standing in for the fourth row is the commonest way a game writes
+			// an affine transform, and demanding four DP4s here is what left 716b0c260da02533
+			// (0:DP4>r0.x c32, 1:DP4>r0.y c33, 2:DP4>r0.z c34, 3:MOV>r0.w c0.zzzz) with groups=1:
+			// the walk matched the c8..c11 projection, could not see the object matrix behind it,
+			// and submitted object space as world space.
+			if (writers.size() != 3 && writers.size() != 4)
 			{
 				return false;
 			}
@@ -414,10 +425,32 @@ namespace remix_rsx
 			chain_source source{};
 			bool have_source = false;
 			u32 first = umax;
+			u32 w_slot = umax;
+			u32 w_component = 0;
 
 			for (const writer_ref& w : writers)
 			{
 				const decoded_instr& in = prog[w.instr];
+
+				// The homogeneous w, not a row: it lands on component 3 alone and reads a constant
+				// rather than the vector the rows multiply. Taken before the opcode check so a MOV
+				// here does not disqualify the group - it is what stands in for the fourth row.
+				if (u32 only = 0; single_component(w.mask, only) && only == 3
+					&& in.d1.vec_opcode == RSX_VEC_OPCODE_MOV
+					&& !in.d3.index_const
+					&& in.src[0].reg_type == RSX_VP_REGISTER_TYPE_CONSTANT
+					&& !in.src[0].neg)
+				{
+					if (w_slot != umax)
+					{
+						// Written twice: which of the two the rows saw is not decidable here.
+						return false;
+					}
+
+					w_slot = in.d1.const_src;
+					w_component = static_cast<u32>(in.src[0].swz_x);
+					continue;
+				}
 
 				if (in.d1.vec_opcode != RSX_VEC_OPCODE_DP4 && in.d1.vec_opcode != RSX_VEC_OPCODE_DPH)
 				{
@@ -476,7 +509,21 @@ namespace remix_rsx
 				consts[component] = in.d1.const_src;
 			}
 
-			for (u32 c = 1; c < 4; ++c)
+			// Components 0..rows-1 in order, so a group holding x and z but not y stops at 1 and is
+			// refused below rather than being rebuilt out of slots that are not a matrix.
+			u32 rows = 0;
+
+			while (rows < 4 && consts[rows] != umax)
+			{
+				++rows;
+			}
+
+			if (!have_source || (rows != 4 && !(rows == 3 && w_slot != umax)))
+			{
+				return false;
+			}
+
+			for (u32 c = 1; c < rows; ++c)
 			{
 				if (consts[c] != consts[0] + c)
 				{
@@ -488,8 +535,12 @@ namespace remix_rsx
 			out.shape = chain_shape::dp4;
 			out.base = consts[0];
 			out.source = source;
-			out.instructions = 4;
+			out.instructions = rows;
 			out.first_instruction = first;
+			out.rows = rows;
+			out.xyz_only = (rows == 3);
+			out.w_slot = w_slot;
+			out.w_component = w_component;
 			return true;
 		}
 
@@ -5267,6 +5318,9 @@ namespace remix_rsx
 		{
 			result.group_base[i] = chains[count - 1 - i].base;
 			result.group_shape[i] = chains[count - 1 - i].shape;
+			result.group_rows[i] = chains[count - 1 - i].rows;
+			result.group_w_slot[i] = chains[count - 1 - i].w_slot;
+			result.group_w_component[i] = chains[count - 1 - i].w_component;
 		}
 
 		result.inner_is_input = reached_input;
@@ -6178,6 +6232,56 @@ namespace remix_rsx
 		}
 
 		return result;
+	}
+
+	bool read_group_matrix(const vp_fingerprint& fp, u32 group, mat4& out)
+	{
+		if (group >= fp.group_count)
+		{
+			return false;
+		}
+
+		slot_block slots{};
+
+		if (!read_slot_block(fp.group_base[group], slots))
+		{
+			return false;
+		}
+
+		// A group that supplies three rows leaves the fourth to a 'MOV r.w, c[K].c'. c[base + 3] is
+		// whatever the program happens to keep above the matrix, so using it as the fourth row is
+		// how a correct 3-row transform turns into a wrong 4-row one.
+		// dp4 only, and only with a w the matcher actually proved. match_mad_chain also reports
+		// rows == 3 (a group whose terminal write is xyz), but it never resolves a w slot and its
+		// slots are columns rather than rows - substituting there would rewrite groups that read
+		// correctly today.
+		if (fp.group_shape[group] == chain_shape::dp4 && fp.group_rows[group] == 3 && fp.group_w_slot[group] != umax)
+		{
+			f32 w[4]{};
+
+			if (!read_slot(fp.group_w_slot[group], w))
+			{
+				return false;
+			}
+
+			// The row substituted below is (0,0,0,1), which is only what the ucode computes if the
+			// constant it moves into w really is 1. Anything else is a w this does not model, and
+			// the draw is better refused than silently rescaled.
+			if (!(std::abs(w[fp.group_w_component[group] & 3] - 1.f) <= 1e-5f))
+			{
+				return false;
+			}
+
+			// dp4 reads c[base + i] as row i of a column-vector matrix, so slot 3 supplies
+			// m[i][3] - the homogeneous column. (0,0,0,1) leaves w untouched at 1.
+			slots.v[3][0] = 0.f;
+			slots.v[3][1] = 0.f;
+			slots.v[3][2] = 0.f;
+			slots.v[3][3] = 1.f;
+		}
+
+		out = slots_to_matrix(slots, fp.group_shape[group]);
+		return true;
 	}
 
 	bool build_ortho2d(const vp_fingerprint& fp, mat4& out)

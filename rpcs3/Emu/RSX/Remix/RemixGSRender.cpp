@@ -2760,15 +2760,15 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 
 	for (u32 i = 0; i < fp.group_count; ++i)
 	{
-		remix_rsx::slot_block slots{};
+		remix_rsx::mat4 g{};
 
-		if (!remix_rsx::read_slot_block(fp.group_base[i], slots))
+		if (!remix_rsx::read_group_matrix(fp, i, g))
 		{
 			++m_stats.ui_skipped;
 			return;
 		}
 
-		clip = remix_rsx::mat4_multiply(clip, remix_rsx::slots_to_matrix(slots, fp.group_shape[i]));
+		clip = remix_rsx::mat4_multiply(clip, g);
 	}
 
 	if (remix_rsx::mat4 prescale{}; fp.group_count && remix_rsx::build_prescale(fp, prescale))
@@ -5446,13 +5446,10 @@ void RemixGSRender::update_camera_candidate()
 
 		if (fp.group_count >= 3)
 		{
-			remix_rsx::slot_block view_slots{};
-			if (!remix_rsx::read_slot_block(fp.group_base[fp.group_count - 2], view_slots))
+			if (!remix_rsx::read_group_matrix(fp, fp.group_count - 2, view))
 			{
 				return;
 			}
-
-			view = remix_rsx::slots_to_matrix(view_slots, fp.group_shape[fp.group_count - 2]);
 
 			if (!remix_rsx::is_affine(view, 0.02f))
 			{
@@ -5746,14 +5743,14 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 
 			for (u32 i = 0; i < world_groups; ++i)
 			{
-				remix_rsx::slot_block slots{};
-				if (!remix_rsx::read_slot_block(fp.group_base[i], slots))
+				remix_rsx::mat4 g{};
+				if (!remix_rsx::read_group_matrix(fp, i, g))
 				{
 					note_world_fail(2);
 					return false;
 				}
 
-				world = remix_rsx::mat4_multiply(world, remix_rsx::slots_to_matrix(slots, fp.group_shape[i]));
+				world = remix_rsx::mat4_multiply(world, g);
 			}
 
 			prepend_object_space(world);
@@ -5779,14 +5776,14 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 
 			for (u32 i = 0; i < world_groups; ++i)
 			{
-				remix_rsx::slot_block slots{};
-				if (!remix_rsx::read_slot_block(fp.group_base[i], slots))
+				remix_rsx::mat4 g{};
+				if (!remix_rsx::read_group_matrix(fp, i, g))
 				{
 					note_world_fail(4);
 					return false;
 				}
 
-				world = remix_rsx::mat4_multiply(world, remix_rsx::slots_to_matrix(slots, fp.group_shape[i]));
+				world = remix_rsx::mat4_multiply(world, g);
 			}
 		}
 		else if (fp.archetype == remix_rsx::vp_archetype::fused && m_active_camera.has_view_proj_inverse)
@@ -5850,14 +5847,14 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 
 			for (u32 i = 0; i < fp.group_count; ++i)
 			{
-				remix_rsx::slot_block slots{};
-				if (!remix_rsx::read_slot_block(fp.group_base[i], slots))
+				remix_rsx::mat4 g{};
+				if (!remix_rsx::read_group_matrix(fp, i, g))
 				{
 					note_world_fail(8);
 					return false;
 				}
 
-				chain = remix_rsx::mat4_multiply(chain, remix_rsx::slots_to_matrix(slots, fp.group_shape[i]));
+				chain = remix_rsx::mat4_multiply(chain, g);
 			}
 
 			++m_stats.world_layered_ref;
@@ -8322,15 +8319,27 @@ void RemixGSRender::dump_vertex_program(u32 first_vertex, u32 vertex_count, u32 
 
 	for (u32 i = 0; i < fp.group_count; ++i)
 	{
-		remix_rsx::slot_block slots{};
-		if (!remix_rsx::read_slot_block(fp.group_base[i], slots))
+		remix_rsx::mat4 g{};
+		if (!remix_rsx::read_group_matrix(fp, i, g))
 		{
 			continue;
 		}
 
-		const remix_rsx::mat4 g = remix_rsx::slots_to_matrix(slots, fp.group_shape[i]);
-		fmt::append(groups, " G%u c[%u..%u] %s %s persp=%d",
-			i, fp.group_base[i], fp.group_base[i] + 3,
+		// Rows, not a fixed 4: a 3-row group's fourth slot belongs to whatever sits above the
+		// matrix, and printing it as part of the group is how a group gets read as one row wider
+		// than the ucode actually wrote.
+		const u32 rows = fp.group_rows[i] ? fp.group_rows[i] : 4;
+
+		std::string w_note;
+
+		if (rows == 3)
+		{
+			fmt::append(w_note, "+w=c%u.%c", fp.group_w_slot[i], "xyzw"[fp.group_w_component[i] & 3]);
+		}
+
+		fmt::append(groups, " G%u c[%u..%u]%s %s %s persp=%d",
+			i, fp.group_base[i], fp.group_base[i] + rows - 1,
+			w_note,
 			remix_rsx::shape_name(fp.group_shape[i]),
 			remix_rsx::format_matrix(g),
 			remix_rsx::classify_perspective(g));
