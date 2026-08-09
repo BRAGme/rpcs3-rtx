@@ -4779,6 +4779,51 @@ void RemixGSRender::audit_skin_extent(u32 vertex_count)
 		worst_raw);
 }
 
+// One line per vertex program describing the palette as it was actually built, called from both
+// skinning paths. It has to live here rather than on the dump line because dump_vertex_program runs
+// before the skinning gate, where m_scratch_bone_transforms is still empty - which is why
+// describe_skinning reads bone0 out of the constants instead of the palette.
+//
+// What it answers: a healthy Resistance 2 rig reports folded=0 with a clean power-of-two row scale
+// (1/16384 and 1/32768 across the twelve rigs measured), because the title pre-multiplies
+// dequantisation into its own bone matrices and there is nothing left for this backend to fold. A
+// rig that reaches the world at the wrong size therefore shows it here as a row scale that is not a
+// tidy divisor, and every bone origin moves with it - which is one fault presenting as both a
+// mis-scaled mesh and a weapon detached from the hand, not two.
+void RemixGSRender::dump_bone_palette(u32 vertex_count, const char* path)
+{
+	if (!m_bone_palette_seen.insert(m_current_vp_hash).second)
+	{
+		return;
+	}
+
+	std::string palette;
+
+	for (usz b = 0; b < m_scratch_bone_transforms.size() && b < 4; ++b)
+	{
+		const auto& m = m_scratch_bone_transforms[b].matrix;
+
+		// Row length beside the row: a mis-folded or mis-read decode shows up as every bone's basis
+		// being the same wrong length, which a translation-only error does not.
+		const f32 sx = std::sqrt((m[0][0] * m[0][0]) + (m[0][1] * m[0][1]) + (m[0][2] * m[0][2]));
+
+		fmt::append(palette, " b%llu|scale=%.6g|[%.5g %.5g %.5g %.5g | %.5g %.5g %.5g %.5g | %.5g %.5g %.5g %.5g]",
+			static_cast<u64>(b), static_cast<f64>(sx),
+			static_cast<f64>(m[0][0]), static_cast<f64>(m[0][1]), static_cast<f64>(m[0][2]), static_cast<f64>(m[0][3]),
+			static_cast<f64>(m[1][0]), static_cast<f64>(m[1][1]), static_cast<f64>(m[1][2]), static_cast<f64>(m[1][3]),
+			static_cast<f64>(m[2][0]), static_cast<f64>(m[2][1]), static_cast<f64>(m[2][2]), static_cast<f64>(m[2][3]));
+	}
+
+	rsx_log.notice("Remix: bone-palette vp=%016llx path=%s bones=%llu pervtx=%u folded=%d vtx=%u%s",
+		m_current_vp_hash,
+		path,
+		static_cast<u64>(m_scratch_bone_transforms.size()),
+		m_scratch_bones_per_vertex,
+		m_scratch_bone_prescale_folded ? 1 : 0,
+		vertex_count,
+		palette.c_str());
+}
+
 bool RemixGSRender::build_blend_skinning(u32 first_vertex, u32 vertex_count)
 {
 	const remix_rsx::vp_fingerprint& fp = *m_current_fingerprint;
@@ -5060,6 +5105,8 @@ bool RemixGSRender::build_blend_skinning(u32 first_vertex, u32 vertex_count)
 		}
 	}
 
+	dump_bone_palette(vertex_count, "blend");
+
 	// --- bisect knobs -------------------------------------------------------------------
 	// Applied after the real decode, same as the single-bone path, so only the one link under
 	// test changes.
@@ -5105,6 +5152,27 @@ bool RemixGSRender::build_skinning(u32 first_vertex, u32 vertex_count)
 	m_scratch_bone_raw.clear();
 	m_scratch_bone_raw.resize(vertex_count);
 	m_scratch_bone_slots.clear();
+	// The decode has to be composed into these matrices exactly as build_blend_skinning does it,
+	// and for the same reason: the title's *blend* palettes arrive with dequantisation already
+	// baked in, but the constants this path reads do not. Measured across one R2 session, every
+	// rig on this path built a unit palette (b0 scale = 1.0, against 1/16384 and 1/32768 on the
+	// blend path), so raw quantised positions went through an identity-scale matrix and reached
+	// the world ~16384x too large - the weapon at 24.87 units, the goliath LOD boxes, and the
+	// streaks that converge on an object origin.
+	//
+	// Order matters: prescale * bone, not bone * prescale. The decode has to scale the bone's
+	// translation as well as its basis, and getting it backwards collapses the skeleton toward its
+	// own origin instead.
+	remix_rsx::mat4 single_prescale = remix_rsx::mat4_identity();
+	const bool single_have_prescale = remix_rsx::build_prescale(fp, single_prescale);
+
+	if ((fp.has_prescale || fp.has_const_affine) && remix_rsx::position_affine_enabled() && !single_have_prescale)
+	{
+		// Recognised but unreadable: refuse rather than draw raw, same rule as the blend path.
+		++m_stats.pos_decode_refused;
+		return false;
+	}
+
 	m_scratch_bone_transforms.clear();
 	m_scratch_bone_axis.clear();
 	m_scratch_bone_offset.clear();
@@ -5193,9 +5261,14 @@ bool RemixGSRender::build_skinning(u32 first_vertex, u32 vertex_count)
 				return false;
 			}
 
-			dense = ::size32(m_scratch_bone_slots);
-			m_scratch_bone_slots.push_back(slot);
-			m_scratch_bone_transforms.push_back(remix_rsx::to_remix_transform(bone));
+			if (single_have_prescale)
+				{
+					bone = remix_rsx::mat4_multiply(single_prescale, bone);
+				}
+
+				dense = ::size32(m_scratch_bone_slots);
+				m_scratch_bone_slots.push_back(slot);
+				m_scratch_bone_transforms.push_back(remix_rsx::to_remix_transform(bone));
 			m_scratch_bone_axis.push_back(remix_rsx::basis_extent(bone));
 			m_scratch_bone_offset.push_back(remix_rsx::translation_extent(bone));
 		}
@@ -5217,6 +5290,10 @@ bool RemixGSRender::build_skinning(u32 first_vertex, u32 vertex_count)
 		++m_stats.skin_blend_refused_scale;
 		return false;
 	}
+
+	m_scratch_bone_prescale_folded = single_have_prescale;
+
+	dump_bone_palette(vertex_count, "single");
 
 	// --- bisect knobs -------------------------------------------------------------------
 	// Both are deliberately applied after the real decode, so the mesh, the weights and the

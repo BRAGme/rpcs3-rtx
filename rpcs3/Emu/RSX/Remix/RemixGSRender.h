@@ -811,6 +811,9 @@ private:
 	// Remix instance categories for one draw, from the albedo hash lists. Replaces the
 	// hardcoded categoryFlags = 0: the rtx.*Textures conf lists never reach an API draw.
 	u32 classify_draw(u64 albedo_hash);
+	// Called from both skinning paths - 'path' records which one, since a rig appearing on one and
+	// not the other is itself the finding.
+	void dump_bone_palette(u32 vertex_count, const char* path);
 
 	// True when this draw is 2D / pre-projected and must not reach Remix.
 	bool is_screen_space_draw() const;
@@ -1418,6 +1421,10 @@ private:
 	// One drawn-extent census line per vertex program. Separate from m_vertex_spread_seen because
 	// that set is keyed on a pre-transform measurement and a program can trip one without the other.
 	std::unordered_set<u64> m_drawn_extent_seen;
+	// One built-palette dump per vertex program. Separate from the dump-line diagnostics because
+	// those run before the skinning gate, where m_scratch_bone_transforms is not yet populated -
+	// which is why describe_skinning reads bone0 out of the constants instead of the palette.
+	std::unordered_set<u64> m_bone_palette_seen;
 
 	// Reused by audit_vertex_extent for its per-axis and per-distance median selection. A member so
 	// a pass that runs on every draw does not allocate on every draw.
