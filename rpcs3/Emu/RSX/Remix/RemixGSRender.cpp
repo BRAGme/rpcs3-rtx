@@ -1284,7 +1284,7 @@ bool RemixGSRender::create_debug_scene()
 	return true;
 }
 
-void RemixGSRender::submit_debug_scene()
+void RemixGSRender::submit_debug_scene(bool with_triangle)
 {
 	const auto& api = m_remix.api();
 
@@ -1310,7 +1310,7 @@ void RemixGSRender::submit_debug_scene()
 
 	remix_rsx::guarded_setup_camera(api.SetupCamera, &camera_info);
 
-	if (m_debug_mesh)
+	if (m_debug_mesh && with_triangle)
 	{
 		remixapi_InstanceInfo instance{};
 		instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
@@ -1482,11 +1482,12 @@ void RemixGSRender::submit_camera()
 		// image-exactness argument only covers arch=fused with has_reference), and a title that
 		// stops resolving a camera for minutes at a time is a separate fault that this must not
 		// paper over - cam_fallback still counts every frame it happens.
-		if (!m_camera_ever_valid || remix_rsx::nocam_enabled())
-		{
-			submit_debug_scene();
-		}
-
+		// The camera is submitted either way; only the triangle is conditional. Returning
+		// without calling SetupCamera at all was the loading-screen freeze: the runtime keeps
+		// presenting the last frame it was given, so a stretch with no camera reads as the image
+		// locking up rather than as an empty scene. Neither the test pattern nor a stale world is
+		// right - an empty frame is.
+		submit_debug_scene(!m_camera_ever_valid || remix_rsx::nocam_enabled());
 		return;
 	}
 

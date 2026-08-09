@@ -781,7 +781,10 @@ private:
 	// Stage A: a hardcoded lit triangle that proves init / camera / present independently
 	// of anything the RSX produces. Still the fallback whenever no camera resolves.
 	bool create_debug_scene();
-	void submit_debug_scene();
+	// with_triangle=false submits the hardcoded camera and no geometry, i.e. an empty frame.
+	// That is what a camera-less frame needs once the title has ever resolved one: skipping
+	// SetupCamera entirely leaves the runtime presenting its last frame, which reads as a freeze.
+	void submit_debug_scene(bool with_triangle = true);
 
 	// Camera derived from the title's own transform constants, or the stage A fallback.
 	void submit_camera();
