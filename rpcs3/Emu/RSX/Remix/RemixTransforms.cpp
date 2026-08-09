@@ -1486,6 +1486,14 @@ namespace remix_rsx
 			u32 scale_slot = 0;
 			u8 scale_component[3] = { 0, 1, 2 };
 			u32 bias_slot = 0;
+			// The scale was written as RCP(c[K].<c>) in a scalar slot, so the factor is 1/value
+			// rather than the value. Still a transform constant and still evaluable per draw.
+			bool scale_is_reciprocal = false;
+			// '(attr + b) * s' rather than 'attr * s + b'. Derived from the walk order: walking
+			// back from the output, meeting the MUL before the ADD means the program applies the
+			// ADD first. build_prescale composes scale-then-bias, so the translation row has to
+			// carry b*s in this case.
+			bool bias_before_scale = false;
 			// Which test refused, for the world-extent census. The matcher has a dozen exits and
 			// every one of them reads as 'affine=0' from outside, which is not enough to tell a
 			// program whose decode is written in a shape this grammar does not cover from one that
@@ -1541,6 +1549,86 @@ namespace remix_rsx
 				}
 
 				return false;
+			};
+
+			// A temp whose value is RCP(c[K].<c>) is still a constant scale - R2 writes its
+			// dequantisation divisor that way, in the scalar half of an instruction whose vector
+			// half does something unrelated:
+			//     6:MOV>r0.w/RCP>r1.x(C0.wwww,I0.xyzw,C0.wwww)c1i0    r1.x = 1 / c1.w
+			// with c1.w = 256. The MUL that uses it therefore has two temp operands and no
+			// constant, which is exactly what 'mul-no-const' was reporting. Requires the scalar
+			// writer to be the only writer: a vector instruction touching the same temp would mean
+			// the value is not purely the reciprocal.
+			// 'which' is the component actually read, not the register: R2 packs unrelated values
+			// into the same temp, and the writes around the reciprocal touch a different lane -
+			//     6:MOV>r0.w/RCP>r1.x(...)c1i0   reciprocal into r1.x
+			//     7:MUL>r1.y(...)c3i0            unrelated, r1.y
+			//     8:FRC>r1.y(...)                unrelated, r1.y
+			//     9:MUL>r0.xyzw(T0.xyzw,T1.xxxx) reads r1.x
+			// - so a sole-writer test on the register alone rejects every real case.
+			// Which clause of the probe below declined, reported as the refusal reason so that
+			// 'mul-no-const' names a test rather than a population. Two rounds of edits to this
+			// matcher were inert because the census could only say "still mul-no-const", which is
+			// consistent with the probe never running, running and finding no writer, and running
+			// and rejecting the writer it found - three different bugs. Static literals only; the
+			// last operand probed wins, which is unambiguous while the grammar allows one scale.
+			const char* recip_why = "mul-no-const";
+
+			const auto reciprocal_of_const = [&](u32 reg, u32 which, u32 bound, u32& slot, u8& comp)
+			{
+				const u32 bit = 1u << (which & 3);
+				bool found = false;
+
+				for (u32 i = 0; i < bound && i < static_cast<u32>(prog.size()); ++i)
+				{
+					const decoded_instr& w = prog[i];
+
+					if (vec_writes_temp(w, reg) && (vec_writemask(w) & bit))
+					{
+						recip_why = "mul-recip-vec-lane";
+						return false;
+					}
+
+					if (!sca_writes_temp(w, reg) || !(sca_writemask(w) & bit))
+					{
+						continue;
+					}
+
+					if (w.d1.sca_opcode != RSX_SCA_OPCODE_RCP)
+					{
+						recip_why = "mul-recip-not-rcp";
+						return false;
+					}
+
+					if (w.src[2].reg_type != RSX_VP_REGISTER_TYPE_CONSTANT)
+					{
+						recip_why = "mul-recip-not-const";
+						return false;
+					}
+
+					if (w.src[2].neg)
+					{
+						recip_why = "mul-recip-neg";
+						return false;
+					}
+
+					if (w.d3.index_const)
+					{
+						recip_why = "mul-recip-indexed";
+						return false;
+					}
+
+					slot = w.d1.const_src;
+					comp = static_cast<u8>(w.src[2].swz_x);
+					found = true;
+				}
+
+				if (!found)
+				{
+					recip_why = "mul-recip-no-writer";
+				}
+
+				return found;
 			};
 
 			if (sca_touches_xyz(temp, before))
@@ -1635,6 +1723,9 @@ namespace remix_rsx
 
 					out.has_bias = true;
 					out.bias_slot = in.d1.const_src;
+					// A scale already found means the walk met the MUL first, i.e. the program
+					// applies this ADD before it: '(attr + b) * s'.
+					out.bias_before_scale = out.has_scale;
 
 					if (in.src[other_slot].reg_type == RSX_VP_REGISTER_TYPE_INPUT)
 					{
@@ -1697,7 +1788,84 @@ namespace remix_rsx
 					// round of work chasing a grammar widening that could never have matched them.
 					if (const_slot == umax)
 					{
-						return refuse("mul-no-const");
+						// Both operands are temps. If exactly one of them is RCP(constant), the
+						// scale is constant-derived after all and the other operand is the value
+						// being scaled - keep walking back into it. This is R2's
+						// '(attr + c18.xyz) * (1 / c1.w)' decode, the whole mul-no-const
+						// population: 41c59a3a, a426abcd, c1781a2e, c87769e0, d736a5bd, dbc64826.
+						u32 recip_operand = umax;
+						u32 value_operand = umax;
+						u32 recip_slot = 0;
+						u8 recip_comp = 0;
+
+						for (u32 s = 0; s < 2; ++s)
+						{
+							if (in.src[s].reg_type != RSX_VP_REGISTER_TYPE_TEMP)
+							{
+								continue;
+							}
+
+							u32 slot = 0;
+							u8 comp = 0;
+
+							// The scale must be read as a broadcast - one lane splatted across
+							// xyz. A per-lane read of a temp is not a scalar factor.
+							const SRC& op = in.src[s];
+							const bool broadcast = (op.swz_x == op.swz_y) && (op.swz_y == op.swz_z);
+
+							if (broadcast && reciprocal_of_const(op.tmp_src, op.swz_x, chosen, slot, comp))
+							{
+								// Two reciprocal operands is a product of two constants, not a
+								// scale on a vertex. Refuse rather than pick one.
+								if (recip_operand != umax)
+								{
+									return refuse("mul-two-recip");
+								}
+
+								recip_operand = s;
+								recip_slot = slot;
+								recip_comp = comp;
+							}
+							else
+							{
+								value_operand = s;
+							}
+						}
+
+						if (recip_operand == umax || value_operand == umax)
+						{
+							// 'mul-no-const' now means only that the probe never ran - neither operand
+							// was a broadcast temp. Every other value names the clause it stopped
+							// on. A reciprocal paired with a non-temp operand is 'attr * (1/c)',
+							// which terminates the walk rather than continuing it; not handled here.
+							return refuse(recip_operand != umax ? "mul-recip-attr" : recip_why);
+						}
+
+						if (in.src[recip_operand].neg || in.src[value_operand].neg)
+						{
+							return refuse("mul-recip-negated");
+						}
+
+						if (!is_identity_xyz_swizzle(in.src[value_operand]))
+						{
+							return refuse("mul-recip-swizzle");
+						}
+
+						if (sca_touches_xyz(in.src[value_operand].tmp_src, chosen))
+						{
+							return refuse("mul-recip-sca-xyz");
+						}
+
+						out.has_scale = true;
+						out.scale_is_reciprocal = true;
+						out.scale_slot = recip_slot;
+						out.scale_component[0] = recip_comp;
+						out.scale_component[1] = recip_comp;
+						out.scale_component[2] = recip_comp;
+
+						prog.collect_vec_writers(walk_target{ false, in.src[value_operand].tmp_src }, writers, chosen);
+						cursor = chosen;
+						break;
 					}
 
 					if (input_slot == umax)
@@ -4703,6 +4871,8 @@ namespace remix_rsx
 						result.affine_scale_component[1] = decode.scale_component[1];
 						result.affine_scale_component[2] = decode.scale_component[2];
 						result.affine_bias_slot = decode.bias_slot;
+						result.affine_scale_reciprocal = decode.scale_is_reciprocal;
+						result.affine_bias_before_scale = decode.bias_before_scale;
 					}
 				}
 			}
@@ -4934,6 +5104,10 @@ namespace remix_rsx
 							result.affine_scale_component[1] = affine.scale_component[1];
 							result.affine_scale_component[2] = affine.scale_component[2];
 							result.affine_bias_slot = affine.bias_slot;
+				result.affine_scale_reciprocal = affine.scale_is_reciprocal;
+				result.affine_bias_before_scale = affine.bias_before_scale;
+							result.affine_scale_reciprocal = affine.scale_is_reciprocal;
+							result.affine_bias_before_scale = affine.bias_before_scale;
 							reached_input = true;
 						}
 					}
@@ -6053,6 +6227,8 @@ namespace remix_rsx
 			// biases and does not scale.
 			out = mat4_identity();
 
+			f32 axis_scale[3] = { 1.f, 1.f, 1.f };
+
 			if (fp.affine_has_scale)
 			{
 				f32 slot[4]{};
@@ -6064,7 +6240,21 @@ namespace remix_rsx
 
 				for (u32 i = 0; i < 3; ++i)
 				{
-					const f32 s = slot[fp.affine_scale_component[i] & 3];
+					f32 s = slot[fp.affine_scale_component[i] & 3];
+
+					// Written as RCP(c[K].<c>) in a scalar slot, so the constant is the divisor.
+					// Guarded before the reciprocal is taken, not after: 1/0 is an infinity that
+					// the finiteness test below would catch, but 1/1e-30 is a finite number large
+					// enough to throw the mesh out of the world.
+					if (fp.affine_scale_reciprocal)
+					{
+						if (!std::isfinite(s) || std::abs(s) < 1e-12f)
+						{
+							return false;
+						}
+
+						s = 1.f / s;
+					}
 
 					// A zero or non-finite axis collapses the mesh into a plane or deletes it.
 					// Refuse the whole decode rather than submit two thirds of it.
@@ -6073,6 +6263,7 @@ namespace remix_rsx
 						return false;
 					}
 
+					axis_scale[i] = s;
 					out.m[i][i] = s;
 				}
 			}
@@ -6093,7 +6284,11 @@ namespace remix_rsx
 						return false;
 					}
 
-					out.m[3][i] = slot[i];
+					// This matrix applies scale then translation, so '(attr + b) * s' has to put
+					// b*s in the translation row - the program adds before it scales. Storing b
+					// unscaled would place the mesh 1/s times too far out, which on R2's /256
+					// decode is a 256x displacement.
+					out.m[3][i] = fp.affine_bias_before_scale ? (slot[i] * axis_scale[i]) : slot[i];
 				}
 			}
 

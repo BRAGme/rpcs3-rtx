@@ -175,6 +175,11 @@ namespace remix_rsx
 		u32 affine_scale_slot = 0;
 		u8 affine_scale_component[3] = { 0, 1, 2 };
 		u32 affine_bias_slot = 0;
+		// The scale came from RCP(c[K].<c>) in a scalar slot, so the factor is 1/value.
+		bool affine_scale_reciprocal = false;
+		// '(attr + b) * s' rather than 'attr * s + b'. build_prescale composes scale then bias, so
+		// the translation row carries b*s when this is set.
+		bool affine_bias_before_scale = false;
 		// Which match_const_affine test refused, kept whether or not the match succeeded. A dozen
 		// separate exits all read as 'affine=0' from the census, and "this decode is written in a
 		// shape the grammar does not cover" and "this program has no decode" want opposite fixes.
