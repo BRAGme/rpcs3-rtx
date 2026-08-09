@@ -1286,7 +1286,25 @@ private:
 	// and the last round proved how expensive guessing between them is: the camera-less-frame
 	// theory predicted ~92% of world_refused and measured 0.11%. Set at each return, printed by
 	// the world-refused census, so the population is named rather than modelled.
+	static constexpr const char* s_world_fail_names[] = {
+		"nocam", "idxworld", "sl_group", "sl_bone", "lay_group", "lay_ref", "fused_vpi",
+		"lay_other", "ref_group", "ref_bone", "ref_vm", "ref_none", "no_reference", "tail" };
+
 	const char* m_world_fail = "";
+
+	// Per *draw*, not per program. The first cut of this printed one census line the first time
+	// a program was refused, which biased the whole distribution: early frames have no camera,
+	// so 17 programs were tagged "nocam" on their first refusal and carried that label forever
+	// even though world_refused_nocam is 0.11% of the population. Counting every refusal is the
+	// only form of this that answers the question.
+	u64 m_world_fail_counts[std::size(s_world_fail_names)] = {};
+
+	void note_world_fail(u32 reason)
+	{
+		m_world_fail = s_world_fail_names[reason];
+		++m_world_fail_counts[reason];
+	}
+
 
 	bool m_sky_camera_warned = false;
 	bool m_pick_slot_warned = false;

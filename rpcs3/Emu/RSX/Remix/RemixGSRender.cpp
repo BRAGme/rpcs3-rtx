@@ -5376,7 +5376,7 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 
 	if (!m_active_camera.valid || remix_rsx::nocam_enabled())
 	{
-		m_world_fail = "nocam";
+		note_world_fail(0);
 		return false;
 	}
 
@@ -5520,7 +5520,7 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 		if (remix_rsx::mat4 probe{}; !remix_rsx::build_prescale(fp, probe))
 		{
 			++m_stats.pos_decode_refused;
-			m_world_fail = "idxworld";
+			note_world_fail(1);
 			return false;
 		}
 	}
@@ -5542,7 +5542,7 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 				remix_rsx::slot_block slots{};
 				if (!remix_rsx::read_slot_block(fp.group_base[i], slots))
 				{
-					m_world_fail = "sl_group";
+					note_world_fail(2);
 					return false;
 				}
 
@@ -5553,7 +5553,7 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 
 			if (!remix_rsx::mat4_is_finite(world) || !remix_rsx::is_affine(world, s_world_affine_tolerance))
 			{
-				m_world_fail = "sl_bone";
+				note_world_fail(3);
 				return false;
 			}
 
@@ -5575,7 +5575,7 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 				remix_rsx::slot_block slots{};
 				if (!remix_rsx::read_slot_block(fp.group_base[i], slots))
 				{
-					m_world_fail = "lay_group";
+					note_world_fail(4);
 					return false;
 				}
 
@@ -5591,7 +5591,7 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 			remix_rsx::slot_block slots{};
 			if (!remix_rsx::read_slot_block(fp.outer_base(), slots))
 			{
-				m_world_fail = "lay_ref";
+				note_world_fail(5);
 				return false;
 			}
 
@@ -5604,7 +5604,7 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 		}
 		else
 		{
-			m_world_fail = "fused_vpi";
+			note_world_fail(6);
 			return false;
 		}
 
@@ -5616,7 +5616,7 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 	{
 		if (!fp.has_outer())
 		{
-			m_world_fail = "lay_other";
+			note_world_fail(7);
 			return false;
 		}
 
@@ -5646,7 +5646,7 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 				remix_rsx::slot_block slots{};
 				if (!remix_rsx::read_slot_block(fp.group_base[i], slots))
 				{
-					m_world_fail = "ref_group";
+					note_world_fail(8);
 					return false;
 				}
 
@@ -5660,7 +5660,7 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 			remix_rsx::slot_block slots{};
 			if (!remix_rsx::read_slot_block(fp.outer_base(), slots))
 			{
-				m_world_fail = "ref_bone";
+				note_world_fail(9);
 				return false;
 			}
 
@@ -5714,7 +5714,7 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 				// missing object is shippable, a smeared one is not.
 				++m_stats.viewmodel_cam_refused;
 				report_viewmodel_camera_census(vm_mode >= 2 ? "REFUSED:noref" : "REFUSED:mode1");
-				m_world_fail = "ref_vm";
+				note_world_fail(10);
 				return false;
 			}
 		}
@@ -5730,13 +5730,13 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 	}
 	else
 	{
-		m_world_fail = "ref_none";
+		note_world_fail(11);
 		return false;
 	}
 
 	if (!remix_rsx::mat4_is_finite(world))
 	{
-		m_world_fail = "no_reference";
+		note_world_fail(12);
 		return false;
 	}
 
@@ -5799,7 +5799,7 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 
 	if (!remix_rsx::is_affine(world, s_world_affine_tolerance))
 	{
-		m_world_fail = "tail";
+		note_world_fail(13);
 		return false;
 	}
 
@@ -8860,6 +8860,22 @@ void RemixGSRender::log_stats()
 			m_stats.cam_fallback,
 			m_stats.cam_held,
 			m_stats.world_refused_nocam);
+
+		std::string fails = "Remix world-fail:";
+
+		for (usz i = 0; i < std::size(s_world_fail_names); ++i)
+		{
+			if (m_world_fail_counts[i] != 0)
+			{
+				fmt::append(fails, " %s=%llu", s_world_fail_names[i], m_world_fail_counts[i]);
+			}
+		}
+
+		if (fs::file out{ fs::get_executable_dir() + "remix_dump.log", fs::write + fs::create + fs::append })
+		{
+			fails += '\n';
+			out.write(fails);
+		}
 
 		if (fs::file out{ fs::get_executable_dir() + "remix_dump.log", fs::write + fs::create + fs::append })
 		{
