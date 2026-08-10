@@ -668,6 +668,14 @@ private:
 		// their own but which blend_unmapped bounds from below. One Resistance 2 capture of 665
 		// dumped draws put the expected blend_translucent share at ~163/665, i.e. about a
 		// quarter of submitted draws.
+		// Alpha-blended draws whose albedo texture has a constant alpha channel, so the blend the
+		// game asked for resolves to a no-op. 'rescued' took its alpha from ATTR3 instead;
+		// 'stranded' had no varying ATTR3 alpha to take and stays opaque. stranded > 0 means
+		// there is a second alpha source in the title's fragment programs that this does not
+		// reach, and only fragment-program analysis will find it.
+		u64 blend_alpha_rescued = 0;
+		u64 blend_alpha_stranded = 0;
+
 		u64 blend_chained = 0;
 		u64 blend_translucent = 0;
 		u64 blend_unmapped = 0;
@@ -1021,6 +1029,23 @@ private:
 	// vertex-coloured geometry stops reaching Remix as flat white. Like apply_texcoords it must
 	// run before the mesh content hash, which covers the colour.
 	void apply_vertex_colour(u32 first_vertex, u32 vertex_count);
+
+	// The textured counterpart, for alpha only. Writes ATTR3's alpha into m_scratch_vertices'
+	// colour alpha and leaves RGB white, so no tint is guessed at - only the channel the draw
+	// provably cannot get from its texture. True means the alpha varies and Remix should be
+	// told to read VertexColor0; false leaves the draw exactly as it was.
+	bool apply_vertex_alpha(u32 first_vertex, u32 vertex_count);
+
+	// Alpha range of the albedo texture bound for the current draw, and whether
+	// apply_vertex_alpha found a usable ATTR3 alpha to substitute for it.
+	u8 m_scratch_albedo_alpha_min = 255;
+	u8 m_scratch_albedo_alpha_max = 0;
+	bool m_scratch_vertex_alpha = false;
+
+	// Decoded ATTR3 alpha for the draw under consideration. Held across the two passes
+	// apply_vertex_alpha makes - measure the range, then commit only if it varies - so the
+	// attribute is walked once and nothing is written until the draw is known to qualify.
+	std::vector<u8> m_scratch_alpha;
 
 	// Locates one vertex attribute in the interleaved blocks and validates the guest span it
 	// would be read through. Unlike the old ATTR0-only code this searches *every* block: a

@@ -2585,6 +2585,73 @@ void RemixGSRender::apply_vertex_colour(u32 first_vertex, u32 vertex_count)
 	++m_stats.vcol_applied;
 }
 
+bool RemixGSRender::apply_vertex_alpha(u32 first_vertex, u32 vertex_count)
+{
+	// The sibling above refuses to touch a textured draw's colour because ATTR3 modulates the
+	// albedo with per-title semantics this backend cannot read, and guessing a tint would be
+	// worse than white. That argument is about RGB. Alpha is a narrower case, and one where
+	// doing nothing is not neutral: the instance blend ext asserts surface alpha comes from the
+	// albedo texture's alpha channel, so when that channel is a constant the blend the game
+	// asked for resolves to "source, unmodified" - the draw is opaque however the factors are
+	// set. Measured on Resistance 2's main menu, 4 of 11 alpha-blended programs are in exactly
+	// that state, all four on DXT1 albedos which cannot carry a gradient at all.
+	//
+	// So this runs only where the current behaviour is provably a no-op, writes only alpha, and
+	// gives up unless ATTR3 actually varies - if the vertex alpha is constant too there is
+	// nothing to rescue and the draw is left untouched rather than swapped onto an equally flat
+	// source. Under those three conditions the change cannot be worse than what it replaces.
+	if (!remix_rsx::vertex_alpha_enabled())
+	{
+		return false;
+	}
+
+	attribute_view colours{};
+
+	if (map_attribute(3, first_vertex, vertex_count, colours) != attribute_status::ok || colours.size < 4)
+	{
+		return false;
+	}
+
+	const auto channel = [](f32 v) -> u32
+	{
+		return static_cast<u32>(std::clamp(v, 0.f, 1.f) * 255.f + 0.5f);
+	};
+
+	m_scratch_alpha.resize(vertex_count);
+
+	u32 lo = 255;
+	u32 hi = 0;
+
+	for (u32 i = 0; i < vertex_count; ++i)
+	{
+		f32 rgba[4]{};
+
+		if (!remix_rsx::decode_position(colours.at(i), colours.type, colours.size, rgba))
+		{
+			return false;
+		}
+
+		const u32 a = channel(rgba[3]);
+		m_scratch_alpha[i] = static_cast<u8>(a);
+		lo = std::min(lo, a);
+		hi = std::max(hi, a);
+	}
+
+	// Flat vertex alpha is the same dead end as the flat texture alpha it would replace.
+	if (lo == hi)
+	{
+		return false;
+	}
+
+	for (u32 i = 0; i < vertex_count; ++i)
+	{
+		// RGB left at white: the tint question the sibling declines to answer stays unanswered.
+		m_scratch_vertices[i].color = 0x00FFFFFFu | (u32{m_scratch_alpha[i]} << 24);
+	}
+
+	return true;
+}
+
 bool RemixGSRender::samples_bound_surface() const
 {
 	// Every referenced 2D unit is tested, not just albedo_texture_unit()'s: that one returns the
@@ -6935,6 +7002,11 @@ void RemixGSRender::submit_subdraw()
 	remixapi_MaterialHandle material = nullptr;
 	u64 albedo_hash = 0;
 
+	// Per draw, not per frame: the previous draw's texture says nothing about this one's.
+	m_scratch_albedo_alpha_min = 255;
+	m_scratch_albedo_alpha_max = 0;
+	m_scratch_vertex_alpha = false;
+
 	if (m_remix.fork_features())
 	{
 		// Walk the eligible 2D units in order and keep the first that yields a material.
@@ -6968,6 +7040,8 @@ void RemixGSRender::submit_subdraw()
 			if (material && entry)
 			{
 				albedo_hash = entry->content_hash;
+				m_scratch_albedo_alpha_min = entry->alpha_min;
+				m_scratch_albedo_alpha_max = entry->alpha_max;
 				++m_stats.tex_bound;
 
 				if (unit != first_unit)
@@ -7047,6 +7121,24 @@ void RemixGSRender::submit_subdraw()
 	if (!material)
 	{
 		apply_vertex_colour(first_vertex, vertex_count);
+	}
+	else if (!remix_rsx::alpha_state_disabled() && rsx::method_registers.blend_enabled()
+		&& m_scratch_albedo_alpha_min == m_scratch_albedo_alpha_max)
+	{
+		// A blended draw whose texture alpha is a constant: the blend cannot do anything as
+		// submitted. Same placement as the call above and for the same reason - the mesh content
+		// hash covers the vertex colour, so this has to happen before it or two draws that
+		// differ only in alpha would share a mesh handle.
+		m_scratch_vertex_alpha = apply_vertex_alpha(first_vertex, vertex_count);
+
+		if (m_scratch_vertex_alpha)
+		{
+			++m_stats.blend_alpha_rescued;
+		}
+		else
+		{
+			++m_stats.blend_alpha_stranded;
+		}
 	}
 
 	// --- sky dome -----------------------------------------------------------------------
@@ -7786,7 +7878,12 @@ void RemixGSRender::submit_subdraw()
 		blend_state.textureColorArg1Source = 1;  // RtTextureArgSource::Texture
 		blend_state.textureColorArg2Source = 0;  // RtTextureArgSource::None
 		blend_state.textureColorOperation = 3;   // DxvkRtTextureOperation::Modulate
-		blend_state.textureAlphaArg1Source = 1;  // RtTextureArgSource::Texture
+		// Texture unless apply_vertex_alpha found the texture's alpha channel to be a constant
+		// and ATTR3's to vary, in which case the assertion below would make the draw's blend a
+		// no-op and VertexColor0 is where its alpha actually lives.
+		blend_state.textureAlphaArg1Source = m_scratch_vertex_alpha
+			? 2u   // RtTextureArgSource::VertexColor0
+			: 1u;  // RtTextureArgSource::Texture
 		blend_state.textureAlphaArg2Source = 0;  // RtTextureArgSource::None
 		blend_state.textureAlphaOperation = 1;   // DxvkRtTextureOperation::SelectArg1
 		blend_state.tFactor = 0xFFFFFFFFu;
@@ -9090,7 +9187,8 @@ void RemixGSRender::log_stats()
 		"vmcam_diverted=%llu vmcam_unusable=%llu vmcam_conflict=%llu vmcam_latched=%llu vmcam_held=%llu "
 		"vmcam_census=%u vmcam_mode=%u | "
 		"cat_hidden=%llu cat_particle=%llu cat_decal=%llu cat_smoothnormals=%llu | "
-		"blend_chained=%llu blend_translucent=%llu blend_unmapped=%llu blend_rtopaque=%llu blend_pairs={%s} | "
+		"blend_chained=%llu blend_translucent=%llu blend_unmapped=%llu blend_rtopaque=%llu "
+		"blend_arescued=%llu blend_astranded=%llu blend_pairs={%s} | "
 		"tex_bound=%llu tex_none=%llu tex_no_unit=%llu tex_unit_retry=%llu tex_albedo_ucode=%llu tex_albedo_guess=%llu tex_retry_refused=%llu tex_unit_substituted=%llu uv_applied=%llu uv_none=%llu uv_absent=%llu uv_layout=%llu uv_memory=%llu uv_fallback=%llu uv_ucode=%llu uv_heuristic=%llu uv_nonfinite=%llu vcol_applied=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_tombstone=%llu tex_rehashed=%llu tex_refreshed=%llu mat_created=%llu tex_retry_unsupported=%llu mat_untested=%llu uv_scale_ucode=%llu uv_scale_fixed=%llu | "
 		"ui_draws=%llu ui_skipped=%llu ui_no_colour=%llu ui_rt=%llu ui_prims=%llu ui_frames=%llu ui_ndc=%llu ui_unit=%llu ui_pixel=%llu ui_nospace=%llu ui_ortho2d=%llu "
 		"ui_vpydown=%llu ui_vpyup=%llu ui_vpfallback=%llu ui_vflip_ndc=%llu/%llu ui_vflip_pixel=%llu/%llu ui_vflip_abstain=%llu | "
@@ -9231,6 +9329,8 @@ void RemixGSRender::log_stats()
 		m_stats.blend_translucent,
 		m_stats.blend_unmapped,
 		m_stats.blend_runtime_opaque,
+		m_stats.blend_alpha_rescued,
+		m_stats.blend_alpha_stranded,
 		blend_pairs.c_str(),
 		m_stats.tex_bound,
 		m_stats.tex_none,

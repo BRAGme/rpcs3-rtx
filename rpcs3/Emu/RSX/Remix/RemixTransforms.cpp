@@ -7165,6 +7165,17 @@ namespace remix_rsx
 		return env || g_cfg.video.remix.no_alpha_test;
 	}
 
+	bool vertex_alpha_enabled()
+	{
+		// Lets an alpha-blended draw take its alpha from ATTR3 when the albedo texture has none
+		// to give. Default on because the case it fires in is one where the current behaviour is
+		// provably a no-op: alpha comes from the texture, the texture's alpha is a constant, so
+		// the blend resolves to "source, unmodified" no matter what the factors say. 0 restores
+		// the unconditional texture-alpha assertion.
+		static const u32 value = env_u32(L"RPCS3_REMIX_VTXALPHA", 1);
+		return value != 0;
+	}
+
 	bool skinid_enabled()
 	{
 		static const bool value = env_flag(L"RPCS3_REMIX_SKINID");

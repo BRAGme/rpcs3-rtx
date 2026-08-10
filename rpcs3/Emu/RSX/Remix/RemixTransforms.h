@@ -1072,6 +1072,10 @@ namespace remix_rsx
 	//                           stays a usable value.
 	// RPCS3_REMIX_SKINRAW=1     feed the raw (un-scaled) attribute value to evaluate_bone_offset
 	//                           instead of the scaled one - M4 deviation D1 under test.
+	// RPCS3_REMIX_VTXALPHA=0    keep asserting that surface alpha is the albedo texture's alpha
+	//                           channel even when that channel is a constant.
+	bool vertex_alpha_enabled();
+
 	bool skinid_enabled();
 	u32 skinbone_index();
 	bool skinraw_enabled();
