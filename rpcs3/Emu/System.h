@@ -157,6 +157,13 @@ class Emulator final
 	std::string m_title;
 	std::string m_localized_title;
 	std::string m_app_version;
+
+	// Boot-time game-version notice: says which version is actually about to run and whether an
+	// installed update was found over a disc. Computed once in Load() (before the update-boot
+	// recursion) because that is the only place the disc's APP_VER and the installed patch's
+	// APP_VER are both known; shown in Run(), because the overlay does not exist yet in Load().
+	std::string m_game_version_notice;
+
 	std::string m_hash;
 	std::string m_cat;
 	std::string m_dir;

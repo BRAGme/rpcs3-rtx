@@ -67,6 +67,15 @@ namespace remix_rsx
 		// folded into the mesh key and must not move when only the CPU copy is rebuilt.
 		u64 content_refresh = 0;
 
+		// Round 8, measurement only. Full hash of the guest range as of the last cadence verify
+		// (RPCS3_REMIX_TEXVERIFY), and the frame that verify ran. A THIRD hash rather than a reuse
+		// of either of the two above, deliberately: 'fingerprint' is the rehash policy's (and is a
+		// strided sample at the default mode), 'content_refresh' belongs to the CPU-pixel refresh
+		// and only advances for callers that pass refresh_pixels - sharing either would make one
+		// policy silently mask the other's staleness.
+		u64 verify_hash = 0;
+		u64 last_verified_frame = 0;
+
 		u32 width = 0;
 		u32 height = 0;
 
@@ -89,11 +98,47 @@ namespace remix_rsx
 		u8 alpha_min = 255;
 		u8 alpha_max = 0;
 
+		// Mean of the decoded R/G/B channels in 0..1, measured in the same single pass as the alpha
+		// range above. This is the *fixture's own colour*, which is what a light derived from that
+		// fixture should be tinted by: a sodium lamp texture is orange and its light should be too.
+		// Defaults to white so an entry that never reached upload() tints nothing.
+		//
+		// Deliberately a mean and not a max: a lamp texture whose glass is orange over a white
+		// housing has a max of white, which would throw away the very hue this exists to carry.
+		f32 mean_rgb[3] = { 1.f, 1.f, 1.f };
+
+		// Round 23. Where the BRIGHTEST region of this texture sits, in normalised texel
+		// coordinates (u = column / width, v = row / height, row 0 = the first decoded row).
+		// peak_uv[0] < 0 means "never measured" - the walk below only runs for textures whose
+		// content hash is on RPCS3_REMIX_SKYEMISSIVE, so every other texture pays nothing.
+		//
+		// It is the luminance-weighted CENTROID of the texels within 2 % of the peak, not the
+		// single brightest texel: MEASURED offline on the dumped Selva dome
+		// (unit0_D1A6D1B27ADE6232_2048x1024.bmp) the sun is a broad warm glow, not a hard disc -
+		// zero texels reach luma 250, 112 reach 245, 3060 reach 220 - so the single brightest
+		// texel (1340,513) is 46 texels off the centroid of the region it belongs to.
+		f32 peak_uv[2] = { -1.f, -1.f };
+		f32 peak_luma = 0.f;
+		u32 peak_texels = 0;
+
 		// Decoded BGRA8, kept so the UI compositor can sample it CPU-side.
 		std::vector<u8> pixels;
 
+		// CELL_GCM_TEXTURE_B8 carries one channel. The Remix material keeps the opaque grayscale
+		// expansion above, while the UI compositor interprets the same byte as glyph coverage.
+		bool b8_coverage = false;
+
 		u64 last_used_frame = 0;
 		bool unsupported = false;
+
+		// Why the decode refused, when it did - the same static string note_refusal prints. Added
+		// beside 'unsupported' rather than replacing it: every existing reader tests the bool and
+		// the point of this round is to measure, not to move behaviour. Two of the five reasons
+		// ("unreadable" and "no-mip0") are *transient* - the guest range was not mapped yet, or the
+		// mip chain had not been written - and this cache records them as permanently unsupported
+		// for the whole 21,600-frame residency. tex_tomb_transient counts how much of the white
+		// population that accounts for, which is the entry ticket for a round-5 tombstone retry.
+		const char* refusal_reason = "";
 	};
 
 	struct texture_stats
@@ -121,6 +166,93 @@ namespace remix_rsx
 		// 'materials'. High here on a title whose foliage looks like solid cards says the cutout
 		// is blend-driven and the material is not the place to look; near zero says the opposite.
 		u64 materials_untested = 0;
+
+		// Tombstone hits whose recorded refusal reason was a *transient* condition - "unreadable"
+		// (the guest range was not mapped when the decode ran) or "no-mip0" (the mip chain had not
+		// been written yet) - rather than a genuine format or size refusal. These are the entries
+		// that should arguably be retried instead of remembered, and until this counter existed
+		// there was no way to tell how much of the permanent-white population they are. Measurement
+		// only this round; nothing retries.
+		u64 tombstone_transient = 0;
+		// CreateTexture calls whose content hash was already live under a *different* descriptor
+		// key. The descriptor-only cache key means one image can hold several entries (different
+		// wrap, different alpha state), which is intended - but it also means the content hash the
+		// mesh key and every conf texture list are written against is not unique to an entry. This
+		// is the direct measurement of the duplicate-hash-namespace suspicion behind the wrong-
+		// texture sightings. Non-zero is the round-5 entry ticket; zero kills the theory outright.
+		u64 key_duplicate_hash = 0;
+
+		// Materials created with a non-zero emissiveIntensity because their content hash is on
+		// RPCS3_REMIX_EMISSIVE. The partition is "listed and created", not "listed": a typo'd hash
+		// and a hash whose texture never decodes are both 0 here, which is the difference between
+		// "the list did nothing" and "the list is empty".
+		u64 materials_emissive = 0;
+
+		// Round 13. The RPCS3_REMIX_SKYEMISSIVE subset of the above - a strict subset, because the
+		// sky branch runs inside the same 'if' and increments both. This is the counter the sky
+		// census reads to answer "was the emissive material actually created", which is a different
+		// question from "is the hash on the list": a hash whose texture never decodes never reaches
+		// CreateMaterial at all.
+		u64 materials_sky_emissive = 0;
+
+		// Round 13. The subset of the above that also declared BlendType::kEmissive, i.e. the ones
+		// that will reach the unordered TLAS and stop occluding the sun. Separate from
+		// materials_sky_emissive so RPCS3_REMIX_SKYEMISSIVEBLEND=0 is visible as a number: with the
+		// knob off these two counters disagree, and that difference IS the A/B.
+		u64 materials_sky_unordered = 0;
+
+		// Round 14 (ITEM 2). The RPCS3_REMIX_SUNCARDEMISSIVE twin of materials_sky_emissive: a
+		// SUNCARDALBEDO hash that reached CreateMaterial and got the emissive + kEmissive treatment.
+		// It is DISJOINT from materials_sky_emissive by construction (the sun-card test requires
+		// !sky_emissive), so the two never double-count one texture. materials_sky_unordered counts
+		// both, because both declare the same blend type and it is the one thing they share.
+		// Reading it: 0 with a non-empty SUNCARDALBEDO means the hash never reached CreateMaterial -
+		// wrong hash, or the texture never decoded. This is the numeric acceptance for ITEM 2.
+		u64 materials_sun_card = 0;
+
+		// Round 7. Entries whose wrap mode was overridden to CLAMP because their content hash is on
+		// RPCS3_REMIX_CLAMPALBEDO - the UI seam lever for the GPU-sampled world-space-UI route.
+		// Counted per created entry, like materials_emissive and for the same reason: "listed and
+		// created" separates a typo'd hash from a list that is simply empty. Round 8: that is now
+		// literally what it counts - a listed texture the guest had ALREADY bound clamp counts
+		// too (the list entry is correct, it just had nothing to change), and a failed
+		// CreateTexture counts for nothing.
+		u64 wrap_forced = 0;
+
+		// Round 8, measurement only. Cache HITS whose guest bytes had changed since the last
+		// cadence verify while the descriptor key stayed put - i.e. the "stale pool slot" arm of
+		// the wrong-texture bug ("a Mantel soldier rendered in tree bark"): a streaming pool
+		// recycles an address, the descriptor-only key still hits, and the entry keeps serving the
+		// previous image's pixels AND the previous image's Remix material. Nothing is rebuilt on
+		// this count - see the RPCS3_REMIX_TEXVERIFY note for why the obvious in-place rebuild is
+		// not safe in this tree - so a non-zero here is evidence, not a fix.
+		u64 stale_detected = 0;
+
+		// Round 17. The subset of stale_detected that RPCS3_REMIX_TEXSTALEEVICT acted on: entries
+		// erased so the next bind decodes the guest bytes that are there NOW and derives the
+		// content hash of the image actually resident. With the knob off (its default) this stays 0
+		// while stale_detected climbs, and that difference IS the A/B for the bark-helmet family.
+		// stale_orphaned counts the texture+material pairs deliberately NOT destroyed on the way
+		// out - see the orphan note at the erase site. The two should track each other exactly.
+		u64 stale_evicted = 0;
+		u64 stale_orphaned = 0;
+
+		// --- round 9: the reap split ------------------------------------------------------------
+		// reap() used to have exactly one outcome and no counter: an entry idle past TEXIDLE lost
+		// its material and its texture and was erased. It consulted nothing about whether a live
+		// MESH still referenced that material - and the mesh cache bakes the material handle into
+		// the mesh at CreateMesh while keying the mesh on its CONTENT, so a reaped-then-rebound
+		// texture gets a NEW material handle while the reused mesh keeps the DESTROYED one
+		// forever. That is a permanently white surface, and if the runtime ever recycles the freed
+		// handle value it is a wrongly-textured one.
+		//
+		// reap_kept: idle entries spared because a live mesh still references their material
+		// (their last_used_frame is bumped so they re-age normally). reap_freed: idle entries
+		// reaped as before. Read them across the 30-second idle repro: reap_kept climbing while
+		// the screen stays textured IS the fix firing. RPCS3_REMIX_TEXREAPSAFE=0 drives reap_kept
+		// to 0 and restores today's reap bit-exactly.
+		u64 reap_kept = 0;
+		u64 reap_freed = 0;
 	};
 
 	// Per-draw albedo texture cache. Owns every remixapi texture and material it creates.
@@ -151,7 +283,20 @@ namespace remix_rsx
 			const texture_entry** out_entry,
 			bool refresh_pixels = false);
 
-		void reap(const remixapi_Interface& api, u64 frame);
+		// 'live_materials' is the set of material handles that live meshes have baked into their
+		// Remix mesh objects. An idle entry whose material is in that set is KEPT rather than
+		// destroyed, because destroying it leaves a dangling handle inside a mesh whose key -
+		// being content-derived - will never change, so no later bind can heal it. Pass nullptr
+		// (or run with RPCS3_REMIX_TEXREAPSAFE=0) for the pre-round-9 behaviour.
+		void reap(const remixapi_Interface& api, u64 frame,
+			const std::unordered_set<const void*>* live_materials = nullptr);
+
+		// True when at least one entry is past TEXIDLE, i.e. when the next reap() would actually
+		// destroy or keep something. The caller uses this to decide whether it is worth walking
+		// ~65k mesh entries to build the live-material set: reap runs every flip, but in steady
+		// state it has work only once per TEXIDLE window per entry, because a kept entry is
+		// re-aged and a freed one is erased. Scans the texture entries only - the cheap side.
+		bool has_idle(u64 frame) const;
 		void destroy_all(const remixapi_Interface& api);
 
 		usz live() const { return m_entries.size(); }
@@ -175,7 +320,27 @@ namespace remix_rsx
 		// distinct offenders, and "many surfaces stay white" cannot be attributed.
 		void note_refusal(const char* reason, u32 gcm_format, u32 width, u32 height);
 
+		// Round 8. One 'Remix texstale:' line per descriptor key whose guest bytes moved under it,
+		// and one 'Remix texdup:' line per content hash living under two descriptor keys. Both are
+		// bounded, both mirror to remix_dump.log, and neither changes a decision - they are the two
+		// halves of the evidence that says which arm of the wrong-texture bug is real.
+		void note_stale(u64 key, const texture_entry& entry, u32 format, u64 frame);
+		void note_content_dup(u64 content_hash, u64 key_a, u64 key_b, u32 format, u32 width, u32 height);
+
+		static constexpr u32 s_max_texstale_lines = 64;
+		static constexpr u32 s_max_texdup_lines = 64;
+		std::unordered_set<u64> m_texstale_seen;
+		std::unordered_set<u64> m_texdup_seen;
+		u32 m_texstale_lines = 0;
+		u32 m_texdup_lines = 0;
+
 		std::unordered_map<u64, texture_entry> m_entries;
+
+		// content_hash -> the descriptor key that first published it. Read-only bookkeeping for
+		// key_duplicate_hash; nothing consults it to make a decision, and it is deliberately not
+		// pruned on reap - a hash that comes back under a second key after the first was reaped is
+		// exactly the collision this is meant to catch, and pruning would hide it.
+		std::unordered_map<u64, u64> m_content_keys;
 		std::unordered_set<u64> m_refusals_seen;
 		texture_stats m_stats{};
 		u32 m_budget_left = 0;
@@ -191,6 +356,51 @@ namespace remix_rsx
 	bool textures_disabled();
 	u32 texture_budget();
 	bool textures_linear();
+
+	// RPCS3_REMIX_TEXVERIFY=<frames> (default 120; 0 disables): how often a live cache entry
+	// re-hashes its guest bytes to find out whether the image under a stable descriptor key has
+	// been replaced. MEASUREMENT ONLY - it counts (tex_stale_detected) and names
+	// ('Remix texstale:'), and rebuilds nothing.
+	//
+	// Why nothing is rebuilt, stated so the next round does not have to rediscover it: the honest
+	// fix is an in-place rebuild with content_hash PINNED (the existing refresh_pixels idiom), so
+	// the mesh key never moves and the 32x mesh-churn trap that made RPCS3_REMIX_TEXREHASH
+	// unusable is avoided. But pinning the hash is exactly what makes destroying and re-creating
+	// the Remix texture + material unsafe HERE: the mesh cache bakes the material handle into the
+	// mesh at CreateMesh time and a reused mesh keeps it (RemixGSRender submit path), so a mesh
+	// key that does not move keeps submitting a destroyed material. Refreshing only the CPU pixels
+	// is safe but does not reach the GPU-sampled route, which is the one the sighting is on.
+	// A safe fix needs a way to re-point a live material, which is a round-9 question.
+	//
+	// Cost: one FNV over the guest range per entry per TEXVERIFY frames, amortised - not per bind.
+	u32 texture_verify_frames();
+
+	// RPCS3_REMIX_TEXSTALEEVICT=1 (default 0 = build 4b7bdb4, bit for bit). Acts on the detector
+	// above: when the cadence verify finds the guest bytes under a stable descriptor key have
+	// changed, ERASE the entry so the next bind decodes the image that is actually there.
+	//
+	// This is the "my helmet turned into tree bark" family, and the mechanism is not a hash
+	// collision. texture_descriptor::key() identifies a texture by WHERE it is - offset, location,
+	// format, pitch, dims, wrap, alpha state - while content_hash identifies it by WHAT it is. Haze
+	// streams into a recycled address pool, so bark is decoded at address X, the helmet is later
+	// written over X, and the helmet's bind produces the SAME descriptor key, hits the cache and is
+	// handed back the material whose albedoTexture path is 0x<bark hash>. Nothing ages it out
+	// either: tex_destroyed and reap_freed are both 0 over 18,269 flips on the round-16 run, so
+	// every swap is permanent for the session. Measured there: tex_stale_detected=134 over 63+
+	// distinct keys.
+	//
+	// The round-8 note above assumed the fix had to be an in-place rebuild with content_hash
+	// PINNED, and that pin is what makes destroying the material unsafe. Erasing does not need the
+	// pin - the next bind derives the correct hash and re-keys its own meshes - so the only thing
+	// still required is that the OLD material outlive the meshes that baked it, which the orphan
+	// branch guarantees.
+	//
+	// Not the RPCS3_REMIX_TEXREHASH trap: that hangs off a strided sample_fingerprint that
+	// false-positives (604 rehashes of 682 textures, 32x mesh churn). This hangs off the full-hash
+	// cadence verify. Expected blast radius on Haze: 134 entries rebuilt in 18,269 flips - 1.2% of
+	// tex_created, 0.003% of tex_hits, and every one of them was serving the wrong image.
+	// Counters: tex_stale_evicted, tex_stale_orphaned. Inert unless TEXVERIFY != 0.
+	bool texture_stale_evict();
 
 	// RPCS3_REMIX_BLENDSTATE=0 restores the behaviour up to and including ae94587: every material
 	// declared its own alpha state (useDrawCallAlphaState = 0) and no remixapi_InstanceInfoBlendEXT
@@ -217,6 +427,22 @@ namespace remix_rsx
 	// window in which the camera stayed in one area; raising it costs VRAM, which tex_live reports.
 	// 0 reaps a texture the frame it stops being bound, so umax is the unset sentinel.
 	u32 texture_idle_frames();
+
+	// RPCS3_REMIX_TEXREAPSAFE=1 (default): reap() may not destroy the material of a texture that a
+	// live mesh still has baked in.
+	//
+	// The lifetime hole this closes is proven by code inspection, independently of whether it is
+	// also the idle-degradation mechanism: reap() consults nothing about meshes, the mesh cache
+	// bakes the material handle at CreateMesh, and a mesh key is content-derived and therefore
+	// stable - so a reaped material leaves a dangling handle in a mesh that will be reused, not
+	// rebuilt, for as long as its geometry is unchanged. No bind can heal that; there is no code
+	// path that re-points a mesh's material.
+	//
+	// It is also the leading suspect for "stand still ~30 s and the room degrades to flat white":
+	// TEXIDLE's config default is 300 frames, which at this title's 30-50 fps is 6-10 s, the right
+	// order for the observed onset, while MESHIDLE at 3600 frames is 72-120 s - the wrong order.
+	// 0 restores the old reap exactly and is the control for that experiment.
+	bool texture_reap_safe();
 }
 
 #endif

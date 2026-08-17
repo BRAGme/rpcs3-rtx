@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <QApplication>
+#include <QFile>
 
 bool keyboard_pad_handler::Init()
 {
@@ -16,6 +17,14 @@ bool keyboard_pad_handler::Init()
 	m_last_mouse_move_right = now;
 	m_last_mouse_move_up    = now;
 	m_last_mouse_move_down  = now;
+	m_codex_input_time = now;
+	m_codex_input_file = qEnvironmentVariable("RPCS3_CODEX_INPUT_FILE");
+	if (!m_codex_input_file.isEmpty())
+	{
+		QFile file(m_codex_input_file);
+		m_codex_input_offset = file.exists() ? file.size() : 0;
+		input_log.notice("Codex input channel enabled: %s", m_codex_input_file.toStdString());
+	}
 	return true;
 }
 
@@ -1186,6 +1195,7 @@ void keyboard_pad_handler::process()
 	constexpr double button_interval = 10.0;
 
 	const auto now = steady_clock::now();
+	process_codex_input();
 
 	const double elapsed_stick = std::chrono::duration_cast<std::chrono::microseconds>(now - m_stick_time).count() / 1000.0;
 	const double elapsed_button = std::chrono::duration_cast<std::chrono::microseconds>(now - m_button_time).count() / 1000.0;
@@ -1392,5 +1402,49 @@ void keyboard_pad_handler::process()
 		{
 			pad->m_sticks[j].m_value = squircled_sticks[j];
 		}
+	}
+}
+
+void keyboard_pad_handler::process_codex_input()
+{
+	if (m_codex_input_file.isEmpty())
+	{
+		return;
+	}
+
+	const auto now = steady_clock::now();
+	if (now - m_codex_input_time < std::chrono::milliseconds(10))
+	{
+		return;
+	}
+	m_codex_input_time = now;
+
+	QFile file(m_codex_input_file);
+	if (!file.open(QIODevice::ReadOnly) || !file.seek(m_codex_input_offset))
+	{
+		return;
+	}
+
+	while (!file.atEnd())
+	{
+		const qint64 line_offset = file.pos();
+		const QByteArray line = file.readLine();
+		if (!line.endsWith('\n'))
+		{
+			m_codex_input_offset = line_offset;
+			return;
+		}
+
+		const QList<QByteArray> parts = line.trimmed().split(' ');
+		bool code_ok = false;
+		bool state_ok = false;
+		const u32 code = parts.value(0).toUInt(&code_ok, 0);
+		const u32 state = parts.value(1).toUInt(&state_ok, 10);
+		if (parts.size() == 2 && code_ok && state_ok && state <= 1)
+		{
+			Key(code, state != 0);
+			input_log.notice("Codex input: code=0x%x pressed=%d", code, state);
+		}
+		m_codex_input_offset = file.pos();
 	}
 }

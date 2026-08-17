@@ -50,17 +50,23 @@ namespace remix_rsx
 			return (parsed >= 0) ? static_cast<u32>(parsed) : fallback;
 		}
 
-		// RSX wrap modes that tile map onto Remix's Repeat (1); everything else clamps (0).
+		// Remix/MDL address modes: Clamp=0, Repeat=1, Mirrored Repeat=2, Clip=3.
+		// Mirror-once has no exact API representation; clamping is safer than turning one
+		// reflected edge into the infinite tiling seen on Haze's alpha masks.
 		u8 to_remix_wrap(rsx::texture_wrap_mode mode)
 		{
 			switch (mode)
 			{
 			case rsx::texture_wrap_mode::wrap:
+				return 1;
 			case rsx::texture_wrap_mode::mirror:
+				return 2;
+			case rsx::texture_wrap_mode::border:
+				return 3;
 			case rsx::texture_wrap_mode::mirror_once_clamp_to_edge:
 			case rsx::texture_wrap_mode::mirror_once_border:
 			case rsx::texture_wrap_mode::mirror_once_clamp:
-				return 1;
+				return 0;
 			default:
 				return 0;
 			}
@@ -256,6 +262,49 @@ namespace remix_rsx
 		return env ? env : std::min<u32>(2, g_cfg.video.remix.texture_rehash);
 	}
 
+	bool texture_reap_safe()
+	{
+		// Round 9. When set (the default), reap() is handed the set of material handles that live
+		// meshes have baked in and refuses to destroy those. 0 restores the pre-round-9 reap
+		// bit-exactly, which is the control for the 30-second idle-degradation repro: if the
+		// degradation comes back with 0 and not with 1, the reaper and the baked handle were the
+		// mechanism. See texture_stats::reap_kept / reap_freed.
+		static const u32 env = read_env_u32(L"RPCS3_REMIX_TEXREAPSAFE", 1);
+		return env != 0;
+	}
+
+	u32 texture_verify_frames()
+	{
+		// Default 120: at 30 fps that is one full hash per live entry every four seconds, which is
+		// fast enough to catch a streaming pool recycling an address between two areas and slow
+		// enough that the cost is invisible against the per-draw work. 0 disables the check
+		// entirely and is the bisect step if frame time regresses.
+		static const u32 env = read_env_u32(L"RPCS3_REMIX_TEXVERIFY", 120);
+		return env;
+	}
+
+	bool texture_stale_evict()
+	{
+		// Round 17: act on the round-8 detector. Default 0, which reproduces build 4b7bdb4 exactly -
+		// this touches the hottest path in the backend and the A/B has to be free.
+		//
+		// The round-8 note above texture_verify_frames() left this unfixed because it assumed the
+		// fix had to REBUILD IN PLACE with content_hash pinned, and pinning the hash is precisely
+		// what makes destroying the Remix material unsafe (a reused mesh keeps the baked handle).
+		// That assumption is what stalled it for nine rounds. Erasing the entry outright does not
+		// need the pin: the next bind decodes the bytes that are there now, derives the CORRECT
+		// content hash, gets its own material, and re-keys its own meshes. The old mesh keeps
+		// referencing the old material, so the old material must simply not be destroyed - see the
+		// orphan branch at the erase site. Bounded, measured leak instead of a dangling handle.
+		//
+		// This is not the RPCS3_REMIX_TEXREHASH trap either. That one hangs off a STRIDED
+		// sample_fingerprint that false-positives (682 textures, 604 rehashes, 32x mesh churn); this
+		// hangs off the full-hash cadence verify, which fired 134 times in 18,269 flips on the
+		// round-16 Haze run.
+		static const u32 env = read_env_u32(L"RPCS3_REMIX_TEXSTALEEVICT", 0);
+		return env != 0;
+	}
+
 	u64 texture_descriptor::key() const
 	{
 		u64 hash = rpcs3::fnv_seed;
@@ -285,6 +334,61 @@ namespace remix_rsx
 		}
 
 		rsx_log.notice("Remix texrefuse: %s fmt=%02x %ux%u", reason, gcm_format, width, height);
+	}
+
+	void texture_cache::note_stale(u64 key, const texture_entry& entry, u32 format, u64 frame)
+	{
+		if (m_texstale_lines >= s_max_texstale_lines || !m_texstale_seen.insert(key).second)
+		{
+			return;
+		}
+
+		++m_texstale_lines;
+
+		const std::string line = fmt::format(
+			"Remix texstale: key=%016llx albedo=%016llX fmt=%02x dims=%ux%u wrap=%u/%u "
+			"age=%llu frame=%llu line=%u/%u",
+			key,
+			entry.content_hash,
+			format,
+			entry.width,
+			entry.height,
+			u32{entry.wrap_u},
+			u32{entry.wrap_v},
+			frame - entry.last_verified_frame,
+			frame,
+			m_texstale_lines,
+			s_max_texstale_lines);
+
+		rsx_log.notice("%s", line);
+
+		if (fs::file out{ fs::get_executable_dir() + "remix_dump.log", fs::write + fs::create + fs::append })
+		{
+			out.write(line + '\n');
+		}
+	}
+
+	void texture_cache::note_content_dup(u64 content_hash, u64 key_a, u64 key_b, u32 format, u32 width, u32 height)
+	{
+		if (m_texdup_lines >= s_max_texdup_lines || !m_texdup_seen.insert(content_hash).second)
+		{
+			return;
+		}
+
+		++m_texdup_lines;
+
+		// albedo= is deliberately spelled the same way the pick line spells it, so a Ctrl+Click on
+		// a wrong-textured surface joins against these lines by plain string match.
+		const std::string line = fmt::format(
+			"Remix texdup: albedo=%016llX key_a=%016llx key_b=%016llx fmt=%02x dims=%ux%u line=%u/%u",
+			content_hash, key_a, key_b, format, width, height, m_texdup_lines, s_max_texdup_lines);
+
+		rsx_log.notice("%s", line);
+
+		if (fs::file out{ fs::get_executable_dir() + "remix_dump.log", fs::write + fs::create + fs::append })
+		{
+			out.write(line + '\n');
+		}
 	}
 
 	remixapi_MaterialHandle texture_cache::bind(const remixapi_Interface& api,
@@ -364,6 +468,18 @@ namespace remix_rsx
 			{
 				++m_stats.unsupported;
 				++m_stats.tombstone_hits;
+
+				// Of those, the ones tombstoned for a condition that was never permanent. The guest
+				// range being unmapped, or the mip chain not written yet, is a statement about the
+				// moment the decode ran - and this cache turns it into a verdict that outlives the
+				// level. Counted, not acted on: retrying tombstones is a real behaviour change with
+				// a mesh-churn failure mode, and this number is what decides whether it is worth
+				// the risk.
+				if (entry.refusal_reason == std::string_view("unreadable")
+					|| entry.refusal_reason == std::string_view("no-mip0"))
+				{
+					++m_stats.tombstone_transient;
+				}
 
 				// Published even though the bind failed, so a caller walking texture units can
 				// tell a *permanent format* refusal from every other null. Haze binds a
@@ -445,27 +561,99 @@ namespace remix_rsx
 					}
 				}
 
-				if (out_entry)
+				// --- round 8: the cadence staleness verify (measurement only) -------------------
+				// The descriptor-only key plus zero write-tracking means a streaming pool that
+				// recycles an address (bark -> soldier) keeps serving the old pixels AND the old
+				// material forever. TEXREHASH would catch it, but its stale path re-keys
+				// content_hash and that is the measured 32x mesh-churn trap. This says how often
+				// it actually happens, by key, without touching a handle. See
+				// texture_verify_frames() for why the in-place rebuild is not safe in this tree.
+				//
+				// Full hash, not the strided sample: the same reason the refresh_pixels block
+				// above gives - a partial page swap changes a small fraction of the bytes.
+				if (const u32 cadence = texture_verify_frames();
+					cadence != 0 && texture_rehash_mode() == 0
+					&& frame >= entry.last_verified_frame + cadence)
 				{
-					*out_entry = &entry;
+					const u32 address = rsx::get_address(desc.offset, desc.location);
+					const u32 length = static_cast<u32>(std::min<usz>(rsx::get_texture_size(tex), 0x4000000));
+
+					if (length && vm::check_addr(address, vm::page_readable, length))
+					{
+						const u64 full = fnv_bytes(vm::_ptr<const u8>(address), length, rpcs3::fnv_seed);
+
+						if (entry.verify_hash != 0 && full != entry.verify_hash)
+						{
+							++m_stats.stale_detected;
+							note_stale(key, entry, desc.format, frame);
+
+							// Round 17. Reuses the same 'stale' local the TEXREHASH arm sets, so
+							// both staleness policies land on the one rebuild path below rather
+							// than growing a second one. ++m_stats.hits has already fired for this
+							// bind; stale_evicted is the correction, and the difference between the
+							// two counters is the whole A/B.
+							if (texture_stale_evict())
+							{
+								stale = true;
+								++m_stats.stale_evicted;
+							}
+						}
+
+						entry.verify_hash = full;
+					}
+
+					// Stamped even when the range was unreadable: retrying an unmapped range on
+					// every single bind is exactly the cost this cadence exists to bound.
+					entry.last_verified_frame = frame;
 				}
 
-				return entry.material;
+				// Round 17: re-tested, because the cadence verify above may have just turned this
+				// hit into a miss. With TEXSTALEEVICT=0 'stale' cannot have changed since the
+				// enclosing test and this is the same unconditional return it was.
+				if (!stale)
+				{
+					if (out_entry)
+					{
+						*out_entry = &entry;
+					}
+
+					return entry.material;
+				}
 			}
 
 			// Content changed under a stable descriptor. Drop the old pair and fall through
 			// to a rebuild; the budget applies to that rebuild like any other miss.
-			if (entry.material)
+			//
+			// Round 17: the TEXSTALEEVICT arm ORPHANS instead of destroying. The mesh cache bakes
+			// the material handle at CreateMesh while keying the mesh on the CONTENT hash, and on
+			// this title ~45 live entries share one content hash (tex_key_dup 11,212 of
+			// tex_created 11,467), so meshes carrying this material are still being looked up by
+			// OTHER entries every frame. Destroying it here is the dangling-handle failure the
+			// round-9 reap split was added to prevent. The TEXREHASH arm keeps destroying because
+			// that is its pre-existing behaviour and TEXSTALEEVICT=0 must stay bit-exact.
+			// Cost of orphaning: one texture+material pair per stale event, 134 over the whole
+			// round-16 run, reclaimed by the runtime at device teardown.
+			const bool orphan = texture_stale_evict() && texture_rehash_mode() == 0;
+
+			if (!orphan && entry.material)
 			{
 				guarded_destroy_material(api.DestroyMaterial, entry.material);
 			}
 
-			if (entry.texture)
+			if (!orphan && entry.texture)
 			{
 				guarded_destroy_texture(api.DestroyTexture, entry.texture);
 			}
 
-			++m_stats.destroyed;
+			if (orphan)
+			{
+				++m_stats.stale_orphaned;
+			}
+			else
+			{
+				++m_stats.destroyed;
+			}
+
 			++m_stats.rehashed;
 			m_entries.erase(it);
 		}
@@ -517,6 +705,42 @@ namespace remix_rsx
 			return nullptr;
 		}
 
+		// Did this image already exist under another descriptor key? The key is descriptor-only
+		// (RemixTextures.cpp:265-274), so the same bytes bound with a different wrap mode or a
+		// different alpha state legitimately produce a second entry - but the *content hash* is what
+		// the mesh key, the pick line and every rtx.conf texture list are written against, and two
+		// live entries sharing one is exactly the ambiguity a wrong-texture sighting would need.
+		// Recorded before the emplace's entry is moved from, and never used to change a decision.
+		{
+			auto [it_content, fresh] = m_content_keys.try_emplace(entry.content_hash, key);
+
+			if (!fresh && it_content->second != key)
+			{
+				++m_stats.key_duplicate_hash;
+				// Round 8: named, not just counted. tex_key_dup has read 11,383 for several rounds
+				// with no way to tell whether the duplicates are benign (one atlas bound clamp on
+				// the UI and repeat in the world) or the wrong-texture bug itself. This is the line
+				// a Ctrl+Click's albedo= joins against.
+				note_content_dup(entry.content_hash, it_content->second, key, desc.format,
+					entry.width, entry.height);
+			}
+		}
+
+		// Round 8: seed the cadence verify from the bytes this entry was actually built from, so
+		// the FIRST verify can already detect a swap. Seeding lazily instead would cost two full
+		// cadence windows before any stale entry could be named.
+		{
+			const u32 address = rsx::get_address(desc.offset, desc.location);
+			const u32 length = static_cast<u32>(std::min<usz>(rsx::get_texture_size(tex), 0x4000000));
+
+			if (texture_verify_frames() != 0 && length && vm::check_addr(address, vm::page_readable, length))
+			{
+				entry.verify_hash = fnv_bytes(vm::_ptr<const u8>(address), length, rpcs3::fnv_seed);
+			}
+
+			entry.last_verified_frame = frame;
+		}
+
 		auto inserted = m_entries.emplace(key, std::move(entry));
 
 		if (!alpha_tested)
@@ -544,6 +768,7 @@ namespace remix_rsx
 		if (total_size == 0 || total_size > 0x4000000)
 		{
 			++m_stats.unsupported;
+			out.refusal_reason = "size";
 			note_refusal("size", gcm_format, tex.width(), tex.height());
 			return false;
 		}
@@ -552,6 +777,7 @@ namespace remix_rsx
 		{
 			// Render-target-sourced or unmapped: guest RAM is not authoritative here.
 			++m_stats.unreadable;
+			out.refusal_reason = "unreadable";
 			note_refusal("unreadable", gcm_format, tex.width(), tex.height());
 			return false;
 		}
@@ -560,10 +786,12 @@ namespace remix_rsx
 		const expand_fn expand = expander_for(gcm_format);
 		const bool is_bc = is_bc_format(gcm_format);
 		const bool is_b8 = (gcm_format == CELL_GCM_TEXTURE_B8);
+		out.b8_coverage = is_b8;
 
 		if (!direct && !expand && !is_bc && !is_b8)
 		{
 			++m_stats.unsupported;
+			out.refusal_reason = "format";
 			note_refusal("format", gcm_format, tex.width(), tex.height());
 			return false;
 		}
@@ -584,6 +812,7 @@ namespace remix_rsx
 		if (!mip0 || mip0->data.empty())
 		{
 			++m_stats.unreadable;
+			out.refusal_reason = "no-mip0";
 			note_refusal("no-mip0", gcm_format, tex.width(), tex.height());
 			return false;
 		}
@@ -594,6 +823,7 @@ namespace remix_rsx
 		if (width == 0 || height == 0 || (usz{width} * height * 4) > s_max_decoded_bytes)
 		{
 			++m_stats.unsupported;
+			out.refusal_reason = "decoded-dims";
 			note_refusal("decoded-dims", gcm_format, width, height);
 			return false;
 		}
@@ -738,6 +968,34 @@ namespace remix_rsx
 
 	bool texture_cache::upload(const remixapi_Interface& api, texture_entry& entry)
 	{
+		// --- round 7: RPCS3_REMIX_CLAMPALBEDO, the UI seam lever ----------------------------------
+		// Applied HERE and not at the entry.wrap_* assignment: the list is keyed on the CONTENT
+		// hash, which only exists once the guest bytes have been decoded and hashed. Everything
+		// downstream reads entry.wrap_u/wrap_v and therefore picks this up for free - the material
+		// identity below folds non-default wrap into material_hash (so the clamped variant cannot
+		// alias the repeat one), material.wrapModeU/V carry it to the GPU sampler for the
+		// world-space-UI route, and the CPU compositor's address_coordinate reads the same two
+		// fields for the 2D route. One list entry closes both routes for that texture.
+		//
+		// Overriding real guest state is normally the bug class this backend exists to avoid, which
+		// is why this is a manual, empty-by-default list rather than a heuristic: the guest's wrap
+		// mode is correctly decoded and faithfully replayed, and the only thing wrong with it is
+		// that a nearest-sampled atlas has no bilinear seam bound the way real RSX does.
+		//
+		// Round 8: the counter says LISTED-AND-CREATED, not "the wrap actually moved". Two ways it
+		// used to lie, both of which make tex_wrap_forced=0 unreadable against its own header
+		// comment ("separates a typo'd hash from a list that is simply empty"): it skipped any
+		// texture the guest had already bound CLAMP (a correct list entry, zero count), and it
+		// counted before CreateTexture, so an upload that failed still counted. Incremented below,
+		// beside m_stats.created.
+		const bool clamp_listed = clamp_albedo_matches(entry.content_hash);
+
+		if (clamp_listed)
+		{
+			entry.wrap_u = 0;
+			entry.wrap_v = 0;
+		}
+
 		const remixapi_Format format = textures_linear()
 			? REMIXAPI_FORMAT_B8G8R8A8_UNORM
 			: REMIXAPI_FORMAT_B8G8R8A8_SRGB;
@@ -749,15 +1007,110 @@ namespace remix_rsx
 			u8 lo = 255;
 			u8 hi = 0;
 
+			// Mean colour accumulated in the same walk. u64 sums: a 2048x2048 texture is 4.2M
+			// texels, and 4.2M * 255 overflows u32 on the first channel.
+			u64 sum_b = 0;
+			u64 sum_g = 0;
+			u64 sum_r = 0;
+			u64 texels = 0;
+
 			for (usz i = 3; i < entry.pixels.size(); i += 4)
 			{
 				const u8 a = entry.pixels[i];
 				lo = std::min(lo, a);
 				hi = std::max(hi, a);
+
+				// BGRA8 - the upload format below is B8G8R8A8, so index 0 is blue.
+				sum_b += entry.pixels[i - 3];
+				sum_g += entry.pixels[i - 2];
+				sum_r += entry.pixels[i - 1];
+				++texels;
 			}
 
 			entry.alpha_min = lo;
 			entry.alpha_max = hi;
+
+			if (texels != 0)
+			{
+				const f64 scale = 1.0 / (255.0 * static_cast<f64>(texels));
+				entry.mean_rgb[0] = static_cast<f32>(static_cast<f64>(sum_r) * scale);
+				entry.mean_rgb[1] = static_cast<f32>(static_cast<f64>(sum_g) * scale);
+				entry.mean_rgb[2] = static_cast<f32>(static_cast<f64>(sum_b) * scale);
+			}
+		}
+
+		// --- round 23: where the sun sits INSIDE the sky dome's texture ------------------------
+		// Only for the dome textures RPCS3_REMIX_SKYEMISSIVE names. Two extra walks of the buffer
+		// for one or two textures per level, once per upload; every other texture skips the block
+		// on a <=8-entry hash compare. See texture_entry::peak_uv for what is measured and why the
+		// centroid is used instead of the single brightest texel.
+		if (entry.width != 0 && entry.height != 0
+			&& entry.pixels.size() >= usz{entry.width} * entry.height * 4
+			&& sky_emissive_albedo_matches(entry.content_hash))
+		{
+			const usz count = usz{entry.width} * entry.height;
+
+			f32 peak = -1.f;
+
+			for (usz t = 0; t < count; ++t)
+			{
+				// BGRA8: index 0 is blue. Rec.709, the same weights the guest-light path uses.
+				const f32 luma = (0.2126f * static_cast<f32>(entry.pixels[(t * 4) + 2]))
+					+ (0.7152f * static_cast<f32>(entry.pixels[(t * 4) + 1]))
+					+ (0.0722f * static_cast<f32>(entry.pixels[t * 4]));
+
+				peak = std::max(peak, luma);
+			}
+
+			if (peak > 0.f)
+			{
+				// Round 24: RPCS3_REMIX_SUNSKYPEAKFRAC, default 98 = the round-23 constant exactly.
+				// On the Selva dome the 98 window catches 112 texels on a SINGLE row at the top edge
+				// of the panorama band, which drags the centroid to v=0.50146; widening the window
+				// is the lever for that without moving the dome that already solves correctly.
+				// DIVIDE, not multiply by 0.01f. Review defect, MEASURED in IEEE-754 single:
+				// 0.98f is 0x3F7AE148 but 98.f * 0.01f is 0x3F7AE147, one ULP LOW - because 0.01f is
+				// itself 0.00999999977648..., so the product rounds down past 0.98f. That would
+				// break this knob's whole contract ("98 reproduces the round-23 constant exactly")
+				// on the one feature whose justification is that it must not move the dome that
+				// already solves correctly. IEEE division is correctly rounded, so p/100 rounds to
+				// the nearest representable value by definition. Checked across the clamp range:
+				// the multiply form is wrong at 85 AND 98; the divide form is exact at 50, 85, 90,
+				// 98 and 100.
+				const f32 threshold = peak
+					* (static_cast<f32>(remix_rsx::sun_sky_peak_percent()) / 100.f);
+
+				f64 weight = 0.0;
+				f64 sum_x = 0.0;
+				f64 sum_y = 0.0;
+				u32 hits = 0;
+
+				for (usz t = 0; t < count; ++t)
+				{
+					const f32 luma = (0.2126f * static_cast<f32>(entry.pixels[(t * 4) + 2]))
+						+ (0.7152f * static_cast<f32>(entry.pixels[(t * 4) + 1]))
+						+ (0.0722f * static_cast<f32>(entry.pixels[t * 4]));
+
+					if (luma < threshold)
+					{
+						continue;
+					}
+
+					const f64 w = static_cast<f64>(luma);
+					sum_x += w * (static_cast<f64>(t % entry.width) + 0.5);
+					sum_y += w * (static_cast<f64>(t / entry.width) + 0.5);
+					weight += w;
+					++hits;
+				}
+
+				if (weight > 0.0)
+				{
+					entry.peak_uv[0] = static_cast<f32>((sum_x / weight) / static_cast<f64>(entry.width));
+					entry.peak_uv[1] = static_cast<f32>((sum_y / weight) / static_cast<f64>(entry.height));
+					entry.peak_luma = peak;
+					entry.peak_texels = hits;
+				}
+			}
 		}
 
 		remixapi_TextureInfo info{};
@@ -783,6 +1136,11 @@ namespace remix_rsx
 		}
 
 		++m_stats.created;
+
+		if (clamp_listed)
+		{
+			++m_stats.wrap_forced;
+		}
 
 		// The fork resolves this pseudo-path against the texture manager's hash table, which
 		// remixapi_CreateTexture just populated with entry.content_hash
@@ -837,13 +1195,165 @@ namespace remix_rsx
 		remixapi_MaterialInfo material{};
 		material.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
 		material.pNext = &opaque;
-		material.hash = entry.content_hash;
+		// Keep the long-standing content hash for the default sampler state, but give every
+		// non-default sampler/alpha variant its own material identity. Texture bytes alone are
+		// not sufficient here: the same atlas is legitimately used as clamp, repeat, and mirror,
+		// and aliasing those CreateMaterial definitions made the winning wrap state draw-order
+		// dependent.
+		u64 material_hash = entry.content_hash;
+		if (entry.wrap_u != 1 || entry.wrap_v != 1 || entry.alpha_func != 7 || entry.alpha_ref != 0)
+		{
+			const u8 material_state[] = { entry.wrap_u, entry.wrap_v, entry.alpha_func, entry.alpha_ref };
+			material_hash = fnv_bytes(material_state, sizeof(material_state), entry.content_hash);
+			if (material_hash == 0)
+			{
+				material_hash = 1;
+			}
+		}
+		material.hash = material_hash;
 		material.albedoTexture = albedo_path;
 		material.normalTexture = nullptr;
 		material.tangentTexture = nullptr;
 		material.emissiveTexture = nullptr;
 		material.emissiveIntensity = 0.f;
 		material.emissiveColorConstant = { 0.f, 0.f, 0.f };
+
+		// RPCS3_REMIX_EMISSIVE. The list is latched once and materials are cache-keyed by content +
+		// sampler/alpha state, so listing a hash cannot change what any *other* material is, and
+		// cache coherence across the run is unaffected: a listed hash is emissive from the first
+		// CreateMaterial to the last.
+		//
+		// This is the fixture's own surface glowing, which is the half of the lighting work with no
+		// embedding problem - it emits from exactly the geometry the game drew, so a lamp shade
+		// cannot occlude it. The sphere light injected on the render side carries the photometric
+		// load; this carries the look.
+		// Round 13: RPCS3_REMIX_SKYEMISSIVE is the same mechanism on a second list with a second
+		// intensity - see the sky_emissive_albedo_matches() doc block. The fixture list wins a tie
+		// because it is the older statement and because a hash on both lists is a configuration
+		// mistake that should behave predictably rather than pick by list order.
+		const bool fixture_emissive = emissive_albedo_matches(entry.content_hash);
+		const bool sky_emissive = !fixture_emissive && sky_emissive_albedo_matches(entry.content_hash);
+
+		// Round 14, ITEM 2: the sun card renders as a hard opaque yellow rectangle with visible
+		// edges. This is the SAME mechanism as the sky dome above, on the SUNCARDALBEDO list and with
+		// its own intensity - deliberately a third membership test feeding one code path rather than
+		// a second implementation. For a glare card BlendType::kEmissive is the whole fix and not an
+		// approximation of one: calcOpaqueSurfaceMaterialOpacity's kEmissive arm drives opacity to 0
+		// with emissive influence 1, so the card's dark texels stop being drawn (black added is
+		// nothing), its rectangle stops occluding what is behind it, and only the bright core emits.
+		//
+		// Why this and not a per-vertex alpha fold in the shape of apply_haze_fade, which is what
+		// round 14's brief asked for: a fold replays a SPECIFIC fragment program's arithmetic, and
+		// this round could not identify the sun card's fragment program at all. The six captured
+		// bin\remix_ucode\*.fp files belong to three ordinary world-geometry vertex programs
+		// (0214281b9a7a412d, ad7ce9d672a0bf6b, d0b6a471bb2d463b), not to a sun sprite. Inventing the
+		// arithmetic of a program nobody has read is exactly the failure round 11 documented.
+		const bool sun_card_emissive = !fixture_emissive && !sky_emissive
+			&& sun_card_emissive_enabled() && sun_card_albedo_matches(entry.content_hash);
+
+		// The two share every line below: per-texel emission plus an emissive blend type. Only the
+		// intensity knob and the counter differ.
+		const bool per_texel_emissive = sky_emissive || sun_card_emissive;
+
+		if (fixture_emissive || per_texel_emissive)
+		{
+			// ROUND 30: emissive_intensity_for(), not emissive_intensity(). The fixture list now
+			// accepts EMISSIVE=<hash>:<intensity> per entry and falls back to the global for any entry
+			// that did not give one, so this line is bit-identical for a colon-free launcher and is the
+			// only change needed to make one bulb hash brighter without touching the others. The
+			// material cache is keyed on content + sampler/alpha state (see :1203) and the intensity is
+			// a pure function of the content hash, so no cache-key change is needed: the same texture
+			// always resolves to the same intensity for the whole run.
+			material.emissiveIntensity = sun_card_emissive
+				? sun_card_emissive_intensity()
+				: (sky_emissive ? sky_emissive_intensity() : emissive_intensity_for(entry.content_hash));
+			// The fixture's own mean colour, normalised so the largest component is 1: intensity is
+			// the knob, hue is the texture's. mean_rgb defaults to white, so a texture that never
+			// reached the measurement pass glows white rather than black.
+			const f32 peak = std::max({ entry.mean_rgb[0], entry.mean_rgb[1], entry.mean_rgb[2] });
+			if (peak > 1e-4f)
+			{
+				material.emissiveColorConstant = {
+					entry.mean_rgb[0] / peak, entry.mean_rgb[1] / peak, entry.mean_rgb[2] / peak };
+			}
+			else
+			{
+				material.emissiveColorConstant = { 1.f, 1.f, 1.f };
+			}
+
+			++m_stats.materials_emissive;
+
+			if (per_texel_emissive)
+			{
+				// The sky's emissive colour must be PER-TEXEL, not the flat mean the fixture path
+				// uses. A lamp is one colour and a sky is a gradient with a bright side; a flat
+				// dome is the one result that would look worse than today's.
+				//
+				// The runtime's own WorldUI arm does exactly this -
+				// rtx_instance_manager.cpp:1106 sets the emissive colour texture to the albedo
+				// texture - and it is reachable from the API because both are resolved through the
+				// same synthetic "0x<hash>" path (textureHashPathLookup). Without it the shader
+				// takes emissiveColorConstant instead: opaque_surface_material_interaction.slangh
+				// :623-632 reads the constant and only overwrites it when an emissive texture
+				// loaded, and it does NOT fall back to the albedo or to the vertex-colour arg
+				// source. So this line is the whole difference between a sky and a coloured shell.
+				material.emissiveTexture = albedo_path;
+				material.emissiveColorConstant = { 1.f, 1.f, 1.f };
+
+				// Counted apart so 'the dome attached' and 'the sun card attached' are two numbers on
+				// the live line. A round that cannot tell those apart cannot attribute either.
+				if (sky_emissive)
+				{
+					++m_stats.materials_sky_emissive;
+				}
+				else
+				{
+					++m_stats.materials_sun_card;
+				}
+
+				// --- the half that gives the sun back ------------------------------------------
+				// An emissive dome that is still an OPAQUE shell around the camera is worse than
+				// useless: rtx_instance_manager.cpp:1283 gives a non-blended instance
+				// OBJECT_MASK_OPAQUE, and integrator_direct.slangh:101 traces the direct shadow ray
+				// against exactly that mask - so the dome blocks 100% of the fallback distant sun
+				// and the only light left in the scene is the dome's own. That is the user's
+				// complaint ("the sky lights up the environment") stated as a mechanism.
+				//
+				// The escape is an EMISSIVE blend type. rtx_instance_manager.cpp:1216 sets
+				// m_isUnordered on alphaState.emissiveBlend, :1270 then gives the instance
+				// OBJECT_MASK_UNORDERED_ALL_EMISSIVE, and those bits are deliberately absent from
+				// OBJECT_MASK_ALL_STANDARD (instance_definitions.h:93-95) - so the shadow ray
+				// misses the dome entirely while primary rays still see it. It is also what
+				// calcOpaqueSurfaceMaterialOpacity's kEmissive arm already documented elsewhere in
+				// this backend: opacity -> 0, emissive influence 1, occludes nothing, contributes
+				// only its emissive radiance. Which is what a sky IS.
+				//
+				// Declared on the MATERIAL rather than pushed through the instance's blend ext, and
+				// that is the safer of the two routes the runtime offers. With
+				// useDrawCallAlphaState = 0 the runtime takes calculateAlphaState's
+				// '!useLegacyAlphaState' arm (rtx_instance_manager.cpp:704-707) and reads
+				// getBlendEnabled()/getBlendType() straight off this material - no dependence on
+				// blend-factor pattern matching, and no dependence on
+				// rtx.enableEmissiveBlendModeTranslation being left on. blendType_hasvalue IS the
+				// blend enable on this path (rtx_remix_api.cpp:511-512), which is why it is set
+				// alongside the value rather than instead of it.
+				//
+				// 6 == BlendType::kEmissive (surface_shared.h:24-39, verified against
+				// isBlendTypeEmissive in rtx_materials.h:49-60). Hard-coded as an integer because
+				// remix_c.h carries the field as an int and does not export the enum.
+				// For the DOME this is severable (SKYEMISSIVEBLEND), because emissive-and-occluding is
+				// a state somebody may want. For the SUN CARD it is not severable and deliberately
+				// has no second knob: the blend type IS the fix, and SUNCARDEMISSIVE=0 already
+				// restores the card bit-for-bit.
+				if (!sky_emissive || sky_emissive_blend_enabled())
+				{
+					opaque.useDrawCallAlphaState = 0u;
+					opaque.blendType_hasvalue = 1;
+					opaque.blendType_value = 6;
+					++m_stats.materials_sky_unordered;
+				}
+			}
+		}
 		material.spriteSheetRow = 1;
 		material.spriteSheetCol = 1;
 		material.spriteSheetFps = 0;
@@ -868,7 +1378,30 @@ namespace remix_rsx
 		return true;
 	}
 
-	void texture_cache::reap(const remixapi_Interface& api, u64 frame)
+	bool texture_cache::has_idle(u64 frame) const
+	{
+		const u64 idle_frames = texture_idle_frames();
+
+		if (m_entries.empty() || frame < idle_frames)
+		{
+			return false;
+		}
+
+		const u64 cutoff = frame - idle_frames;
+
+		for (const auto& [key, entry] : m_entries)
+		{
+			if (entry.last_used_frame <= cutoff)
+			{
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	void texture_cache::reap(const remixapi_Interface& api, u64 frame,
+		const std::unordered_set<const void*>* live_materials)
 	{
 		const u64 idle_frames = texture_idle_frames();
 
@@ -887,6 +1420,30 @@ namespace remix_rsx
 				continue;
 			}
 
+			// Round 9: the material-lifetime hole.
+			//
+			// bind() stamps last_used_frame on every descriptor HIT, so an entry only reaches this
+			// point when nothing has bound it for TEXIDLE frames. That is NOT the same as "nothing
+			// is drawing it": the mesh cache bakes the material handle into the Remix mesh at
+			// CreateMesh and keys the mesh on its CONTENT, so a mesh whose geometry has not changed
+			// is reused rather than rebuilt - and it keeps whatever material handle it was created
+			// with. Destroying that material leaves the mesh holding a dead handle that no later
+			// bind can ever replace, because the mesh key never changes. A permanently white
+			// surface; and if the runtime recycles the freed handle value, a wrongly-textured one.
+			//
+			// Keeping the entry re-ages it (last_used_frame bumped to now) so it reaps normally
+			// once its mesh is itself reaped by MESHIDLE. The retained set is bounded by the
+			// materials of live meshes - i.e. what is on screen - which has to stay resident
+			// anyway.
+			if (live_materials && it->second.material
+				&& live_materials->contains(static_cast<const void*>(it->second.material)))
+			{
+				it->second.last_used_frame = frame;
+				++m_stats.reap_kept;
+				++it;
+				continue;
+			}
+
 			if (it->second.material)
 			{
 				guarded_destroy_material(api.DestroyMaterial, it->second.material);
@@ -898,6 +1455,7 @@ namespace remix_rsx
 				++m_stats.destroyed;
 			}
 
+			++m_stats.reap_freed;
 			it = m_entries.erase(it);
 		}
 	}

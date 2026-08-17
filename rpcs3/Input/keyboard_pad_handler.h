@@ -5,6 +5,7 @@
 
 #include <QWindow>
 #include <QKeyEvent>
+#include <QString>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -111,6 +112,10 @@ private:
 	bool m_mouse_wheel_used = false;
 	bool get_mouse_lock_state() const;
 	void release_all_keys();
+	void process_codex_input();
+	QString m_codex_input_file;
+	qint64 m_codex_input_offset = 0;
+	steady_clock::time_point m_codex_input_time;
 
 	std::vector<Pad> m_pads_internal; // Accumulates input until the next poll. Only used for user input!
 

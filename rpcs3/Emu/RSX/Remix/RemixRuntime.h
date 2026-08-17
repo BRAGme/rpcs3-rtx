@@ -74,6 +74,7 @@ namespace remix_rsx
 	u32 guarded_destroy_texture(PFN_remixapi_DestroyTexture fn, remixapi_TextureHandle handle);
 	u32 guarded_draw_screen_overlay(PFN_remixapi_DrawScreenOverlay fn, const void* pixels, u32 width, u32 height, remixapi_Format format, f32 opacity);
 	u32 guarded_set_config_variable(PFN_remixapi_SetConfigVariable fn, const char* key, const char* value);
+	u32 guarded_set_game_value(PFN_remixapi_SetGameValue fn, const char* key, const char* value);
 
 	// Readable name for a remixapi_ErrorCode or for error_code_faulted.
 	const char* error_name(u32 code);

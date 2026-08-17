@@ -8,6 +8,7 @@
 #include "Emu/system_config.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 
 namespace remix_rsx
@@ -17,7 +18,339 @@ namespace remix_rsx
 		// Sanity ceiling on the overlay target. 4K RGBA8 is 32 MiB.
 		constexpr u32 s_max_dimension = 4096;
 
-		u32 sample_bgra(const texture_entry& tex, f32 u, f32 v, bool clamp_uv)
+		// RPCS3_REMIX_UIRECTSHRINK, parsed once. See RemixCompositor.h for what it is for; the
+		// parse is byte-for-byte the shape clamp_albedos() uses (hex, comma/semicolon/space
+		// separated, zero entries ignored). Worst case is 8 x 16 hex + 7 separators + null = 136
+		// wchar against 192, so a saturated list can neither overflow nor trip the length test.
+		// The length test refuses an over-long LIST, not an over-long TOKEN: _wcstoui64 saturates
+		// a >16-digit value to ULLONG_MAX and a leading '-' is negated, neither of which is
+		// checked. Both yield a hash that simply never matches, which is the harmless failure.
+		struct ui_rect_shrink_list
+		{
+			std::array<u64, 8> values{};
+			u32 count = 0;
+		};
+
+		const ui_rect_shrink_list& ui_rect_shrink_albedos()
+		{
+			static const ui_rect_shrink_list list = []()
+			{
+				ui_rect_shrink_list result{};
+				wchar_t buffer[192]{};
+				const DWORD written = GetEnvironmentVariableW(L"RPCS3_REMIX_UIRECTSHRINK", buffer, static_cast<DWORD>(std::size(buffer)));
+
+				if (written == 0 || written >= std::size(buffer))
+				{
+					return result;
+				}
+
+				wchar_t* cursor = buffer;
+
+				while (*cursor && result.count < result.values.size())
+				{
+					while (*cursor == L',' || *cursor == L';' || *cursor == L' ' || *cursor == L'\t')
+					{
+						++cursor;
+					}
+
+					wchar_t* end = nullptr;
+					const u64 value = ::_wcstoui64(cursor, &end, 16);
+
+					if (end == cursor)
+					{
+						break;
+					}
+
+					if (value != 0)
+					{
+						result.values[result.count++] = value;
+					}
+
+					cursor = end;
+				}
+
+				return result;
+			}();
+
+			return list;
+		}
+
+		// One triangle's (or quad's) sampled UV, pulled toward its own authored rectangle centre.
+		// Returns 100 (no-op) unless the texture is listed AND the authored span is small enough to
+		// be an atlas cell rather than a sheet blit: a listed full-sheet quad must not collapse onto
+		// its middle quarter. The unit is normalised UV, so 0.5 means half the sheet; the largest
+		// AUTHORED single-glyph span measured on Haze's atlas is 70/512 = 0.137 in u and 46/512 =
+		// 0.09 in v, so the guard sits 2.7x above the population it is meant to admit.
+		u32 ui_rect_shrink_for(const texture_entry& tex, f32 min_u, f32 max_u, f32 min_v, f32 max_v)
+		{
+			if (!ui_rect_shrink_matches(tex.content_hash))
+			{
+				return 100;
+			}
+
+			if (!std::isfinite(min_u) || !std::isfinite(max_u) || !std::isfinite(min_v) || !std::isfinite(max_v))
+			{
+				return 100;
+			}
+
+			if ((max_u - min_u) > 0.5f || (max_v - min_v) > 0.5f)
+			{
+				return 100;
+			}
+
+			return ui_rect_shrink_percent();
+		}
+
+		// c + (coordinate - c) * k, with c the authored rectangle's own centre. A no-op at k == 1.
+		void apply_rect_shrink(f32& su, f32& sv, u32 percent,
+			f32 min_u, f32 max_u, f32 min_v, f32 max_v)
+		{
+			if (percent == 100)
+			{
+				return;
+			}
+
+			const f32 k = static_cast<f32>(percent) / 100.f;
+			const f32 cu = (min_u + max_u) * 0.5f;
+			const f32 cv = (min_v + max_v) * 0.5f;
+
+			su = cu + ((su - cu) * k);
+			sv = cv + ((sv - cv) * k);
+		}
+
+		// ROUND 26. The SCREEN half of the same correction, and it is the half round 25 was missing.
+		// Same k, same "about the primitive's own centre" rule, so the primitive's px-per-texel ratio
+		// is left EXACTLY as authored - only the padding around the glyph is removed. Shrinking the UV
+		// alone kept the full-size screen quad and therefore magnified the glyph 1/k times, which is
+		// precisely what the user reported ("more legible but bigger and squished").
+		void apply_screen_shrink(f32 (&x)[3], f32 (&y)[3], u32 percent)
+		{
+			if (percent == 100)
+			{
+				return;
+			}
+
+			const f32 k = static_cast<f32>(percent) / 100.f;
+			const f32 cx = (std::min({ x[0], x[1], x[2] }) + std::max({ x[0], x[1], x[2] })) * 0.5f;
+			const f32 cy = (std::min({ y[0], y[1], y[2] }) + std::max({ y[0], y[1], y[2] })) * 0.5f;
+
+			for (u32 i = 0; i < 3; ++i)
+			{
+				x[i] = cx + ((x[i] - cx) * k);
+				y[i] = cy + ((y[i] - cy) * k);
+			}
+		}
+
+		// Is this triangle one half of an AXIS-ALIGNED rectangle in the given pair of coordinates?
+		// True exactly when the three first-coordinate values take two distinct values and the three
+		// second-coordinate values take two distinct values, which is the shape of (TL,TR,BR) and
+		// (TL,BR,BL) and of nothing else.
+		//
+		// This is the guard that makes the screen shrink safe, and it is why the rule can be applied
+		// per triangle at all: both halves of an axis-aligned quad have the SAME bounding box, so they
+		// shrink about the same centre and still tile the shrunk quad exactly. A general triangle - a
+		// strip's connecting triangle, a rotated UI element - has a bounding box of its own, would
+		// shrink about a different centre than its neighbour, and would TEAR. Those are refused here
+		// and keep round 24's sampling untouched, on both the UV and the screen axis.
+		//
+		// IT IS CALLED ON BOTH PAIRS, and a review defect is why. Screen-rectangularity alone is not
+		// enough: apply_rect_shrink pulls toward the triangle's own UV box, and the 0.5 span guard is
+		// evaluated per triangle, so a listed quad with a sheared or rotated UV mapping over an
+		// axis-aligned screen quad would give its two halves different UV centres - and possibly
+		// different shrink verdicts - which tears along the quad's diagonal. Both boxes have to be
+		// rectangles for the per-triangle rule to be coherent.
+		//
+		// The tolerance is relative so that a coordinate arriving through the ortho matrix and the
+		// viewport conversion is not rejected over the last mantissa bit; the absolute floor keeps a
+		// degenerate primitive from making the test vacuous, and is passed in because a screen pixel
+		// and a normalised texel are four orders of magnitude apart.
+		bool is_axis_aligned_half(const f32 (&a)[3], const f32 (&b)[3], f32 floor_eps)
+		{
+			const f32 alo = std::min({ a[0], a[1], a[2] });
+			const f32 ahi = std::max({ a[0], a[1], a[2] });
+			const f32 blo = std::min({ b[0], b[1], b[2] });
+			const f32 bhi = std::max({ b[0], b[1], b[2] });
+
+			if (!std::isfinite(alo) || !std::isfinite(ahi) || !std::isfinite(blo) || !std::isfinite(bhi))
+			{
+				return false;
+			}
+
+			const f32 ea = std::max(floor_eps, (ahi - alo) * 1e-3f);
+			const f32 eb = std::max(floor_eps, (bhi - blo) * 1e-3f);
+
+			if ((ahi - alo) <= ea || (bhi - blo) <= eb)
+			{
+				return false;
+			}
+
+			for (u32 i = 0; i < 3; ++i)
+			{
+				// A NaN component would otherwise slip through: std::min/max over an initializer
+				// list are min_element/max_element, every comparison against NaN is false, so the
+				// bounds come back finite from the other two vertices and every |NaN - bound| > e
+				// test below is false as well. Rejected explicitly instead.
+				if (!std::isfinite(a[i]) || !std::isfinite(b[i]))
+				{
+					return false;
+				}
+
+				if (std::abs(a[i] - alo) > ea && std::abs(a[i] - ahi) > ea)
+				{
+					return false;
+				}
+
+				if (std::abs(b[i] - blo) > eb && std::abs(b[i] - bhi) > eb)
+				{
+					return false;
+				}
+			}
+
+			return true;
+		}
+
+		// --- round 7: the atlas sub-rect seam rule ---------------------------------------------
+		// The defect this exists for, in one line of arithmetic. Under REPEAT a coordinate even
+		// marginally outside [0,1] does not clamp to the glyph's own edge - 'coordinate -=
+		// floor(coordinate)' sends it to the OPPOSITE EDGE OF THE WHOLE SHEET - and the fetch below
+		// is NEAREST, so it then returns a different glyph's ink at 100% weight. Real RSX bilinear
+		// blends such a seam over at most about one texel; this sampler has no such bound. The
+		// project's own census caught it: vp=6f76ab0ad8d926b1 draws a 13-quad glyph batch with
+		// u=[-0.018555..0.99902] on a repeat-bound atlas, and 0.0186 UV units is ~9.5 texels on a
+		// 512-wide sheet - authored slop, an order of magnitude past float rounding.
+		//
+		// The discriminator is authored SPAN, not magnitude. An atlas sub-rect draw whose UV span
+		// on an axis is at most one texture cannot be intending to tile, so a coordinate outside
+		// [0,1] is padding and the behaviour matching what the guest's own raster produced is to
+		// clamp to the sheet edge (usually empty gutter). A draw that genuinely spans more than one
+		// texture keeps true repeat. Magnitude cannot separate these two populations - any epsilon
+		// big enough to cover the measured 0.0186 excursion carves a visible dead band around every
+		// seam of a genuinely tiling draw - which is the tell that magnitude is the wrong axis.
+		//
+		// The discriminator is PER-TRIANGLE by design, and that is load-bearing rather than
+		// incidental: the census line above is a 13-quad batch whose DRAW-level u span is
+		// 0.99902 - (-0.018555) = 1.0176, which is already past the 1 + 1e-3 slack. Each glyph
+		// quad inside it spans a fraction of the sheet, so the rule sees a sub-rect at the only
+		// granularity where the question "is this primitive tiling?" has an answer. Testing it
+		// per draw would refuse the exact population it was written for.
+		//
+		// Round 8 (review defect A): span alone is not sufficient. A REPEAT-bound draw authored
+		// u in [1.2, 1.8] - an offset or scrolling tile - has span 0.6 and would have been called
+		// a sub-rect, at which point EVERY one of its coordinates is out of range and the clamp
+		// below collapses the whole primitive onto texel width-1. Negatives collapse onto texel 0
+		// the same way, and the damage is silent because the bad samples increment counters.seam,
+		// so the live line reads "the fix is firing" exactly when it is destroying the draw. The
+		// missing term is an INTERSECTION test - the authored window has to actually straddle the
+		// unit square (max > 0 && min < 1), which is the rule's own stated rationale
+		// ("marginally outside"). A window living entirely outside [0,1] is a tile offset, not
+		// slop, and keeps true repeat.
+		//
+		// Per-axis and per-triangle, so the two regressions of the old combined force_clamp flag
+		// (clamping both axes when either clamped; mirror collapsed to repeat) are impossible by
+		// construction. Coordinates inside [0,1], mirror, clip, clamp and the force_clamp
+		// native-overlay path are all bit-identical to before.
+		// One primitive's authored UV window on one axis, classified. Both rasterizers call this so
+		// the triangle and quad paths cannot drift apart, which is how the intersection term came
+		// to be missing from one of them for a round.
+		bool is_seam_subrect(f32 min_c, f32 max_c)
+		{
+			if (!std::isfinite(min_c) || !std::isfinite(max_c))
+			{
+				return false;
+			}
+
+			// Narrow enough not to be tiling, AND actually overlapping the sheet. Half-open on the
+			// low side and closed on the high side matches address_coordinate's own bounds: a
+			// window touching exactly max_c == 0 sits on the wrap image of texel 0 rather than
+			// straddling, and min_c == 1 is the same case at the other end.
+			return (max_c - min_c) <= 1.f + 1e-3f && max_c > 0.f && min_c < 1.f;
+		}
+
+		bool address_coordinate(f32& coordinate, u8 mode, bool force_clamp, bool subrect,
+			bool seam_rule, uv_address_counters& counters)
+		{
+			const bool in_range = coordinate >= 0.f && coordinate <= 1.f;
+
+			if (force_clamp || mode == 0)
+			{
+				if (in_range)
+				{
+					++counters.in;
+				}
+				else
+				{
+					++counters.clamp;
+				}
+
+				coordinate = std::clamp(coordinate, 0.f, 1.f);
+				return true;
+			}
+
+			if (mode == 1)
+			{
+				// HALF-OPEN on purpose, and this is the one place the bound matters. Repeat's
+				// 'coordinate -= floor(coordinate)' sends exactly 1.0 to 0.0, i.e. to texel 0, not
+				// to texel dim-1. Taking the closed [0,1] early-out here would leave 1.0 alone and
+				// sample the far edge instead - a behaviour change that would survive
+				// UICLAMPSUBRECT=0 and quietly break the "0 restores today's sampling bit-exactly"
+				// guarantee the whole A/B rests on. Below 1.0 the wrap is the identity, so the
+				// early-out is exact.
+				if (coordinate >= 0.f && coordinate < 1.f)
+				{
+					++counters.in;
+					return true;
+				}
+
+				// THE FIX. Everything else in this function is round 6's behaviour verbatim.
+				// Note this also captures coordinate == 1.0 exactly, which reaches here by the
+				// half-open test above: on a sub-rect draw that is the sheet's right/bottom edge
+				// and clamping keeps it there, where wrapping would have jumped it to texel 0.
+				// That is the seam defect in miniature, and it only changes with the knob on.
+				if (subrect && seam_rule)
+				{
+					++counters.seam;
+					coordinate = std::clamp(coordinate, 0.f, 1.f);
+					return true;
+				}
+
+				++counters.wrap;
+				coordinate -= std::floor(coordinate);
+				return true;
+			}
+
+			if (mode == 2)
+			{
+				if (in_range)
+				{
+					++counters.in;
+				}
+				else
+				{
+					++counters.mirror;
+				}
+
+				coordinate = std::fmod(coordinate, 2.f);
+				if (coordinate < 0.f)
+				{
+					coordinate += 2.f;
+				}
+				coordinate = (coordinate <= 1.f) ? coordinate : (2.f - coordinate);
+				return true;
+			}
+
+			// Clip is the closest available representation of RSX clamp-to-border.
+			if (in_range)
+			{
+				++counters.in;
+				return true;
+			}
+
+			++counters.clip;
+			return false;
+		}
+
+		u32 sample_bgra(const texture_entry& tex, f32 u, f32 v, bool force_clamp,
+			bool subrect_u, bool subrect_v, bool seam_rule, uv_address_counters& counters)
 		{
 			if (tex.pixels.empty() || tex.width == 0 || tex.height == 0)
 			{
@@ -27,15 +360,17 @@ namespace remix_rsx
 			f32 su = u;
 			f32 sv = v;
 
-			if (clamp_uv)
+			// Round 8 (review defect C): both axes are evaluated before the verdict is combined.
+			// '||' short-circuits, so under CLIP mode an out-of-range u returned false and the V
+			// axis was never addressed at all - a clamp-to-border texture dropped its entire V
+			// population out of the ui_uv census, and the partition silently stopped summing to
+			// two increments per sampled texel.
+			const bool keep_u = address_coordinate(su, tex.wrap_u, force_clamp, subrect_u, seam_rule, counters);
+			const bool keep_v = address_coordinate(sv, tex.wrap_v, force_clamp, subrect_v, seam_rule, counters);
+
+			if (!keep_u || !keep_v)
 			{
-				su = std::clamp(su, 0.f, 1.f);
-				sv = std::clamp(sv, 0.f, 1.f);
-			}
-			else
-			{
-				su -= std::floor(su);
-				sv -= std::floor(sv);
+				return 0;
 			}
 
 			const u32 x = std::min(tex.width - 1, static_cast<u32>(su * static_cast<f32>(tex.width)));
@@ -43,6 +378,15 @@ namespace remix_rsx
 
 			u32 texel;
 			std::memcpy(&texel, tex.pixels.data() + ((usz{y} * tex.width + x) * 4), sizeof(u32));
+
+			if (tex.b8_coverage)
+			{
+				// B8 UI sheets are coverage masks. Treating the expanded grayscale byte as
+				// opaque colour makes every glyph's black padded quad erase the overlapping
+				// glyph before it; Haze's 512x512 font sheet exposes that as sliced letters.
+				return 0x00FFFFFFu | ((texel & 0xFFu) << 24);
+			}
+
 			return texel;
 		}
 
@@ -56,6 +400,24 @@ namespace remix_rsx
 				const u32 lhs = (a_bgra >> shift) & 0xFF;
 				const u32 rhs = (b_bgra >> shift) & 0xFF;
 				out |= (((lhs * rhs) + 127) / 255) << shift;
+			}
+
+			return out;
+		}
+
+		u32 interpolate_bgra(const u32 (&bgra)[3], f32 w0, f32 w1, f32 w2)
+		{
+			u32 out = 0;
+
+			for (u32 c = 0; c < 4; ++c)
+			{
+				const u32 shift = c * 8;
+				const f32 value =
+					static_cast<f32>((bgra[0] >> shift) & 0xFF) * w0 +
+					static_cast<f32>((bgra[1] >> shift) & 0xFF) * w1 +
+					static_cast<f32>((bgra[2] >> shift) & 0xFF) * w2;
+
+				out |= static_cast<u32>(std::clamp(value, 0.f, 255.f) + 0.5f) << shift;
 			}
 
 			return out;
@@ -140,6 +502,70 @@ namespace remix_rsx
 		return env != 0xFFFFFFFFu ? env : g_cfg.video.remix.ui_width;
 	}
 
+	u32 ui_clamp_subrect_mode()
+	{
+		static const u32 value = []() -> u32
+		{
+			wchar_t buffer[16]{};
+			const DWORD written = GetEnvironmentVariableW(L"RPCS3_REMIX_UICLAMPSUBRECT", buffer, static_cast<DWORD>(std::size(buffer)));
+
+			if (written == 0 || written >= std::size(buffer))
+			{
+				return 1;
+			}
+
+			const long parsed = ::wcstol(buffer, nullptr, 10);
+			return (parsed >= 0) ? static_cast<u32>(parsed) : 1u;
+		}();
+
+		return value;
+	}
+
+	// See RemixCompositor.h for the measurement this exists for. Same latched-comma-list shape as
+	// clamp_albedos() in RemixTransforms.cpp, kept local because both call sites are in this file.
+	bool ui_rect_shrink_matches(u64 content_hash)
+	{
+		const ui_rect_shrink_list& list = ui_rect_shrink_albedos();
+		const auto end = list.values.begin() + list.count;
+		return content_hash != 0 && std::find(list.values.begin(), end, content_hash) != end;
+	}
+
+	u32 ui_rect_shrink_count()
+	{
+		return ui_rect_shrink_albedos().count;
+	}
+
+	u32 ui_rect_shrink_percent()
+	{
+		static const u32 value = []() -> u32
+		{
+			wchar_t buffer[16]{};
+			const DWORD written = GetEnvironmentVariableW(L"RPCS3_REMIX_UIRECTSHRINKPCT", buffer, static_cast<DWORD>(std::size(buffer)));
+
+			if (written == 0 || written >= std::size(buffer))
+			{
+				return 50;
+			}
+
+			const long parsed = ::wcstol(buffer, nullptr, 10);
+
+			// Review defect, round 25: the doc said "clamped 10..100" and the code REJECTED out of
+			// range back to 50 instead. That inverts the safe reading of the dangerous direction -
+			// someone typing 200 expecting "even more of a no-op than 100" would have got the full
+			// 50% shrink. Now it does what it says. wcstol yields 0 on garbage, which is the one
+			// case that must NOT clamp (0 -> 10 would be a 90% shrink on unparseable input), so
+			// nonsense still falls back to the default.
+			if (parsed <= 0)
+			{
+				return 50;
+			}
+
+			return static_cast<u32>(std::clamp<long>(parsed, 10, 100));
+		}();
+
+		return value;
+	}
+
 	void compositor::begin_frame(u32 width, u32 height)
 	{
 		if (width == 0 || height == 0 || width > s_max_dimension || height > s_max_dimension)
@@ -208,24 +634,90 @@ namespace remix_rsx
 			return;
 		}
 
-		// Straight alpha over, which is what DrawScreenOverlay's compute pass expects.
+		// Keep the compositor buffer in straight-alpha form, which is what
+		// DrawScreenOverlay's compute pass expects. The old expression stored premultiplied
+		// RGB while retaining alpha, so the runtime multiplied coverage a second time. Thin
+		// native-overlay glyphs (including cellMsgDialog's Press-X prompt) became effectively
+		// invisible, and overlapping B8 font glyphs accumulated dark fringes.
 		const u32 inv = 255 - alpha;
+		const u32 dst_alpha = dst[3];
+		const u32 out_alpha = alpha + ((dst_alpha * inv + 127) / 255);
 
 		for (u32 c = 0; c < 3; ++c)
 		{
 			const u32 src = (src_bgra >> (c * 8)) & 0xFF;
-			dst[c] = static_cast<u8>(((src * alpha) + (dst[c] * inv) + 127) / 255);
+			const u32 dst_term = (u32{dst[c]} * dst_alpha * inv + 127) / 255;
+			dst[c] = static_cast<u8>(((src * alpha) + dst_term + (out_alpha / 2)) / out_alpha);
 		}
 
-		dst[3] = static_cast<u8>(std::min<u32>(255, alpha + ((dst[3] * inv) + 127) / 255));
+		dst[3] = static_cast<u8>(out_alpha);
 	}
 
-	void compositor::draw_triangle(const f32 (&x)[3], const f32 (&y)[3], const f32 (&u)[3], const f32 (&v)[3],
-		const texture_entry* tex, u32 tint_bgra, bool clamp_uv)
+	void compositor::draw_triangle(const f32 (&x_in)[3], const f32 (&y_in)[3], const f32 (&u)[3], const f32 (&v)[3],
+		const texture_entry* tex, const u32 (&tint_bgra)[3], bool clamp_uv, bool force_opaque)
 	{
 		if (m_buffer.empty())
 		{
 			return;
+		}
+
+		// Round 7: the triangle's own authored UV window, per axis. <= 1 texture wide means "this
+		// is a sub-rect of an atlas", which cannot be an intent to tile. The 1e-3 slack admits a
+		// full-sheet blit authored exactly [0,1] whose interpolation lands a hair over.
+		//
+		// Round 8: AND the window has to overlap the unit square. See the header comment - span
+		// alone calls u in [1.2, 1.8] a sub-rect and then clamps the entire primitive onto one
+		// edge texel.
+		//
+		// Round 26: hoisted above the area/bbox computation, because the screen shrink below now
+		// rewrites the vertices this triangle is rasterized from.
+		const f32 min_u = std::min({ u[0], u[1], u[2] });
+		const f32 max_u = std::max({ u[0], u[1], u[2] });
+		const f32 min_v = std::min({ v[0], v[1], v[2] });
+		const f32 max_v = std::max({ v[0], v[1], v[2] });
+		const bool subrect_u = is_seam_subrect(min_u, max_u);
+		const bool subrect_v = is_seam_subrect(min_v, max_v);
+		const bool seam_rule = ui_clamp_subrect_mode() != 0;
+
+		// Round 25. 100 unless this texture is listed by RPCS3_REMIX_UIRECTSHRINK; hoisted out of
+		// the per-pixel loop because it depends only on the triangle.
+		//
+		// Round 26. AND the triangle has to be one half of an axis-aligned rectangle in BOTH screen
+		// and UV, because the rule now moves the SCREEN vertices too and that is only coherent when
+		// both halves of a quad share both bounding boxes. A primitive that is listed and small but
+		// not rectangular keeps round 24's sampling on BOTH axes rather than getting the UV half of
+		// a correction whose screen half was refused.
+		//
+		// The empty-list test is FIRST and it is a performance gate, not a tidy-up: with no hash
+		// listed this whole block costs one relaxed load of a function-local static and nothing
+		// else per triangle. This rasterizer is what once held Haze at 1.9 FPS, so a default-off
+		// feature must not put four min/max and a loop on every textured UI triangle.
+		u32 shrink = 100;
+
+		if (tex && ui_rect_shrink_count() != 0)
+		{
+			const u32 want = ui_rect_shrink_for(*tex, min_u, max_u, min_v, max_v);
+
+			if (want != 100)
+			{
+				// 1e-3 px on screen; 1e-6 in normalised UV, which is 5e-4 of a texel on a 512 sheet.
+				if (is_axis_aligned_half(x_in, y_in, 1e-3f) && is_axis_aligned_half(u, v, 1e-6f))
+				{
+					shrink = want;
+				}
+				else
+				{
+					++m_uv.rect_declined;
+				}
+			}
+		}
+
+		f32 x[3] = { x_in[0], x_in[1], x_in[2] };
+		f32 y[3] = { y_in[0], y_in[1], y_in[2] };
+
+		if (shrink != 100)
+		{
+			apply_screen_shrink(x, y, shrink);
 		}
 
 		const f32 area = ((x[1] - x[0]) * (y[2] - y[0])) - ((x[2] - x[0]) * (y[1] - y[0]));
@@ -236,6 +728,7 @@ namespace remix_rsx
 		}
 
 		const f32 inv_area = 1.f / area;
+		const bool flat_tint = tint_bgra[0] == tint_bgra[1] && tint_bgra[0] == tint_bgra[2];
 
 		const s32 min_x = std::max<s32>(0, static_cast<s32>(std::floor(std::min({ x[0], x[1], x[2] }))));
 		const s32 max_x = std::min<s32>(static_cast<s32>(m_width) - 1, static_cast<s32>(std::ceil(std::max({ x[0], x[1], x[2] }))));
@@ -264,21 +757,51 @@ namespace remix_rsx
 					continue;
 				}
 
-				u32 colour = tint_bgra;
+				// Most Haze UI, including its full-screen loading image, uses one tint for the
+				// whole primitive. Avoid four channels of barycentric interpolation per pixel in
+				// that overwhelmingly common case; varying-colour HUD triangles retain the exact
+				// interpolation path below.
+				const u32 tint = flat_tint ? tint_bgra[0] : interpolate_bgra(tint_bgra, w0, w1, w2);
+				u32 colour = tint;
 
 				if (tex)
 				{
-					const f32 su = (u[0] * w0) + (u[1] * w1) + (u[2] * w2);
-					const f32 sv = (v[0] * w0) + (v[1] * w1) + (v[2] * w2);
-					colour = modulate(sample_bgra(*tex, su, sv, clamp_uv), tint_bgra);
+					f32 su = (u[0] * w0) + (u[1] * w1) + (u[2] * w2);
+					f32 sv = (v[0] * w0) + (v[1] * w1) + (v[2] * w2);
+					apply_rect_shrink(su, sv, shrink, min_u, max_u, min_v, max_v);
+					colour = modulate(
+						sample_bgra(*tex, su, sv, clamp_uv, subrect_u, subrect_v, seam_rule, m_uv),
+						tint);
+
+					if (force_opaque)
+					{
+						colour |= 0xFF000000u;
+					}
 				}
 
 				blend(static_cast<u32>(px), static_cast<u32>(py), colour);
 			}
 		}
 
+		// Round 26: counted HERE, beside m_dirty/m_draws, and not at the shrink itself. A review
+		// defect: the degenerate-area return and the off-screen-bbox return both sit between the
+		// two, so incrementing early would count primitives that were never rasterized and the
+		// counter would disagree with m_draws. It says "primitives actually corrected", so it has
+		// to be on the same path as the draw.
+		if (shrink != 100)
+		{
+			++m_uv.rect_shrunk;
+		}
+
 		m_dirty = true;
 		++m_draws;
+	}
+
+	void compositor::draw_triangle(const f32 (&x)[3], const f32 (&y)[3], const f32 (&u)[3], const f32 (&v)[3],
+		const texture_entry* tex, u32 tint_bgra, bool clamp_uv, bool force_opaque)
+	{
+		const u32 tints[3] = { tint_bgra, tint_bgra, tint_bgra };
+		draw_triangle(x, y, u, v, tex, tints, clamp_uv, force_opaque);
 	}
 
 	void compositor::draw_quad(f32 x0, f32 y0, f32 x1, f32 y1, f32 u0, f32 v0, f32 u1, f32 v1,
@@ -291,6 +814,50 @@ namespace remix_rsx
 
 		if (x1 < x0) std::swap(x0, x1), std::swap(u0, u1);
 		if (y1 < y0) std::swap(y0, y1), std::swap(v0, v1);
+
+		// Round 7: same sub-rect test as the triangle rasterizer, from this quad's own two UV
+		// endpoints. rpcs3's own overlay quads reach here with force_clamp already true and so
+		// never enter the new rule; the title's axis-aligned UI quads do.
+		// Round 8: same intersection term - a quad authored v in [-1.8, -1.2] is a tile offset,
+		// not seam slop, and must keep true repeat instead of collapsing onto row 0.
+		const f32 min_u = std::min(u0, u1);
+		const f32 max_u = std::max(u0, u1);
+		const f32 min_v = std::min(v0, v1);
+		const f32 max_v = std::max(v0, v1);
+		const bool subrect_u = is_seam_subrect(min_u, max_u);
+		const bool subrect_v = is_seam_subrect(min_v, max_v);
+		const bool seam_rule = ui_clamp_subrect_mode() != 0;
+
+		// Round 25: the same rule as the triangle path, from this quad's own endpoints. Both
+		// rasterizers read it so they cannot drift apart, which is how the round-8 intersection
+		// term came to be missing from one of them for a round.
+		//
+		// Round 26: hoisted above the pixel bounds, because the screen half of the rule shrinks
+		// x0/y0/x1/y1 themselves. This entry point is axis-aligned in both spaces by construction,
+		// so it needs no equivalent of the triangle path's shape test.
+		//
+		// HONESTY, from the review: this arm is currently UNREACHABLE. All four draw_quad call
+		// sites pass tex = nullptr (rpcs3's own overlay bars and the UI probe), so `shrink` here is
+		// always 100 and the round-25 apply_rect_shrink below is equally dead. It is kept, and kept
+		// identical to the triangle path, because "both rasterizers read the same rule" is how the
+		// round-8 intersection term came to be missing from one of them for a whole round. It means
+		// rect_shrunk is only ever incremented from draw_triangle - i.e. in TRIANGLES, two per
+		// glyph quad.
+		const u32 shrink = (tex && ui_rect_shrink_count() != 0)
+			? ui_rect_shrink_for(*tex, min_u, max_u, min_v, max_v)
+			: 100u;
+
+		if (shrink != 100)
+		{
+			const f32 k = static_cast<f32>(shrink) / 100.f;
+			const f32 cx = (x0 + x1) * 0.5f;
+			const f32 cy = (y0 + y1) * 0.5f;
+
+			x0 = cx + ((x0 - cx) * k);
+			x1 = cx + ((x1 - cx) * k);
+			y0 = cy + ((y0 - cy) * k);
+			y1 = cy + ((y1 - cy) * k);
+		}
 
 		const s32 min_x = std::max<s32>(0, static_cast<s32>(std::floor(x0)));
 		const s32 max_x = std::min<s32>(static_cast<s32>(m_width) - 1, static_cast<s32>(std::ceil(x1)) - 1);
@@ -308,16 +875,28 @@ namespace remix_rsx
 		for (s32 py = min_y; py <= max_y; ++py)
 		{
 			const f32 ty = ((static_cast<f32>(py) + 0.5f) - y0) / span_y;
-			const f32 sv = v0 + ((v1 - v0) * ty);
+			const f32 base_v = v0 + ((v1 - v0) * ty);
 
 			for (s32 px = min_x; px <= max_x; ++px)
 			{
 				const f32 tx = ((static_cast<f32>(px) + 0.5f) - x0) / span_x;
-				const f32 su = u0 + ((u1 - u0) * tx);
+				f32 su = u0 + ((u1 - u0) * tx);
+				f32 sv = base_v;
+				apply_rect_shrink(su, sv, shrink, min_u, max_u, min_v, max_v);
 
-				const u32 colour = tex ? modulate(sample_bgra(*tex, su, sv, clamp_uv), tint_bgra) : tint_bgra;
+				const u32 colour = tex
+					? modulate(sample_bgra(*tex, su, sv, clamp_uv, subrect_u, subrect_v, seam_rule, m_uv),
+						tint_bgra)
+					: tint_bgra;
 				blend(static_cast<u32>(px), static_cast<u32>(py), colour);
 			}
+		}
+
+		// Same reasoning as the triangle path: counted beside the draw, not at the shrink, so the
+		// off-screen-bbox return above cannot inflate it.
+		if (shrink != 100)
+		{
+			++m_uv.rect_shrunk;
 		}
 
 		m_dirty = true;

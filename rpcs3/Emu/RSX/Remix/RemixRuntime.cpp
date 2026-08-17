@@ -23,10 +23,10 @@
 //                   (byte-identical to public/include/remix/remix_c.h at that commit)
 //   Runtime asset : local build of that commit -- NOT the Remix_Plus_v1.5.1 release zip, which
 //                   predates the VIEW_MODEL category bit this backend relies on. Deployed to
-//                   <exe dir>\remix\; d3d9.dll is 240655872 bytes,
-//                   SHA-256 A20E4B72D26D919E1011639D0A64DBCA8575B5D404FD2B11E2D649576C4B568A.
+//                   <exe dir>\remix\; d3d9.dll is 240657408 bytes,
+//                   SHA-256 36A5641AF4FA848EF9348CA2FFFCD6FF9141AC87007264FB16C6F194A34B0DE7.
 //                   For this exact binary log_dll_identity prints
-//                   "size=240655872 fnv1a=4567ee3a10da2838", so a run's log line can be
+//                   "size=240657408 fnv1a=63656dfe3da8f069", so a run's log line can be
 //                   compared against this block character for character, with no rehashing
 //                   and no access to the build tree. Both values are mirrored below in
 //                   vendored_runtime_size / vendored_runtime_fnv1a, which warn at load if the
@@ -114,8 +114,8 @@ namespace remix_rsx
 		// The runtime described by the provenance block at the top of this file. Kept next to the
 		// check that uses them so the two cannot drift apart; both must be updated whenever
 		// bin\remix\ is redeployed, in the same commit as the re-vendored remix_c.h.
-		constexpr u64 vendored_runtime_size  = 240655872;
-		constexpr u64 vendored_runtime_fnv1a = 0x4567ee3a10da2838;
+		constexpr u64 vendored_runtime_size  = 240657408;
+		constexpr u64 vendored_runtime_fnv1a = 0x63656dfe3da8f069;
 
 		// Identity of the DLL actually loaded, so a report can say which binary produced a run.
 		void log_dll_identity(const std::wstring& path)
@@ -252,6 +252,7 @@ namespace remix_rsx
 			{ "CreateMaterial", reinterpret_cast<const void*>(m_storage.api.CreateMaterial) },
 			{ "DestroyMaterial", reinterpret_cast<const void*>(m_storage.api.DestroyMaterial) },
 			{ "DrawScreenOverlay", reinterpret_cast<const void*>(m_storage.api.DrawScreenOverlay) },
+			{ "SetGameValue", reinterpret_cast<const void*>(m_storage.api.SetGameValue) },
 		};
 
 		bool all_present = true;
@@ -565,6 +566,23 @@ namespace remix_rsx
 	}
 
 	u32 guarded_set_config_variable(PFN_remixapi_SetConfigVariable fn, const char* key, const char* value)
+	{
+		if (!fn)
+		{
+			return REMIXAPI_ERROR_CODE_NOT_INITIALIZED;
+		}
+
+		__try
+		{
+			return fn(key, value);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			return error_code_faulted;
+		}
+	}
+
+	u32 guarded_set_game_value(PFN_remixapi_SetGameValue fn, const char* key, const char* value)
 	{
 		if (!fn)
 		{

@@ -1092,6 +1092,12 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 		return game_boot_result::still_running;
 	}
 
+	if (recursion_count == 0)
+	{
+		// Fresh boot: drop the previous title's version notice so it can never be shown twice.
+		m_game_version_notice.clear();
+	}
+
 	struct cleanup_t
 	{
 		Emulator* _this;
@@ -2435,6 +2441,42 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 		ppu_exec_object ppu_exec;
 		ppu_exec.open(elf_file);
 
+		// Game version notice: state plainly which version is about to run and whether an update is
+		// installed over the disc. RPCS3 has no game-update query anywhere in the tree (the only
+		// updater is the emulator self-updater), so this deliberately makes no network request and
+		// cannot say what the newest published update is. What it does cover is the case that
+		// silently costs hours: a disc booting at its shipped version with no patch installed.
+		// Computed here because this is the only point where the disc's APP_VER (m_app_version,
+		// parsed above) and the installed patch's APP_VER are both reachable; it is shown from
+		// Run(), because the overlay display manager does not exist yet at this point in Load().
+		if (recursion_count == 0 && !m_ar && !m_title_id.empty() && m_cat == "DG")
+		{
+			const std::string disc_ver = m_app_version.empty() ? "Unknown" : m_app_version;
+			const psf::registry patch_sfo = psf::load(hdd0_game + m_title_id + "/PARAM.SFO").sfo;
+			const std::string patch_ver{psf::get_string(patch_sfo, "APP_VER", "")};
+
+			// Same acceptance test the update boot below applies, so the notice can never claim an
+			// update that Load() will then refuse to boot.
+			const bool patch_installed = psf::get_string(patch_sfo, "TITLE_ID") == m_title_id
+				&& psf::get_string(patch_sfo, "CATEGORY") == "GD" && !patch_ver.empty();
+
+			if (!patch_installed)
+			{
+				m_game_version_notice = fmt::format("Game update: none installed - running disc version %s", disc_ver);
+				sys_log.warning("%s. A newer update may exist for %s; RPCS3 does not check.", m_game_version_notice, m_title_id);
+			}
+			else if (disc_ver == "Unknown" || rpcs3::utils::version_is_bigger(patch_ver, disc_ver, m_title_id, false))
+			{
+				m_game_version_notice = fmt::format("Game update %s installed (disc version %s)", patch_ver, disc_ver);
+				sys_log.success("%s", m_game_version_notice);
+			}
+			else
+			{
+				m_game_version_notice = fmt::format("Game update %s installed, but it is not newer than disc version %s", patch_ver, disc_ver);
+				sys_log.warning("%s", m_game_version_notice);
+			}
+		}
+
 		// Check game updates
 		if (const std::string hdd0_boot = hdd0_game + m_title_id + "/USRDIR/EBOOT.BIN"; !m_ar
 				&& recursion_count == 0 && disc.empty() && !bdvd_dir.empty() && !m_title_id.empty()
@@ -2740,6 +2782,16 @@ void Emulator::Run(bool start_playtime)
 
 	m_state = system_state::starting;
 	m_state.notify_all();
+
+	// Show the game-version notice computed in Load(). It is queued here rather than there because
+	// the overlay display manager is created with the RSX thread, which does not exist that early;
+	// rsx::overlays::queue_message silently drops anything queued before it. Cleared after queueing
+	// so a later Run() (resume from pause) does not repeat it.
+	if (!m_game_version_notice.empty())
+	{
+		rsx::overlays::queue_message(m_game_version_notice, 8'000'000);
+		m_game_version_notice.clear();
+	}
 
 	if (g_cfg.misc.prevent_display_sleep)
 	{
