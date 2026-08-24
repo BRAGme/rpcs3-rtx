@@ -9794,6 +9794,23 @@ namespace remix_rsx
 		return value;
 	}
 
+	// --- ROUND 32: the geometry audits are the only REMOVABLE occupant of 'rest' -------------------
+	// audit_vertex_extent makes four separate passes over the decoded positions of every sub-draw,
+	// and audit_world_extent walks the whole index list transforming each vertex into world space.
+	// Both are diagnostics: they feed census lines and the VTXREFUSE / wext gates, neither of which
+	// is armed on this title (VTXREFUSE defaults off; wext_refused MEASURED at 0 for the whole
+	// round-31 session). They were never timed, and 'rest' - the unattributed part of 'draw' - was
+	// MEASURED at 40.96 ms/frame, 80.5% of draw, in that session's worst geometry window.
+	//
+	// Default 1 = current behaviour bit-for-bit. This ships alongside the 'audit=' timer on the
+	// 'Remix timing:' line so the size of the trade is stated before it is taken; do NOT set 0 as a
+	// blind perf fix, and re-check wext_refused first on any other title.
+	bool draw_audit_enabled()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_DRAWAUDIT", 1);
+		return value != 0;
+	}
+
 	f32 streak_extent_ratio()
 	{
 		// env_u32 rather than env_flag: 0 is the meaningful setting (it restores 81af315) and
@@ -10981,6 +10998,16 @@ namespace remix_rsx
 		return value != 0;
 	}
 
+	// --- ROUND 32 -------------------------------------------------------------------------------
+	// Restrict pre-anchor deferral to the anchor_prev branch, excluding gauge_anchor_absent. See the
+	// long note at the increment site of defer_absent_declined for the measurement. Default 1;
+	// 0 reproduces round 31's deferral population exactly. Inert while DEFERPREANCHOR=0.
+	bool defer_prev_only_enabled()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_DEFERPREVONLY", 1);
+		return value != 0;
+	}
+
 	u32 defer_pre_anchor_max()
 	{
 		// Hard cap on the per-frame deferral buffer. A frame that buffers more than this spills the
@@ -11451,6 +11478,22 @@ namespace remix_rsx
 		return env >= 0.f ? env : 4.f;
 	}
 
+	// --- round 36: which quantity the anchor test compares. Derivation in RemixTransforms.h -------
+	//
+	// env_u32 and NOT env_float, and that is the whole reason this knob is not simply folded into
+	// sky_max_anchor(): env_float rejects 0 outright, so a knob whose 0 means "legacy" would
+	// silently read as something else - which is the exact SKYANCHOR=0 defect round 32 measured.
+	//
+	// Clamp stated against the value the launcher arms: SKYANCHORMODE=2 against a ceiling of 3, so
+	// the armed value is inside the clamp and the knobs= block reports it back unchanged. The
+	// ceiling is deliberately ABOVE the armed value - a ceiling that equals what the launcher sets
+	// is the round-31 trap, a knob that can only be turned one way.
+	u32 sky_anchor_mode()
+	{
+		static const u32 value = std::min<u32>(env_u32(L"RPCS3_REMIX_SKYANCHORMODE", 0), 3u);
+		return value;
+	}
+
 	u32 sky_backdrop_mode()
 	{
 		// Off by default. Mode 1 is the one to run first: it counts what mode 2 would tag and
@@ -11502,14 +11545,49 @@ namespace remix_rsx
 
 	u32 viewmodel_mode()
 	{
-		// Default 2 (tag). Unlike sky_backdrop_mode, which ships at 1 because tagging it wrong
-		// paints the scene blue, this one cannot currently change a pixel: the runtime this
-		// backend targets has no bit 26 to receive (dxvk-remix-numos3 public/include/remix/
-		// remix_c.h stops at SMOOTH_NORMALS = 1 << 24, and rtx_remix_api.cpp toRtCategories()
-		// maps bits 0..24 by name under a static_assert on InstanceCategories::Count == 25).
-		// Shipping it at 1 would therefore buy nothing and leave the backend needing a code
-		// change on the day the fork gains the bit, which is precisely when it should already
-		// be measured. RPCS3_REMIX_VIEWMODEL=0 restores 81af315's *tagging* exactly; it no longer
+		// Default 2 (tag).
+		//
+		// --- ROUND 34: THE CLAIM THIS BLOCK USED TO MAKE IS MEASURED FALSE. DELETED. ------------
+		// It said "this cannot currently change a pixel: the runtime this backend targets has no
+		// bit 26 to receive", reasoning from remix_c.h stopping at SMOOTH_NORMALS = 1 << 24 and
+		// toRtCategories() mapping bits 0..24 under a static_assert on
+		// InstanceCategories::Count == 25. Every one of those observations is true and the
+		// conclusion drawn from them is wrong, because bit 26 is deliberately NOT an
+		// InstanceCategories member - it is consumed by categoryToCameraType() and never reaches
+		// toRtCategories() at all. Commit 6476faea's own message says so.
+		//
+		// MEASURED by disassembling the DEPLOYED bin\remix\d3d9.dll (sha256
+		// 16a0b512f33ebb66a89ac703e75289d9e008558a13d2c9a6a5455b0be7c40858, size 240657408, fnv1a
+		// 09653f484ec94dc0). In toRtDrawState at RVA 0x001ED290:
+		//     0x001ED309  mov   eax,[rdx+0x10]   ; remixapi_InstanceInfo::categoryFlags
+		//     0x001ED30C  bt    eax,0x1a         ; bit 26 = VIEW_MODEL
+		//     0x001ED312  mov   ebx,1            ; CameraType::ViewModel
+		//     0x001ED34D  mov   [rbp+0x1f4],eax  ; DrawCallState::cameraType  <- load-bearing
+		// The +0x10 operand is verified against remix_c.h's layout (sType@0, pNext@8,
+		// categoryFlags@0x10, mesh@0x18, transform@0x20) by the transform rows loaded from
+		// +0x20/0x30/0x40 immediately after. The build also carries the Sky->Main clamp
+		// (cmp ebx,4 / cmove eax,0) and the API version bump to 0.1000.1
+		// (mov eax,0x03E80001 at RVA 0x000EDCD1), both introduced by 6476faea specifically.
+		// toRtDrawState is byte-identical across all 15,328 bytes to
+		// dxvk-remix-numos3\_output\d3d9.dll.
+		//
+		// SO THE CATEGORY PATH IS LIVE, and the remaining gate is the CAMERA, not the bit:
+		// InstanceManager::createViewModelInstances early-returns on
+		// !cameraManager.isCameraValid(CameraType::ViewModel) after
+		// cleanupAllPersistentViewModelInstances() - it does NOT mask the instance, so a tagged
+		// draw with no viewmodel camera renders as ordinary world geometry (which is exactly what
+		// round 20 measured on 123 tagged draws). The mask=0 path belongs to gate 3,
+		// RtxOptions::PlayerModel::enableInPrimarySpace(), which is false and absent from rtx.conf.
+		// Do not repeat the launcher's claim that a mis-tagged draw is removed from the world pass;
+		// on this configuration it is not.
+		//
+		// Also measured: an external draw can reach CameraType::ViewModel ONLY through this bit.
+		// remixapi_SetupCamera's REMIXAPI_CAMERA_TYPE_VIEW_MODEL registers matrices in a camera
+		// slot and cannot make any instance reference it, and submitExternalDraw touches
+		// ExternalDrawState::cameraType at exactly one site - getCamera(state.cameraType) - and
+		// never copies it into state.drawCall.cameraType.
+		//
+		// RPCS3_REMIX_VIEWMODEL=0 restores 81af315's *tagging* exactly; it no longer
 		// restores 81af315, because viewmodel_camera_mode does not consult this knob and decides
 		// the reference on its own. Both have to be 0 to get the old behaviour whole.
 		static const u32 value = env_u32(L"RPCS3_REMIX_VIEWMODEL", 2);
@@ -11919,6 +11997,61 @@ namespace remix_rsx
 		return ui_force_vps().count;
 	}
 
+	// --- round 36: the (vp, fp) pair form of the same route. Derivation in RemixTransforms.h -----
+	//
+	// Deliberately a straight copy of hide_pair_vp_hash()/hide_pair_fp_hash() in shape: same buffer
+	// size, same "written == 0 || written >= size" refusal, same base-16 parse, same "empty either
+	// half disarms" rule. Two gates that mean the same thing should not have two different failure
+	// modes for a mistyped hash.
+	u64 ui_force_pair_vp_hash()
+	{
+		static const u64 value = []() -> u64
+		{
+			wchar_t buffer[32]{};
+			const DWORD written = GetEnvironmentVariableW(L"RPCS3_REMIX_UIFORCEPAIRVP", buffer, static_cast<DWORD>(std::size(buffer)));
+
+			if (written == 0 || written >= std::size(buffer))
+			{
+				return 0;
+			}
+
+			return ::_wcstoui64(buffer, nullptr, 16);
+		}();
+		return value;
+	}
+
+	u64 ui_force_pair_fp_hash()
+	{
+		static const u64 value = []() -> u64
+		{
+			wchar_t buffer[32]{};
+			const DWORD written = GetEnvironmentVariableW(L"RPCS3_REMIX_UIFORCEPAIRFP", buffer, static_cast<DWORD>(std::size(buffer)));
+
+			if (written == 0 || written >= std::size(buffer))
+			{
+				return 0;
+			}
+
+			return ::_wcstoui64(buffer, nullptr, 16);
+		}();
+		return value;
+	}
+
+	bool ui_force_pair_matches(u64 vp_hash, u64 fp_hash)
+	{
+		const u64 want_vp = ui_force_pair_vp_hash();
+		const u64 want_fp = ui_force_pair_fp_hash();
+
+		// An empty EITHER half disarms the route, and this is the line that makes the play-test
+		// card's one-line revert true: blank RPCS3_REMIX_UIFORCEPAIRVP and nothing is forced.
+		if (want_vp == 0 || want_fp == 0 || vp_hash == 0 || fp_hash == 0)
+		{
+			return false;
+		}
+
+		return vp_hash == want_vp && fp_hash == want_fp;
+	}
+
 	f32 sun_radiance()
 	{
 		// The shader divides a distant light's radiance by sin^2(halfAngle) and samples the
@@ -12317,6 +12450,56 @@ namespace remix_rsx
 		return std::min<u32>(value, 96u);
 	}
 
+	// --- round 34: the pivot, and the decoupling of the tag from the placement --------------------
+	//
+	// Both doc blocks in RemixTransforms.h carry the measured derivation. The clamps here are stated
+	// against the values the launcher arms, per the round-31/32 lesson that cost two rounds
+	// (STATICINDEXBUDGET had ceiling == default; SUNSPRITEHOLD was armed 277x over its ceiling):
+	// the launcher arms VMBASISPIVOT=1 against a ceiling of 2, and VMTAGONLY=1 against a boolean, so
+	// both armed values are inside their clamps and the knobs= block will report them back unchanged.
+	u32 viewmodel_basis_pivot()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_VMBASISPIVOT", 0);
+		return std::min<u32>(value, 2u);
+	}
+
+	// --- round 36: the real rotation. Derivation and pre-registered readings in RemixTransforms.h -
+	//
+	// Clamps stated against the values the launcher arms, per the round-31/32 lesson that has now
+	// cost four rounds: VMROTAXIS=1 against a ceiling of 6, VMROTDEG=180 against a modulus of 360,
+	// VMROTPIVOT=0 against a ceiling of 3. All three armed values are inside their clamps, so the
+	// knobs= block reports them back unchanged - which is the only way to see a typo here.
+	//
+	// env_u32 and not env_float on all three, deliberately: env_float rejects 0, and 0 is the OFF
+	// value for two of them. That is the SKYANCHOR=0 defect (round 32) and it is not repeated here.
+	// Note the modulus makes VMROTDEG=360 mean 0, i.e. OFF - write 180, never 360.
+	u32 viewmodel_rotate_axis()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_VMROTAXIS", 0);
+		return std::min<u32>(value, 6u);
+	}
+
+	u32 viewmodel_rotate_degrees()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_VMROTDEG", 0);
+		return value % 360u;
+	}
+
+	u32 viewmodel_rotate_pivot()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_VMROTPIVOT", 0);
+		return std::min<u32>(value, 3u);
+	}
+
+	// env_u32, not env_float: env_float rejects 0 outright (round 32 found SKYANCHOR=0 silently
+	// yielding 4 through exactly that filter), and a boolean knob whose 0 does not mean off would be
+	// the same defect a third time.
+	bool viewmodel_tag_only()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_VMTAGONLY", 0);
+		return value != 0;
+	}
+
 	// --- round 19: the depth rule is NOT dead on this title --------------------------------------
 	//
 	// REFUTATION, measured. RemixGSRender.cpp:5313 says "Haze reports the same scale_z/offset_z for
@@ -12337,6 +12520,105 @@ namespace remix_rsx
 	{
 		static const u32 milli = env_u32(L"RPCS3_REMIX_VMDEPTHOFFSET", 0);
 		return static_cast<f32>(milli) / 1000.f;
+	}
+
+	// --- round 35: the (vertex program, FRAGMENT program) hide gate ------------------------------
+	//
+	// Round 35's brief proposed the (vp, albedo) pair route for the player's legs. MEASURED over the
+	// whole of bin\remix_dump.log (757 MB, every 'Remix fpcandidate:' row), that route OVER-MATCHES
+	// and the fragment program does not:
+	//
+	//   vp=f39f504649b6f442 + albedo=0721D150DF278E7D  selects the LEGS (fp=b64dc06f79b8b42b,
+	//     vtx=952) AND the ARMS/weapon (fp=d6f00cddfb5c6e0a, vtx=2140) - both appear on the user's
+	//     own Ctrl+Click picks with exactly that vp and that albedo.
+	//   vp=f39f504649b6f442 + fp=b64dc06f79b8b42b      is 1381 census rows, 1381 of them at vtx=952,
+	//     across 12 albedos (the skin variants). Not one row is anything else.
+	//
+	// So the FP is the discriminator for the player body here. That does not contradict round 27,
+	// which measured that the fp does NOT separate the weapon from the arms - both of those are
+	// d6f00cddfb5c6e0a. It separates the BODY from the first-person rig, which is a different cut.
+	//
+	// Both halves default empty and an empty either half disarms the route, the same rule VMPAIR and
+	// the triple use. mode selects what the match does:
+	//
+	//   1 = REMIXAPI_INSTANCE_CATEGORY_BIT_HIDDEN. MEASURED in the deployed runtime's source
+	//       (dxvk-remix-numos3 rtx_instance_manager.cpp, "if (currentInstance.m_isHidden)" ->
+	//       "mask = 0"): the instance leaves the TLAS entirely, so it is gone from PRIMARY rays and
+	//       from shadow rays alike, and rtx_accel_manager.cpp skips its BLAS. No shadow, no cost.
+	//   2 = REMIXAPI_INSTANCE_CATEGORY_BIT_THIRD_PERSON_PLAYER_MODEL. Sets OBJECT_MASK_PLAYER_MODEL
+	//       (bit 6), which is NOT in OBJECT_MASK_ALL, so primary visibility needs
+	//       rtx.playerModel.enableInPrimarySpace = True and shadow casting is then switched by
+	//       rtx.playerModel.enablePrimaryShadows (default True -> set it False). That pair is the
+	//       ONLY per-instance "visible but casts no shadow" route in this runtime - there is no
+	//       castShadow flag anywhere in the tree. TWO WARNINGS: both conf lines are required (with
+	//       neither, the legs become invisible AND still cast), and enableInPrimarySpace = True also
+	//       masks every VIEW_MODEL candidate to zero inside createViewModelInstances, which would
+	//       take the arms with it the moment a ViewModel camera becomes valid.
+	//
+	// Only an EXPLICIT 0 disables the flag. Unset is 1 (HIDDEN) and an out-of-range value clamps UP
+	// to 2, never down to 0 - so the mode knob is not the safety here, the two hash halves are: the
+	// mode is read only after hide_pair_matches() has already required both of them.
+	u64 hide_pair_vp_hash()
+	{
+		static const u64 value = []() -> u64
+		{
+			wchar_t buffer[32]{};
+			const DWORD written = GetEnvironmentVariableW(L"RPCS3_REMIX_HIDEPAIRVP", buffer, static_cast<DWORD>(std::size(buffer)));
+
+			if (written == 0 || written >= std::size(buffer))
+			{
+				return 0;
+			}
+
+			return ::_wcstoui64(buffer, nullptr, 16);
+		}();
+		return value;
+	}
+
+	u64 hide_pair_fp_hash()
+	{
+		static const u64 value = []() -> u64
+		{
+			wchar_t buffer[32]{};
+			const DWORD written = GetEnvironmentVariableW(L"RPCS3_REMIX_HIDEPAIRFP", buffer, static_cast<DWORD>(std::size(buffer)));
+
+			if (written == 0 || written >= std::size(buffer))
+			{
+				return 0;
+			}
+
+			return ::_wcstoui64(buffer, nullptr, 16);
+		}();
+		return value;
+	}
+
+	// env_u32, not env_float: env_float rejects 0 outright, and 0 here has to mean "no flag, but
+	// still counted" - see the cat_hide_pair increment in classify_draw.
+	//
+	// Default 1, ceiling 2, so the ceiling is deliberately ABOVE the default and every value in the
+	// range is reachable - the round-31 trap was a ceiling that EQUALLED the default, which made the
+	// knob turnable in one direction only. Note this knob alone cannot hide anything: it is read
+	// only after hide_pair_matches() has already required BOTH hash halves to be set.
+	u32 hide_pair_mode()
+	{
+		static const u32 value = std::min<u32>(env_u32(L"RPCS3_REMIX_HIDEPAIRMODE", 1), 2u);
+		return value;
+	}
+
+	bool hide_pair_matches(u64 vp_hash, u64 fp_hash)
+	{
+		const u64 want_vp = hide_pair_vp_hash();
+		const u64 want_fp = hide_pair_fp_hash();
+
+		// An empty EITHER half disarms the route. This is the load-bearing line for "preserve
+		// today's behaviour exactly when the new knob is empty", and it is also the one-line revert
+		// the play-test card quotes: blank either half and nothing is hidden.
+		if (want_vp == 0 || want_fp == 0 || vp_hash == 0 || fp_hash == 0)
+		{
+			return false;
+		}
+
+		return vp_hash == want_vp && fp_hash == want_fp;
 	}
 
 	// --- round 20: the (vp, albedo) pair gate for the viewmodel ----------------------------------
@@ -13024,11 +13306,23 @@ namespace remix_rsx
 
 	u32 sun_sprite_hold_frames()
 	{
-		// Clamped to 3600 rather than left open: the whole point of the one-frame rule it relaxes is
-		// that a per-level source must not survive a level change, and an unbounded hold would undo
-		// that. 3600 frames is about a minute - long enough that no amount of looking away can drop
-		// the aim mid-level, far short of a level's lifetime.
-		static const u32 value = std::min<u32>(env_u32(L"RPCS3_REMIX_SUNSPRITEHOLD", 0), 3600);
+		// --- ROUND 32: the ceiling was BELOW the value the launcher was setting -------------------
+		// The old clamp was std::min(env, 3600) and launch-haze-remix.cmd sets 999999, so the
+		// effective hold was 3600 frames. MEASURED in the round-31 run's own 'Remix live:' line:
+		// the knobs block reads `sunspritehold=3600` while the launcher says 999999 - the instrument
+		// was already reporting the clamp and nobody read it. 3600 frames is ~90 s at the measured
+		// 38-47 fps, and the user's report is "changed back to old position a few MINUTES into
+		// playing the mission". The hold did not fail; it expired, on schedule, at the ceiling.
+		//
+		// The old comment's reasoning was sound but the arithmetic was not: it argued 3600 is "far
+		// short of a level's lifetime", and a Haze mission is minutes long, so 3600 frames is well
+		// INSIDE a level. Raised to 216000 (~1 hour at 60 fps, ~95 min at the measured rate), which
+		// is longer than any single Haze level and still finite, so the per-level property the old
+		// comment wanted is preserved in substance: a hold cannot outlive a session.
+		//
+		// This is the round-31 clamp trap a second time (STATICINDEXBUDGET had ceiling == default).
+		// Grep any new knob's clamp against BOTH its default and the value the launcher arms.
+		static const u32 value = std::min<u32>(env_u32(L"RPCS3_REMIX_SUNSPRITEHOLD", 0), 216000);
 		return value;
 	}
 

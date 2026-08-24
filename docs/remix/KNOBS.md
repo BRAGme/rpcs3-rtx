@@ -420,3 +420,1033 @@ been reasoning from.
 190,080 population: `<0.05` = **0** and `<0.2` = **0** for the entire session; `<1` = 54,533;
 `<10` = 109,461; `>=10` = 26,086; worst residue **35,970.5** against `tol=0.02`. 71.3% are at least
 50x the tolerance, so the distribution is nowhere near it and widening the gate is not the fix.
+
+---
+
+## Round 32 (2026-08-17)
+
+**The headline: two of round 31's four leads dissolved on inspection, and the two that survived were
+already-solved problems that had been switched off or clamped out.** Read this section before
+proposing a fix for wobble or for the sun.
+
+### `ref=anchor_prev` with `anchor_frame == frame - 1` carries NO information. It is a tautology.
+
+`find_gauge_anchor(false, ...)` accepts an entry **only** when `entry.frame + 1 == m_frame_counter`
+(anchor: `if (current ? (entry.frame == m_frame_counter) : (entry.frame + 1 == m_frame_counter))`).
+So a `ref=anchor_prev` pick can print no other age. "All 7 picks read `anchor_frame = frame - 1`" is
+the lookup predicate restated -- not an off-by-one and not a discovery. **Pre-registered refutation:
+if `anchor_prev` could ever report an age other than 1, the observation would carry information. It
+cannot.**
+
+What `ref=anchor_prev` *does* mean: the draw arrived **before this frame's first `WORLDIDENTITYVP`
+draw** on its own render-target key. `capture_gauge_anchor` returns immediately unless
+`world_identity_vp_matches(m_current_vp_hash)`, so the anchor cannot exist until one of those six
+programs draws. That ordering is deliberate and documented at the call site.
+
+### The wobble fix already exists, was user-confirmed, and is deliberately OFF for ~14 fps.
+
+`launch-haze-remix.cmd` sets `RPCS3_REMIX_DEFERPREANCHOR=0`, with a 2026-08-16 comment recording the
+whole trade in the launcher's own words: *"What you lose: the ship no longer slides as you turn --
+that fix was real and you confirmed it. What you get back: roughly 14 fps. This is a genuine trade,
+not a defect."* Its own pre-registered tripwire tripped: MEASURED `defer_buffered=543244
+defer_fresh=149761 defer_flip=393483` = **72% of the buffering did no work**.
+
+**So "props wobbling with the camera" in round 32 is the known, accepted cost of that revert. It is
+not a new bug and it does not need a new root cause.** Confirmed from the round-31 run's own
+counters: `defer_buffered=0 defer_fresh=0 defer_flip=0`.
+
+### Lead B (the X-only camera divergence) is CONFIRMED, 28x larger than reported, and its mechanism is named.
+
+The brief quoted 15.08 units from one pick. MEASURED from the same session's `Remix live:` lines:
+`anchor_cam_offset=4255` flips with `anchor_cam_offmax=430.126` units, and `camframe_max=430.126`
+(the same event). Between `flips=25441` and `flips=27250` the count went 884 -> 2687, i.e. **~99.7% of
+flips in that stretch had a >1-unit disagreement.** In the *following* session the same counters read
+`anchor_cam_offset=0 anchor_cam_offmax=0` -- so this is **level-scoped, not always-on**.
+
+`Remix anchor-gauge:` names it exactly. All 121 over-one-unit lines in a 125 MB window carry the
+**same pair** -- `anchor_vp=bd1c10df5703e559`, `elected_vp=7f3d3abcefc8b057` -- and the shape is a
+**monotonic ramp that wraps**, not noise:
+
+| frame | `anchorcam` X | `electedcam` X | offset X |
+| --- | --- | --- | --- |
+| 27720 | -217.335 | 25.8755 | -243.21 |
+| 27960 | -327.359 | 25.8759 | -353.235 |
+| 28080 | -383.777 | 25.8759 | -409.653 |
+| 28200 | **+411.656** | 26.0178 | +385.639 |
+| 28680 | 144.0 | 33.6889 | 110.311 |
+
+`electedcam` X moves 25.87 -> 34.66 over 1080 frames (a player walking). `anchorcam` sweeps +/-400 and
+wraps. Y and Z agree to six digits throughout. **Four consequences:**
+
+1. **A one-frame staleness cannot produce 400 units at walking pace.** Lead A and lead B are
+   unrelated defects and were being conflated.
+2. **`ANCHORSTICKY` structurally cannot catch this.** Its test is
+   `matrix_relative_delta(fused, slot->fused) <= s_camera_discontinuity_tolerance` -- a
+   *consecutive-frame* comparison. A slow monotonic drift stays under the tolerance every single
+   frame, forever. Confirmed by counters: `gauge_contested=0`, `anchor_parked=3`.
+3. **`bd1c10df5703e559` is the offender; `0214281b9a7a412d` is not.** The five round-31 picks anchored
+   on `0214...` read `camanchor - cam` of ~2e-4. Round 30 reached the same per-donor conclusion, so
+   this **confirms** round 30 rather than contradicting it.
+4. **`gauge_cam` fired on only 7447 of 18451 flips (40.4%)**, so on ~60% of flips the camera was left
+   in the elected frame while draws divided by anchors.
+
+**Trap in reading `camanchor=` on a pick line.** It is *seeded* with `m_active_camera.position` and
+overwritten only if `anchor_frame_eye()` succeeds (anchor:
+`record.camera_anchor_position[i] = m_active_camera.position[i];` followed by
+`anchor_frame_eye(record.camera_anchor_position);`). So **`camanchor == cam` bit-for-bit is
+ambiguous** -- it means either "the two frames agreed" or "no anchor eye was available". A difference
+at 1e-4 proves a real read; exact equality does not. Two of the seven round-31 picks are ambiguous on
+this basis, so "6 of 7 picks agree" overstates the evidence.
+
+**Also a methodological catch:** `Remix worldid-census:` reporting `tmax=1.49e-08` for
+`bd1c10df5703e559` does **not** vindicate it. That test measures `world = fused x ref^-1` where `ref`
+is that same anchor's own inverse, so it is self-referential and identity by construction. It says
+nothing about whether the anchor's frame matches the world frame.
+
+| name | default | effect | in GUI |
+| --- | --- | --- | --- |
+| `RPCS3_REMIX_SUNSPRITEHOLD` (**source clamp raised**) | `0`; ceiling was **3600**, now `216000` | **Round 32 -- the sun revert was a CLAMP, not a failed hold. Highest-confidence finding of the round.** The launcher arms `999999`; the old clamp was `std::min(env, 3600)`, so the effective hold was 3600 flips -- the knob was armed **277x above its own ceiling**. The instrument was already reporting it and nobody read it: the round-31 run's `Remix live:` knobs block reads **`sunspritehold=3600`** on the same line the launcher's 999999 was supposed to produce. MEASURED flip rate from consecutive `Remix sun-submit:` lines (frame 10800 at `0:03:03.633284`, frame 18000 at `0:05:28.412816`) = **49.7 flips/s**, so 3600 flips = **~72 s**. The user's report is "changed back to old position a few **minutes** into playing the mission". **The hold did not fail; it expired on schedule.** The old comment's reasoning was sound and its arithmetic was not -- it argued 3600 is "far short of a level's lifetime", and a Haze mission is minutes long, so 3600 flips is well *inside* a level. Raised to 216000 (~1 h at 60 fps), longer than any single Haze level and still finite. **This is the round-31 clamp trap a second time** (`STATICINDEXBUDGET` had ceiling == default). **Grep any new knob's clamp against BOTH its default AND the value the launcher arms.** Also MEASURED and separate: `m_sun_sprite_have` is written in exactly **one** place and **never cleared** -- no flip reset, no level-change clear, no discontinuity clear -- so the clamp was the only release path there was. **Revert:** nothing to revert; the launcher value is unchanged and now takes effect. To restore round-28 behaviour set `RPCS3_REMIX_SUNSPRITEHOLD=3600`. | no |
+| `RPCS3_REMIX_DRAWAUDIT` | `1` (on) | **Round 32 -- the only REMOVABLE occupant of `rest`, and `rest` is where the frame goes.** MEASURED in the round-31 log's worst window that actually submitted geometry (`frames=38`): `draw=50.88` ms/frame of a `frame_ms=53.03`, children `ui=2.53 mesh_create=0.14 tex_bind=1.11 uv=5.67 draw_instance=0.48` -> **`rest=40.96` ms/frame = 80.5% of `draw` and 77% of the whole frame**. `0` skips `audit_vertex_extent` (four separate passes over the decoded positions of every sub-draw) and `audit_world_extent` (walks the whole index list transforming each vertex into world space). Both are diagnostics. **Read `audit=` on `Remix timing:` FIRST** -- the timer and the knob ship together precisely so the size of the trade is stated before it is taken. What `0` costs: the vtx-spread census, the streak/wext census, and the **wext refusal gate**. Losing the gate is defensible on Haze *and only because it is measured*: `wext_refused=0` for the entire round-31 session, so it never fired and skipping it cannot change what is submitted. **On any other title, check `wext_refused` on `Remix live:` before setting 0.** `VTXREFUSE=1` with `DRAWAUDIT=0` is contradictory -- the audit never runs, so it can refuse nothing. **Revert:** `set "RPCS3_REMIX_DRAWAUDIT=1"`. | no |
+| `RPCS3_REMIX_DEFERPREVONLY` | `1` (on) | **Round 32 -- narrows pre-anchor deferral to the branch that can actually pay off.** Two branches set `defer_candidate`: `anchor_prev` (last frame's anchor exists for this source, so this frame's is plausibly still to come) and `gauge_anchor_absent` (**no** anchor in this frame or the previous one). Holding an absent-source draw bets on an anchor appearing for a source that has not produced one in two consecutive frames. MEASURED size of that bet: `gauge_used=680753 gauge_prev=225700 gauge_absent=125966`, so absent is **125966 of the 351666 deferral population = 35.8%**; reproduced at 35.8% in the earlier session (`prev=328430 absent=182985`). This removes a third of the buffering cost before any judgement about whether the remainder pays. **INERT at the shipped config** -- `DEFERPREANCHOR=0` makes the whole path dead -- it is staged so that when deferral is re-tested the cheap third is already gone. Read `defer_absent_declined` against `defer_buffered` on `Remix live:`. `defer_absent_declined` being non-zero with `DEFERPREANCHOR=0` is **expected**: the count is taken at the election, which runs regardless. **Revert:** `set "RPCS3_REMIX_DEFERPREVONLY=0"` reproduces round 31's deferral population exactly. | no |
+| `Remix timing:` gains `decode=`, `audit=`, `hash=`, `xform=`, `scene=[..]`, `meshes=` | -- | **Round 32 -- split `rest` (80.5% of `draw`) and name the level a sample came from.** The four new children are siblings of round 31's five, all inside `submit_subdraw`, so `rest` remains a saturating residual and shrinks by exactly what they capture. `decode` = index widen/rebase + `strip_to_list` + non-native primitive expansion + the per-vertex position decode with its `w_divide` + the index bounds check (five untimed O(vertex_count) loops that run on **every** sub-draw before any gate). `audit` = both geometry audits (see `DRAWAUDIT`). `hash` = static-index key build + per-triangle union accumulation + the union re-hash + skin-palette hashing -- **the source's own nominated suspect.** `xform` = `per_draw_transform` alone, ~1250 lines and fourteen exits; it is the only child whose cost is **invariant to vertex count**, which makes it the discriminator: if `xform` tracks draw count while `decode`/`hash`/`audit` track vertex count, the two are separable in one run. Implemented with a new `scope_us` RAII helper carrying an explicit `stop()`, because unlike round 31's five single-call children these are contiguous **spans** containing refusal `return`s (the two static-index dropped exits alone); an explicit `now_us()` pair would report a span that is hot *because* it is refusing draws as free. `stop()` keeps the diff to two inserted lines per span with no re-indentation. **`scene=` and `meshes=` fix a real analysis failure, not a nicety:** the round-31 log's three largest `frame_ms` samples were `62.21`, `60.79` and `54.23`, and **all three are boot/menu windows** (`draw=0.00`, `overlay`~26 ms, `ui_px`~2M) -- as are the three smallest. Nothing on the line said so, so worst-frame analysis was being done on the wrong frames. `scene=` is `m_active_camera.position`, freshly rewritten by `apply_gauge_anchor_camera` earlier in the same `flip()`. **Three facts to carry forward.** (a) **`other = frame_ms - flip`, so `other` CONTAINS `draw`.** They are NOT siblings and adding them double-counts. Correct decomposition: `frame_ms = flip + other`; `other` is a superset of `draw`; `draw = ui + mesh_create + tex_bind + uv + draw_instance + decode + audit + hash + xform + rest`. (b) **The ucode fingerprint/matcher lookup is NOT in `rest`** -- `fingerprint_for` and `fp_fingerprint_for` run in `end()` *before* the `draw` timer opens, so they land in `other`. Do not hunt for them in `rest`. (c) **`ui_px/frame` is not the `ui=` scope's pixel count.** One `m_pixels` counter is shared by `composite_ui_draw` (timed as `ui`, inside `draw`) and `composite_native_overlay` (timed as `overlay`, inside `flip`); a real log line reads `draw=0.00 (ui=0.00 ...)` with `ui_px/frame=2065645`. **Never divide `ui_px` by `ui`.** | no |
+| `Remix static-index:` gains `resident=`, `evicted=`, `nomesh=` | -- | **Round 32 -- the second axis, without which a budget sweep cannot be judged.** Round 31 correctly refused to raise the budget past 8 because its cost model omitted **BLAS residency**: every rebuild mints a new union hash and orphans the old one, so doubling the budget doubles both the creation rate and the rate at which union BLASes go idle -- and `MESHCAP=0` means no ceiling. Nothing said how many `entries` currently hold a live mesh. The triple sums to `entries=` exactly (mirroring the `stale + dropped == deferred` invariant) using the submit path's own derivation: `resident` = `mesh_hash != 0` and present in `m_meshes`; `evicted` = `mesh_hash != 0` but reaped, so the next draw of that entry takes the **`dropped`** exit and renders nothing; `nomesh` = `mesh_hash == 0`, never committed a union (the second-skin / material-pointer case, also `dropped`). **So `dropped` is predicted by `evicted + nomesh`, and `resident` is what BLAS memory pays for.** One pass over a container MEASURED at 470 entries, once per stats window, not per frame. **Deliberately NOT global mesh counts:** `meshes_live`/`created`/`destroyed` are already on `Remix stats:` and `Remix live:`, and adding them a third time would be exactly the duplicate-counter defect this project already shipped once. **`STATICINDEXBUDGET` stays at 8 this round** -- the instrument ships first, per round 31's own blocking note. Pre-registered sweep reading is in `round33-inbox.md`. **Note the static-index counters are never reset per window**, so two lines from one run must be differenced; raw values across runs of different length are meaningless. | no |
+
+### The five distance gates audited (round 31 asked for this)
+
+`origin` is the transform's translation row and `dist` is `|translation - eye|`, so an absolute-world
+draw with a correct identity transform necessarily reads ~`|camera|`. Verdicts, from source:
+
+| knob | armed | LHS quantity | verdict |
+| --- | --- | --- | --- |
+| `SKYANCHOR` | 4 | **translation column** `transform.matrix[i][3]` | **DEAD for absolute-world geometry.** A correct identity transform reads ~2100 units on Haze against a threshold of 4. Still meaningful for camera-locked draws (Haze's dome reads 0.000). **A correct `centre` is computed 12 lines above in the same loop and the gate re-reads the raw translation instead** -- a one-line change would put it on the same footing as the other four. Counters `sky_anchor` / `sky_anchor_held` are on `Remix stats:` only, i.e. NOT readable while the game runs. |
+| `VIEWMODELANCHOR` | 4 | genuine bbox centre (`VMANCHORGEO=1`) | **INERT.** All three arming lists (`VIEWMODELVP`, `VIEWMODELALBEDO`, `VMPAIRVP`) are empty, so `viewmodel_anchor_rejects` is never called. Would be sound if armed -- round 30 + `VMANCHORGEO` already fixed the artefact on this path. `vm_tagged=0` for the whole run confirms. |
+| `VMPAIRMAXDIST` | 2 | genuine bbox centre | **INERT**, doubly so: requires a non-empty `VMPAIRVP`, which round 28 deliberately blanked. `vm_pair_far=0` means "the route is disarmed", **not** "the bound never fired" -- the launcher's own note reads it the second way. |
+| `SUNCARDMINDIST` | 4 | genuine world bbox centre from decoded verts | **MEANINGFUL.** Immune to the artefact. Census-line floor only; pinned rows exempt. No counter for the gate itself, so a firing is observable only as a missing census row. |
+| `FPCENSUSMAXDIST` | 4 | genuine bbox centre, `!measured` never admitted | **MEANINGFUL.** Census admission only; tags and refuses nothing. |
+
+**And a live bug found in the audit: `SKYANCHOR=0` and `VIEWMODELANCHOR=0` do NOT disable those
+gates.** `env_float` ends `return (std::isfinite(parsed) && parsed > 0.f) ? parsed : fallback;`, so `0`
+fails the filter, returns the `-1` sentinel, and the accessor's ternary yields **4**. Both the source
+comment ("0 is a legitimate value meaning do not require the anchor at all") and this document's own
+`SKYANCHOR` row further up are **wrong against current bytes**. These two knobs are turnable upward
+only, never off. The same filter affects `SUNSPRITEMAXSPAN`, `SUNCARDINT`, `SUNRADIANCE` and
+`SUNANGLE`. `env_float_signed` does accept 0 and negatives.
+
+### The sun's other half: it starts 42.5 degrees wrong on every boot
+
+Separate from the clamp, and MEASURED from `bin\log\RPCS3.log`. On the land carrier the sprite is the
+**only live rung** of the precedence chain `SUNMAP > SPRITE > SUNSKY > SUNTRACK card > SUNDIR`:
+`SUNTRACK=0` disarms the card, and all 172 `Remix stats:` lines read
+`sun_sky_examined=0 sun_sky_solved=0 sun_sky_refused=0` with zero `Remix sunmap:` lines and neither
+`SKYEMISSIVE` albedo appearing anywhere in the log -- so the whole sky-sun subsystem never runs there.
+
+The sprite can only solve while it is **fully inside NDC** (`constexpr f32 k_edge = 1.f - 1e-4f;`),
+which is why looking up fixes the aim. MEASURED transition one flip apart at the same camera position:
+`verdict=offscreen ndc=[...]..[0.8454 1.1697]` then `verdict=solved ndc=[...]..[0.87662 0.9463]` --
+`hi[1]` crossed back inside +1. Pitching up is exactly what lowers `hi[1]`.
+
+Consequence: `Remix sun: created travel=[-0.3659 -0.9022 0.2285]` at `0:02:56`, then thirteen
+`Remix sun-submit:` lines through frame 18000 all reading `aimed=0 retargets=0` at that same travel,
+then a single `src=sprite` retarget with **`moved=42.48 deg`**. So the sun is 42.5 degrees wrong from
+boot until the player happens to look up, because the electing draw does not exist before then.
+Zero-code mitigation: set `RPCS3_REMIX_SUNDIR` to the sprite-derived travel for this level,
+`0.1223,-0.9444,-0.3051` (currently `-0.365,-0.9,0.228`). Trade: `SUNDIR` is global, so this is right
+for the carrier and arbitrary elsewhere -- which is what `SUNMAP` exists to fix per level.
+
+**Unresolved and INFERRED, for round 33:** because `update_sun_light()` returns early when no rung is
+live, RPCS3's own light `0x4` *keeps* its last aim and **cannot** re-elect to `SUNDIR` mid-mission. So
+a sun that visibly reverts is more likely the *runtime's own* fallback distant light:
+`bin\rtx.conf` reads `rtx.fallbackLightMode = 1` (NoLightsPresent), which the fork re-evaluates every
+frame in `prepareSceneData`, and the distant fallback is deliberately not recreated per frame. Setting
+`rtx.fallbackLightMode = 0` is the zero-rebuild way to eliminate that candidate. **Not changed here --
+`bin\rtx.conf` is the user's live tagging state.**
+
+
+## Round 34 (2026-08-17)
+
+**The headline: the viewmodel census had already emitted, in a log nobody read, and it names the bug.**
+Six `Remix vmbasis:` lines are in `bin\log\RPCS3.log` from the run that ended 2026-08-17 09:37:23 --
+round 33's own `RPCS3_REMIX_VMDEPTHOFFSET=2` play-test. Every doc block in the tree calling that census
+"the measurement no census has ever emitted" was stale from that moment. **Grep the previous round's
+log before writing a hypothesis.**
+
+### The viewmodel: four faults, all MEASURED, and the tag was never one of them
+
+| # | fault | evidence |
+| --- | --- | --- |
+| 1 | **The viewmodel divide is self-referential and parks every viewmodel draw at the world origin.** `m_frame_viewmodel_candidate.reference_inverse = inverse(folded)` is latched from the FIRST viewmodel-depth draw of the frame, and the comment beside the latch says the population is *expected* to share one view-projection. So `world = fused x reference_inverse` divides a matrix by (near enough) its own inverse. | `vmcam_applied=7960` of `vmcam_considered=7974` (99.8%). Census `pre` translation `[0.0555344 -0.244347 0.00686479]` on the vtx=3649 arms draw with `cam=[1774.14 -31.2479 1177.04]` -- **2129 units out**. Two of six lines have a bit-near-exact identity `pre`. |
+| 2 | **`apply_viewmodel_basis` pivots about the EYE, on a premise that is false here.** Its own doc block says the operator "cannot rescale the geometry - only reorient it and its position relative to the eye". True; the second clause is the defect once the translation is not the eye. | `post` translation `[158.622 -59.112 2563.8]`. All six census lines move **2537..2564 units**. `eye_pre=[1698.05 -236.325 1262.76]` -> `eye_post=[1698.05 236.325 -1262.76]`. |
+| 3 | **`!viewmodel_draw` disarms the tail-rescue ladder, and PROJSPLIT lives behind it.** Same gate round 28 caught deleting the arms through the `VMPAIRVP` route; still live, anchor `if (remix_rsx::tail_rescue_enabled() && remix_rsx::gauge_anchor_enabled() && !viewmodel_place`. | `const bool tail_split_ok = remix_rsx::split_view_projection(rescue_fused, tail_split);` sits inside `if (rescue_valid)`. |
+| 4 | **`!m_active_viewmodel.valid` suppresses the ONLY VIEW_MODEL camera submission in the backend.** There is exactly one site setting `camera_info.type = REMIXAPI_CAMERA_TYPE_VIEW_MODEL`. `m_frame_viewmodel_candidate` is filled with `.valid/.archetype/.projection/.has_reference/.reference_inverse` and **no `.view`, no `.position`** -- it is a divisor, not a camera, and nothing submits it as one. Latching it does not replace the twin, it deletes it. | `vmcam_twin=3185 vmcam_real=3185` of `flips=7096` = **44.9%**, and the missing 55.1% are exactly the frames a viewmodel-depth draw latched the candidate, i.e. the frames the arms were on screen. **That is the dev menu's `VIEWMODEL Position: - Direction: - FOV: -`.** |
+
+**And the world path is measurably CORRECT for these draws, which retires round 5's justification.**
+Untagged `Remix picked:` lines for the same program in the same level read
+`origin=[1780.78 -31.2362 1186.65]` against `cam=[1780.42 -31.3929 1186.57]` (albedo `0721D150DF278E7D`
+vtx=2140, **0.40 units**) and `origin=[1780.75 -31.1536 1186.66]` against
+`cam=[1780.42 -31.3948 1186.57]` (albedo `86885A0E60751491` vtx=4456, **0.44 units**), with
+`basis=[0.998796 0.99919 1.00065]` and `[1.00293 1.00239 1.0015]`. Round 5's doc block says dividing the
+viewmodel by the world camera "collapses the basis to (0.491, 0.002, 1.150)". Against current bytes that
+same quantity reads **unity to three decimals** -- the f64 gauge, the anchor election and PROJSPLIT all
+landed after round 5 measured it. **Do not re-derive the old number from the old comment; re-measure it.**
+
+Independent corroboration already in the tree, unreconciled for ~11 rounds: the doc block on
+`geometry_centre_in` says *"Haze's viewmodel programs use near-identity transforms (origin ~ [0,0,0])
+with world-space vertices ... The picks meanwhile reported those same draws ~1.5 units from the eye -
+because the picks measure the geometry."* That is fault 1 and fault 2 stated together, and
+`apply_viewmodel_basis` was never reconciled with it.
+
+| name | default | effect | in GUI |
+| --- | --- | --- | --- |
+| `RPCS3_REMIX_VMTAGONLY` | `0` (off = bit-for-bit round 33) | **Round 34 -- the actual viewmodel fix, and the bigger half.** Tagging a draw VIEW_MODEL does four things in `per_draw_transform` and only one is the tag. `1` introduces `viewmodel_place = viewmodel_draw && !viewmodel_tag_only()` and severs the three placement consumers: the divide by `m_active_viewmodel.reference_inverse` (fault 1), `defer_candidate = false`, the `REFUSED:noref`/`REFUSED:mode1` arm that **drops** the draw, and the `&& !viewmodel_draw` rescue gate (fault 3). `viewmodel_draw` itself is deliberately NOT cleared -- the submit site recomputes the verdict from the same inputs and must still tag, still run the basis operator and still emit the census. It also lifts the fault-4 camera suppression, because with the reference unused there is no reading left on which it has priority over anything. **Pre-registered refutation:** `vm_tagged` stays non-zero while `vmcam_considered` goes to **0** (the block is skipped entirely), `vmcam_twin` rises from 44.9% of flips toward `cam_resolved`, and the census's new `cdist_pre=` reads **~0.4** instead of ~2129. **If `cdist_pre` stays at ~2129, the relocation is NOT the viewmodel divide and this knob is the wrong lever -- say so and stop.** **Revert:** `set "RPCS3_REMIX_VMTAGONLY=0"`. | no |
+| `RPCS3_REMIX_VMBASISPIVOT` | `0` (the eye = round 19..33 bit-for-bit); clamp `min(env, 2)`, launcher arms `1`, so every reachable value is inside the clamp | **Round 34 -- the pivot was the bug.** `0` = the anchor-frame eye. `1` = the draw's own geometry centroid under the **pre**-operator transform, the only pivot that makes `apply_viewmodel_basis`'s own claim literally true: the mesh rotates and does not move. Falls back to the eye if the centroid is unmeasurable, reported as `pivotsrc=3` -- never to the origin. `2` = the transform's translation column; **wrong on this title** (that column *is* the world origin) and provided only to separate "modelled about the origin" from "modelled about the centroid" in one run. Uses `geometry_centre_in`, both overloads of which are already `const`, so `apply_viewmodel_basis` stays `const`; it reports the pivot back through out-params rather than storing it. **Inert while `VMBASIS=0`** -- the operator returns before the pivot is read, so `pivotsrc=0` with `flip=0` means "did not run", not "chose the eye". **Revert:** `0`. | no |
+| `RPCS3_REMIX_VMBASIS` (**launcher disarmed 6 -> 0**) | `0` | **Round 34 -- step 1 of two, honouring round 19's own discipline rather than restating it.** Round 19 armed `6` to fix "mirrored, upside down and displaced". All three symptoms had one cause and it was not handedness. An orientation guess taken against a mesh 2129 units from where it belongs measures nothing. **Step 1 (this build): `VMTAGONLY=1` + `VMBASISPIVOT=1` + `VMBASIS=0` -- one new variable, the tag.** The census still emits, with `pre == post`, and `cdist_pre=` is the number to read. **Step 2 (only after step 1 is judged): set 6 again.** With `VMBASISPIVOT=1` that is an in-place 180-degree rotation about the camera's right axis: `dbasis` goes non-zero and `dcentre` must stay ~0. **If the arms look right after step 1, do not do step 2.** **Revert:** `6` restores round 33. | no |
+| `Remix vmbasis:` gains `tagonly=`, `pivotsrc=`, `pivot=[..]`, `cmeasured=`, `centre_pre=[..]`, `centre_post=[..]`, `cdist_pre=`, `cdist_post=`, `dcentre=`, `dtrans=`, `dbasis=` | -- | **Round 34 -- separating the two halves an orientation correction has to keep apart.** `det_pre`/`det_post` only say whether an axis was reversed, and `eye_pre`/`eye_post` are the object **origin**'s offset from the eye, which on this title is the world origin and therefore says nothing about where the mesh is. `dbasis` = `max abs(post3x3 - pre3x3)` and **must be non-zero or the operator did not run**. `dcentre` = `norm(centroid(post) - centroid(pre))` and **must be ~0 or the operator moved the mesh**. `dtrans` is kept beside it deliberately: at a centroid pivot `dtrans` is large while `dcentre` is ~0, and reading `dtrans` alone would look like a failure -- they disagree exactly when the mesh is not modelled about its own origin, which is the case that made this round necessary. `cdist_pre`/`cdist_post` are the centroid's distance from the eye, i.e. the one number that says whether the arms are in front of the player at all. **Pre-registered for pivot 1: `dcentre < 1e-3` with `dbasis ~2`, and `cdist_post` within a few hundredths of `cdist_pre`.** Appended as one contiguous block immediately before `frame=`/`line=` -- the only insertion point that cannot shift an existing specifier/argument pair. 17 specifiers, 17 arguments, paired position by position; verified in the binary with the NEW text present *and* the OLD tail `eye_post=[%.6g %.6g %.6g] frame=%llu line=%u/%u` absent. | no |
+| `knobs:` on the boot line and `Remix live:` gain `vmbasispivot=` and `vmtagonly=` | -- | Round 34. Both print the **clamped** value, so a launcher armed outside its clamp shows up here. That is the diff round 31 (`STATICINDEXBUDGET` ceiling == default) and round 32 (`SUNSPRITEHOLD` armed 277x over ceiling) each lost a round to not making. | no |
+
+### The deployed runtime DOES accept bit 26. The `viewmodel_mode()` comment saying otherwise is deleted.
+
+MEASURED by disassembling `bin\remix\d3d9.dll` (sha256
+`16a0b512f33ebb66a89ac703e75289d9e008558a13d2c9a6a5455b0be7c40858`, 240657408 bytes, fnv1a
+`09653f484ec94dc0`). In `toRtDrawState` at RVA `0x001ED290`:
+
+```
+0x001ED309  mov   eax,[rdx+0x10]    ; remixapi_InstanceInfo::categoryFlags
+0x001ED30C  bt    eax,0x1a          ; bit 26 = VIEW_MODEL
+0x001ED312  mov   ebx,1             ; CameraType::ViewModel
+0x001ED31C  and   ebx,4             ; else bit2 SKY -> Sky, else Main
+0x001ED346  cmp   ebx,4 / cmove     ; deliberate Sky -> Main clamp
+0x001ED34D  mov   [rbp+0x1f4],eax   ; DrawCallState::cameraType   <-- load-bearing
+```
+
+The `+0x10` operand is verified against `remix_c.h`'s layout (`sType@0 pNext@8 categoryFlags@0x10
+mesh@0x18 transform@0x20`) by the transform rows loaded from `+0x20/0x30/0x40` immediately after. The
+build also carries the API bump to **0.1000.1** (`mov eax,0x03E80001` at RVA `0x000EDCD1`), which
+commit `6476faea` introduced. `toRtDrawState` is **byte-identical across all 15,328 bytes** to
+`dxvk-remix-numos3\_output\d3d9.dll`; a whole-file diff is 2,282 bytes over 9 regions, eight of them
+build stamps, the ninth `ImGui_ImplWin32_WndProcHandler`.
+
+**The deleted claim and why it was wrong.** `viewmodel_mode()` argued from three true observations --
+`remix_c.h` stops at `SMOOTH_NORMALS = 1 << 24`, `toRtCategories()` maps bits 0..24 by name, and the
+`static_assert` on `InstanceCategories::Count == 25` -- to a false conclusion. **Bit 26 is deliberately
+not an `InstanceCategories` member**; it is consumed by `categoryToCameraType()` and never reaches
+`toRtCategories()`. `6476faea`'s own message says the `static_assert` is unchanged. Two obvious "tests"
+for this are therefore non-tests: the assert count, and scanning for new identifier names (they are
+preprocessor-only and reach neither DLL nor PDB).
+
+An external draw can reach `CameraType::ViewModel` **only** through the category bit.
+`remixapi_SetupCamera`'s `REMIXAPI_CAMERA_TYPE_VIEW_MODEL` registers matrices in a camera slot and
+cannot make an instance reference it, and `submitExternalDraw` touches `ExternalDrawState::cameraType`
+at exactly one site -- `getCamera(state.cameraType)` -- and never copies it into
+`state.drawCall.cameraType`.
+
+`createViewModelInstances` early-returns in order on (1) `!RtxOptions::ViewModel::enable()`, (2)
+`!cameraManager.isCameraValid(CameraType::ViewModel)`, (3) `PlayerModel::enableInPrimarySpace()`.
+**Only gate 3 masks the instance** (`m_vkInstance.mask = 0`), and it is `false` and absent from
+`rtx.conf`. So **a tagged draw with no viewmodel camera renders as ordinary world geometry**, which is
+exactly what round 20 measured on 123 tagged draws. **The launcher's claim that a mis-tagged draw is
+removed from the world pass is retracted for this configuration.**
+
+**Vendored constants reconciled.** `vendored_runtime_fnv1a` was `0x63656dfe3da8f069`, described as sha256
+`36A5641AF4FA848E...`. **No file on this machine hashes to that** -- it was an earlier incremental link
+of the same tree (same PDB GUID `228D2E7A-E41C-451F-8C80-D8B7ADD7E065`, lower Age), since overwritten.
+Now `0x09653f484ec94dc0`; `vendored_runtime_size` was already correct at 240657408, which is why the
+warning fired on the hash alone and read as noise. Verified in the binary: new quad present at file
+offset 19237648, old quad **absent**. Also retracted: the provenance block's claim that the
+`remix-plus-1.5.1` zip "predates the VIEW_MODEL category bit" -- the July CI build at
+`bin\remix\d3d9.dll.bak-0729` already carries a bit-26 arm (`bt eax,0x1a` at RVA `0x001FAEB6`).
+
+**PDB TRAP, worth more than the constant.** `bin\remix\d3d9.pdb` has GUID
+`04C3AFFD-472B-4565-9AA0-08EBE452E439` Age 24 -- that is **`.bak-0729`'s** PDB, not the deployed DLL's,
+stale by ~2.5 weeks and 24 link generations. Symbolizing a crash in the deployed runtime with it gives
+**wrong function names**. The matching lineage is `dxvk-remix-numos3\_output\d3d9.pdb` (GUID
+`228D2E7A...`, Age 49).
+
+**Runtime swap, if the user wants it (their decision, not taken here).** `_output\d3d9.dll` is the same
+code plus the `if (bd == NULL) return 0;` null-`bd` guard in `ImGui_ImplWin32_WndProcHandler`, which is
+the fix for the Remix ImGui WndProc crash that affects every Remix game -- the currently deployed DLL
+does **not** have it (`xor edi,edi` then falls through into the switch). No ABI, interface-slot or
+version change; both are 0.1000.1. Costs: it comes from a **dirty** tree so the commit alone does not
+reproduce it (identify by sha256 `F75A70D76B850829...`), `vendored_runtime_fnv1a` would need to become
+`0x5c5478cd184f4b0a` instead, and `_output\d3d9.pdb` should be copied alongside it.
+
+### Round 31's BLAS objection does NOT survive. `STATICINDEXBUDGET` 8 -> 32.
+
+Round 31's words, `launch-haze-remix.cmd`: *"every rebuild mints a new BLAS handle and the superseded
+one stays resident for MESHIDLE frames, and RPCS3_REMIX_MESHCAP=0 means there is no ceiling on the
+resident set."* **Both halves are false**, read from
+`dxvk-remix-numos3\src\dxvk\rtx_render\rtx_accel_manager.cpp` (clean since `ef3313e2`, 2026-06-04; all
+eight BLAS anchor strings verified present in the deployed DLL; **no** conf file overrides any of the
+five options in `bin\rtx.conf`, `bin\user.conf` or `bin\remix\rtx.conf`).
+
+1. **A ~426-triangle union never gets its own BLAS.** `forceMergedBlas` includes
+   `(!minimizeBlasMerging() && blasPrims < minPrimsInDynamicBLAS)` with the threshold
+   `std::max(minPrimsInDynamicBLAS(), 100u)` = **1000** and a **strict `<`**. Measured triangles per
+   union across three logged runs: **426.2 / 267.1 / 364.3**. `forceMergedBlas` overrides *every* clause
+   of `requestDynamicBlas`, including `dynamicBlas != nullptr` ("keep the one you have"), and hands any
+   existing dynamic BLAS back to `m_blasPool`.
+2. **A new mesh HASH costs no BLAS at all.** `remixapi_CreateMesh` allocates
+   `HOST_VISIBLE|HOST_CACHED` buffers ("Remix API mesh buffer") and does a map insert
+   (`m_extMeshes.emplace`). A BLAS is only born on the **draw** path (`commitExternalGeometryToRT` ->
+   `BlasEntry` -> `AccelManager`). MEASURED: **86.9 submitted draws per frame against
+   `meshes_live=16133`**, so >=99.4% of live handles hold no BLAS on any frame.
+3. **`numFramesToKeepBLAS` resolves to 1 here, so a BLAS is freed 2 frames (~70 ms) after its last
+   draw.** `std::max(enablePreviousTLAS() ? 2u : 1u, numFramesToKeepBLAS())`, and `enablePreviousTLAS()`
+   is **false** on this machine's `user.conf` (`upscalerType = 1` = DLSS + `enableRayReconstruction =
+   True` -> ray reconstruction on; `integrateIndirectMode = 0` != ReSTIRGI). `PooledBlas::~PooledBlas`
+   genuinely frees. **MESHIDLE governs host mesh handles, not BLAS memory.** Note `numFramesToKeepBLAS`
+   is also aliased as `numFramesToKeepGeometryData()` **and** `numFramesToKeepMaterialTextures()` -- one
+   option, three jobs, not obvious from the name.
+4. **The merged pool is recycled by BUFFER SIZE, never by mesh hash.** Pool size is bounded by buckets
+   alive in the last 2 frames. What a new hash *does* cost is a changed bucket content hash, so
+   `canSkipBuild` fails and that bucket takes a full BUILD instead of an UPDATE -- **per-frame and
+   transient, not cumulative.**
+5. **No cap a higher rebuild rate can blow.** One `vkCmdBuildAccelerationStructuresKHR` for everything
+   accumulated; scratch memory grows on demand and is released each frame; `maxPrimsInMergedBLAS` is a
+   **per-mesh** test that routes a >50000-prim mesh to its own BLAS, and `BlasBucket::tryAddInstance`
+   never rejects on triangle count. The only hard cap is RPCS3-side (`s_max_indices_per_mesh` = 1048576
+   = 349,525 tris), and at 426 tris/union you are ~800x away.
+
+**Real cost of a higher budget, in order:** GPU merged-bucket full rebuilds (transient; watch
+`frame_ms`); CPU **4.54 us per mesh create** = `mesh_create=0.26` / `mesh_creates/frame=57.3` = **0.74%
+of a 35.22 ms frame**; ~20 KB host RAM per resident union (~24 MB for 1200). **VRAM growth: none on this
+evidence.**
+
+**Why 32 and not 64:** 32 leaves `peak` readable, and the entire 8->64 range is bounded at +0.25 ms of
+frame time. Demand in the plant burst was **~57 deferrals/frame against 8 slots** (census lines 43->44,
+2.01 s apart: `deferred +3202` over `rebuilds +324` = 9.88/rebuild, ~56 frames at the measured 27.9 fps).
+Eviction *is* recoverable -- `if (static_entry->dirty || !active_valid)` re-enters the rebuild path --
+but recovery must win a budget slot, so restoring 1168 evicted unions at 8/frame is **>=146 frames ~
+5.1 s** while `MESHIDLE=600` re-evicts anything out of view for 10 s. A treadmill the current budget
+cannot win.
+
+**Pre-registered reading, all DIFFERENCED WITHIN THE NEW RUN** (first to last census line; the rate
+varies **1.03..4.34** across runs, so raw cross-run values are meaningless):
+- SUCCESS 1: **`peak < 32`**.
+- SUCCESS 2: `dropped`/`rebuild` falls below **3.661** (this run's differenced value). The widely-quoted
+  **1.17 was an undifferenced `2020/1728`**; that run's correct differenced value is **1.145**.
+- SUCCESS 3: `resident`/`entries` on the **FINAL** line rises above **63.8%** (257/403).
+  **`resident`/`evicted`/`nomesh` are point-in-time GAUGES, not cumulative counters -- read the last
+  line, never difference them.**
+- REGRESSION 1: `frame_ms` rises >1.0 ms while `mesh_create` stays under 1.0 ms. That is the
+  merged-bucket rebuild term, and it is the only real cost.
+- REGRESSION 2: per-create cost rises above ~6 us.
+- **RETIRED:** round 32 registered *"if `dropped` falls while `evicted` RISES, the budget is churning
+  BLASes faster than they are reaped and 16 is a regression."* **Withdrawn.** `evicted` counts
+  RPCS3-side handles reaped by MESHIDLE and a handle carries no BLAS unless drawn that frame. Rising
+  `evicted` with falling `dropped` is the **expected** shape. The regression signal is `frame_ms`.
+
+**Invariants checked:** `stale + dropped == deferred` **HOLDS** on absolutes and on every differenced
+pair. `resident + evicted + nomesh == entries` **HOLDS** -- but it is true **by construction**, all four
+coming from one pass over `m_static_indices` with a three-way if/else, so it is a self-consistency check
+on that loop, not independent corroboration.
+
+**Most alarming number found, and it is not in the current run:** a 309-line run ended
+**`resident=12 evicted=1168`** -- 1.0% of static-index entries still held a live mesh handle. Another
+ended `resident=3 evicted=695`. Since `evicted` means the next draw of that entry takes the `dropped`
+exit and renders nothing, that is the invisible-walls symptom in numeric form, and it is a
+**steady-state decay, not a load transient.** Lever flagged but NOT taken: a longer idle window scoped
+to static-index **union** meshes only would relieve the budget more cheaply than raising it, but that is
+a code change, not a knob.
+
+### `Use RSX Backface Culling` -- the user changed the file the game does not read
+
+MEASURED: `bin\config\config.yml` reads **`true`**; `bin\config\custom_configs\config_BLUS30094.yml`
+reads **`false`**; and `bin\log\RPCS3.log` line 166 reads
+`Emulator::BootGame: ... config_mode='custom config'`. **The custom config wins, so the effective value
+is OFF and the user's change never took effect.** There is no env escape hatch either --
+`cull_from_rsx()` is `env || g_cfg.video.remix.cull_from_rsx`, the env var can only force ON, and
+`RPCS3_REMIX_CULL` is absent from the launcher. Consequence:
+`instance.doubleSided = (cull_from_rsx() && cull_face_enabled()) ? 0u : 1u` submits **every instance
+doubleSided=1**; nothing is ever single-sided. **Advice: leave it off** -- round 33 recorded that
+turning it on made the plant far worse (walls/floor went black), and single-sided submission drops the
+inward-facing faces this title needs. The white walls are the static-index budget, not culling.
+
+Other values in the custom config, for the record: `Live Mesh Cap: 0`, `Mesh Idle Frames: 300` (the
+launcher's `MESHIDLE=600` overrides it -- `mesh_idle_frames()` is `env != umax ? env : g_cfg...`),
+`Texture Idle Frames: 21600`, `Texture Uploads Per Frame: 192`, `Camera Hold Frames: 300`,
+`Resolution Scale: 150`, `Shader Precision: Low`.
+
+### `audit` IS the largest child of `draw` — but `DRAWAUDIT=0` is NOT safe, and was reverted
+
+`round33-inbox.md` registered: *"If `audit` is the largest new child: the fix is
+`RPCS3_REMIX_DRAWAUDIT=0`, not an optimisation."* MEASURED, last two `Remix timing:` windows of the
+2026-08-17 run:
+
+```
+frame_ms=35.22 | draw=33.20 (ui=2.28 mesh_create=0.26 tex_bind=0.53 uv=3.48 draw_instance=0.43
+                             decode=6.35 audit=11.35 hash=3.76 xform=0.19 rest=4.58)
+frame_ms=33.57 | draw=31.51 (... decode=6.10 audit=11.03 hash=3.64 xform=0.12 rest=3.78)
+```
+
+`audit` **is** the largest new child at **11.35 ms = 32.2% of the whole frame and 34.2% of `draw`**, and
+`rest` has fallen to 4.58 ms (13%) -- round 31's 40.96 ms residual is fully accounted, and **`rest` is
+not `0.00` beside a large `draw`**, so round 33's saturation/double-counting tripwire did not trip.
+`decode` is second at 6.35 ms and is the next target if more is wanted.
+
+**`DRAWAUDIT=0` was armed, then REVERTED to `1`, because the safety argument is wrong.** The argument
+everyone has used — including round 32's own knob row and this round's first draft — is *"`wext_refused=0`
+for the whole session, so the gate never fired and skipping the audit cannot change what is submitted."*
+A review of the round-34 diff found **`wext` is not the only gate the audit feeds.** `m_streak_measured`
+is written **only** inside `audit_world_extent`, so with the audit off it stays `false` for the entire
+session, and two further consumers change behaviour:
+
+- The `SKIPEXTENTVP` refusal gate reads `&& m_streak_measured` and therefore **stops firing**. The
+  launcher arms `SKIPEXTENTVP=57A12323F22F4988` with `SKIPEXTENTMIN=128` — and `57A12323F22F4988` is
+  **one of the three near-depth viewmodel programs**. Disabling that refusal changes what is submitted
+  for the exact population priority 1 is measuring.
+- `extent_plausible = !m_streak_measured || ...` becomes **unconditionally true**, so
+  `GUESTLIGHTEXTENT` stops rejecting anything (injection is unaffected at `GUESTLIGHTAUTO=0`, but the
+  lightcand census widens and pays bounding-box walks it previously skipped — a perf knob partly
+  defeating itself).
+
+`RemixTransforms.h`'s "What 0 costs" enumerates only the vtx-spread census, the streak/wext census and
+the wext refusal gate. **Neither of the above is named, and the doc should be corrected before anyone
+arms 0 again.** Arming `DRAWAUDIT=0` in the same run as the viewmodel change would confound the one
+measurement that matters, so frame time waits a round. **Round 35: take the ~11 ms then, and either arm
+`DRAWAUDIT=0` with `SKIPEXTENTVP` blanked so the interaction is explicit, or attack `decode` (6.35 ms) by
+caching decoded positions per (source pointer, count) as round 33 pre-registered.**
+
+**General lesson: "counter X is 0, therefore removing the code that computes X is free" only holds if X
+is the code's ONLY consumer.** Grep every reader of every intermediate the block writes, not just the
+counter named in the knob's doc.
+
+### Task 4: the identity-transform props are CORRECT. The premise was the artefact.
+
+All three picks are verdict **(C) absolute-world-space static geometry**, for which an identity instance
+transform is right and the mesh's own vertex coordinates place it at ~1800. **Nothing is riding the
+camera.**
+
+- **`identity-bypass` has ELEVEN producers, not one.** `world_identity_match` ORs
+  `world_identity_vp_matches` with `world_identity_pair` .. `pair5`, `fp_pair`, and `opaque_fp_pair` ..
+  `opaque_fp_pair4`. `WORLDIDENTITYVP`/`STATICINDEXVP` carry the same six hashes and **none of the three
+  picks is in either**, but the launcher arms ten more pair knobs and all three picked VPs appear among
+  them. `a7505f7ad3a86838`/`fp=a91b57ce21bf0082` matches `WORLDIDENTITYOPAQUEFPPAIR4` exactly, with
+  `depth_write=1 blend=0` satisfying `opaque_depth_draw`. **`origin` is exactly `[0 0 0]`, not an
+  epsilon -- the signature of an assignment, not a division.**
+- **(A) view-space vertices is REFUTED from the raw bounds:**
+  `raw=[1788.75 -24.9408 1204.12]..[1808.94 -24.9388 1212.04]` -- absolute world, magnitude ~1800.
+- **Not camera-locked, MEASURED:** only **7 distinct raw bboxes across 321 draws spanning frames
+  3596..55560**, in two fixed world clusters. The dominant bbox is **bit-identical across 135 draws
+  covering frames 9006..19320**, during which the camera moved 3.23 in X and 2.29 in Z. Control that the
+  metric resolves motion: a sibling albedo shows **129 distinct bboxes over 1845 rows**.
+- **The `a7505f7ad3a86838` pin discards essentially nothing:** `Remix worldid-draw:` reads
+  `basis_delta=1.13687e-13 translation=3.72529e-09`, and **251 of 321 traced draws (78.2%)** discard a
+  translation < 1e-6. `WORLDIDMAXT=32` already exempts the two largest remaining buckets, leaving
+  **8.1%** residual. **Do not change these three.**
+- For `1f9342de47afb400` and `d0b6a471bb2d463b` **no knob fires** (the armed albedo/fp keys do not match
+  the picked ones), so the division genuinely ran and produced a residue of **2.18e-11** against entries
+  of order 1e3 -- agreement to ~14 significant digits. INFERRED: there is no object->world matrix in the
+  chain; `fused` **is** `V x P`, the same matrix the anchor holds. `ad7ce9d672a0bf6b` is itself on
+  `WORLDIDENTITYVP`, i.e. another declared world-space program reading the same constants.
+
+**NEW DEFECT found while doing this, and it is the real one: the world divide is BIMODAL on the same
+mesh, and the wrong mode's residue is of CAMERA magnitude.** For (`d0b6a471bb2d463b`,
+`27159433F0E63031`), all on the same `surf=014D0000` and the same raw bbox: 355 rows (79.2%) discard
+<1e-6, and **76 rows (17.0%) discard >1000**. Pick-line `|origin - cam|` for that mode clusters at
+2094.94 .. 2143.41 against `|cam| = 2106.8` -- agreement within 2%. `max_translation` is
+`max abs(matrix[row][3])`, so this is a camera-coordinate residue, i.e. `fused x ref^-1` where `ref` did
+not match the draw's `fused`. Supporting: `camclip=512x288` vs the draws' `1024x576` in most rows, and
+`camage` up to **702 frames**. **Pre-registered:** if that bucket does not fall from **76/448 = 17.0%**,
+the reference-mismatch inference is wrong. The tree already names the shape: *"Haze submits absolute
+world vertices through several passes which share a vertex program. A VP-wide transform rule cannot
+distinguish the gameplay draw from a camera-relative copy."*
+
+### The warping light fixture: 612 albedos on one VP, and `eye_dist` separates it cleanly
+
+`vp=830d7d1b9681c475` draws **612 distinct albedos across 35,575 `Remix fpcandidate:` rows**, so any
+VP-keyed fix over-matches by ~600x. But **(vp, albedo) does isolate the fixture**, and the discriminator
+is the `eye_dist` **floor**:
+
+| class | albedos | n | `eye_dist` | vtx | ext |
+| --- | --- | --- | --- | --- | --- |
+| ARMS, rigid | `1CDD5249E6504F13`, `CC6008D0E9E98972` | 718, 65 | **0.25 .. 1.10** | 244-3800 | 0.061-0.830 |
+| ARMS, contaminated -- **exclude from any albedo rule** | `0721D150DF278E7D`, `86885A0E60751491` | 2928, 808 | 0.09 .. **2158.85** | 40-4456 | 0.070-20.203 |
+| FIXTURE | `3928B58DC87F4702`, `5BC48BBB303398E3`, `60CCC35DE6ED42B7`, `08865794B7B59AEC`, `57720018CA20525D`, `5A55210D7739C716`, `38C858E6DC48E488` | 22..335 each | **floor never below 1.81** | 168-590 | 0.272-2.770 |
+| translucent, distinct (`depth_write=0 blend=1`, `sampled=0x7`, `fp=479890ff55f1d96e`) | `C61753D31FB96507` | 1613 | 1.58 .. 3.77 | 59 fixed | 5.067-8.473 |
+
+No overlap between the rigid-arm ceiling (1.10) and the fixture floor (1.81). **The warp is NOT in the
+vertex data:** `corr(ext, eye_dist)` is `abs(r) <= 0.22` for all four fixture albedos tested, and
+`5BC48BBB303398E3` holds `ext` to 0.331..0.333 (0.6%) over 20 draws at a fixed 180 vertices. The
+distortion is in the recovered basis -- picks show anisotropic deviation up to **+/-0.28%**
+(`0.997445 0.999418` .. `1.00279 0.999904`), varying frame to frame, with `ref=anchor_prev` on 51/65
+picks. **Pre-registered test with a baseline, for whoever attacks it:** measure `basis` spread on picks
+of (`830d7d1b9681c475`, `5BC48BBB303398E3`), whose raw `ext` is constant to 0.6% so any deviation is
+pure gauge error. **Baseline +/-0.28%.** If a freshness fix does not bring it below **+/-0.05%** and does
+not lower `gauge_prev`, the anisotropy is in the anchor program's own matrix rather than its age -- stop
+and attack `ad7ce9d672a0bf6b` instead.
+
+### Method notes earned this round
+
+- **The log from the last play-test is a primary source and it was not read.** Round 33 set
+  `VMDEPTHOFFSET=2`, the user played it, and `bin\log\RPCS3.log` held `vm_tagged=7960`, six
+  `Remix vmbasis:` lines with the full pre/post matrices, `vmcam_applied=7960/7974` and
+  `vmcam_twin=3185/7096` -- four of this round's five findings, sitting in a 7 MB file.
+- **A doc comment that says "no census has ever emitted this" is a claim with an expiry date.** Three
+  separate blocks carried it after it became false. When shipping an instrument, the same commit should
+  say how to tell it has fired.
+- **`FileStream` tail + `-Max N` stops at the FIRST N matches in the window, not the last.** I read
+  `vm_tagged=0` and `vmcam_twin=0` off a 40 MB tail and they were from an earlier session; a 4 MB tail
+  gave `flips=7096 vm_tagged=7960 vmcam_twin=3185`. **When tailing an append-mode log, shrink the window
+  until the match count is under the cap, then take the last line.**
+- **Two counters with the same name on two different lines are not necessarily a duplicate defect.**
+  `vm_tagged` is on both `Remix stats:` (RPCS3.log) and `Remix live:` (dump) and they agreed exactly at
+  7960. `Remix live:` does **not** appear in RPCS3.log at all (0 hits vs 79 for `Remix stats:`), so
+  grepping the emulator log for a live-only field silently finds nothing.
+- **"Strictly more correct and keeps priority" needs a consumer.** Fault 4 is a suppression guarding a
+  priority over a structure that no code path can use. Before writing a precedence rule, check that the
+  higher-priority object is actually consumable by the same sink.
+- **When splitting one flag into two, ask of EACH consumer whether it had a second reason.**
+  `viewmodel_draw` drove four things and three moved to `viewmodel_place`. The fourth — `defer_candidate
+  = false` — looks like placement and is documented as placement, but it has a second, independent
+  reason: `flush_deferred_for_anchor` recomputes `entry.info.transform = to_remix_transform(world)` and
+  does **not** re-run `apply_viewmodel_basis`, so a deferred viewmodel draw would silently lose its basis
+  correction and be placed differently depending on whether it was buffered. **It deliberately stays on
+  `viewmodel_draw`.** Caught in review of this round's own diff, not by testing — it is unreachable at
+  the shipped `DEFERPREANCHOR=0`, so no run would have found it.
+- **Two review findings that are NOT round 34's and are still open, both from the uncommitted round-32
+  work.** (a) The `xform` timing span **encloses `deferred_instance`**: `per_draw_transform` calls
+  `capture_gauge_anchor` -> `write_gauge_anchor` -> `flush_deferred_for_anchor` -> `submit_deferred`,
+  which adds to `m_timing.deferred_instance` from inside the `xform` scope. `rest` stays a valid residual
+  (`deferred_instance` is not in the subtraction), but round 32's claim that `xform` is "the only child
+  whose cost is INVARIANT to vertex count, which makes it the discriminator" is false the moment
+  `DEFERPREANCHOR=1` — precisely the run it was staged for. Inert today because the flush early-returns
+  on an empty buffer. (b) **`SUNSPRITEHOLD` is still armed at `999999` against the new ceiling of
+  `216000`**, so the knobs line will report `sunspritehold=216000` and reproduce the exact
+  reported-vs-armed mismatch round 32's fix was written to end. One launcher edit.
+- **A "0.4 units from the eye" anchor distance and a "2129 units from the eye" transform translation are
+  the same draw.** The first is `geometry_centre_in` (VMANCHORGEO), the second is `matrix[i][3]`. They
+  are different quantities and conflating them is what let the eye pivot survive fifteen rounds. The new
+  `cdist_pre=`/`centre_pre=` fields print both halves on one line so it cannot happen again.
+
+## Round 35 (2026-08-17)
+
+Deployed: `bin\rpcs3.exe` = `bin\rpcs3-next.exe` (hashes in `round36-inbox.md`). Runtime
+`bin\remix\d3d9.dll` **UNCHANGED at `16A0B512F33EBB66`** — nothing was deployed into `bin\remix\`.
+
+### `apply_viewmodel_basis` is CORRECT. The "120-degree yaw" was a row-vs-column projection error.
+
+The round-35 brief reported that `VMBASIS=6` "produced a 120-degree yaw about the up axis" where a clean
+180-degree rotation about the camera's right axis was wanted, and asked for the reflection composition to
+be rewritten. **Refuted.** The brief projected the instance transform's **ROWS** onto the camera axes.
+`remixapi_Transform` is **column-vector** — `p_world = M * p_object`, and `matrix[i][3]` is the
+translation, which is what the `VMBASISPIVOT=2` branch and the census's `dtrans=` both read — so the
+object's world-space X/Y/Z axes are its **COLUMNS**. Row `i` of a non-symmetric rotation is a coefficient
+vector, not an axis.
+
+MEASURED, re-projected by script over all 10 `flip=6` lines of the 2026-08-17 12:36 run in
+`bin\remix_dump.log` (`VMTAGONLY=1 VMBASISPIVOT=1 VMBASIS=6`):
+
+| line | COLUMN dots post (X.right Y.up Z.fwd) | ROW dots post (as the brief read them) |
+| --- | --- | --- |
+| `830d7d1b9681c475` / `0721D150DF278E7D` vtx=2140 frame=3945 | **+0.99945 +0.99946 +0.99891** | -0.50091 +0.99984 -0.50101 |
+| `830d7d1b9681c475` / `86885A0E60751491` vtx=3649 frame=3945 | **+0.99751 +0.99986 +0.99752** | -0.53236 +0.99976 -0.53211 |
+| `57a12323f22f4988` / `804C702EC7A87C58` vtx=8 frame=3945 | **+0.99948 +0.99987 +0.99948** | -0.44552 +0.99976 -0.44529 |
+| `9f591b6a6b825612` / `CC6008D0E9E98972` vtx=4 frame=6640 (the visor) | **+0.91169 +0.92747 +0.96838** | +0.87411 +0.94216 +0.91478 |
+
+The row reading reproduces the brief's numbers to five decimals, which is what identifies the artefact.
+The column reading **is the pass mark the brief itself asked for** — X.right, Y.up, Z.fwd all at +1 — and
+it holds on *every* flip=6 line, so the premise that "one program composes correctly and the other yaws"
+is also an artefact: the visor is not better behaved, it is only less perfectly camera-aligned to begin
+with (its own `pre` reads +0.912 / -0.927 / -0.968).
+
+Everything else the brief pre-registered for the placement already passed and is unchanged:
+`cdist_pre=0.429486` vs `cdist_post=0.429487`, `dcentre=1.45e-06`, `dbasis=1.99947`, `pivotsrc=1`.
+
+**Shipped: `dotpre=[...] dotpost=[...]` on the `Remix vmbasis:` line** (`RemixGSRender.cpp`,
+`axis_dot` lambda in `report_viewmodel_basis_census`) — the COLUMN direction cosines, normalised on both
+sides so a scaled basis still reads 1. Format audited position by position: **61 specifiers against 61
+top-level arguments, zero type mismatches.**
+
+### The target, not the operator, is what is undecided — and the eight flips are now a lookup table
+
+MEASURED: `pre` is uniformly `(right, -up, -fwd)` on all 24 `tagonly=1` census rows, so every flip has a
+known `dotpost` reading and a known determinant (even flips preserve it, odd flips mirror):
+
+| flip | dotpost (X.right Y.up Z.fwd) | det | flip | dotpost | det |
+| --- | --- | --- | --- | --- | --- |
+| 0 | (+1 -1 -1) | +1 | 4 | (+1 -1 +1) | **-1 MIRROR** |
+| 1 | (-1 -1 -1) | -1 | 5 | (-1 -1 +1) | +1 |
+| 2 | (+1 +1 -1) | -1 | 6 | (+1 +1 +1) | +1 (round 34 step 2) |
+| 3 | (-1 +1 -1) | +1 | 7 | (-1 +1 +1) | -1 |
+
+The user's verdict on flip=6 was **"arms are facing the right way, just upside down and a little high"**.
+Keeping the forward axis, negating the up axis and adding no mirror leaves exactly one flip: **5**, armed
+this round. This is INFERRED from a verbal report, not measured, which is why `dotpost=` ships beside it.
+
+**Why not 4, which the round-19 launcher note recommends for exactly this symptom:** flip 4 has det -1,
+i.e. it mirrors the arms. `det_pre` reads +1.00001 on every census line, and the legs and the whole world
+come through the same world divide and are not mirrored, so that divide preserves handedness and the
+correction must be a proper rotation. Round 19's "try 4" predates that measurement. Superseded.
+
+### "A little high" is REAL, is NOT caused by the rotation, and gets no offset knob this round
+
+MEASURED, `centre_pre` minus `m_active_camera.position` over all 24 `tagonly=1` census rows — **every**
+near-depth viewmodel draw's centroid sits ABOVE the eye:
+
+| (vp, albedo) | dY(centre - eye) | horizontal dXZ |
+| --- | --- | --- |
+| `830d7d1b9681c475` / `86885A0E60751491` | +0.158 .. +0.164 | 0.43 |
+| `830d7d1b9681c475` / `0721D150DF278E7D` | +0.374 .. +0.384 | 0.21 |
+| `57a12323f22f4988` / `804C702EC7A87C58` | +0.098 .. +0.108 | 0.63 |
+| `f39f504649b6f442` / `86885A0E60751491` | +0.373 .. +0.382 | 0.48 |
+| `f39f504649b6f442` / `0721D150DF278E7D` | +0.599 .. +0.599 | 0.11 |
+| `15ad612980aca110` / `804C702EC7A87C58` | +0.932 | 0.48 |
+| `9f591b6a6b825612` / `CC6008D0E9E98972` | +0.321 .. +0.413 | 0.13 |
+
+**It is not the operator.** The same albedo reads +0.3844 at flip=0 (frame 2512) and +0.3754 at flip=6
+(frame 3945) — a 0.009 difference across a different camera pose — and `dcentre <= 6.5e-06` on every
+line says directly that the basis operator does not move the centroid. So "high" is a property of the
+recovered world transform, not of `VMBASIS`.
+
+**It is not yet proven wrong, either.** INFERRED: an upside-down arm rig puts the hands at the top of the
+frame, which reads as "high" independently of any translation. Re-judge it after the orientation is
+settled; do NOT add an offset knob before then, or the knob will be tuned to compensate for a rotation.
+
+### The player's body: the FRAGMENT program is the discriminator, and (vp, albedo) is NOT
+
+The brief directed the legs work at the (vp, albedo) pair route. **That route over-matches here.**
+MEASURED from the user's own Ctrl+Click picks in `bin\remix_dump.log`:
+
+```
+legs  vp=f39f504649b6f442 fp=b64dc06f79b8b42b albedo=0721D150DF278E7D vtx=952  viewmodel=0
+arms  vp=f39f504649b6f442 fp=d6f00cddfb5c6e0a albedo=0721D150DF278E7D vtx=2140 viewmodel=1
+```
+
+Same vp, same albedo. A (vp, albedo) pin takes the arms with the legs — round 20's failure mode again.
+
+MEASURED over every `Remix fpcandidate:` row in the 757 MB dump: `b64dc06f79b8b42b` appears **1381
+times, all 1381 at vtx=952**, across 12 albedos (the skin variants). Not one row is anything else. So
+`(f39f504649b6f442, b64dc06f79b8b42b)` is the player body and nothing else.
+
+This does **not** contradict round 27's "the fragment program does not partition the rig" — that measured
+that the weapon and the arms share `d6f00cddfb5c6e0a`, which is still true. It partitions the BODY from
+the first-person rig, which is a different cut.
+
+Shipped as `RPCS3_REMIX_HIDEPAIRVP` + `RPCS3_REMIX_HIDEPAIRFP` + `RPCS3_REMIX_HIDEPAIRMODE`, armed at
+that pair with mode 1. Counter `cat_hidepair` on `Remix stats:` (kept separate from `cat_hidden`, which
+already read 2617 from the albedo list). Format audited: **256 specifiers against 256 arguments.**
+Empty either half disarms the route. Clamp `min(env, 2)`, default 1 — ceiling above default.
+
+### What the VIEW_MODEL tag actually buys on this runtime, measured from the fork's source
+
+Read out of `dxvk-remix-numos3` (the fork that built the deployed DLL; every cited file has an mtime
+before the deploy timestamp, so this is INFERRED-to-be-the-running-code rather than disassembled):
+
+- **There is no per-instance "casts shadows" flag anywhere in the runtime.** A search for
+  `castsShadow|castShadow|noShadow|shadowCaster|disableShadow` over `rtx_render/` and `shaders/rtx/`
+  returns zero hits. Shadow visibility is decided entirely by the 8-bit
+  `VkAccelerationStructureInstanceKHR::mask` and by which TLAS the instance lands in.
+- **`InstanceCategories::Hidden` is not a shadow-only lever** — it sets `mask = 0`, removing the instance
+  from primary rays too, and the BLAS is then skipped.
+- **A VIEW_MODEL-tagged instance stops casting onto world geometry only once the duplicate exists.**
+  `primaryRayMaskToObjectMask` strips `OBJECT_MASK_ALL_VIEWMODEL` from a non-viewmodel hit's shadow mask,
+  so world surfaces can never be shadowed by view-model geometry. But the duplicate is created only past
+  four gates in `createViewModelInstances`, and the second is `!isCameraValid(CameraType::ViewModel)`,
+  which requires a VIEW_MODEL camera submitted **that frame**.
+- **VIEW_MODEL tagging does nothing at all about clipping.** The instance is ordinary world-space geometry
+  in the same opaque TLAS and the primary ray mask includes `OBJECT_MASK_VIEWMODEL`, so view model and
+  world resolve against each other. The only mitigation the runtime offers is shrinking it
+  (`rtx.viewModel.scale`, default 1.0, "Minimize to prevent clipping").
+- **The only per-instance "visible but casts no shadow" route that exists** is
+  `THIRD_PERSON_PLAYER_MODEL` (`OBJECT_MASK_PLAYER_MODEL`, bit 6, not in `OBJECT_MASK_ALL`) plus
+  `rtx.playerModel.enableInPrimarySpace = True` and `rtx.playerModel.enablePrimaryShadows = False`.
+  Both lines or it is worse than nothing, and `enableInPrimarySpace = True` also masks every VIEW_MODEL
+  candidate to zero. That is `HIDEPAIRMODE=2`.
+- **`rtx.worldSpaceUiTextures` is LIVE on this path** (its consumer is the fork's `rtx_fork_submit.cpp`,
+  not `src/d3d9/`) but it does **not** hide anything from shadow rays — it forces unlit emissive. It is
+  not a solution to "the helmet must not cast big shadows".
+- **A leading `-` in a `rtx.conf` hash list is a first-class veto, not a two's-complement number.**
+  `util_hash_set_layer.h` strips it with `.substr(1)` and inserts into `m_negatives`. So
+  `-0x0721D150DF278E7D` in `rtx.worldSpaceUiTextures` means "remove this hash from the list", and since
+  nothing else contributes it, it currently subtracts nothing. (This only holds for `HashSet` options;
+  `HashVector` options have no `-` branch and there a leading `-` really would wrap around.)
+- **Correction to a standing backend comment:** `classify_draw` says "IGNORE is a no-op on the API draw
+  path". The fork has since added `externalDrawShouldSkip` (`rtx_fork_submit.cpp`), called from
+  `rtx_scene_manager.cpp`, which drops an `Ignore`-tagged submesh before instance creation. INFERRED to be
+  in the deployed DLL from file mtimes (all before the deploy), NOT confirmed by disassembly.
+
+### The helmet-as-UI request: the mechanism is a one-line launcher edit, the TARGET is unidentified
+
+`UIFORCEVP` is the right mechanism and it is stronger than any category flag: a forced draw returns from
+`RemixGSRender.cpp`'s screen-space block **before** `per_draw_transform` and `submit_subdraw`, so there is
+no mesh, no instance, no material and no BLAS — no shadow, no lighting, no world clipping, and no depth of
+any kind (the compositor has no depth; `grep -n depth RemixCompositor.*` returns zero hits). It is a
+**comma list, bound 8**, currently holding one hash (`2F64C2F8FFD6ADD1`, `ui_forced=98681`), so seven
+slots are free and adding the helmet needs **no rebuild**. One guard to know:
+`!rsx::method_registers.depth_write_enabled()` — a listed program that writes depth is not forced.
+
+**But `9f591b6a6b825612`, labelled "the visor" since round 19, is not a visor.** MEASURED over every
+`Remix fpcandidate:` row: it has exactly two fragment programs and neither is a helmet overlay.
+
+| fp | albedo | vtx | extent | eye_dist | rows |
+| --- | --- | --- | --- | --- | --- |
+| `cbede4eb45f0fd25` | `C61753D31FB96507` (+8 more) | 59 | 5.15 .. 11.02 | 1.56 .. 3.77 | 1309 |
+| `7faad0c4437ae7c1` | `CC6008D0E9E98972` | 4 | **0.02 .. 0.03** | 0.20 .. 0.56 | 56 |
+
+A 7-unit object two metres away is not a visor at the eye, and a 3-centimetre quad is not one either.
+Round 19's label came from the near-depth census (`scale_z=0.00125`), never from a pick. **The helmet has
+never been identified**, and pinning `UIFORCEVP` at a program with 34 (albedo, vtx) signatures on a guess
+is exactly what deleted world geometry in round 20. One Ctrl+Click on the helmet/visor edge unblocks it.
+
+### Frame time: `DRAWAUDIT=0` deliberately NOT taken, and why
+
+`audit=7.60 ms` of `draw=23.34 ms` of `frame_ms=31.25` in the last run (24.3% of the frame, down from
+round 34's 11.35/35.22 = 32.2% — the same knobs, a different scene, which is why the ratio is the
+comparable number and not the milliseconds). Not armed: round 34 proved `DRAWAUDIT=0` also stops the
+`SKIPEXTENTVP` refusal gate firing (it reads `&& m_streak_measured`, written only inside
+`audit_world_extent`), and `SKIPEXTENTVP` is armed on `57A12323F22F4988` — **one of the near-depth
+viewmodel programs this round is measuring**. Decoupling it means blanking `SKIPEXTENTVP` in the same
+run, which changes what is submitted for exactly that population. Deferred rather than confounded.
+
+### Clamp audit (the trap that has bitten three rounds running)
+
+Every armed value verified inside its clamp against current bytes. Two are exactly AT their ceiling and
+that is now the intended state, not a mismatch: `STATICINDEXBUDGET=64` against `clamp(env, 1, 64)`, and
+`SUNSPRITEHOLD=216000` against `min(env, 216000)` — **round 34's open item 2 is closed**, the launcher
+reads 216000 and the knobs line will now agree. Two `set` lines are no-ops because armed == default:
+`VMBASISMAX=24` and `DRAWAUDIT=1`. `VMBASIS=5` passes `& 7u`. `VMPAIRVP` is blank so `VMPAIRALBEDO` and
+`VMPAIRMAXDIST=2` are inert by construction — do not read `vm_tagged_pair=0` as a failure.
+
+**A stale launcher claim found and corrected:** the note at `launch-haze-remix.cmd` saying that blanking
+`VMPAIRVP` also disarms the VIEW_MODEL camera because "vm_tag_route_armed has four terms and this
+launcher makes all four false" is **no longer true** — round 34 armed `VMDEPTHOFFSET=2`, and
+`viewmodel_depth_offset_max() > 0.f` is the fourth term.
+
+### Caught by diff review, not by me: the new knobs were reported on no line at all
+
+The first cut of round 35 shipped `HIDEPAIRVP` / `HIDEPAIRFP` / `HIDEPAIRMODE` with **no field on either
+`knobs=` block** — the same reported-vs-armed blindness that cost round 31 and round 32 a round each, and
+that round 34 added `vmbasispivot=`/`vmtagonly=` specifically to end. Concretely: `HIDEPAIRMODE=3` would
+have silently run as mode 2 (THIRD_PERSON_PLAYER_MODEL, a completely different behaviour from HIDDEN)
+with nothing anywhere saying so, and a mistyped hash parses to 0 and disarms the route with no field
+naming which half was wrong. Fixed: `hidepairvp=%016llx hidepairfp=%016llx hidepairmode=%u` added to
+both blocks, arguments in matching positions, re-audited at **112/112** and **308/308** specifiers to
+arguments with the new triple verified sitting between `vmtagonly` and `vmpairvps` in both.
+
+**The lesson is not "add the field", it is that I applied the clamp-audit discipline to the knobs I
+inherited and not to the knob I wrote.** A new knob needs the same instrumentation the old ones have, in
+the same commit — otherwise the audit that catches the trap has nothing to read.
+
+Three comment defects were found in the same review and are fixed: a second copy of the wrong-default
+claim (`RemixTransforms.cpp`, "Anything else = 0 = off" — the default is 1 and out-of-range clamps *up*
+to 2); a round-34 paragraph documenting `cdist_pre`/`cdist_post` orphaned from its `eye_distance` lambda
+by the round-35 insertion, now moved back beside it; and "the -0.5/+0.866 '120 degrees'" written beside a
+triple that contains no 0.866 (the ±0.866 are the OFF-diagonal row dots, X.fwd and Z.right).
+
+The review independently re-derived the flip table from the operator itself
+(`C = sum_k s_k a_k a_k^T`, left-multiplied, giving `dotpost = (s0, -s1, -s2)` from `pre = (+1,-1,-1)`)
+and confirmed all eight rows and all eight determinant signs, and separately confirmed the
+column-vs-row indexing, the `m_current_fp_hash` freshness and the disarmed no-op. So the round's central
+refutation has two independent derivations, not one.
+### Method notes earned this round
+
+- **Before rewriting an operator because a projection looks wrong, check which way the matrix multiplies.**
+  A row projection and a column projection of the same rotation are different numbers, and only one of
+  them is a property of the object. The fix here was zero lines of operator change and six specifiers of
+  census.
+- **When a census prints two matrices and leaves the reader to project them, the reader will eventually
+  project them wrong.** Print the derived quantity.
+- **A discriminator that failed for one cut can still be the right one for another.** Round 27 correctly
+  measured that the fragment program does not separate the weapon from the arms, and that finding was
+  carried forward as "the fp does not partition the rig" — but it partitions the body from the rig
+  perfectly. Re-test a rejected key against the new question.
+
+## Round 36 (2026-08-24)
+
+Deployed: `bin\rpcs3.exe` = `bin\rpcs3-next.exe` = **`F9206BA434AE3ADB`**. Runtime `bin\remix\d3d9.dll`
+**UNCHANGED at `16A0B512F33EBB66`** — nothing was deployed into `bin\remix\`. Previous `rpcs3-next.exe`
+saved as `bin\rpcs3-next-pre-round36-20260824.exe` (`C87A2930E676F5F8`).
+
+### READ THIS FIRST: the title was NOT running round 35's binary
+
+MEASURED at the start of this round. `bin\rpcs3.exe` was `E984DD7DAE13CAD5` dated 2026-08-17 13:21 — round
+35's build, exactly as its inbox said. But **`bin\rpcs3-next.exe`, which is the file the launcher runs, was
+`C87A2930E676F5F8` dated 2026-08-23 08:01 and 7,680 bytes larger**, copied from
+`build\codex-link\rpcs3.exe`. A concurrent session (a Resistance 2 effort, Aug 22-23) edited
+`rpcs3\Emu\RSX\Remix\RemixGSRender.cpp` on 2026-08-23 07:51, built into its own output directory, and
+deployed that. `launch-haze-remix.cmd` also carries an Aug 22 23:11 edit.
+
+Consequences, stated plainly: round 35's inbox reported the two hashes as identical and they were not by the
+time the play-test happened; the play-test verdicts quoted in the round-36 brief were produced by
+`C87A2930E676F5F8`, whose Remix source differs from round 35's in ways this round did not diff. The round-36
+build is taken from the CURRENT tree, so it contains round 35 + that session's changes + this round's, and
+supersedes both. **Check `bin\rpcs3-next.exe`'s hash, not `bin\rpcs3.exe`'s, before trusting any play-test.**
+
+### THE VIEWMODEL IS NOT MIS-ORIENTED. IT IS SUBMITTED BEHIND THE CAMERA.
+
+The brief was right that the sign-flip model is refuted, and right that the diagonal camera-axis dot products
+cannot settle it. The reason is that they contain no position at all, and position is the whole defect.
+
+MEASURED over 287 `Remix vmbasis:` lines in the last 400 MB of `bin\remix_dump.log` (the `VMBASIS=5`
+session), by re-projecting each line's own logged `pre=`/`post=` matrices and `right=`/`up=`/`fwd=` camera
+axes — no new build was needed, the data was already on the line:
+
+1. **The camera basis is left-handed on all 287 lines**: `right x up . fwd = +1.00`, every line, no
+   exceptions. So the sign of a forward coordinate is a fact about the scene and not a convention of the
+   instrument. This is the control that has to come first, because everything below is a sign.
+
+2. **Every near-eye VIEW_MODEL-tagged draw is submitted BEHIND THE EYE.** Centroid resolved onto
+   (right, up, fwd) as an offset from `m_active_camera.position`, all groups within 5 units:
+
+| vp | vtx | n | fwd | up | dist |
+| --- | --- | --- | --- | --- | --- |
+| `af06f6d32ec048ee` | 4 | 25 | **-0.383 .. -0.056** | +0.023 .. +0.601 | 0.19 .. 0.68 |
+| `aae8e0d5ae292dd4` | 91 | 22 | **+0.083 .. +0.484** | -0.067 .. +0.299 | 0.478 .. 0.490 |
+| `15ad612980aca110` | 8 | 8 | **-0.586 .. -0.450** | +0.101 .. +0.937 | 0.61 .. 1.05 |
+| `f39f504649b6f442` | 3649 | 7 | **-0.647 .. -0.467** | +0.142 .. +0.381 | 0.59 .. 0.76 |
+| `830d7d1b9681c475` | 3649 | 7 | **-0.542 .. -0.405** | +0.150 .. +0.402 | 0.46 .. 0.68 |
+| `57a12323f22f4988` | 8 | 7 | **-0.627 .. -0.451** | +0.097 .. +0.927 | 0.63 .. 1.03 |
+| `830d7d1b9681c475` | 2140 | 6 | **-0.206 .. -0.131** | +0.373 .. +0.628 | 0.43 .. 0.65 |
+| *(20 further groups)* | | | all negative | mostly positive | < 1.1 |
+
+   **`aae8e0d5ae292dd4` vtx=91 is the control and it is the important row**: it is the one near-eye group in
+   the whole census that is NOT viewmodel-tagged, and it reads fwd **positive** — in front of the eye, 0.48
+   units out, 8.6 degrees off camera-aligned. That is what a correctly placed first-person object looks like
+   on this instrument. Every tagged group reads the opposite sign.
+
+3. **The relative basis is a rotation about the camera's RIGHT axis, 118 to 179 degrees.** Full 3x3
+   direction-cosine matrix, orthonormalised columns: `det = +1.00000`, column norms `1.0000`, axis component
+   on `right` >= 0.996 on every near-eye line. Not a yaw, not a mirror, not a shear, and not a
+   "24-degree misalignment on two axes" — that reading is what a single clean rotation looks like when only
+   its diagonal is printed. The spread 118 / 155 / 156 / 174 / 177 / 178 / 179 is the rig's own aim pitch
+   (180 minus the object's pitch), which differs per object in the same frame.
+
+**One operator produces all three at once: 180 degrees about the camera's right axis, PIVOTED AT THE EYE.**
+It sends `up -> -up`, `fwd -> -fwd`, `right -> right` and leaves the distance from the eye alone — which is
+"upside down and backwards", the user's own words for `VMBASIS=0`, and it is the only single rigid motion
+that puts an object simultaneously behind you, above you, and rotated 180 degrees about your right axis.
+
+**Why `VMBASIS=6` did not fix it, and this is the part a sign mask structurally cannot reach.** At 180
+degrees the Rodrigues form collapses to `-I + 2 a a^T`, which is bit-for-bit what `sum_k s_k a_k a_k^T` with
+`s = (+1,-1,-1)` already builds — so flip 6's **3x3 was correct all along** and `dotpost = (+,+,+)` was
+telling the truth about the orientation. What flip 6 could not do is move the mesh, because rounds 34-35
+pivoted it at the **centroid** (`VMBASISPIVOT=1`). It turned the arms in place and left them above and
+behind the eye. Correctly-oriented arms hanging behind your head read as "still upside down", which is
+exactly what came back. Verified on the census's own fields: at flip 6 the post-operator relative angle is
+**2.1 / 2.7 / 4.1 degrees** for the three `830d7d1b9681c475` / `57a12323f22f4988` groups — essentially
+camera-aligned — while `dcentre <= 6.5e-06` says directly that the mesh never moved.
+
+Pivot 0 was not the escape, because pivot 0 is the **anchor-frame** eye (`anchor_frame_eye()`, and
+`RPCS3_REMIX_CAMANCHOREYE=1` is armed at `launch-haze-remix.cmd:482`), which round 34 measured throwing the
+mesh 2537..2564 units.
+
+**The raw eye is the right pivot, and that is a measurement, not a preference.** `cdist_pre` is
+`|centroid - m_active_camera.position|` and reads **0.43 .. 1.04 on all 287 lines of the current build**. A
+centroid half a unit from that point cannot be in a different frame from it.
+
+### Shipped: `RPCS3_REMIX_VMROTAXIS` / `VMROTDEG` / `VMROTPIVOT` — a real rotation
+
+`apply_viewmodel_rotation` (`RemixGSRender.cpp`, immediately above `report_viewmodel_basis_census`). Runs
+after `apply_viewmodel_basis` and is independent of it.
+
+- **axis** `0` off; `1/2/3` = the camera's right/up/forward axis, Rodrigues, LEFT-multiplied about the pivot;
+  `4/5/6` = the MODEL's own X/Y/Z, RIGHT-multiplied (`M' = M * R`) about the object origin. 4..6 is the
+  "authored Z-up in a Y-up renderer" hypothesis the brief named — it would be `VMROTAXIS=4 VMROTDEG=270` —
+  and the pivot knob is inert there (census reports `rotpivsrc=5`).
+- **deg** taken `% 360`. **`VMROTDEG=360` therefore parses to 0 and means OFF** — write 180.
+- **pivot** `0` raw eye (armed), `1` centroid, `2` translation, `3` anchor-frame eye (= round 19..35).
+- Clamps: `min(env,6)`, `% 360`, `min(env,3)`. Armed `1 / 180 / 0`, all inside. `env_u32` on all three, never
+  `env_float` — `env_float` rejects 0 and 0 is the OFF value for two of them (round 32's `SKYANCHOR=0`
+  defect).
+
+**Launcher: `VMBASIS` 5 -> 0.** The flip sweep is closed; composing both is legal but confounds them.
+
+### Census: the observable that is not a dot product
+
+`Remix vmbasis:` gains one contiguous block before `frame=`:
+`rotaxis= rotdeg= rotpivsrc= rotpivot=[..] drot= cpre=[right up fwd] cpost=[..] relpre= relpost=`.
+
+- **`cpre`/`cpost`** are the geometry centroid resolved onto the camera axes as an offset from the eye, in
+  metres. This is the field that names the bug and it is the one the brief asked for. `eye_pre`/`eye_post`
+  already resolved the object ORIGIN onto those axes, but on this title that origin is the world origin and
+  says nothing about the mesh — which is why round 34 added `centre_pre`/`centre_post` in the first place.
+- **`relpre`/`relpost`** are the ANGLE of the full relative rotation, from `trace(D) = 1 + 2 cos(theta)` on
+  orthonormalised columns. Three diagonal cosines are three of nine numbers; one angle cannot be misread the
+  way `(+0.99, -0.47, -0.46)` was.
+- **`dbasis` now measures pre -> MID, not pre -> post**, and `drot` measures mid -> post, where `mid` is the
+  transform between the two operators. Otherwise adding a second operator would have silently re-pointed an
+  existing field at the sum of both. With `VMBASIS=0` armed, `dbasis` reads 0 and that is correct.
+
+Format audited position by position: **`Remix vmbasis:` 76 specifiers / 76 arguments**, with `rotaxis` at
+spec[58] against `viewmodel_rotate_axis()`, `drot` at spec[64] against `drot`, `relpost` at spec[72] against
+`relative_angle(post)`.
+
+**PRE-REGISTERED for `VMROTAXIS=1 VMROTDEG=180 VMROTPIVOT=0`** — every one of these can read otherwise:
+
+| field | must read | what a different reading means |
+| --- | --- | --- |
+| `cpost` fwd | **> 0** where `cpre` fwd was < 0 | still behind the eye: the pivot or the axis is wrong |
+| `cpost` up | **< 0** where `cpre` up was > 0 | same |
+| `cpost` right | unchanged to ~1e-3 | a rotation about `right` cannot move the right component |
+| `relpost` | `180 - relpre` +- 1 deg, i.e. **1 .. 62** | the 3x3 did not compose |
+| `cdist_post` | == `cdist_pre` to 1% | ~2550 means the anchor-frame eye leaked back in |
+| `dcentre` | **0.3 .. 1.6** | ~0 means a CENTROID pivot leaked back in (`cdist` alone cannot see this — it is invariant under both pivots, `dcentre` is the discriminator) |
+| `dbasis` / `drot` | 0 / ~2 | `dbasis` non-zero means `VMBASIS` is still armed |
+| `knobs=` | `vmrotaxis=1 vmrotdeg=180 vmrotpivot=0` | anything else is a clamp or a typo |
+
+If the arms come out right way up at the wrong PITCH, that residual is the 118..179 spread and the answer is
+a smaller angle on the same axis (`DEG=156`, then `118`) — one launcher edit, no rebuild. If they come out
+upside down the OTHER way, the model-space hypothesis is live: `VMROTAXIS=4 VMROTDEG=270`.
+
+### The helmet: `RPCS3_REMIX_UIFORCEPAIRVP` + `UIFORCEPAIRFP`, and the vp-only key would have over-matched 26x
+
+Ground truth, the user's Ctrl+Click this session:
+`vp=830d7d1b9681c475 fp=479890ff55f1d96e albedo=C61753D31FB96507 vtx=59 extent=6.465 depth_test=0
+depth_write=0 blend=1`.
+
+MEASURED over the last 400 MB of `bin\remix_dump.log` (1,038,135 lines, counted twice by two independent
+scripts that agree exactly):
+
+- `vp=830d7d1b9681c475` alone: **47,399 lines across 31 distinct fragment programs**, its two largest fps
+  carrying **230 and 193 distinct vertex counts**. It draws most of the scene. Adding it to `UIFORCEVP` is a
+  **~26x over-match** and is round 20's failure mode exactly.
+- the PAIR `(830d7d1b9681c475, 479890ff55f1d96e)`: **1,833 lines, 1,767 of them (96.4%) at albedo
+  `C61753D31FB96507` / vtx=59** — the helmet. Residue: 35 lines of a vtx=152 family at extent 2.16..2.52,
+  and 9 quads at vtx 6/14/44/66 with extent 0.09..0.13.
+- The helmet's pick state `depth_test=0 depth_write=0 blend=1` is **unique among all 227 picks** for that vp.
+
+**Why the UI route and not a category flag** — on round 35's reading of the deployed runtime, not on
+preference. There is no per-instance castShadow flag anywhere in it; `Hidden` sets `mask = 0` and kills
+primary rays too (the helmet would vanish, failing "visible"); `THIRD_PERSON_PLAYER_MODEL` needs
+`rtx.playerModel.enableInPrimarySpace = True`, which masks every VIEW_MODEL candidate to zero and would take
+the ARMS with it — a head-on collision with this round's viewmodel work. A UI-forced draw returns from the
+screen-space block **before** `per_draw_transform` and `submit_subdraw`: no mesh, no instance, no material,
+**no BLAS**. No shadow and no world clipping by construction rather than by flag.
+
+The existing guard is doing real work and is kept: `!depth_write_enabled()`. The helmet reads
+`depth_write=0`; any member of the pair that writes depth stays on the world path.
+`m_current_fp_hash` is fresh at that site — written once per clause at `RemixGSRender.cpp:3766`, before
+`draw_call.begin()`.
+
+Counter `ui_forced_pair` on `Remix stats:`, kept separate from `ui_forced` for the reason round 35 had to
+split `cat_hidepair` out of `cat_hidden`: a shared counter cannot say which key matched. Both hashes print
+as `uiforcepairvp=` / `uiforcepairfp=` (the PARSED values, so a typo that parses to 0 and silently disarms
+the route is visible). Format audited: **`Remix stats:` 259 / 259**, `ui_forced_pair` at spec[242].
+
+**THE RISK, stated up front:** the compositor can still refuse a forced draw (`ui_skipped`, `ui_space_none`,
+`ui_render_target`) and a refusal DELETES the draw rather than falling back to world geometry. If the helmet
+DISAPPEARS instead of flattening, read those three counters — not `ui_forced_pair`.
+
+### The black sky: the anchor test IS broken, and it is NOT why the sky is black
+
+Two separate findings, and conflating them would have shipped a fix that made the problem worse.
+
+**(a) The anchor test measures the wrong quantity — confirmed, fixed as a measurement.**
+`sky_max_anchor()` is compared against `|transform.translation - eye|`. For an absolute-world draw (correct
+identity-ish transform, world-space vertices) the translation IS the world origin, so the quantity it
+evaluates is `|eye|`. The unlocked levels read `anchor=2137.85 limit=4` with the camera 2137 units out —
+that identity to five figures. Round 31 measured the same thing on `VIEWMODELANCHOR`; round 32 already
+listed `SKYANCHOR` as dead for absolute-world geometry. Shipped: `centre_anchor = |AABB centre - eye|`
+computed in the loop that already has the box, printed as `canchor=` beside the existing `anchor=` on every
+`Remix sky-census:` row at every mode, plus `anchormode=`. `RPCS3_REMIX_SKYANCHORMODE` selects the
+comparison: `0` legacy (default, bit-for-bit), `1` centre-vs-limit, `2` eye inside the AABB, `3` = 2 or 0.
+Format audited: **`Remix sky-census:` 35 / 35**, `canchor` at spec[30].
+
+**(b) Admitting more domes would make them WORSE, and this launcher already worked out why.**
+`launch-haze-remix.cmd:1775-1790` reads the runtime source directly: `rtx_instance_manager.cpp:1006` sets
+`m_isHidden = true` for `CameraType::Sky`, and `rasterizeSky()` is unreachable from an API-submitted draw.
+`is_sky` sets `REMIXAPI_INSTANCE_CATEGORY_BIT_SKY` at `RemixGSRender.cpp:21468`. **On this backend the SKY
+tag can only ever make the dome INVISIBLE.** So `SKYANCHORMODE=2` would turn black domes into absent domes.
+It is shipped at 0 and deliberately not armed.
+
+Second, independent reason not to arm it, MEASURED on the 278 `reject:anchor` rows of the last 250 MB:
+**146 of them are HIGH-vtx terrain (1211..12875 vertices) against 69 plausible dome bands**, and `inside=1`
+fires on **exactly 146 of the 278**. Until somebody cross-tabs `inside=` against `vtx` on those rows, mode 2
+may be admitting precisely the terrain and refusing precisely the domes. No anchor threshold separates them
+either — terrain saturates first at every value tested (at `anchor<=10`: 51 terrain to 2 domes; at `<=100`:
+142 to 12). What DOES separate them: the two populations share **zero vertex programs and zero albedos**, and
+`backdrop=1` fires on 39 dome rows and **0** terrain rows. A future rule keys on the program, the albedo, or
+the already-computed `backdrop` predicate — never on a looser distance.
+
+**(c) The actual black-sky fix is `RPCS3_REMIX_SKYEMISSIVE`, and it needed no rebuild.**
+`sky_emissive_albedo_matches()` is consumed in `RemixTextures.cpp:1049` and `:1235` against the texture
+CONTENT HASH, with no reference to `is_sky` or to the anchor gate at all. It is what makes a dome visible on
+this backend. The list held two hashes; the newly-reachable levels use different dome textures and were
+therefore never lit. Added the four largest anchor-rejected dome candidates, each recurring across six
+separate runs in the log:
+
+| albedo | max wext | vtx |
+| --- | --- | --- |
+| `35C2353F6B3CE2A8` | 2.14e6 | 54..79 |
+| `174F4F689CF2A3D8` | 1.83e6 | 42..66 |
+| `3213E0CC136ED294` | 1.44e6 | 45..90 |
+| `32AE81D64BEA29CD` | 1.29e6 | 147..266 |
+
+Low vertex counts against million-unit extents: dome latitude bands. The terrain in the same
+`reject:anchor` pile runs vtx 1211..12875 at wext under 79k and shares no albedo with these four.
+List bound verified against the parser: `std::array<u64, 8>`, buffer 400 wchar; **six entries, 101 chars**.
+`sky_emissive_albedo_count()` already prints on the knobs line and **must read 6**.
+
+**The `haze_sun_table.csv` and `levelnames.json` named in the round-36 brief DO NOT EXIST.** Exhaustive
+recursive search of `C:\Users\Tristan\AppData\Local\Temp\claude` (116 files total across 5 session
+directories), `C:\Users\Tristan\.claude` and the repo found neither, nor any directory named `haze` holding
+them. Per-level sun azimuth/elevation/colour must be re-mined before it can be used.
+
+### The four other distance gates, audited against current bytes
+
+Round 32 found two inert and two meaningful. Re-audited now that the underlying quantity is known to be
+wrong, the split is different and it is **which quantity**, not which is armed:
+
+| gate | quantity compared | file:line | verdict |
+| --- | --- | --- | --- |
+| `VIEWMODELANCHOR` | `transform.matrix[i][3] - eye` (TRANSLATION) | `RemixGSRender.cpp:21203-21208` | **wrong quantity**, but it never refuses — it only increments `viewmodel_far`. So the gate is harmless and the COUNTER is misleading evidence. |
+| `VMPAIRMAXDIST` | `transform.matrix[i][3]` (TRANSLATION) | `RemixGSRender.cpp:21094` feeding `viewmodel_pair_rejects` at `:6431` | **wrong quantity, and this one does refuse.** Currently inert only because `VMPAIRVP` is blank. |
+| `SUNCARDMINDIST` | the geometry CENTRE vs the anchor-frame eye | `RemixGSRender.cpp:4763` | **correct quantity** |
+| `FPCENSUSMAXDIST` | `geometry_centre_in(transform, centre)` | `RemixGSRender.cpp:7447+` | **correct quantity** |
+
+### Geometry following the camera: round 34's finding is REFUTED, and so is its mechanism
+
+The brief asked me to confirm the bimodal world divide is still live and fix it. It is not, and the named
+mechanism is refuted independently. No fix shipped, on evidence.
+
+- **There is no `discard=` field and there never was.** Whole-file byte scan of all 923,425,680 bytes:
+  `discard=` **0 hits**, `disc=` 0, `worlddiv` 0. Round 34's "discard" is a narration name for
+  `translation=` on `Remix worldid-draw:` — the code calls it exactly that at `RemixGSRender.cpp:19511`,
+  "the transform the override is about to discard".
+- **On `d0b6a471bb2d463b` the >1000 bucket is 6 of 5,380 rows = 0.11%**, against round 34's claimed
+  76 of 448 = 17.0%. **In the most recent run it is 0 of 72**, and that run's own cumulative census reads
+  `tmax=2.23517e-08` over **35,202 draws**. Below the 1% refutation threshold on both readings.
+- **The `camclip=512x288` vs `clip=1024x576` mismatch is still present — and cannot be the cause.** It
+  disagrees on 96.43% of target rows and 98.79% of `Remix gauge:` rows, including **72 of 72 rows of the
+  newest run, where the residue is 0%**. A condition present at 100% while the effect is at 0% is not the
+  cause.
+- **The bimodality is not unique to that mesh** and the named mesh is the LEAST affected of the top six:
+  `c1d482dcd1b03ed0` 24.80% >1000, `ad7ce9d672a0bf6b` 2.14%, `0214281b9a7a412d` 2.13%,
+  `bd1c10df5703e559` 0.68%, `d0b6a471bb2d463b` 0.11%. `basis_delta > 1000` is **0 rows on every vp**.
+- **New MEASURED correlation, and it is honest in both directions.** Cross-tab of `camage` against
+  `translation`, 265,453 rows:
+
+| bucket | `Remix gauge:` rows | gauge t>=1000 | `Remix worldid-draw:` rows | worldid t>=1000 |
+| --- | --- | --- | --- | --- |
+| camage=0 | 62,927 | **0.01%** | 163,432 | **4.71%** |
+| camage 2-8 | 4,032 | 0.52% | 15,154 | 0.09% |
+| camage 9-64 | 1,859 | 9.04% | 11,700 | 0.27% |
+| camage >64 | 1,468 | **28.61%** | 1,221 | **6.72%** |
+
+  A stale camera anchor enriches the gauge outliers **2861-fold** and the per-draw outliers only **1.4-fold**.
+  So the stale anchor explains the gauge REFERENCE going wrong and does **not** explain the per-draw residue.
+  Corroborating: at frame 55760 `Remix gauge:` carries `translation=3346.54 basis_delta=1.63014 camage=711`
+  and the identical numbers appear on `ad7ce9d672a0bf6b`, `c1d482dcd1b03ed0` and `d0b6a471bb2d463b` the same
+  frame — the outlier is a property of the frame's reference, inherited by whatever draws in it.
+
+The live lead is now **`c1d482dcd1b03ed0` at 24.80%**, not `d0b6a471bb2d463b`, and the question is what the
+world-identity override is discarding on a quarter of that program's draws.
+
+### Method notes earned this round
+
+- **A dot product has no position in it.** Three rounds were spent sweeping an orientation knob against a
+  defect that was three parts position and one part orientation, because the census printed only direction
+  cosines. The fix was to print where the centroid actually is, in the frame the question is asked in.
+- **Print the whole rotation, or at least its angle — never just the diagonal.** `(+0.99, -0.47, -0.46)`
+  reads as "two axes about half wrong" and is one clean 118-degree rotation about the first axis.
+- **When a symptom persists across every setting of a knob, suspect the knob's PIVOT, not its value.**
+  `VMBASIS`'s 3x3 was correct from round 34 onward; only its pivot was wrong, and no amount of sweeping the
+  3x3 could show that.
+- **A control group is worth more than another measurement of the suspect.** One untagged near-eye draw
+  reading `fwd > 0` while 26 tagged groups read `fwd < 0` is what turned "the sign convention might be mine"
+  into "the placement is wrong".
+- **Check what the tag DOES before widening the gate that grants it.** Admitting more sky domes would have
+  hidden them, because SKY means hidden on this backend. The launcher had recorded that a year of rounds
+  ago and the brief that asked for the widening had not read it.
+- **The file the launcher runs is not necessarily the file you built.** `bin\rpcs3-next.exe` had been
+  replaced by another session's build; hashing both is the only way to know.

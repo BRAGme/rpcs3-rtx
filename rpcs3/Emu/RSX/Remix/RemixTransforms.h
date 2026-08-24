@@ -1340,6 +1340,20 @@ namespace remix_rsx
 	// says the flagged draws reach the scene at all.
 	bool vertex_spread_refuse();
 
+	// RPCS3_REMIX_DRAWAUDIT=0: skip audit_vertex_extent AND audit_world_extent entirely.
+	//
+	// Default 1 (current behaviour, bit-for-bit). This is a PERF knob, and it is the only one on the
+	// backend that trades a diagnostic for frames rather than trading correctness. Read 'audit=' on
+	// the 'Remix timing:' line first: it is a new round-32 child of 'draw' and it exists to say how
+	// big this trade is before anyone takes it.
+	//
+	// What 0 costs: the vtx_spread census, the streak/wext census, and the wext refusal gate. On Haze
+	// the gate is free to lose - wext_refused MEASURED at 0 across the whole round-31 session - but
+	// that is a per-title fact, so check wext_refused on the 'Remix live:' line before setting 0
+	// anywhere else. VTXREFUSE=1 and DRAWAUDIT=0 together are contradictory; the audit wins nothing
+	// because it never runs.
+	bool draw_audit_enabled();
+
 	// RPCS3_REMIX_STREAKGATE=<ratio>: how many times the frame's own median world extent a draw's
 	// post-transform bounding box may span before audit_world_extent refuses it. 0 restores the
 	// behaviour at 81af315, where nothing measured the geometry Remix actually receives.
@@ -1737,6 +1751,15 @@ namespace remix_rsx
 	// is ever lost. 0 restores the immediate submit bit-exactly.
 	bool defer_pre_anchor_enabled();
 	u32 defer_pre_anchor_max();
+
+	// RPCS3_REMIX_DEFERPREVONLY=1 (default): defer only the anchor_prev branch, never the
+	// gauge_anchor_absent branch. An absent-source draw has had no anchor for two consecutive frames,
+	// so holding it bets on an anchor appearing for a source that is not producing them; an
+	// anchor_prev draw's source demonstrably produced one last frame. MEASURED: absent is 35.8% of
+	// the deferral population in both round-31 sessions, so this removes a third of the buffering
+	// cost before any judgement about whether the remainder pays. Read defer_absent_declined against
+	// defer_buffered. 0 reproduces round 31 exactly. INERT while DEFERPREANCHOR=0 (its current value).
+	bool defer_prev_only_enabled();
 
 	// RPCS3_REMIX_FPA2C=1 (default): read the two alpha-to-coverage bits the RSX carries - the
 	// fragment shader control word's RSX_SHADER_CONTROL_ALPHA_TO_COVERAGE (gcm_enums.h:468) and
@@ -2355,6 +2378,59 @@ namespace remix_rsx
 	// against the resolved camera, so a draw with no world transform is refused, not guessed.
 	f32 sky_max_anchor();
 
+	// --- round 36: the anchor test was asking the wrong question, and the black skies are it ------
+	//
+	// RPCS3_REMIX_SKYANCHORMODE=<0..3>, default 0 = today's behaviour bit for bit.
+	//
+	// THE DEFECT. sky_max_anchor() above is compared against |transform.translation - eye|. That is
+	// only "is this dome centred on the eye" for a dome whose transform CARRIES its position. An
+	// absolute-world draw - correct identity-ish transform, world-space vertices - has its
+	// translation at the world origin, so the quantity it actually measures is |eye|, and the
+	// bigger the level, the further from the origin the player walks, the more certainly it fails.
+	// The user's newly-reachable levels read anchor=2137.85 against limit=4 with |camera| ~ 2137,
+	// which is that identity to five figures. Round 31 established the same thing for
+	// VIEWMODELANCHOR (the guard read ~2100 to a point no geometry occupied while the picks read
+	// 1.5), and round 32 already listed SKYANCHOR as "dead for absolute-world geometry" - this is
+	// that finding producing a visible symptom for the first time: the dome is never categorised
+	// SKY, is submitted as ordinary unlit geometry, and renders black.
+	//
+	// THE REPLACEMENT, and why it is not "raise the limit". Raising SKYANCHOR cannot work: the
+	// number it is compared against is a property of where the PLAYER is standing, so any limit
+	// that admits the dome at 2137 also admits every other absolute-world draw in the level, and
+	// SKY hides the instance from the world pass - over-tagging deletes terrain. What the test is
+	// trying to ask is "does this thing surround the camera", and there is already a scale-free,
+	// translation-free answer computed three lines above it: `inside`, whether the eye lies within
+	// the draw's transformed AABB. A dome contains the eye whether it is authored on the eye or at
+	// the world origin. Terrain does not - the eye stands ABOVE the ground surface.
+	//
+	//   0 = |translation - eye| <= sky_max_anchor(). Round 13..35. Default, unchanged.
+	//   1 = |AABB centre - eye| <= sky_max_anchor(). The same test with the defect removed but the
+	//       absolute limit kept - correct for an eye-following dome, still wrong for a static one
+	//       (a dome authored at the world origin has its centre at the world origin too). Provided
+	//       to separate "the translation was wrong" from "the distance test was wrong", which are
+	//       different claims and only one run apart.
+	//   2 = the eye is INSIDE the transformed AABB. Ignores sky_max_anchor() entirely. This is the
+	//       one the launcher arms.
+	//   3 = mode 2 OR mode 0, i.e. admit a dome that either surrounds the eye or sits on it. The
+	//       most permissive, kept for the case where a dome's AABB genuinely excludes the eye
+	//       (a dome clipped to the horizon band, say) - try this only if mode 2 leaves a level black.
+	//
+	// The extent floor (sky_min_extent(), 2000 by default) and the depth-write test both still run
+	// AHEAD of this, unchanged, and they are what keeps mode 2 from being a blanket admission: a
+	// draw has to be enormous AND depth-write-free AND contain the eye.
+	//
+	// AUDITABLE BY CONSTRUCTION: the census prints canchor= (the new quantity) and inside= beside
+	// the existing anchor= on every row, at every mode, so the two can be compared on the SAME rows
+	// before and after the switch rather than across two runs.
+	//
+	// REVERT, one launcher line, no rebuild: set "RPCS3_REMIX_SKYANCHORMODE=0".
+	// PRE-REGISTERED REFUTATION: if a level's dome rows read inside=0, mode 2 will refuse them too
+	// and the sky stays black - the AABB premise is then wrong and mode 3 is the next test, not a
+	// bigger limit. If terrain starts vanishing, mode 2 is over-admitting and the revert is above.
+	// env_u32, not env_float - env_float rejects 0 and 0 is this knob's OFF value (round 32's
+	// SKYANCHOR=0 defect, which is exactly this trap).
+	u32 sky_anchor_mode();
+
 	// RPCS3_REMIX_SKYBACKDROP=<0|1|2>: the *backdrop* rule, which is a different object from the
 	// sky-dome rule above and is deliberately not on by default.
 	//   0  off (default). Nothing measured, nothing tagged.
@@ -2671,6 +2747,49 @@ namespace remix_rsx
 	// out white (VCOLMOD=0 means the world path never replays its vertex colour).
 	bool ui_force_vp_matches(u64 vp_hash);
 	u32 ui_force_vp_count();
+
+	// --- round 36: the same route keyed on a (vp, fp) PAIR, for the helmet -----------------------
+	//
+	// RPCS3_REMIX_UIFORCEPAIRVP + RPCS3_REMIX_UIFORCEPAIRFP, both hex, both default empty, and an
+	// empty EITHER half disarms the route - the same rule hide_pair_matches() uses, and the same
+	// one-line revert.
+	//
+	// WHY A PAIR AND NOT THE EXISTING LIST. The user has asked four times for the helmet to be
+	// treated as UI so it stops casting a big shadow and clipping through geometry, and the pick
+	// that finally isolates it is
+	//   vp=830d7d1b9681c475 fp=479890ff55f1d96e albedo=C61753D31FB96507 vtx=59 extent=6.465
+	//   depth_test=0 depth_write=0 blend=1
+	// MEASURED over the last 400 MB of bin\remix_dump.log (1,038,135 lines):
+	//   - vp=830d7d1b9681c475 alone appears on 47,399 lines across 31 distinct fragment programs,
+	//     and its two largest fps carry 230 and 193 distinct vertex counts. It is a general-purpose
+	//     program covering most of the scene. Adding it to RPCS3_REMIX_UIFORCEVP is a ~26x
+	//     over-match and is round 20's failure mode exactly.
+	//   - the PAIR (830d7d1b9681c475, 479890ff55f1d96e) appears on 1,833 lines, 1,767 of them
+	//     (96.4%) at albedo C61753D31FB96507 / vtx=59 - the helmet. The 3.6% residue is 35 lines of
+	//     a vtx=152 family at extent ~2.2 and 9 sub-0.13-extent quads at vtx 6/14/44/66.
+	//
+	// WHY THE UI ROUTE AND NOT A CATEGORY FLAG, decided on evidence rather than preference. Round 35
+	// read the deployed runtime's source and established that there is NO per-instance castShadow
+	// flag anywhere in it; Hidden sets mask = 0 and removes the instance from PRIMARY rays too (so
+	// the helmet would vanish, failing "visible"); and THIRD_PERSON_PLAYER_MODEL needs two
+	// rtx.conf lines, one of which (rtx.playerModel.enableInPrimarySpace = True) masks every
+	// VIEW_MODEL candidate to zero and would take the arms with it - which collides head-on with
+	// the round-36 viewmodel work. The UI-force route needs none of that: a forced draw returns
+	// from the screen-space block BEFORE per_draw_transform and submit_subdraw, so no mesh, no
+	// instance, no material and no BLAS are ever created. No shadow and no world clipping by
+	// construction, not by flag.
+	//
+	// The existing guard still applies and is doing real work here: a listed draw is forced only
+	// when depth_write_enabled() is false, and the helmet pick reads depth_write=0. Any member of
+	// the pair that writes depth is left on the world path untouched.
+	//
+	// THE RISK, stated so it is not a surprise: the compositor can still refuse a forced draw
+	// (ui_skipped / ui_space_none / ui_render_target) and a refusal DELETES the draw rather than
+	// falling back to world geometry. If the helmet DISAPPEARS instead of flattening, that is what
+	// happened - read those three counters, not this one. ui_forced_pair counts only the forcing.
+	bool ui_force_pair_matches(u64 vp_hash, u64 fp_hash);
+	u64 ui_force_pair_vp_hash();
+	u64 ui_force_pair_fp_hash();
 
 	// ---------------------------------------------------------------------------------------
 	// round 10
@@ -3166,9 +3285,162 @@ namespace remix_rsx
 
 	// RPCS3_REMIX_VMBASISMAX=<lines>, default 24, clamped to 96 in code. Cap for the
 	// 'Remix vmbasis:' census, which prints the recovered world matrix and the camera basis for the
-	// VIEW_MODEL-tagged draws - the measurement no census has ever emitted, and the reason the axis
-	// pair above has to be guessed this round instead of read.
+	// VIEW_MODEL-tagged draws.
+	//
+	// ROUND 34 CORRECTION - "the measurement no census has ever emitted" is now FALSE, and this doc
+	// block said it for fourteen rounds. It emitted SIX lines in bin\log\RPCS3.log at 0:00:57 and
+	// 0:02:30 of the RPCS3_REMIX_VMDEPTHOFFSET=2 run that ended 2026-08-17 09:37:23, on
+	// vp=830d7d1b9681c475 / af06f6d32ec048ee / 57a12323f22f4988, with vm_tagged=7960 of
+	// vm_considered=632100. The reason it had never fired before is not the cap and not the dedup: it
+	// is that nothing had ever been tagged, and the depth knob is what tagged it. Read those six
+	// lines before adding any instrument here.
 	u32 viewmodel_basis_census_max();
+
+	// RPCS3_REMIX_VMBASISPIVOT=<0|1|2>, default 0 = the eye = today's behaviour bit for bit.
+	//
+	// ROUND 34. viewmodel_basis_flip() above reflects about the EYE, on the premise that first-person
+	// geometry sits at the eye so a reflection there only reorients it. MEASURED from the six census
+	// lines named in viewmodel_basis_census_max(): that premise is false for every tagged draw on this
+	// title. The arms' recovered instance transform has its translation at the WORLD ORIGIN
+	// (pre translation [0.0555 -0.2443 0.00686] on the vtx=3649 arms draw) while the eye is at
+	// [1774.14 -31.2479 1177.04], i.e. 2129 units away - so reflecting about the eye moved the mesh to
+	// [158.622 -59.112 2563.8]. All six lines land 2537..2564 units from where they started. That, and
+	// not a 0.4-unit nudge behind the camera, is why the arms and the weapon vanished outright.
+	//
+	//   0 = the anchor-frame eye (round 19..33).
+	//   1 = the draw's own geometry centroid under the pre-operator transform. Keeps the mesh exactly
+	//       where it is and rotates it in place, which is what an orientation correction is supposed to
+	//       be. Falls back to the eye when the centroid is unmeasurable, reported as pivotsrc=3.
+	//   2 = the transform's own translation column, i.e. the object origin. Cheaper than 1 and correct
+	//       whenever the mesh is modelled about its origin; on this title's viewmodel that origin is
+	//       the world origin, so 2 is the wrong choice HERE and is provided only to separate "modelled
+	//       about the origin" from "modelled about the centroid" in one run.
+	//
+	// The 'Remix vmbasis:' census proves which of the two halves moved: dbasis= must be non-zero (the
+	// operator did something) and dcentre= must be ~0 (it did not displace the mesh). At pivot 0 this
+	// title reads dcentre ~2550; a correct pivot reads ~1e-4.
+	//
+	// READ THIS BEFORE JUDGING THE PIVOT: this knob is INERT while RPCS3_REMIX_VMBASIS=0, because
+	// apply_viewmodel_basis returns on 'flip == 0' before the pivot is selected. The round-34 launcher
+	// arms VMBASIS=0 deliberately, so its census will read 'pivotsrc=0 pivot=[0 0 0] dbasis=0' and that
+	// is NOT a failure of the pivot - it is the operator not running. The dbasis/dcentre criterion above
+	// belongs to STEP 2 (VMBASIS=6 with this at 1). Step 1 judges PLACEMENT only, from cdist_pre=.
+	// 'pivotsrc=0' is shared by "chose the eye" and "returned early"; flip= and cam= on the same line
+	// disambiguate.
+	u32 viewmodel_basis_pivot();
+
+	// --- round 36: a REAL rotation, because the sign mask above cannot express the fix -----------
+	//
+	// RPCS3_REMIX_VMROTAXIS=<0..6>, default 0 = OFF = today's behaviour bit for bit.
+	// RPCS3_REMIX_VMROTDEG=<0..359>, default 0 (taken mod 360, so 360 means 0 - say 180, not 360).
+	// RPCS3_REMIX_VMROTPIVOT=<0..3>, default 0 = the RAW eye.
+	//
+	// WHY THIS EXISTS. viewmodel_basis_flip() is a 3-bit sign mask about a pivot, and round 36
+	// measured that no setting of it can be right, because the defect is not a sign pattern - it is
+	// a 180 degree rotation about the camera's RIGHT axis THROUGH THE EYE, which moves the mesh as
+	// well as turning it. MEASURED over 287 'Remix vmbasis:' lines in bin\remix_dump.log
+	// (the last 400 MB, the VMBASIS=5 session):
+	//
+	//   - the camera basis is left-handed on all 287 lines (right x up . fwd = +1.00), so 'fwd'
+	//     genuinely points into the scene and the sign of the forward coordinate is readable;
+	//   - EVERY near-eye VIEW_MODEL-tagged draw lands with its submitted centroid BEHIND the eye.
+	//     26 distinct (vp, vtx) groups inside 5 units, fwd ranging -0.06 .. -0.81, up +0.05 .. +0.94.
+	//     The one near-eye group that is NOT tagged (vp=aae8e0d5ae292dd4, vtx=91) reads fwd
+	//     +0.083 .. +0.484 - in FRONT - which is the control that says the sign is not a convention
+	//     error in the instrument;
+	//   - the object basis relative to the camera basis is a rotation about the camera's RIGHT axis
+	//     of 118 .. 179 degrees (axis component on right >= 0.996 on every near-eye line). Not a
+	//     yaw, not a mirror: det(D) = +1.00000 and the column norms are 1.0000.
+	//
+	// One operator produces all three at once: rotate 180 degrees about the camera's right axis,
+	// pivoted at the EYE. It maps up -> -up, fwd -> -fwd and leaves right alone, which is exactly
+	// "upside down and backwards" - the user's own words for VMBASIS=0.
+	//
+	// WHY VMBASIS=6 DID NOT FIX IT, and this is the part the sign mask cannot reach: flip 6 is the
+	// SAME 3x3 (at 180 degrees the Rodrigues form collapses to -I + 2 a a^T, which is what
+	// 'sum_k s_k a_k a_k^T' with s = (+1,-1,-1) already is), but the launcher pivots it at the
+	// CENTROID (VMBASISPIVOT=1), so it turns the mesh in place and leaves it behind the eye. The
+	// user then sees correctly-oriented arms hanging above and behind them, which reads as "still
+	// upside down". Pivot 0 was not the alternative because it is the ANCHOR-frame eye
+	// (anchor_frame_eye(), and RPCS3_REMIX_CAMANCHOREYE=1 is armed), which round 34 measured
+	// throwing the mesh 2537..2564 units.
+	//
+	// So the new pivot 0 here is the RAW m_active_camera.position with NO anchor conversion, and
+	// that is justified by measurement, not by preference: cdist_pre on the current build reads
+	// 0.43 .. 1.04 on all 287 lines, and cdist_pre IS |centroid - m_active_camera.position|. A
+	// centroid half a unit from that point cannot be in a different frame from it.
+	//
+	//   axis 0       = off.
+	//   axis 1, 2, 3 = the camera's right / up / forward axis, in world space, taken from the
+	//                  columns of the row-vector worldToView. LEFT-multiplied about the pivot, so
+	//                  it turns the geometry in the camera's frame.
+	//   axis 4, 5, 6 = the MODEL's own X / Y / Z axis. RIGHT-multiplied (M' = M * R), which is a
+	//                  rotation in the mesh's own space about its own origin - this is the knob for
+	//                  the "authored Z-up in a Y-up renderer" hypothesis (that would be axis 4 with
+	//                  270 degrees). The pivot knob is INERT for 4..6 and the census says so with
+	//                  rotpivsrc=5.
+	//
+	//   pivot 0 = the raw eye (m_active_camera.position). NEW, and the one the launcher arms.
+	//   pivot 1 = the draw's own geometry centroid, i.e. turn in place (what VMBASISPIVOT=1 does).
+	//   pivot 2 = the transform's translation column.
+	//   pivot 3 = the anchor-frame eye, i.e. round 19..35's pivot 0. Kept so the old behaviour is
+	//             still reachable for an A/B, not because it is believed correct.
+	//
+	// Composition: viewmodel_basis_flip() still runs FIRST and this runs after it, so the two are
+	// independent and the launcher arms VMBASIS=0 to isolate this one. Setting both is legal and
+	// the census reports each half separately (dbasis= is the flip, drot= is this).
+	//
+	// PRE-REGISTERED READING for VMROTAXIS=1 VMROTDEG=180 VMROTPIVOT=0, all on 'Remix vmbasis:':
+	//   cpost=[right up fwd] must have fwd > 0 where cpre had fwd < 0, and up < 0 where cpre had
+	//   up > 0, with right unchanged to ~1e-3. relpost must be (180 - relpre) +- 1 degree, i.e.
+	//   1 .. 62 rather than 118 .. 179. cdist_post must equal cdist_pre to within 1% - a rotation
+	//   about the eye cannot change the distance from the eye, so a cdist_post that MOVES is proof
+	//   the pivot is not the eye. dcentre must be 0.3 .. 1.6, NOT ~0 (that would be a centroid
+	//   pivot leaking back in) and NOT ~2550 (that would be the anchor-frame eye leaking back in).
+	u32 viewmodel_rotate_axis();
+	u32 viewmodel_rotate_degrees();
+	u32 viewmodel_rotate_pivot();
+
+	// RPCS3_REMIX_VMTAGONLY=<0|1>, default 0 = OFF = today's behaviour bit for bit.
+	//
+	// ROUND 34, and it is the actual viewmodel fix. Tagging a draw VIEW_MODEL currently does four
+	// things at once in per_draw_transform, three of which are about PLACEMENT and one of which is the
+	// tag. 1 severs the three and keeps the tag:
+	//
+	//   - it stops the draw being divided by m_active_viewmodel.reference_inverse,
+	//   - it stops 'defer_candidate = false' taking it out of the deferral population,
+	//   - it stops the REFUSED:noref / REFUSED:mode1 arm dropping the draw outright,
+	//   - and it stops '&& !viewmodel_draw' disarming the tail-rescue ladder, which is where PROJSPLIT
+	//     lives - round 28 found that same gate deleting the arms through the VMPAIRVP route.
+	//
+	// WHY THE VIEWMODEL REFERENCE IS THE WRONG DIVISOR, MEASURED. It is latched as
+	// inverse(folded) from the FIRST viewmodel-depth draw of the frame (RemixGSRender.cpp,
+	// 'm_frame_viewmodel_candidate.reference_inverse = viewmodel_inverse'), and the comment beside it
+	// states the population is expected to share one view-projection. So world = fused x
+	// reference_inverse is a matrix divided by (near enough) its own inverse and collapses to the
+	// identity BY CONSTRUCTION - the same self-referential trap round 32 caught in the worldid-census
+	// tmax field. Every viewmodel draw therefore lands at the world origin. The six census lines show
+	// exactly that: two of the six have a bit-near-exact identity 'pre' and all six have a translation
+	// within 0.4 of [0 0 0].
+	//
+	// AND THE WORLD DIVISOR IS MEASURABLY CORRECT FOR THESE DRAWS. 'Remix picked:' lines for the same
+	// program in the same level, untagged and therefore on the world path, read
+	// origin=[1780.78 -31.2362 1186.65] against cam=[1780.42 -31.3929 1186.57] (albedo
+	// 0721D150DF278E7D vtx=2140) and origin=[1780.75 -31.1536 1186.66] against
+	// cam=[1780.42 -31.3948 1186.57] (albedo 86885A0E60751491 vtx=4456) - 0.40 and 0.44 units from the
+	// eye, with basis=[0.998796 0.99919 1.00065] and [1.00293 1.00239 1.0015].
+	//
+	// THAT RETIRES ROUND 5's JUSTIFICATION. The doc block on the latch says dividing the viewmodel by
+	// the world camera "collapses the basis to (0.491, 0.002, 1.150)". Against current bytes the same
+	// quantity reads unity to three decimals, because the f64 gauge (round 4/14), the anchor election
+	// and PROJSPLIT all landed after that measurement. Do not re-derive the old number from the old
+	// comment - re-measure it.
+	//
+	// Pre-registered refutation: with 1 set, vm_tagged stays non-zero while vmcam_considered goes to
+	// ZERO (the whole block is skipped), and the census's own centre_pre / cdist_pre must read ~0.4
+	// from the eye instead of ~2129. If cdist_pre stays at ~2129 with tagonly=1 then the relocation is
+	// NOT the viewmodel divide and this knob is the wrong lever.
+	bool viewmodel_tag_only();
 
 	// RPCS3_REMIX_VMDEPTHOFFSET=<threshold x 1000>, default 0 = use the built-in 1e-3 constant =
 	// today's behaviour bit for bit.
@@ -3179,6 +3451,25 @@ namespace remix_rsx
 	// scale_z=0.00125 offset_z=0.00125 while the other 35 censused programs use 0.49875/0.50125.
 	// The rule misses them by 25%. Setting this to 2 (=0.002) lets it select them.
 	f32 viewmodel_depth_offset_max();
+
+	// --- round 35: the (vertex program, FRAGMENT program) hide gate ------------------------------
+	//
+	// RPCS3_REMIX_HIDEPAIRVP=<hex> + RPCS3_REMIX_HIDEPAIRFP=<hex>, both EMPTY by default, and an
+	// empty EITHER half disarms the route - today's behaviour bit for bit.
+	// RPCS3_REMIX_HIDEPAIRMODE=<1|2>, default 1.
+	//
+	// For "stop the player's body casting a full-body shadow". The fragment program is the
+	// discriminator the (vp, albedo) pair could not be: on Haze, (f39f504649b6f442, 0721D150DF278E7D)
+	// selects the legs AND the arms, while (f39f504649b6f442, b64dc06f79b8b42b) is 1381 of 1381
+	// census rows at vtx=952. Derivation and the mode semantics are in RemixTransforms.cpp beside
+	// hide_pair_vp_hash().
+	//
+	// The fp hash compared here is m_current_fp_hash, i.e. the same value 'Remix picked:' and
+	// 'Remix fpcandidate:' print as fp= - so a hash read off a Ctrl+Click can be pasted straight in.
+	u64 hide_pair_vp_hash();
+	u64 hide_pair_fp_hash();
+	u32 hide_pair_mode();
+	bool hide_pair_matches(u64 vp_hash, u64 fp_hash);
 
 	// --- round 20 --------------------------------------------------------------------------------
 

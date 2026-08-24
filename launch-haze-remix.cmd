@@ -178,7 +178,71 @@ rem If mesh_live climbs across the session, set a finite RPCS3_REMIX_MESHCAP bef
 rem The source ceiling was ALSO 4, so this knob could only ever be turned DOWN; round 31 raised
 rem the clamp to 64 so the range exists at all.
 rem REVERT: set "RPCS3_REMIX_STATICINDEXBUDGET=4"
-set "RPCS3_REMIX_STATICINDEXBUDGET=8"
+rem
+rem ROUND 34 - RAISED 8 -> 32, AND ROUND 31's OBJECTION IS FORMALLY RETIRED.
+rem Round 31 blocked this on: "every rebuild mints a new BLAS handle and the
+rem superseded one stays resident for MESHIDLE frames, and MESHCAP=0 means
+rem there is no ceiling on the resident set." BOTH HALVES ARE FALSE, read from
+rem the deployed runtime's own source (dxvk-remix-numos3, rtx_accel_manager.cpp
+rem clean since 2026-06-04, and all eight BLAS anchor strings verified present
+rem in the deployed d3d9.dll):
+rem   * rtx.minPrimsInDynamicBLAS = 1000 with a STRICT '<' against
+rem     std::max(1000,100). Haze's unions measure 426.2 / 267.1 / 364.3
+rem     triangles across three logged runs, so EVERY union takes the merged
+rem     bucket and NONE has ever had its own BLAS. forceMergedBlas overrides
+rem     every clause of requestDynamicBlas, including "keep the one you have",
+rem     and hands any existing dynamic BLAS back to the pool.
+rem   * A new mesh HASH costs no BLAS at all. remixapi_CreateMesh allocates
+rem     HOST_VISIBLE|HOST_CACHED buffers and a map insert; a BLAS is only born
+rem     on the DRAW path. 86.9 submitted draws/frame against meshes_live=16133
+rem     means >99.4% of live handles hold no BLAS on any frame.
+rem   * The merged pool is recycled BY BUFFER SIZE, never by mesh hash, and
+rem     rtx.numFramesToKeepBLAS resolves to 1 here (enablePreviousTLAS is false:
+rem     upscalerType=DLSS + enableRayReconstruction=True, integrateIndirectMode
+rem     != ReSTIRGI), so a BLAS is destroyed 2 frames - ~70 ms - after its last
+rem     draw. MESHIDLE=600 governs HOST mesh handles, not BLAS memory.
+rem There is also no per-frame BLAS build budget, no bucket triangle cap, and
+rem scratch memory grows on demand; the only hard cap is RPCS3's own
+rem s_max_indices_per_mesh, and at 426 tris/union you are ~800x away from it.
+rem
+rem THE REAL COST, in order: merged-bucket FULL rebuilds on the GPU (transient,
+rem watch frame_ms); CPU 4.54 us/mesh-create = 0.74% of frame; ~20 KB host RAM
+rem per resident union. VRAM growth: none on this evidence.
+rem
+rem WHY 32 AND NOT 64: 32 leaves 'peak' readable. Demand in the plant burst was
+rem ~57 deferrals/frame against 8 slots (census lines 43->44: deferred +3202
+rem over rebuilds +324 = 9.88/rebuild, ~56 frames at the measured 27.9 fps), so
+rem 32 relieves ~56% of it. If the census comes back peak=32 budget=32, go
+rem straight to 64 - the whole 8->64 range is bounded at +0.25 ms of frame time.
+rem
+rem PRE-REGISTERED READING, all DIFFERENCED WITHIN THE NEW RUN (first to last
+rem census line - never against another run; the rate varies 1.03-4.34 across
+rem runs and raw cross-run values are meaningless):
+rem   SUCCESS 1: peak < 32.
+rem   SUCCESS 2: dropped/rebuild falls below 3.661 (this run's differenced
+rem              value; the widely-quoted "1.17" was an undifferenced 2020/1728
+rem              and its correct value is 1.145).
+rem   SUCCESS 3: resident/entries on the FINAL line rises above 63.8%
+rem              (257/403). resident/evicted/nomesh are POINT-IN-TIME GAUGES,
+rem              not cumulative counters - read the last line, never difference
+rem              them.
+rem   REGRESSION 1: frame_ms rises >1.0 ms above baseline while mesh_create
+rem              stays under 1.0 ms. That is the merged-bucket rebuild term.
+rem   REGRESSION 2: mesh_create / mesh_creates-per-frame rises above ~6 us.
+rem   RETIRED: round 32 registered "if dropped falls while evicted RISES the
+rem              raise is a regression". That clause is WRONG and is withdrawn.
+rem              'evicted' counts RPCS3-side handles reaped by MESHIDLE, and a
+rem              handle carries no BLAS unless drawn that frame. Rising evicted
+rem              with falling dropped is the EXPECTED shape. The regression
+rem              signal is frame_ms.
+rem
+rem THE OTHER LEVER, FLAGGED NOT TAKEN: one earlier run ended resident=12
+rem evicted=1168 - 1.0% of unions still held a live handle - and every evicted
+rem one needs a budget slot to come back, so 1168 unions at 8 slots/frame is
+rem >=146 frames and MESHIDLE re-evicts anything out of view for 10 s. That is
+rem a treadmill. A longer idle window scoped to static-index UNION meshes only
+rem would relieve the budget more cheaply, but it is a code change, not a knob.
+set "RPCS3_REMIX_STATICINDEXBUDGET=64"
 rem 2026-08-15 IDLE-REAPER EXPERIMENT. Textures degrade to flat white after ~30s
 rem standing still, and this reproduces with TEXREHASH off, so it is a real
 rem residency bug. Both idle thresholds raised 3600 -> 36000 frames (~72s -> ~12min
@@ -616,7 +680,7 @@ rem   125.5 deg  -0.250,-0.9,0.350   halfway - the one you just judged
 rem Now stepping BACK from 125.5 toward the default in ~22.5 deg increments.
 rem The armed line is the first step; the two after it go further if that is not
 rem enough. Only the BEARING moves.
-set "RPCS3_REMIX_SUNDIR=-0.365,-0.9,0.228"
+set "RPCS3_REMIX_SUNDIR=0.1223,-0.9444,-0.3051"
 rem set "RPCS3_REMIX_SUNDIR=-0.424,-0.9,0.071"   <- 170.5 deg, further back
 rem set "RPCS3_REMIX_SUNDIR=-0.419,-0.9,-0.097"  <- 193 deg, nearly the default
 rem set "RPCS3_REMIX_SUNDIR=-0.250,-0.9,0.350"   <- 125.5 deg, what you just saw
@@ -689,6 +753,80 @@ set "RPCS3_REMIX_DEFERPREANCHOR=0"
 rem Hard cap on how many draws one frame may hold back; the excess goes out the
 rem old way and counts defer_spilled.
 set "RPCS3_REMIX_DEFERPREANCHORMAX=4096"
+rem ROUND 32 - NARROW THE DEFERRAL POPULATION BEFORE RE-TESTING THE KNOB ABOVE.
+rem The 2026-08-16 revert note above is correct: 72% of the buffering did no work
+rem (defer_buffered=543244 defer_fresh=149761 defer_flip=393483). But nothing
+rem separated the TWO branches that ask to be deferred, and they are not equally
+rem likely to pay:
+rem   anchor_prev  - last frame's anchor EXISTS for this render source, so this
+rem                  frame's is plausibly still to come. Deferring is a good bet.
+rem   gauge_absent - NO anchor in this frame or the previous one. Deferring bets
+rem                  on a source that has not produced an anchor in two frames.
+rem MEASURED, round-31 run: gauge_prev=225700 gauge_absent=125966, so absent is
+rem 35.8% of the 351666 deferral population. Reproduced at 35.8% in the earlier
+rem session (prev=328430 absent=182985). This drops that third.
+rem INERT while DEFERPREANCHOR=0 - it is staged, not active.
+rem IF YOU WANT THE STABLE PROPS BACK, this is the run to try:
+rem   set "RPCS3_REMIX_DEFERPREANCHOR=1"   (leave DEFERPREVONLY at 1)
+rem   then read defer_buffered / defer_fresh / defer_flip / defer_absent_declined.
+rem   PRE-REGISTERED: defer_flip/defer_buffered must come in BELOW 72%, and fps
+rem   must stay above ~40. If defer_flip is still ~half of defer_buffered, the
+rem   absent branch was not the waste and narrowing is refuted - set both back.
+rem REVERT: set this to 0 to reproduce round 31's deferral population exactly.
+set "RPCS3_REMIX_DEFERPREVONLY=1"
+rem ROUND 32 - THE GEOMETRY AUDITS, AND THE ONLY REMOVABLE PART OF THE FRAME.
+rem MEASURED in round 31's worst window that actually drew geometry (frames=38):
+rem   draw=50.88 of frame_ms=53.03, and the five named children only account for
+rem   ui=2.53 mesh_create=0.14 tex_bind=1.11 uv=5.67 draw_instance=0.48
+rem   => rest=40.96 ms/frame = 80.5% of draw, 77% of the whole frame.
+rem audit_vertex_extent makes FOUR passes over every sub-draw's decoded positions
+rem and audit_world_extent walks the whole index list into world space. Both are
+rem diagnostics. Setting this to 0 skips both.
+rem DO NOT set 0 as a blind perf fix. Read audit= on the new "Remix timing:" line
+rem first - the timer exists so the size of the trade is a number, not a guess.
+rem What 0 costs: the vtx-spread census, the streak/wext census, and the wext
+rem REFUSAL gate. Losing the gate is safe on Haze only because it is measured -
+rem wext_refused=0 for the whole round-31 session, so it never fired. Check that
+rem counter on "Remix live:" before using 0 on any other title.
+rem REVERT: set "RPCS3_REMIX_DRAWAUDIT=1"
+rem
+rem ROUND 34 - ARMED AT 0, AND THIS IS ROUND 33's OWN PRE-REGISTERED VERDICT.
+rem round33-inbox.md registered: "If 'audit' is the largest new child: the fix
+rem is RPCS3_REMIX_DRAWAUDIT=0, not an optimisation." MEASURED from
+rem bin\log\RPCS3.log (the run that ended 2026-08-17 09:37:23), last two
+rem 'Remix timing:' windows:
+rem   frame_ms=35.22 | draw=33.20 (ui=2.28 mesh_create=0.26 tex_bind=0.53
+rem     uv=3.48 draw_instance=0.43 decode=6.35 audit=11.35 hash=3.76 xform=0.19
+rem     rest=4.58)
+rem   frame_ms=33.57 | draw=31.51 (... decode=6.10 audit=11.03 hash=3.64
+rem     xform=0.12 rest=3.78)
+rem So audit IS the largest new child at 11.35 ms = 32.2% of the whole frame
+rem and 34.2% of draw, and 'rest' has fallen to 4.58 ms (13%) - the round-31
+rem 40.96 ms residual is fully accounted. 'rest' is NOT 0.00 beside a large
+rem 'draw', so the saturation/double-counting tripwire did not trip.
+rem
+rem LEFT AT 1 THIS ROUND ANYWAY, AND THE REASON IS A REVIEW FINDING THAT KILLS
+rem THE "ZERO VISUAL CHANGE" CLAIM. I armed 0, then a review of the round-34
+rem diff found that DRAWAUDIT=0 has TWO consumers its own documentation does
+rem not list, both via m_streak_measured - which is written ONLY inside
+rem audit_world_extent, so with the audit off it stays false all session:
+rem   * the SKIPEXTENTVP gate reads '&& m_streak_measured', so it stops firing.
+rem     The launcher arms SKIPEXTENTVP=57A12323F22F4988 with SKIPEXTENTMIN=128,
+rem     and 57A12323F22F4988 is ONE OF THE THREE NEAR-DEPTH VIEWMODEL PROGRAMS.
+rem     Disabling that refusal changes what is submitted for the exact
+rem     population this round's priority-1 test is measuring.
+rem   * extent_plausible = '!m_streak_measured || ...' becomes unconditionally
+rem     true, so GUESTLIGHTEXTENT stops rejecting anything.
+rem So "wext_refused=0, therefore dropping the audit cannot change what is
+rem submitted" was WRONG - wext is not the only gate the audit feeds. Arming
+rem both DRAWAUDIT=0 and the viewmodel change in one run would confound the
+rem measurement that matters, so frame time waits a round.
+rem
+rem ROUND 35: take the ~11 ms then, and either (a) arm DRAWAUDIT=0 with
+rem SKIPEXTENTVP blanked so the interaction is explicit, or (b) attack the
+rem decode child (6.35 ms) instead, by caching decoded positions per
+rem (source pointer, count) as round 33 pre-registered.
+set "RPCS3_REMIX_DRAWAUDIT=1"
 rem ALPHA TO COVERAGE - the third cutout channel, and the last hardware mechanism
 rem that could explain foliage/fences rendering as solid cards. rpcs3's own OpenGL
 rem backend reads these two bits and this backend never did. Read a2c_ctrl /
@@ -809,6 +947,48 @@ rem COST: it is also 198 'Remix suncard:' rows, but suncard_elected=0 and SUNTRA
 rem elects nothing today; and 13 'Remix sky-census:' rows, all reject:extent, so no sky tag
 rem is lost. REVERT: set "RPCS3_REMIX_CAT_HIDE=B6AE753B64E6F693"
 set "RPCS3_REMIX_CAT_HIDE=B6AE753B64E6F693,597C5F48E671924F"
+rem
+rem === ROUND 35: THE PLAYER'S FULL-BODY SHADOW - a (vp, FRAGMENT program) key ===
+rem You asked twice: "how can we do away with the legs and arms shadow instead of
+rem a shadow showing a full body" and "i also dont see the shadows for them so
+rem could we apply that to the legs too".
+rem
+rem WHY THE KEY IS THE FRAGMENT PROGRAM AND NOT THE ALBEDO. The round-35 brief
+rem proposed the (vp, albedo) pair route. MEASURED over the whole 757 MB
+rem bin\remix_dump.log, that route OVER-MATCHES and would take the arms with the
+rem legs - your own Ctrl+Click picks show both carrying vp=f39f504649b6f442 AND
+rem albedo=0721D150DF278E7D:
+rem
+rem   legs   vp=f39f504649b6f442 fp=b64dc06f79b8b42b vtx=952  extent=1.145
+rem   arms   vp=f39f504649b6f442 fp=d6f00cddfb5c6e0a vtx=2140 viewmodel=1
+rem
+rem The FRAGMENT program separates them cleanly. Every one of the 1381
+rem 'Remix fpcandidate:' rows for b64dc06f79b8b42b is vtx=952 - 12 albedos (the
+rem skin variants), not one row anything else. That is the whole player body and
+rem nothing else, which is exactly what round 20's albedo-only pin was not.
+rem
+rem MODE 1 (armed) = HIDDEN. In the deployed runtime this sets the instance mask
+rem to 0, so the body leaves the acceleration structure entirely: no full-body
+rem shadow, and no legs when you look down. Zero conf edits, works immediately.
+rem
+rem MODE 2 = THIRD_PERSON_PLAYER_MODEL: legs still VISIBLE, casting no shadow.
+rem This is the only "visible but no shadow" route that exists in the runtime -
+rem there is no castShadow flag anywhere in it. It needs TWO lines added to
+rem bin\rtx.conf by you, and BOTH or it is worse than nothing:
+rem     rtx.playerModel.enableInPrimarySpace = True
+rem     rtx.playerModel.enablePrimaryShadows = False
+rem With only the first, the legs go invisible and still cast. With neither, the
+rem legs go invisible. Warning: enableInPrimarySpace = True also masks every
+rem VIEW_MODEL candidate to zero inside the runtime's createViewModelInstances,
+rem which would take the ARMS with it the moment a view-model camera is valid.
+rem
+rem PRE-REGISTERED: 'Remix stats:' cat_hidepair climbs into the thousands (the
+rem body draws about once a frame). If it reads 0 the key never matched and the
+rem hashes are wrong, NOT the mechanism.
+rem REVERT: blank either half - set "RPCS3_REMIX_HIDEPAIRVP="
+set "RPCS3_REMIX_HIDEPAIRVP=F39F504649B6F442"
+set "RPCS3_REMIX_HIDEPAIRFP=B64DC06F79B8B42B"
+set "RPCS3_REMIX_HIDEPAIRMODE=1"
 rem
 rem === GUEST-LIGHT DISCRIMINATOR - measurement only this round =================
 rem A census of every submitted draw that LOOKS like a light fixture: bright
@@ -1610,6 +1790,44 @@ rem lights the scene itself instead of standing there as a black shell that
 rem absorbs the sun. Queued as round 13.
 set "RPCS3_REMIX_SKYANCHOR=4"
 rem
+rem === ROUND 36: RPCS3_REMIX_SKYANCHORMODE - MEASUREMENT FIX, NOT ARMED =======
+rem The knob above is compared against |transform.translation - eye|. For an
+rem absolute-world draw - correct identity-ish transform, world-space vertices -
+rem the translation IS the world origin, so the quantity it evaluates is |eye|,
+rem and the further the player walks from the origin the more certainly it
+rem fails. The unlocked levels read anchor=2137.85 against limit=4 with the
+rem camera 2137 units out. Same defect round 31 measured on VIEWMODELANCHOR (the
+rem guard read ~2100 to a point no geometry occupied); round 32 already listed
+rem SKYANCHOR as dead for absolute-world geometry. Now fixed as a MEASUREMENT.
+rem
+rem SHIPPED: canchor= (|AABB centre - eye|, the quantity it should have been
+rem comparing) and anchormode= now print on every "Remix sky-census:" row BESIDE
+rem the existing anchor=, so old and new are auditable on the SAME rows in ONE
+rem run instead of across two.
+rem   0 = |translation - eye| (round 13..35). DEFAULT AND ARMED.
+rem   1 = |AABB centre - eye| against the same limit.
+rem   2 = the eye is INSIDE the transformed AABB. Scale-free, translation-free.
+rem   3 = 2 OR 0.
+rem
+rem DELIBERATELY LEFT AT 0, for TWO measured reasons, and this is the important
+rem half of the round-36 sky work:
+rem   (a) Admitting more domes makes them WORSE, not better. is_sky sets
+rem       REMIXAPI_INSTANCE_CATEGORY_BIT_SKY and on this path that tag HIDES the
+rem       instance. Mode 2 would turn black domes into ABSENT domes.
+rem   (b) MEASURED on the 278 reject:anchor rows of the last 250 MB: 146 of them
+rem       are HIGH-vtx terrain (1211..12875 vertices) against 69 plausible dome
+rem       bands - and inside=1 fires on exactly 146 of the 278. Until somebody
+rem       cross-tabs inside= against vtx on those rows, mode 2 may be admitting
+rem       precisely the terrain and refusing precisely the domes. SKY hiding
+rem       terrain is how geometry vanishes at certain angles.
+rem THE BLACK-SKY FIX IS RPCS3_REMIX_SKYEMISSIVE, NOT THIS.
+rem WHAT DOES SEPARATE THEM, measured on the same rows: the dome and terrain
+rem populations share ZERO vertex programs and ZERO albedos, and backdrop=1
+rem fires on 39 dome rows and 0 terrain rows. A future rule should key on the
+rem program hash, the albedo, or the already-computed backdrop predicate - never
+rem on a looser distance.
+set "RPCS3_REMIX_SKYANCHORMODE=0"
+rem
 rem === REMINDERS (no code this round, both still your call) ===================
 rem The round-8 list-retirement stages (SKIPPAIRVP / SKIPEXTENTVP, then SKIPVP)
 rem are still commented and still unrun. The madaccum decode may have made them
@@ -1802,7 +2020,44 @@ rem on this line. Read 'Remix sky-census:' for a TAGGED line with a large
 rem rawext and add whatever albedo it names.
 rem WATCH: mat_skyemissive / mat_skyunordered going non-zero in this area.
 rem REVERT: drop CDFE11B12552EA2D back off the list.
-set "RPCS3_REMIX_SKYEMISSIVE=D1A6D1B27ADE6232,CDFE11B12552EA2D"
+rem
+rem === ROUND 36: FOUR MORE DOMES - THIS IS THE BLACK-SKY FIX ==================
+rem The chapter-select unlock made every campaign level reachable and the sky is
+rem BLACK in the ones that were never played. The cause is THIS LIST, not the
+rem sky classifier. On the remixapi path a SKY tag can only ever HIDE the dome
+rem (rtx_instance_manager.cpp:1006 sets m_isHidden, and rasterizeSky() is
+rem unreachable from an API draw - the block at ~:1775 above worked that out
+rem from the runtime source and it still holds). What makes a dome VISIBLE on
+rem this backend is the EMISSIVE material, and that is keyed on the texture
+rem content hash HERE, in RemixTextures.cpp, with no reference to the sky
+rem classifier at all. Two domes were listed; the other levels use different
+rem textures and were therefore never lit.
+rem
+rem The four added below are the largest anchor-rejected dome candidates in the
+rem "Remix sky-census:" rows of the unlocked levels, by world extent. All four
+rem recur across six separate runs in the log, which is what makes them a
+rem cohort rather than four one-off draws:
+rem   35C2353F6B3CE2A8  max wext 2.14e6  vtx 54..79
+rem   174F4F689CF2A3D8  max wext 1.83e6  vtx 42..66
+rem   3213E0CC136ED294  max wext 1.44e6  vtx 45..90
+rem   32AE81D64BEA29CD  max wext 1.29e6  vtx 147..266
+rem Low vertex counts against million-unit extents: dome latitude bands. The
+rem terrain in the same reject:anchor pile runs vtx 1211..12875 at wext under
+rem 79k, and shares ZERO albedos and ZERO vertex programs with these four.
+rem
+rem LIST BOUND IS 8 AND THIS MAKES SIX - verified against the parser
+rem (RemixTransforms.cpp, sky_emissive_albedos(), std::array<u64,8>, buffer 400
+rem wchar against 102 used). The count prints on the knobs line and MUST read 6.
+rem If it reads 2 the list did not parse at all; if it reads 8 the bound
+rem truncated it.
+rem PRE-REGISTERED, per level: the sky stops being black and starts glowing at
+rem SKYEMISSIVEINT=2.0. If a level goes from black to BLINDING, lower
+rem SKYEMISSIVEINT rather than removing the hash. If a level is STILL black, its
+rem dome is a fifth texture - Ctrl+Click the sky and read albedo= off
+rem "Remix picked:", or take the largest-wext row of "Remix sky-census:".
+rem REVERT to the round-35 list (no rebuild):
+rem   set "RPCS3_REMIX_SKYEMISSIVE=D1A6D1B27ADE6232,CDFE11B12552EA2D"
+set "RPCS3_REMIX_SKYEMISSIVE=D1A6D1B27ADE6232,CDFE11B12552EA2D,35C2353F6B3CE2A8,174F4F689CF2A3D8,3213E0CC136ED294,32AE81D64BEA29CD"
 rem
 rem === RPCS3_REMIX_SKYEMISSIVEINT - the dome's emissive intensity ===========
 rem DEFAULT 2.0, and that number is not a guess: rtx_instance_manager.cpp:1105
@@ -2337,7 +2592,79 @@ rem shear the viewmodel, only reorient it. Trying another value is one edit
 rem here and no rebuild. If 6 lands it upside down but facing the right way,
 rem try 4; if it is mirrored left-right instead, try 3; 2 is up-only.
 rem REVERT: 0 = exactly the round-18 orientation.
-set "RPCS3_REMIX_VMBASIS=6"
+rem
+rem ROUND 34 - DISARMED TO 0, DELIBERATELY, AND THIS IS STEP 1 OF TWO. Round
+rem 19 armed 6 to fix "mirrored, upside down and displaced". Round 34 measured
+rem that all three symptoms had one cause and it was NOT handedness: the
+rem viewmodel divide collapses to the identity by construction and parks the
+rem mesh at the world origin (see VMTAGONLY below). An orientation guess taken
+rem against a mesh that is 2129 units from where it should be tells you
+rem nothing, and applying 6 on top threw it a further 2.5 km.
+rem
+rem So: STEP 1 (this build) = VMTAGONLY=1 + VMBASISPIVOT=1 + VMBASIS=0. That
+rem restores the placement the world path already gets right and adds ONLY the
+rem VIEW_MODEL tag - ONE new variable, which is the discipline round 19's own
+rem note asked for. The census still emits, with pre==post, and cdist_pre= is
+rem the number to read.
+rem STEP 2 (only after step 1 is judged) = set this back to 6. With
+rem VMBASISPIVOT=1 that is an in-place 180-degree rotation about the camera's
+rem right axis: dbasis= goes non-zero and dcentre= must stay ~0. If the arms
+rem look right after step 1, do NOT do step 2.
+rem
+rem === ROUND 35 - 6 -> 5. THE OPERATOR WAS NEVER BROKEN; ONLY THE TARGET IS. ===
+rem The round-35 brief reported that flip=6 "produced a 120-degree yaw about the
+rem up axis" and asked for the reflection composition to be rewritten. It did
+rem not. That reading projected the transform's ROWS onto the camera axes;
+rem remixapi_Transform is COLUMN-VECTOR, so the object's world-space axes are
+rem its COLUMNS. Re-projected by script over all 10 flip=6 lines of the
+rem 2026-08-17 12:36 run in bin\remix_dump.log:
+rem
+rem   vp=830d7d1b9681c475 albedo=0721D150DF278E7D vtx=2140 frame=3945
+rem     COLUMNS post = (+0.99945 +0.99946 +0.99891)  <- the brief's own pass mark
+rem     ROWS    post = (-0.50091 +0.99984 -0.50101)  <- the "120 degrees"
+rem
+rem The census now prints dotpre=/dotpost= (the COLUMN direction cosines
+rem X.right / Y.up / Z.fwd) so this cannot be mis-read a third time.
+rem
+rem MEASURED: pre is uniformly (right, -up, -fwd) on all 24 tagonly=1 census
+rem rows, so the eight flips have eight KNOWN dotpost readings:
+rem
+rem   flip 0 -> (+1 -1 -1) det +1     flip 4 -> (+1 -1 +1) det -1  MIRROR
+rem   flip 1 -> (-1 -1 -1) det -1     flip 5 -> (-1 -1 +1) det +1
+rem   flip 2 -> (+1 +1 -1) det -1     flip 6 -> (+1 +1 +1) det +1  <- round 34
+rem   flip 3 -> (-1 +1 -1) det +1     flip 7 -> (-1 +1 +1) det -1
+rem
+rem Your verdict on 6 was "arms are facing the right way, just upside down".
+rem Keep the forward axis (+1 in Z.fwd), negate the up axis, and do NOT add a
+rem mirror, and exactly one flip is left: 5.
+rem
+rem WHY NOT 4, which the round-19 note above recommends for this exact symptom:
+rem 4 has det -1, i.e. it MIRRORS the arms. det_pre reads +1.00001 on every
+rem census line, and the legs and the whole world come through the same world
+rem divide and are not mirrored - so the divide preserves handedness and the
+rem correction from pre to truth must be a PROPER rotation. Round 19's "try 4"
+rem was written before that measurement existed. Superseded.
+rem
+rem PRE-REGISTERED: dotpost=[-1 -1 +1] on the census, dcentre < 1e-3,
+rem cdist_post within 0.01 of cdist_pre.
+rem IF STILL WRONG, sweep with the dots as the key - this is one edit, no
+rem rebuild:
+rem   still upside down, left/right now swapped -> the error IS a mirror: try 4
+rem   right way up but now facing backwards     -> try 0
+rem   right way up, facing right, wrong side    -> try 6 and report again
+rem REVERT: 6 = the round-34 step-2 build you just played.
+rem
+rem =============================== ROUND 36 ===================================
+rem DISARMED (5 -> 0), and the sweep above is CLOSED. Three flips were played
+rem and all three read wrong to the user - 0 "upside down and backwards",
+rem 6 "facing the right way, just upside down", 5 "still upside down". At flip
+rem 6 all three camera-axis dots are POSITIVE, so if the defect were a sign
+rem pattern then (+,+,+) would have been correct. It is not. The sign-flip
+rem model is refuted; RPCS3_REMIX_VMROTAXIS below replaces it. Setting this
+rem back to any non-zero value composes a flip UNDER the rotation - legal, but
+rem the two are then confounded and dbasis= / drot= is the only way to split
+rem them again.
+set "RPCS3_REMIX_VMBASIS=0"
 rem
 rem Cap for the new 'Remix vmbasis:' census, one line per program. It prints
 rem the recovered world matrix BEFORE and AFTER the flip, the camera's three
@@ -2346,6 +2673,71 @@ rem the object origin resolved onto right/up/forward in metres. The sign
 rem pattern that changes between those two triples names the wrong axes
 rem directly, so round 20 does not have to guess again. Needs DIAGLINES=1.
 set "RPCS3_REMIX_VMBASISMAX=24"
+rem
+rem === ROUND 36: RPCS3_REMIX_VMROTAXIS / VMROTDEG / VMROTPIVOT ===============
+rem A REAL ROTATION - axis and angle - because no sign mask can express this.
+rem
+rem WHAT WAS MEASURED (287 "Remix vmbasis:" lines, last 400 MB of
+rem bin\remix_dump.log, the VMBASIS=5 session):
+rem   1. The camera basis is LEFT-HANDED on all 287 lines (right x up . fwd =
+rem      +1.00 exactly), so the sign of a forward coordinate is readable and is
+rem      not an artefact of the instrument.
+rem   2. EVERY near-eye VIEW_MODEL-tagged draw is submitted BEHIND THE EYE.
+rem      26 distinct (vp,vtx) groups inside 5 units: fwd -0.06 .. -0.81, up
+rem      +0.05 .. +0.94. THE CONTROL: the one near-eye group that is NOT tagged
+rem      (vp=aae8e0d5ae292dd4 vtx=91) reads fwd +0.08 .. +0.48 - in front.
+rem   3. The object basis relative to the camera basis is a rotation about the
+rem      camera RIGHT axis of 118..179 degrees (axis dot right >= 0.996 on every
+rem      near-eye line), det = +1.00000, column norms 1.0000. Not a yaw, not a
+rem      mirror, not a shear.
+rem ONE operator produces all three at once: 180 degrees about the camera right
+rem axis, PIVOTED AT THE EYE. It sends up -> -up, fwd -> -fwd, right -> right,
+rem which is "upside down and backwards" - the exact words for VMBASIS=0.
+rem
+rem WHY VMBASIS=6 DID NOT FIX IT. At 180 degrees the Rodrigues form collapses to
+rem (-I + 2 a a^T), which is bit-for-bit the 3x3 that flip 6 already builds - so
+rem the TURN was right all along. The launcher pivoted it at the CENTROID
+rem (VMBASISPIVOT=1), so it turned the mesh in place and left it above and
+rem behind the eye. Correctly-oriented arms hanging behind your head read as
+rem "still upside down". Pivot 0 was not the alternative, because pivot 0 is the
+rem ANCHOR-FRAME eye (CAMANCHOREYE=1 is armed at ~:482) which round 34 measured
+rem throwing the mesh 2537..2564 units.
+rem
+rem So VMROTPIVOT=0 here is the RAW m_active_camera.position, no anchor
+rem conversion, and that is justified by a number rather than a preference:
+rem cdist_pre on the current build reads 0.43..1.04 on all 287 lines, and
+rem cdist_pre IS |centroid - m_active_camera.position|. A centroid half a unit
+rem from that point cannot be in a different frame from it.
+rem
+rem AXIS: 0 off; 1/2/3 = camera right/up/forward (left-multiplied, about the
+rem pivot); 4/5/6 = the MODEL own X/Y/Z (right-multiplied, about the object
+rem origin - the "authored Z-up in a Y-up renderer" lever, which would be
+rem AXIS=4 DEG=270). The pivot knob is inert for 4..6 (census: rotpivsrc=5).
+rem DEG is taken mod 360 - write 180, NEVER 360 (360 parses to 0 = OFF).
+rem PIVOT: 0 raw eye (armed) / 1 centroid, i.e. turn in place / 2 the transform
+rem translation / 3 the anchor-frame eye = round 19..35 behaviour.
+rem
+rem READ IT ON "Remix vmbasis:" IN bin\remix_dump.log (readable while the game
+rem runs). PRE-REGISTERED - every one of these can read otherwise:
+rem   cpost=[right up fwd] must have fwd > 0 where cpre had fwd < 0, and up < 0
+rem     where cpre had up > 0, with right unchanged to ~1e-3.
+rem   relpost must be (180 - relpre) +- 1 deg, i.e. 1..62 instead of 118..179.
+rem   cdist_post must equal cdist_pre to within 1%. A rotation about the eye
+rem     CANNOT change the distance from the eye - if cdist moves, the pivot is
+rem     not the eye and the whole construction is wrong.
+rem   dcentre 0.3..1.6. ~0 means a centroid pivot leaked back in; ~2550 means
+rem     the anchor-frame eye did.
+rem   dbasis=0 (VMBASIS is off) and drot ~2 (this operator ran).
+rem   knobs= must read vmrotaxis=1 vmrotdeg=180 vmrotpivot=0.
+rem IF THE ARMS ARE NOW RIGHT WAY UP BUT AT THE WRONG PITCH, that residual is
+rem the 118..179 spread (the rig own aim pitch) and the answer is a smaller
+rem angle on the SAME axis - try DEG=156, then DEG=118. One edit, no rebuild.
+rem IF THEY ARE NOW UPSIDE DOWN THE OTHER WAY, the model-space hypothesis is
+rem live: set "RPCS3_REMIX_VMROTAXIS=4" and "RPCS3_REMIX_VMROTDEG=270".
+rem REVERT (no rebuild): set "RPCS3_REMIX_VMROTAXIS=0"
+set "RPCS3_REMIX_VMROTAXIS=1"
+set "RPCS3_REMIX_VMROTDEG=180"
+set "RPCS3_REMIX_VMROTPIVOT=0"
 rem
 rem --- THE VIEWMODEL SELECTOR (armed only if VMBASIS cannot fix it) --------
 rem MEASURED, and it refutes a comment that has stood since round 5
@@ -2372,7 +2764,86 @@ rem
 rem LEFT AT 0 DELIBERATELY: arming it the same round as VMBASIS would change
 rem two things at once and neither result could be attributed. Try VMBASIS
 rem first. REVERT: 0 = use the built-in constant = round-18 behaviour.
-set "RPCS3_REMIX_VMDEPTHOFFSET=0"
+rem
+rem ROUND 34 - ARMED AT 2, AND THE ROUND-33 TEST IS NOW EXPLAINED. Round 33
+rem set this to 2, the user play-tested it, and the arms and weapon VANISHED
+rem entirely. That run's log is bin\log\RPCS3.log (ended 2026-08-17 09:37:23)
+rem and it holds the whole answer:
+rem   * vm_tagged=7960 of vm_considered=632100, so the tag DID fire and the
+rem     draws DID reach the runtime - "the depth route does not work" is wrong.
+rem   * The 'Remix vmbasis:' census emitted for the FIRST TIME EVER, six lines.
+rem     Every doc block in the tree calling it "the measurement no census has
+rem     ever emitted" was stale from that moment and nobody read the log.
+rem   * On the arms draw (vp=830d7d1b9681c475 albedo=86885A0E60751491
+rem     vtx=3649): pre translation [0.0555 -0.2443 0.00686] - THE WORLD ORIGIN
+rem     - with cam=[1774.14 -31.2479 1177.04], and post translation
+rem     [158.622 -59.112 2563.8]. All six lines moved 2537..2564 units.
+rem
+rem So the arms were thrown 2.5 km away, TWICE over: first by the viewmodel
+rem divide (which is self-referential - see VMTAGONLY) and then by VMBASIS
+rem reflecting about an eye 2129 units from the mesh. Both are fixed below, so
+rem this is armed again. REVERT: 0 = the built-in 0.001 constant, which the
+rem viewmodel's 0.00125 misses by 25%, i.e. nothing is ever tagged.
+set "RPCS3_REMIX_VMDEPTHOFFSET=2"
+rem
+rem --- ROUND 34: THE PIVOT. This is the fix VMBASIS needed since round 19. --
+rem VMBASIS reflects about the EYE, on the premise that first-person geometry
+rem sits AT the eye so a reflection there is a pure reorientation. The census
+rem above measures that premise false: the arms' instance transform has its
+rem translation at the WORLD ORIGIN, 2129 units from the eye, so reflecting
+rem about the eye is a 2.5 km translation with a rotation attached.
+rem   0 = the eye (round 19..33, bit for bit)
+rem   1 = the draw's own geometry centroid -> rotates in place, moves nothing
+rem   2 = the transform's translation column (wrong HERE, since that is the
+rem       world origin; provided to separate "modelled about the origin" from
+rem       "modelled about the centroid" in one run)
+rem
+rem READ THE CENSUS, NOT THE SCREEN: dbasis= must be NON-ZERO (the operator
+rem ran) and dcentre= must be ~0 (it did not displace the mesh). At pivot 0
+rem this title reads dcentre ~2550. cdist_pre= is the number that says whether
+rem the arms are in front of the player at all - the untagged world path
+rem measures 0.40 and 0.44 units on 'Remix picked:' lines for the two
+rem first-person albedos, so ~0.4 is right and ~2129 is the relocation.
+rem REVERT: 0.
+set "RPCS3_REMIX_VMBASISPIVOT=1"
+rem
+rem --- ROUND 34: TAG THE VIEWMODEL WITHOUT MOVING IT. The bigger half. -----
+rem Tagging a draw VIEW_MODEL currently does FOUR things in per_draw_transform
+rem and only one of them is the tag. 1 severs the three placement ones:
+rem   * the divide by m_active_viewmodel.reference_inverse,
+rem   * 'defer_candidate = false',
+rem   * the REFUSED:noref / REFUSED:mode1 arm, which DROPS the draw,
+rem   * and '&& !viewmodel_draw' disarming the tail-rescue ladder - which is
+rem     where PROJSPLIT lives, and is the same gate round 28 caught deleting
+rem     the arms through the VMPAIRVP route.
+rem
+rem WHY THE VIEWMODEL REFERENCE IS WRONG, MEASURED. It is latched as
+rem inverse(folded) from the FIRST viewmodel-depth draw of the frame, and the
+rem comment beside the latch says the population is expected to share one
+rem view-projection. So world = fused x reference_inverse divides a matrix by
+rem its own inverse and collapses to the identity BY CONSTRUCTION - the same
+rem self-referential trap round 32 caught in worldid-census tmax. Two of the
+rem six census lines have a bit-near-exact identity 'pre' and all six sit
+rem within 0.4 units of [0 0 0].
+rem
+rem AND THE WORLD DIVISOR IS MEASURABLY CORRECT FOR THESE DRAWS. Untagged
+rem 'Remix picked:' lines for the same program in the same level read
+rem origin=[1780.78 -31.2362 1186.65] vs cam=[1780.42 -31.3929 1186.57] and
+rem origin=[1780.75 -31.1536 1186.66] vs cam=[1780.42 -31.3948 1186.57] -
+rem 0.40 and 0.44 units from the eye, basis=[0.998796 0.99919 1.00065] and
+rem [1.00293 1.00239 1.0015]. That RETIRES round 5's justification for the
+rem viewmodel reference ("dividing by the world camera collapses the basis to
+rem 0.491, 0.002, 1.150") - against current bytes that quantity reads unity,
+rem because the f64 gauge, the anchor election and PROJSPLIT all landed after
+rem round 5 measured it.
+rem
+rem PRE-REGISTERED REFUTATION: with 1 set, vm_tagged stays non-zero while
+rem vmcam_considered goes to ZERO (the whole block is skipped), and the
+rem census's cdist_pre= must read ~0.4 instead of ~2129. If cdist_pre stays at
+rem ~2129 then the relocation is NOT the viewmodel divide and this knob is the
+rem wrong lever - say so and stop.
+rem REVERT: set "RPCS3_REMIX_VMTAGONLY=0"
+set "RPCS3_REMIX_VMTAGONLY=1"
 rem
 rem --- THE PROJ_SPLIT PREMISE TEST (measuring only this round) -------------
 rem Round 18 reported proj_split=74552/0/0 and read the zero refusals as the
@@ -2829,6 +3300,49 @@ rem which already accepts this exact program (the 277 route=2d lines above).
 rem WATCH: 'ui_forced=' on 'Remix stats:'. Zero means the list is not matching.
 rem REVERT: set "RPCS3_REMIX_UIFORCEVP="
 set "RPCS3_REMIX_UIFORCEVP=2F64C2F8FFD6ADD1"
+rem
+rem === ROUND 36: RPCS3_REMIX_UIFORCEPAIRVP / UIFORCEPAIRFP - THE HELMET ======
+rem The same override keyed on a (vertex program, FRAGMENT program) PAIR. This
+rem is the fourth time the helmet has been asked for and the first time it has
+rem been aimed, because the Ctrl+Click finally isolated it:
+rem   vp=830d7d1b9681c475 fp=479890ff55f1d96e albedo=C61753D31FB96507 vtx=59
+rem   extent=6.465 depth_test=0 depth_write=0 blend=1
+rem
+rem WHY NOT JUST ADD THE VP TO THE LIST ABOVE. MEASURED over the last 400 MB of
+rem bin\remix_dump.log (1,038,135 lines):
+rem   vp=830d7d1b9681c475 alone = 47,399 lines, 31 fragment programs, and its
+rem     two largest fps carry 230 and 193 distinct vertex counts. It draws most
+rem     of the scene. A vp-only pin is a ~26x over-match - round 20 failure mode.
+rem   the PAIR                  = 1,833 lines, 1,767 of them (96.4%) at albedo
+rem     C61753D31FB96507 / vtx=59, i.e. the helmet. The 3.6% residue is 35 lines
+rem     of a vtx=152 family at extent ~2.2 and 9 quads under extent 0.13.
+rem
+rem WHY THE UI ROUTE AND NOT A CATEGORY FLAG - decided on round 35 reading of
+rem the DEPLOYED runtime, not on preference. There is NO per-instance castShadow
+rem flag anywhere in it. HIDDEN sets mask=0 and kills primary rays too, so the
+rem helmet would vanish (fails "visible"). THIRD_PERSON_PLAYER_MODEL needs
+rem rtx.playerModel.enableInPrimarySpace=True, which masks every VIEW_MODEL
+rem candidate to zero and would take the ARMS with it - a head-on collision with
+rem the VMROT work above. The UI route needs none of that: a forced draw returns
+rem BEFORE per_draw_transform and submit_subdraw, so no mesh, no instance, no
+rem material and NO BLAS are created. No shadow and no world clipping by
+rem construction rather than by flag. The existing depth_write guard still runs
+rem and still helps - the helmet reads depth_write=0, and any member of the pair
+rem that writes depth stays on the world path untouched.
+rem
+rem WATCH, on "Remix stats:" in bin\log\RPCS3.log (read it AFTER the session -
+rem that file is exclusively locked while the game runs):
+rem   ui_forced_pair= should be in the hundreds or thousands. ZERO means the
+rem     hashes never matched, NOT that the mechanism failed.
+rem   uiforcepairvp= / uiforcepairfp= print the PARSED hashes, so a typo that
+rem     parses to 0 - which silently disarms the route - is visible there.
+rem THE RISK, stated up front: the compositor can still REFUSE a forced draw
+rem (ui_skipped / ui_space_none / ui_render_target) and a refusal DELETES it
+rem rather than falling back to world geometry. If the helmet DISAPPEARS instead
+rem of flattening, read those three counters - not ui_forced_pair.
+rem REVERT (no rebuild): set "RPCS3_REMIX_UIFORCEPAIRVP="
+set "RPCS3_REMIX_UIFORCEPAIRVP=830D7D1B9681C475"
+set "RPCS3_REMIX_UIFORCEPAIRFP=479890FF55F1D96E"
 rem
 rem --- 3. THE VIEWMODEL PAIR: IT IS AIMED AT REFUSED DRAWS --------------------
 rem MEASURED, round-22 run: vm_tagged_pair=0 over the whole run. The reason is
@@ -3563,7 +4077,7 @@ rem WATCH: the carrier's sunlight should stop snapping back after you look away.
 rem 'Remix sunsprite:' lastgood= should stay populated; src= should stop
 rem alternating between sprite and sunmap on that level.
 rem REVERT: 300.
-set "RPCS3_REMIX_SUNSPRITEHOLD=999999"
+set "RPCS3_REMIX_SUNSPRITEHOLD=216000"
 rem WATCH: sunsprite=<seen>/<solved> on the "Remix live:" line, and
 rem   "Remix sun-retarget: ... src=sprite" in bin\remix_dump.log. src= is the
 rem   field that says which source won; if it still reads sunmap, the sprite is

@@ -51,6 +51,41 @@ namespace
 			std::chrono::steady_clock::now().time_since_epoch()).count());
 	}
 
+	// --- ROUND 32: a scope timer, because the spans that own 'rest' all have early returns --------
+	// The five round-31 children are each ONE call, so an explicit now_us() pair around them is
+	// exact. The four round-32 children are contiguous SPANS of submit_subdraw, and every one of
+	// them contains at least one refusal `return` (the static-index dropped exits alone are two).
+	// An explicit pair would silently skip the accumulation on those paths, so a span that is hot
+	// precisely because it is refusing draws would read as cheap.
+	//
+	// Under-counting is the safe direction for a saturating residual - it can only leave time in
+	// 'rest', never overflow it - but it is also the direction that hides the answer, which is the
+	// whole point of the round. RAII closes on every exit including a throw.
+	// stop() exists so a span can be closed at its natural end WITHOUT wrapping 300 lines in a new
+	// brace level - the destructor then only fires on the refusal paths that never reached the
+	// stop(). That keeps the diff to two inserted lines per span and leaves the enclosing code
+	// byte-identical, which matters because these spans sit in the middle of submit_subdraw.
+	struct scope_us
+	{
+		u64* sink;
+		u64 start;
+
+		explicit scope_us(u64& target) : sink(&target), start(now_us()) {}
+		~scope_us() { stop(); }
+
+		void stop()
+		{
+			if (sink)
+			{
+				*sink += now_us() - start;
+				sink = nullptr;
+			}
+		}
+
+		scope_us(const scope_us&) = delete;
+		scope_us& operator=(const scope_us&) = delete;
+	};
+
 	// Round 7: one line to BOTH logs. Every census in this file open-codes this pair, and every
 	// diagnostic that did not - notably the three outcomes of neutral_material() - became
 	// unreadable mid-session, because RPCS3.log is exclusively locked while the emulator runs and
@@ -772,6 +807,25 @@ void RemixGSRender::on_init_thread()
 			// is selecting the viewmodel; projsplitvdelta != 0 means the proj_split cross is finally
 			// being gated on its own premise instead of on a check that cannot fail.
 			"vmbasis=%u vmbasismax=%u vmdepthoffset=%.4g projsplitvdelta=%.4g "
+			// Round 34. vmbasispivot names the pivot the basis operator reflects about (0 = the eye,
+			// which was measured throwing the viewmodel 2537..2564 units away); vmtagonly=1 severs
+			// the three PLACEMENT consumers of the viewmodel verdict and keeps only the tag. Both
+			// print the CLAMPED value, so a launcher armed outside the clamp shows up here - that is
+			// the diff round 31 and round 32 each lost a round to not making.
+			"vmbasispivot=%u vmtagonly=%u "
+			// Round 36, same reason again, and this triple needs it MORE than the others: VMROTDEG
+			// is taken mod 360, so VMROTDEG=360 parses to 0 and silently means OFF, and VMROTAXIS
+			// is clamped to 6 so a fat-fingered 16 runs as 6 (model Z) rather than being refused.
+			// Both are invisible anywhere else.
+			"vmrotaxis=%u vmrotdeg=%u vmrotpivot=%u "
+			// Round 35, and it is the SAME reason round 34's pair above is here. hidepairmode prints
+			// the CLAMPED value (ceiling 2), so HIDEPAIRMODE=3 silently running as mode 2 -
+			// THIRD_PERSON_PLAYER_MODEL, an entirely different behaviour from HIDDEN - is visible
+			// instead of silent. The two hashes print the PARSED value, so a typo or a pasted prefix
+			// that parses to 0 shows as 0 here and names which half disarmed the route: an
+			// armed-looking launcher that hides nothing is exactly the misconfiguration the
+			// neighbouring vmpairvps/vmpairalbedos fields exist to make un-missable.
+			"hidepairvp=%016llx hidepairfp=%016llx hidepairmode=%u "
 			// Round 20. Both are LIST SIZES, and the pair gate needs BOTH non-zero to do anything at
 			// all - vmpairvps=1 vmpairalbedos=0 is an armed-looking launcher that tags nothing, which
 			// is the misconfiguration this field exists to make un-missable.
@@ -890,6 +944,19 @@ void RemixGSRender::on_init_thread()
 			remix_rsx::viewmodel_basis_census_max(),
 			static_cast<f64>(remix_rsx::viewmodel_depth_offset_max()),
 			static_cast<f64>(remix_rsx::proj_split_view_delta_max()),
+			// Round 34's pair, in the order of "vmbasispivot=%u vmtagonly=%u" above.
+			remix_rsx::viewmodel_basis_pivot(),
+			remix_rsx::viewmodel_tag_only() ? 1u : 0u,
+			// Round 36's triple, in the order of
+			// "vmrotaxis=%u vmrotdeg=%u vmrotpivot=%u" above. All three are the CLAMPED values.
+			remix_rsx::viewmodel_rotate_axis(),
+			remix_rsx::viewmodel_rotate_degrees(),
+			remix_rsx::viewmodel_rotate_pivot(),
+			// Round 35's triple, in the order of
+			// "hidepairvp=%016llx hidepairfp=%016llx hidepairmode=%u" above.
+			remix_rsx::hide_pair_vp_hash(),
+			remix_rsx::hide_pair_fp_hash(),
+			remix_rsx::hide_pair_mode(),
 			remix_rsx::viewmodel_pair_vp_count(),
 			remix_rsx::viewmodel_pair_albedo_count(),
 			remix_rsx::alpha_state_census_max(),
@@ -5433,6 +5500,34 @@ u32 RemixGSRender::classify_draw(u64 albedo_hash)
 		++m_stats.cat_smooth_normals;
 	}
 
+	// --- round 35: the (vp, fp) hide route ---------------------------------------------------
+	//
+	// Ahead of the albedo-list gate below, and deliberately: this route is keyed on the two
+	// PROGRAM hashes and never consults an albedo, so behind that early return it would be
+	// silently dead unless some unrelated category list happened to be populated. Same reasoning
+	// as the smooth-normals block above.
+	//
+	// For the player's own body/legs. See remix_rsx::hide_pair_matches() for why the fragment
+	// program is the discriminator and the (vp, albedo) pair is not.
+	if (remix_rsx::hide_pair_matches(m_current_vp_hash, m_current_fp_hash))
+	{
+		const u32 mode = remix_rsx::hide_pair_mode();
+
+		if (mode == 1)
+		{
+			flags |= REMIXAPI_INSTANCE_CATEGORY_BIT_HIDDEN;
+		}
+		else if (mode == 2)
+		{
+			flags |= REMIXAPI_INSTANCE_CATEGORY_BIT_THIRD_PERSON_PLAYER_MODEL;
+		}
+
+		// Counted on the MATCH, not inside a mode branch, so mode=0 reads as "the key selected N
+		// draws and did nothing to them" rather than as "the key never matched". Those are
+		// different failures and the counter has to be able to tell them apart.
+		++m_stats.cat_hide_pair;
+	}
+
 	if (!albedo_hash || !remix_rsx::any_category_listed())
 	{
 		return flags;
@@ -5589,10 +5684,39 @@ void RemixGSRender::submit_camera()
 		|| remix_rsx::viewmodel_vp_count() != 0
 		|| remix_rsx::viewmodel_depth_offset_max() > 0.f;
 
+	// --- ROUND 34: '!m_active_viewmodel.valid' IS WHY THE DEV MENU SHOWS 'VIEWMODEL Position: -' ---
+	//
+	// This is the ONLY site in the whole backend that ever sets camera_info.type to
+	// REMIXAPI_CAMERA_TYPE_VIEW_MODEL - grep it, there is one - so it is the only way a VIEW_MODEL
+	// camera can reach the runtime. And it is suppressed whenever m_active_viewmodel.valid, on the
+	// reasoning three lines above that "a real viewmodel reference, if one is ever latched from a
+	// VIEWMODELVP program, is strictly more correct and keeps priority."
+	//
+	// THERE IS NOTHING FOR IT TO HAVE PRIORITY OVER. m_frame_viewmodel_candidate is filled in with
+	// .valid, .archetype, .projection, .has_reference and .reference_inverse and NOTHING ELSE - no
+	// .view, no .position - so it is a DIVISOR, not a camera, and no code path submits it as one.
+	// Latching it therefore does not replace the twin; it deletes it.
+	//
+	// MEASURED, from the RPCS3_REMIX_VMDEPTHOFFSET=2 run's last 'Remix live:' line (flips=7096):
+	// vmcam_twin=3185 vmcam_real=3185, i.e. a VIEW_MODEL camera reached the runtime on 44.9% of
+	// flips - and the 55.1% where it did not are exactly the frames on which a viewmodel-depth draw
+	// had latched the candidate, which is to say exactly the frames where the arms were on screen and
+	// tagged. createViewModelInstances early-returns on
+	// !cameraManager.isCameraValid(CameraType::ViewModel), so on those frames the tag was honoured by
+	// toRtDrawState, the pass then bailed, and the instance rendered as ordinary world geometry - at
+	// the world origin, with the eye-pivot flip on top. That is the dev menu's row of dashes.
+	//
+	// Under RPCS3_REMIX_VMTAGONLY=1 m_active_viewmodel is not consulted as a divisor at all, so
+	// letting it suppress the camera as well has no defensible reading left. The suppression is kept
+	// for the default configuration so this stays a single-knob A/B.
+	//
+	// PRE-REGISTERED READING: with VMTAGONLY=1, vmcam_twin must rise from 44.9% of flips toward
+	// cam_resolved, and the Remix dev menu's VIEWMODEL row must show a real Position/Direction/FOV.
+	// If vmcam_twin still tracks 45% then the suppressor is not this condition and I am wrong.
 	if (remix_rsx::viewmodel_albedo_camera_enabled()
 		&& vm_tag_route_armed
 		&& remix_rsx::viewmodel_mode() >= 2
-		&& !m_active_viewmodel.valid)
+		&& (!m_active_viewmodel.valid || remix_rsx::viewmodel_tag_only()))
 	{
 		camera_info.type = REMIXAPI_CAMERA_TYPE_VIEW_MODEL;
 
@@ -5927,8 +6051,8 @@ void RemixGSRender::report_uv_failure(attribute_status best)
 
 void RemixGSRender::report_sky_census(sky_outcome outcome, u32 vertex_count, bool depth_write,
 	const f32 (&lo)[3], const f32 (&hi)[3], const remixapi_Transform& transform,
-	f32 world_extent, f32 anchor, bool measured, bool camera_inside, f32 units_per_vertex,
-	u64 albedo_hash)
+	f32 world_extent, f32 anchor, f32 centre_anchor, bool measured, bool camera_inside,
+	f32 units_per_vertex, u64 albedo_hash)
 {
 	// The aggregate counters say how many draws each gate refused, not *which*. On the first live
 	// capture of the anchored-sky rule that was the whole problem: 739228 candidates, 707975
@@ -5979,7 +6103,11 @@ void RemixGSRender::report_sky_census(sky_outcome outcome, u32 vertex_count, boo
 		"Remix sky-census: vp=%016llx %s vtx=%u depth_write=%d prim=%u albedo=%016llX | "
 		"raw=[%.5g %.5g %.5g]..[%.5g %.5g %.5g] rawext=%.6g wext=%.6g minext=%.6g | "
 		"anchor=%.6g limit=%.6g measured=%d origin=[%.5g %.5g %.5g] cam=[%.5g %.5g %.5g] "
-		"cam_age=%u cam_arch=%s | inside=%d upv=%.6g upvmin=%.6g backdrop=%d | frame=%llu line=%u/%u",
+		"cam_age=%u cam_arch=%s | inside=%d upv=%.6g upvmin=%.6g backdrop=%d | "
+		// Round 36. Appended as one contiguous block immediately before frame=/line=, the only
+		// insertion point that cannot shift an existing specifier/argument pair. canchor is the
+		// quantity the anchor test SHOULD have been comparing all along - see sky_anchor_mode().
+		"canchor=%.6g anchormode=%u | frame=%llu line=%u/%u",
 		m_current_vp_hash,
 		outcome_name,
 		vertex_count,
@@ -6009,6 +6137,11 @@ void RemixGSRender::report_sky_census(sky_outcome outcome, u32 vertex_count, boo
 		// no env var set therefore already says which programs mode 2 would tag.
 		(measured && camera_inside && world_extent >= remix_rsx::sky_min_extent()
 			&& units_per_vertex >= s_sky_backdrop_min_units_per_vertex) ? 1 : 0,
+		// Round 36's pair, in the order of "canchor=%.6g anchormode=%u" above. anchormode prints
+		// the CLAMPED value (ceiling 3), so SKYANCHORMODE=9 silently running as mode 3 - the
+		// permissive union, not the inside test - is visible here rather than nowhere.
+		static_cast<f64>(centre_anchor),
+		remix_rsx::sky_anchor_mode(),
 		m_frame_counter,
 		m_sky_census_lines,
 		s_max_sky_census_lines);
@@ -6438,9 +6571,77 @@ void RemixGSRender::report_viewmodel_camera_census(const char* outcome_name)
 // orientation and position-relative-to-the-eye and cannot rescale the geometry. A wrong guess
 // therefore cannot make the viewmodel bigger, smaller or sheared - only differently wrong - which is
 // what makes it safe to ship a guess at all.
-void RemixGSRender::apply_viewmodel_basis(remixapi_Transform& transform) const
+//
+// --- round 34: the pivot was the bug, and the census that had already emitted said so -------------
+//
+// The block above argues the operator "cannot rescale the geometry - only reorient it and its position
+// relative to the eye". Both halves are true; the second half is the defect. MEASURED from the six
+// 'Remix vmbasis:' lines this census produced in bin\log\RPCS3.log on 2026-08-17 (the
+// RPCS3_REMIX_VMDEPTHOFFSET=2 run, vm_tagged=7960 of vm_considered=632100):
+//
+//   vp=830d7d1b9681c475 albedo=86885A0E60751491 vtx=3649
+//     cam  = [1774.14 -31.2479 1177.04]
+//     pre  translation = [0.0555344 -0.244347 0.00686479]   (the WORLD ORIGIN, 2129 units from cam)
+//     post translation = [158.622 -59.112 2563.8]
+//     eye_pre = [1698.05 -236.325 1262.76] -> eye_post = [1698.05 236.325 -1262.76]
+//
+// All six lines move 2537..2564 units. The premise "the viewmodel sits at the eye, so a reflection
+// about the eye is a pure reorientation" holds only for a transform whose translation IS the eye, and
+// these transforms' translation is the origin - because the viewmodel divide collapses to the identity
+// by construction (see remix_rsx::viewmodel_tag_only()).
+//
+// RPCS3_REMIX_VMBASISPIVOT selects the pivot. 0 keeps the eye and is bit-for-bit round 19..33. 1 uses
+// the draw's own geometry centroid, which is the only pivot that makes the claim in the block above
+// literally true: the mesh rotates and does not move. 2 uses the transform's translation column.
+//
+// --- round 35: THIS OPERATOR IS CORRECT. The refutation, with the numbers. -----------------------
+//
+// The round-35 brief reported that flip=6 "produced a 120-degree yaw about the up axis" and asked for
+// the reflection composition to be rewritten. It does not, and it was not. The brief projected the
+// transform's ROWS onto the camera axes; remixapi_Transform is COLUMN-VECTOR, so the object's
+// world-space axes are its COLUMNS.
+//
+// MEASURED, on this census's own lines in bin\remix_dump.log (VMTAGONLY=1 VMBASISPIVOT=1 VMBASIS=6
+// run, 2026-08-17 12:36), re-projected with a script over all 10 lines of that run:
+//
+//   vp=830d7d1b9681c475 albedo=0721D150DF278E7D vtx=2140 frame=3945
+//     COLUMN dots  pre = (+0.99945 -0.99946 -0.99891)   post = (+0.99945 +0.99946 +0.99891)
+//     ROW    dots               (as the brief read them) post = (-0.50091 +0.99984 -0.50101)
+//
+// The column reading is exactly the pass criterion the brief asked for - X.right, Y.up, Z.fwd all at
+// +1 - and the two -0.5 entries the brief read as "120 degrees" are an artefact of the row projection.
+// (The +/-0.866 it paired them with are the OFF-diagonal row dots, X.fwd and Z.right, which are not in
+// the triple above at all.) The same holds on the
+// visor (9f591b6a6b825612, columns +0.91169 +0.92747 +0.96838) and on every other flip=6 line: the
+// operator is not "correct on one program and yawing on another", it is correct on all of them.
+//
+// So the composition, the pivot and the order are all right, and dotpre=/dotpost= now print the
+// COLUMN direction cosines on the census line so this cannot be mis-read a third time.
+//
+// WHAT IS ACTUALLY UNDECIDED is the TARGET, not the operator. MEASURED: pre is uniformly
+// (right, -up, -fwd) on all 24 tagonly=1 census rows, so the eight flips map to eight known column
+// readings (dotpost, in order X.right / Y.up / Z.fwd), of which only the even ones keep det = +1:
+//
+//   flip 0 -> (+1 -1 -1) det +1      flip 4 -> (+1 -1 +1) det -1  MIRROR
+//   flip 1 -> (-1 -1 -1) det -1      flip 5 -> (-1 -1 +1) det +1
+//   flip 2 -> (+1 +1 -1) det -1      flip 6 -> (+1 +1 +1) det +1  <- shipped in round 34 step 2
+//   flip 3 -> (-1 +1 -1) det +1      flip 7 -> (-1 +1 +1) det -1
+//
+// The user's verdict on flip=6 was "arms are facing the right way, just upside down". Keeping the
+// forward axis and negating the up axis, without introducing a mirror, leaves exactly ONE flip: 5.
+// That is INFERRED from a verbal report, not measured, which is why dotpost= ships with it.
+void RemixGSRender::apply_viewmodel_basis(remixapi_Transform& transform, f32 (&pivot_out)[3],
+	u32& pivot_source) const
 {
 	const u32 flip = remix_rsx::viewmodel_basis_flip();
+
+	// Written before the early returns so the census always reports a pivot, and 0 is never
+	// mistakable for "the eye happened to be at the origin": source 0 with flip 0 means the operator
+	// did not run at all.
+	pivot_out[0] = 0.f;
+	pivot_out[1] = 0.f;
+	pivot_out[2] = 0.f;
+	pivot_source = 0;
 
 	if (flip == 0 || !m_active_camera.valid)
 	{
@@ -6485,6 +6686,54 @@ void RemixGSRender::apply_viewmodel_basis(remixapi_Transform& transform) const
 	f32 eye[3] = { m_active_camera.position[0], m_active_camera.position[1], m_active_camera.position[2] };
 	anchor_frame_eye(eye);
 
+	// ROUND 34. `eye` above is the round-19..33 pivot and stays the default. The two alternatives are
+	// measured against it by the census's dcentre= field, which is |centroid(post) - centroid(pre)|:
+	// a correct pivot reads ~0 there and a wrong one reads the displacement.
+	//
+	// Deliberately reading the PRE transform: `transform` is still the recovered matrix at this point
+	// (the multiply below is the first write), so geometry_centre_in gives the centroid where the mesh
+	// actually is. Both overloads of geometry_centre_in are const, which is what lets this stay a const
+	// method - see its declaration in RemixGSRender.h.
+	f32 pivot[3] = { eye[0], eye[1], eye[2] };
+	pivot_source = 0;
+
+	switch (remix_rsx::viewmodel_basis_pivot())
+	{
+	case 1:
+	{
+		f32 centre[3]{};
+
+		if (geometry_centre_in(transform, centre))
+		{
+			pivot[0] = centre[0];
+			pivot[1] = centre[1];
+			pivot[2] = centre[2];
+			pivot_source = 1;
+		}
+		else
+		{
+			// Named, not silent: a non-zero count of pivotsrc=3 on the census says the vertex scratch
+			// was empty at the submit site and the fix needs a different measurement, not a different
+			// pivot. Falls back to the eye, i.e. to today's behaviour, rather than to the origin.
+			pivot_source = 3;
+		}
+
+		break;
+	}
+	case 2:
+		pivot[0] = transform.matrix[0][3];
+		pivot[1] = transform.matrix[1][3];
+		pivot[2] = transform.matrix[2][3];
+		pivot_source = 2;
+		break;
+	default:
+		break;
+	}
+
+	pivot_out[0] = pivot[0];
+	pivot_out[1] = pivot[1];
+	pivot_out[2] = pivot[2];
+
 	f32 offset[3]{};
 
 	for (u32 r = 0; r < 3; ++r)
@@ -6493,10 +6742,10 @@ void RemixGSRender::apply_viewmodel_basis(remixapi_Transform& transform) const
 
 		for (u32 c = 0; c < 3; ++c)
 		{
-			mapped += basis[r][c] * eye[c];
+			mapped += basis[r][c] * pivot[c];
 		}
 
-		offset[r] = eye[r] - mapped;
+		offset[r] = pivot[r] - mapped;
 	}
 
 	// remixapi_Transform is column-vector 3x4, so the world-space post-transform left-multiplies.
@@ -6518,6 +6767,221 @@ void RemixGSRender::apply_viewmodel_basis(remixapi_Transform& transform) const
 	}
 }
 
+// --- round 36: apply_viewmodel_rotation ---------------------------------------------------------
+//
+// A proper rotation - axis and angle - instead of a sign mask. The full derivation, the 287-line
+// measurement behind it and the pre-registered readings are on viewmodel_rotate_axis() in
+// RemixTransforms.h; the short version is that the defect is a 180 degree rotation about the
+// camera's RIGHT axis THROUGH THE EYE, which displaces the mesh as well as turning it, and a mask
+// pivoted at the centroid can only ever fix the turning half.
+//
+// Runs AFTER apply_viewmodel_basis and is independent of it, so VMBASIS=0 isolates this operator.
+// At 180 degrees about a unit axis the Rodrigues form collapses to (-I + 2 a a^T), which is
+// bit-for-bit what 'sum_k s_k a_k a_k^T' with s = (+1,-1,-1) already builds for flip 6 - so with
+// VMROTAXIS=1 VMROTDEG=180 VMROTPIVOT=1 this reproduces VMBASIS=6 exactly and the ONLY difference
+// between the two configurations is the pivot. That is deliberate: it makes the A/B a one-variable
+// test against an operator that is already known to compose correctly.
+//
+// rotpivot_source, kept in a numbering that cannot be confused with apply_viewmodel_basis's:
+//   0 = the raw eye        1 = the geometry centroid       2 = the transform's translation
+//   3 = the anchor-frame eye                               4 = centroid asked for, unmeasurable,
+//                                                              fell back to the raw eye
+//   5 = model-space rotation, pivot is the object origin and the pivot knob is inert
+//   6 = the camera is invalid, nothing was applied
+//   7 = the knob is off (axis 0 or 0 degrees), nothing was applied
+void RemixGSRender::apply_viewmodel_rotation(remixapi_Transform& transform, f32 (&pivot_out)[3],
+	u32& pivot_source) const
+{
+	// Written before every early return, exactly as apply_viewmodel_basis does, so the census
+	// always has a defined pivot and "did not run" is a distinct code rather than a zero vector.
+	pivot_out[0] = 0.f;
+	pivot_out[1] = 0.f;
+	pivot_out[2] = 0.f;
+	pivot_source = 7;
+
+	const u32 axis_sel = remix_rsx::viewmodel_rotate_axis();
+	const u32 degrees = remix_rsx::viewmodel_rotate_degrees();
+
+	if (axis_sel == 0 || degrees == 0)
+	{
+		return;
+	}
+
+	const f64 radians = static_cast<f64>(degrees) * 3.14159265358979323846 / 180.0;
+	const f32 cs = static_cast<f32>(std::cos(radians));
+	const f32 sn = static_cast<f32>(std::sin(radians));
+
+	f32 rot[3][3]{};
+
+	if (axis_sel >= 4)
+	{
+		// MODEL SPACE. Right-multiplication, M' = M * R, which rotates the mesh about its own
+		// origin in its own frame and leaves the translation column untouched by construction.
+		// This is the lever for "the content is authored in a different up-axis convention".
+		const u32 k = axis_sel - 4u;
+
+		// Axis-aligned, so it is written out rather than run through Rodrigues - a rotation about
+		// a basis vector has an exact integer form and this way a sign error is visible on the page.
+		const u32 a = (k + 1u) % 3u;
+		const u32 b = (k + 2u) % 3u;
+
+		rot[k][k] = 1.f;
+		rot[a][a] = cs;
+		rot[a][b] = -sn;
+		rot[b][a] = sn;
+		rot[b][b] = cs;
+
+		const remixapi_Transform source = transform;
+
+		for (u32 r = 0; r < 3; ++r)
+		{
+			for (u32 col = 0; col < 3; ++col)
+			{
+				f32 sum = 0.f;
+
+				for (u32 j = 0; j < 3; ++j)
+				{
+					sum += source.matrix[r][j] * rot[j][col];
+				}
+
+				transform.matrix[r][col] = sum;
+			}
+		}
+
+		pivot_out[0] = transform.matrix[0][3];
+		pivot_out[1] = transform.matrix[1][3];
+		pivot_out[2] = transform.matrix[2][3];
+		pivot_source = 5;
+		return;
+	}
+
+	if (!m_active_camera.valid)
+	{
+		pivot_source = 6;
+		return;
+	}
+
+	// CAMERA SPACE. Column axis_sel-1 of the row-vector worldToView is that camera axis in world
+	// space - the same extraction apply_viewmodel_basis and the census's axis_dot both use.
+	f32 axis[3]{};
+
+	for (u32 r = 0; r < 3; ++r)
+	{
+		axis[r] = m_active_camera.view.m[r][axis_sel - 1u];
+	}
+
+	const f32 axis_len = std::sqrt(axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]);
+
+	if (!(axis_len > 1e-6f) || !std::isfinite(axis_len))
+	{
+		// A degenerate view basis is not something to rotate about. Reported as "camera invalid"
+		// rather than silently applying an identity, so a non-zero rotpivsrc=6 count names it.
+		pivot_source = 6;
+		return;
+	}
+
+	for (u32 r = 0; r < 3; ++r)
+	{
+		axis[r] /= axis_len;
+	}
+
+	// Rodrigues: R = I cos + sin [a]x + (1 - cos) a a^T.
+	const f32 one_minus = 1.f - cs;
+
+	rot[0][0] = cs + one_minus * axis[0] * axis[0];
+	rot[0][1] = one_minus * axis[0] * axis[1] - sn * axis[2];
+	rot[0][2] = one_minus * axis[0] * axis[2] + sn * axis[1];
+	rot[1][0] = one_minus * axis[1] * axis[0] + sn * axis[2];
+	rot[1][1] = cs + one_minus * axis[1] * axis[1];
+	rot[1][2] = one_minus * axis[1] * axis[2] - sn * axis[0];
+	rot[2][0] = one_minus * axis[2] * axis[0] - sn * axis[1];
+	rot[2][1] = one_minus * axis[2] * axis[1] + sn * axis[0];
+	rot[2][2] = cs + one_minus * axis[2] * axis[2];
+
+	// The pivot. Default 0 is the RAW eye - NOT anchor_frame_eye(), which is round 19..35's pivot 0
+	// and which round 34 measured throwing the mesh 2537..2564 units. Justification is a number,
+	// not a preference: cdist_pre (= |centroid - m_active_camera.position|) reads 0.43..1.04 on all
+	// 287 census lines of the current build, so the submitted transform and this position are in
+	// the same frame. Pivot 3 restores the old behaviour for an A/B.
+	f32 pivot[3] = { m_active_camera.position[0], m_active_camera.position[1], m_active_camera.position[2] };
+	pivot_source = 0;
+
+	switch (remix_rsx::viewmodel_rotate_pivot())
+	{
+	case 1:
+	{
+		// Deliberately reading the transform as it stands, which at this point is post-VMBASIS -
+		// this operator composes on top of that one, so its pivot has to be measured on what it is
+		// actually about to rotate.
+		f32 centre[3]{};
+
+		if (geometry_centre_in(transform, centre))
+		{
+			pivot[0] = centre[0];
+			pivot[1] = centre[1];
+			pivot[2] = centre[2];
+			pivot_source = 1;
+		}
+		else
+		{
+			pivot_source = 4;
+		}
+
+		break;
+	}
+	case 2:
+		pivot[0] = transform.matrix[0][3];
+		pivot[1] = transform.matrix[1][3];
+		pivot[2] = transform.matrix[2][3];
+		pivot_source = 2;
+		break;
+	case 3:
+		anchor_frame_eye(pivot);
+		pivot_source = 3;
+		break;
+	default:
+		break;
+	}
+
+	pivot_out[0] = pivot[0];
+	pivot_out[1] = pivot[1];
+	pivot_out[2] = pivot[2];
+
+	// p' = pivot + R * (p - pivot), so the affine part is pivot - R*pivot.
+	f32 offset[3]{};
+
+	for (u32 r = 0; r < 3; ++r)
+	{
+		f32 mapped = 0.f;
+
+		for (u32 c = 0; c < 3; ++c)
+		{
+			mapped += rot[r][c] * pivot[c];
+		}
+
+		offset[r] = pivot[r] - mapped;
+	}
+
+	// remixapi_Transform is column-vector 3x4, so a world-space post-transform left-multiplies -
+	// the same composition apply_viewmodel_basis uses, and the same reason.
+	const remixapi_Transform source = transform;
+
+	for (u32 r = 0; r < 3; ++r)
+	{
+		for (u32 col = 0; col < 4; ++col)
+		{
+			f32 sum = 0.f;
+
+			for (u32 k = 0; k < 3; ++k)
+			{
+				sum += rot[r][k] * source.matrix[k][col];
+			}
+
+			transform.matrix[r][col] = (col == 3) ? (sum + offset[r]) : sum;
+		}
+	}
+}
+
 // The measurement round 19 could not make, so round 20 does not have to guess again. Nothing in
 // nineteen rounds has ever printed the recovered world matrix of a VIEW_MODEL-tagged draw: the
 // 'Remix worldvp:' census covers six programs and none of them is the viewmodel, and round 18's
@@ -6531,7 +6995,8 @@ void RemixGSRender::apply_viewmodel_basis(remixapi_Transform& transform) const
 // literally right/up/forward in metres - the sign pattern that changes between pre and post is the
 // answer to "which two axes are wrong".
 void RemixGSRender::report_viewmodel_basis_census(const remixapi_Transform& pre,
-	const remixapi_Transform& post, u32 vertex_count)
+	const remixapi_Transform& mid, const remixapi_Transform& post, u32 vertex_count,
+	const f32 (&pivot)[3], u32 pivot_source, const f32 (&rot_pivot)[3], u32 rot_pivot_source)
 {
 	// --- round 20: the dedup key now carries the ALBEDO, and that is a fix, not a tidy-up --------
 	//
@@ -6604,11 +7069,233 @@ void RemixGSRender::report_viewmodel_basis_census(const remixapi_Transform& pre,
 			+ e(0, 2) * (e(1, 0) * e(2, 1) - e(1, 1) * e(2, 0));
 	};
 
+	// --- round 34: the two numbers that decide whether the operator is doing its job --------------
+	//
+	// An orientation correction must change the ORIENTATION and not the POSITION. Those are separable
+	// and neither of round 19/20's fields separated them: det_pre/det_post only say whether an axis was
+	// reversed, and eye_pre/eye_post are the object ORIGIN's offset from the eye, which on this title
+	// is the world origin and therefore says nothing about where the mesh is.
+	//
+	//   dbasis  = max |post3x3 - pre3x3|. Must be NON-ZERO or the operator did not run.
+	//   dcentre = |centroid(post) - centroid(pre)|. Must be ~0 or the operator MOVED the mesh.
+	//   dtrans  = |translation(post) - translation(pre)|, kept beside dcentre on purpose: at a
+	//             centroid pivot dtrans is large and dcentre is ~0, and reading dtrans alone would look
+	//             like a failure. They disagree exactly when the mesh is not modelled about its origin,
+	//             which is the case that made this whole round necessary.
+	//
+	// MEASURED at pivot 0 on the 2026-08-17 run, re-derived from that run's own logged pre=/post= rows:
+	// dcentre would have read ~2550 on all six lines. Pre-registered reading for pivot 1: dcentre < 1e-3
+	// with dbasis ~2, and cdist_post within a few hundredths of cdist_pre.
+	f32 centre_pre[3]{};
+	f32 centre_post[3]{};
+	const bool centre_measured = geometry_centre_in(pre, centre_pre)
+		&& geometry_centre_in(post, centre_post);
+
+	f64 dcentre = 0.0;
+	f64 dtrans = 0.0;
+	f64 dbasis = 0.0;
+	f64 drot = 0.0;
+
+	for (u32 i = 0; i < 3; ++i)
+	{
+		if (centre_measured)
+		{
+			dcentre += static_cast<f64>(centre_post[i] - centre_pre[i])
+				* static_cast<f64>(centre_post[i] - centre_pre[i]);
+		}
+
+		dtrans += static_cast<f64>(post.matrix[i][3] - pre.matrix[i][3])
+			* static_cast<f64>(post.matrix[i][3] - pre.matrix[i][3]);
+
+		for (u32 j = 0; j < 3; ++j)
+		{
+			// ROUND 36: measured pre -> MID, not pre -> post. 'mid' is the transform after
+			// apply_viewmodel_basis and before apply_viewmodel_rotation, so this field keeps the
+			// meaning round 34 gave it - "the flip did something" - now that a second operator runs
+			// behind it. drot below is the rotation's own delta. With VMBASIS=0 (which the round-36
+			// launcher arms) dbasis reads 0 and that is correct, not a failure.
+			dbasis = std::max(dbasis,
+				std::abs(static_cast<f64>(mid.matrix[i][j]) - static_cast<f64>(pre.matrix[i][j])));
+			drot = std::max(drot,
+				std::abs(static_cast<f64>(post.matrix[i][j]) - static_cast<f64>(mid.matrix[i][j])));
+		}
+	}
+
+	dcentre = std::sqrt(dcentre);
+	dtrans = std::sqrt(dtrans);
+
+	// --- round 35: the three direction cosines, so nobody hand-projects this line again -----------
+	//
+	// Round 34's census printed the two matrices and left the projection to the reader. The round-35
+	// brief did that projection on the ROWS and read a 120-degree yaw that is not there.
+	//
+	// remixapi_Transform is COLUMN-VECTOR - p_world = M * p_object, matrix[i][3] IS the translation
+	// (that is what the pivot-2 branch and dtrans= both read) - so the object's world-space X/Y/Z
+	// axes are the COLUMNS. Row i of a non-symmetric rotation is a coefficient vector, not an axis,
+	// and projecting it onto a camera axis measures nothing about the object. MEASURED on this
+	// census's own line vp=830d7d1b9681c475 albedo=0721D150DF278E7D flip=6 frame=3945: the ROWS give
+	// (-0.50091 +0.99984 -0.50101) - whose two -0.5 entries the brief read as a 120-degree yaw - while
+	// the COLUMNS of that same matrix give (+0.99945 +0.99946 +0.99891). The operator was right; the
+	// projection was not.
+	//
+	// dotpre/dotpost are cos(angle between object axis j and camera axis j), normalised on both
+	// sides so a scaled basis still reads 1 - magnitude is dbasis's job, not this field's. A correct
+	// orientation reads all three of dotpost at +1; the sign pattern names the wrong axes directly.
+	const auto axis_dot = [&](const remixapi_Transform& m, u32 j)
+	{
+		if (!m_active_camera.valid)
+		{
+			return 0.0;
+		}
+
+		f64 d = 0.0;
+		f64 obj_len = 0.0;
+		f64 cam_len = 0.0;
+
+		for (u32 r = 0; r < 3; ++r)
+		{
+			// Column j of the row-vector worldToView is camera axis j in world space - the same
+			// extraction apply_viewmodel_basis() uses to build its reflection.
+			const f64 o = static_cast<f64>(m.matrix[r][j]);
+			const f64 c = static_cast<f64>(m_active_camera.view.m[r][j]);
+
+			d += o * c;
+			obj_len += o * o;
+			cam_len += c * c;
+		}
+
+		obj_len = std::sqrt(obj_len);
+		cam_len = std::sqrt(cam_len);
+
+		return (obj_len > 0.0 && cam_len > 0.0) ? (d / (obj_len * cam_len)) : 0.0;
+	};
+
+	// The distance from the eye of the centroid, before and after. This is the field that says in one
+	// number whether the arms are still in front of the player: the untagged world path measures 0.40
+	// and 0.44 units for the two first-person albedos on 'Remix picked:' lines, so a cdist_pre of that
+	// order means the placement is right and one of ~2129 means the viewmodel divide relocated it.
+	// (Round 34's paragraph, moved down with the lambda it documents when round 35's axis_dot block
+	// was inserted above.)
+	const auto eye_distance = [&](const f32 (&centre)[3])
+	{
+		if (!centre_measured || !m_active_camera.valid)
+		{
+			return 0.0;
+		}
+
+		f64 sum = 0.0;
+
+		for (u32 i = 0; i < 3; ++i)
+		{
+			const f64 d = static_cast<f64>(centre[i]) - static_cast<f64>(m_active_camera.position[i]);
+			sum += d * d;
+		}
+
+		return std::sqrt(sum);
+	};
+
+	// --- round 36: the observable that is NOT a camera-axis dot product ---------------------------
+	//
+	// dotpre/dotpost above are the three DIAGONAL direction cosines, and round 36's brief is right
+	// that they cannot settle this: flip 6 drives all three to +1 and the arms still read wrong.
+	// Two things they structurally cannot say, and both are what "upside down" turns out to mean:
+	//
+	//   cpre / cpost  the geometry CENTROID resolved onto (right, up, forward) as an offset from
+	//                 the eye, in metres. This is the field that says WHERE the mesh is, and it is
+	//                 the one that named the bug: every near-eye tagged draw reads a NEGATIVE
+	//                 forward component, i.e. it is submitted behind the camera. A dot product of
+	//                 two directions can never see that, because it has no position in it at all.
+	//                 (eye_pre/eye_post already resolve the object ORIGIN onto the same axes, but
+	//                 on this title that origin is the world origin and says nothing about the mesh
+	//                 - which is exactly why round 34 added centre_pre/centre_post. This is those
+	//                 centroids, in the frame that makes them readable.)
+	//
+	//   relpre/relpost  the ANGLE, in degrees, of the full relative rotation between the object's
+	//                 orthonormalised basis and the camera's. The three diagonal cosines are three
+	//                 of nine numbers and a rotation about the right axis by 118 degrees reads
+	//                 (+0.99, -0.47, -0.46) on the diagonal - which looks like "two axes about half
+	//                 wrong" and is actually one clean rotation. One angle cannot be misread that
+	//                 way. A correct viewmodel reads a SMALL relpost; it does not read three +1s.
+	//
+	// Both are computed from the orthonormalised columns, so a scaled instance still reads its true
+	// angle - magnitude is dbasis/drot's job.
+	const auto camera_local_centre = [&](const f32 (&centre)[3], u32 k)
+	{
+		if (!centre_measured || !m_active_camera.valid)
+		{
+			return 0.0;
+		}
+
+		f64 sum = 0.0;
+
+		for (u32 c = 0; c < 3; ++c)
+		{
+			sum += static_cast<f64>(m_active_camera.view.m[c][k])
+				* (static_cast<f64>(centre[c]) - static_cast<f64>(m_active_camera.position[c]));
+		}
+
+		return sum;
+	};
+
+	const auto relative_angle = [&](const remixapi_Transform& m)
+	{
+		if (!m_active_camera.valid)
+		{
+			return 0.0;
+		}
+
+		// D[i][j] = cos(camera axis i, object axis j). trace(D) = 1 + 2 cos(theta) for any
+		// rotation, and D is a rotation whenever both bases are orthonormal - which the camera's
+		// is by construction and the object's is made to be here.
+		f64 trace = 0.0;
+
+		for (u32 j = 0; j < 3; ++j)
+		{
+			f64 len = 0.0;
+
+			for (u32 r = 0; r < 3; ++r)
+			{
+				len += static_cast<f64>(m.matrix[r][j]) * static_cast<f64>(m.matrix[r][j]);
+			}
+
+			len = std::sqrt(len);
+
+			if (!(len > 0.0))
+			{
+				return 0.0;
+			}
+
+			for (u32 r = 0; r < 3; ++r)
+			{
+				trace += static_cast<f64>(m_active_camera.view.m[r][j])
+					* static_cast<f64>(m.matrix[r][j]) / len;
+			}
+		}
+
+		const f64 cos_theta = std::clamp((trace - 1.0) * 0.5, -1.0, 1.0);
+
+		return std::acos(cos_theta) * 180.0 / 3.14159265358979323846;
+	};
+
 	dump_line(fmt::format(
 		"Remix vmbasis: vp=%016llx albedo=%016llX flip=%u vtx=%u byhash=%d byalbedo=%d bypair=%d "
 		"scale_z=%.6g offset_z=%.6g | right=[%.6g %.6g %.6g] up=[%.6g %.6g %.6g] fwd=[%.6g %.6g %.6g] "
 		"cam=[%.6g %.6g %.6g] | pre=[%s | %s | %s] post=[%s | %s | %s] | "
-		"det_pre=%.6g det_post=%.6g eye_pre=[%.6g %.6g %.6g] eye_post=[%.6g %.6g %.6g] "
+		"det_pre=%.6g det_post=%.6g eye_pre=[%.6g %.6g %.6g] eye_post=[%.6g %.6g %.6g] | "
+		// Round 34. Appended as one contiguous block immediately before frame=/line=, which is the
+		// only insertion point that cannot shift an existing specifier/argument pair.
+		"tagonly=%u pivotsrc=%u pivot=[%.6g %.6g %.6g] cmeasured=%d "
+		"centre_pre=[%.6g %.6g %.6g] centre_post=[%.6g %.6g %.6g] "
+		"cdist_pre=%.6g cdist_post=%.6g dcentre=%.6g dtrans=%.6g dbasis=%.6g "
+		// Round 35. Appended as one contiguous block immediately before frame=/line=, for the same
+		// reason round 34's block was: it is the only insertion point that cannot shift an existing
+		// specifier/argument pair.
+		"dotpre=[%.6g %.6g %.6g] dotpost=[%.6g %.6g %.6g] "
+		// Round 36. Appended as one contiguous block immediately before frame=/line=, for the same
+		// reason rounds 34 and 35 chose that point: it is the only insertion that cannot shift an
+		// existing specifier/argument pair.
+		"rotaxis=%u rotdeg=%u rotpivsrc=%u rotpivot=[%.6g %.6g %.6g] drot=%.6g "
+		"cpre=[%.6g %.6g %.6g] cpost=[%.6g %.6g %.6g] relpre=%.6g relpost=%.6g "
 		"frame=%llu line=%u/%u",
 		m_current_vp_hash,
 		m_scratch_vm_albedo,
@@ -6632,6 +7319,37 @@ void RemixGSRender::report_viewmodel_basis_census(const remixapi_Transform& pre,
 		det3(pre), det3(post),
 		eye_local(pre, 0), eye_local(pre, 1), eye_local(pre, 2),
 		eye_local(post, 0), eye_local(post, 1), eye_local(post, 2),
+		// Round 34's block, in the order of the specifiers above:
+		//   tagonly, pivotsrc, pivot x3, cmeasured, centre_pre x3, centre_post x3,
+		//   cdist_pre, cdist_post, dcentre, dtrans, dbasis = 17 specifiers, 17 arguments.
+		// (Whole line: 55 specifiers against 55 top-level arguments, counted after this edit.)
+		remix_rsx::viewmodel_tag_only() ? 1u : 0u,
+		pivot_source,
+		static_cast<f64>(pivot[0]), static_cast<f64>(pivot[1]), static_cast<f64>(pivot[2]),
+		centre_measured ? 1 : 0,
+		static_cast<f64>(centre_pre[0]), static_cast<f64>(centre_pre[1]), static_cast<f64>(centre_pre[2]),
+		static_cast<f64>(centre_post[0]), static_cast<f64>(centre_post[1]), static_cast<f64>(centre_post[2]),
+		eye_distance(centre_pre), eye_distance(centre_post),
+		dcentre, dtrans, dbasis,
+		// Round 35's block, in the order of the specifiers above:
+		//   dotpre x3, dotpost x3 = 6 specifiers, 6 arguments.
+		// (Whole line: 61 specifiers against 61 top-level arguments, counted after this edit.)
+		axis_dot(pre, 0), axis_dot(pre, 1), axis_dot(pre, 2),
+		axis_dot(post, 0), axis_dot(post, 1), axis_dot(post, 2),
+		// Round 36's block, in the order of the specifiers above:
+		//   rotaxis, rotdeg, rotpivsrc, rotpivot x3, drot, cpre x3, cpost x3, relpre, relpost
+		//   = 15 specifiers, 15 arguments.
+		// (Whole line: 76 specifiers against 76 top-level arguments, counted after this edit.)
+		remix_rsx::viewmodel_rotate_axis(),
+		remix_rsx::viewmodel_rotate_degrees(),
+		rot_pivot_source,
+		static_cast<f64>(rot_pivot[0]), static_cast<f64>(rot_pivot[1]), static_cast<f64>(rot_pivot[2]),
+		drot,
+		camera_local_centre(centre_pre, 0), camera_local_centre(centre_pre, 1),
+		camera_local_centre(centre_pre, 2),
+		camera_local_centre(centre_post, 0), camera_local_centre(centre_post, 1),
+		camera_local_centre(centre_post, 2),
+		relative_angle(pre), relative_angle(post),
 		m_frame_counter,
 		m_viewmodel_basis_census_lines,
 		remix_rsx::viewmodel_basis_census_max()));
@@ -11621,6 +12339,40 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 	// clamped both axes when either one clamped and reduced mirror modes to ordinary repeat.
 	const bool force_clamp_uv = false;
 	const bool flip_v = remix_rsx::texcoord_flip_v();
+	const bool r2_menu_rotate_glyphs =
+		Emu.GetTitleID() == "NPEA00431" &&
+		m_current_vp_hash == 0x2f7d2b0aefd94351ull &&
+		m_current_fp_hash == 0x1ec925f04d709fd7ull &&
+		entry && entry->content_hash == 0x07459087FA45AECBull;
+	const bool r2_menu_reflect_geometry = r2_menu_rotate_glyphs
+		&& entry->width == 512 && entry->height == 512;
+	const auto is_axis_aligned_half = [](const f32 (&a)[3], const f32 (&b)[3], f32 floor_eps)
+	{
+		const f32 a_lo = std::min({ a[0], a[1], a[2] });
+		const f32 a_hi = std::max({ a[0], a[1], a[2] });
+		const f32 b_lo = std::min({ b[0], b[1], b[2] });
+		const f32 b_hi = std::max({ b[0], b[1], b[2] });
+		const f32 a_eps = std::max(floor_eps, (a_hi - a_lo) * 1e-3f);
+		const f32 b_eps = std::max(floor_eps, (b_hi - b_lo) * 1e-3f);
+
+		if (!std::isfinite(a_lo) || !std::isfinite(a_hi) || !std::isfinite(b_lo) || !std::isfinite(b_hi)
+			|| (a_hi - a_lo) <= a_eps || (b_hi - b_lo) <= b_eps)
+		{
+			return false;
+		}
+
+		for (u32 c = 0; c < 3; ++c)
+		{
+			if (!std::isfinite(a[c]) || !std::isfinite(b[c])
+				|| (std::abs(a[c] - a_lo) > a_eps && std::abs(a[c] - a_hi) > a_eps)
+				|| (std::abs(b[c] - b_lo) > b_eps && std::abs(b[c] - b_hi) > b_eps))
+			{
+				return false;
+			}
+		}
+
+		return true;
+	};
 	// Haze's full-screen framebuffer copies carry valid RGB but leave alpha at zero. The native
 	// presentation treats those copies as opaque; multiplying their undefined alpha in the CPU
 	// compositor made the complete menu disappear despite the captured 1280x720 RGB being valid.
@@ -11641,11 +12393,20 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 		return;
 	}
 
-	m_compositor.set_clip(
-		(static_cast<f32>(scissor_x) / clip_w) * fw,
-		(static_cast<f32>(scissor_y) / clip_h) * fh,
-		(static_cast<f32>(scissor_right) / clip_w) * fw,
-		(static_cast<f32>(scissor_bottom) / clip_h) * fh);
+	const f32 clip_left = (static_cast<f32>(scissor_x) / clip_w) * fw;
+	const f32 clip_top = (static_cast<f32>(scissor_y) / clip_h) * fh;
+	const f32 clip_right = (static_cast<f32>(scissor_right) / clip_w) * fw;
+	const f32 clip_bottom = (static_cast<f32>(scissor_bottom) / clip_h) * fh;
+	if (r2_menu_reflect_geometry)
+	{
+		for (u32 i = 0; i < vertex_count; ++i)
+		{
+			m_scratch_ui_y[i] = fh - m_scratch_ui_y[i];
+		}
+	}
+
+	m_compositor.set_clip(clip_left, r2_menu_reflect_geometry ? fh - clip_bottom : clip_top,
+		clip_right, r2_menu_reflect_geometry ? fh - clip_top : clip_bottom);
 
 	// Round 7: accumulators for the 'Remix uiwrap:' census, filled inside the triangle loop below
 	// and consumed once after it. Sentinels chosen so the emit site can tell "no textured triangle
@@ -11747,6 +12508,35 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 
 				u[c] = uv[0] * uv_scale[0];
 				v[c] = remix_rsx::apply_v_flip(uv[1] * uv_scale[1], flip_v);
+			}
+
+			if (r2_menu_rotate_glyphs && !r2_menu_reflect_geometry
+				&& entry->width == 512 && entry->height == 512
+				&& std::min({ v[0], v[1], v[2] }) >= 0.f && std::max({ v[0], v[1], v[2] }) <= 0.5f
+				&& is_axis_aligned_half(x, y, 1e-3f) && is_axis_aligned_half(u, v, 1e-6f))
+			{
+				const f32 pre_u[3] = { u[0], u[1], u[2] };
+				const f32 pre_v[3] = { v[0], v[1], v[2] };
+				const f32 v_lo = std::min({ v[0], v[1], v[2] });
+				const f32 v_hi = std::max({ v[0], v[1], v[2] });
+				const f32 v_sum = v_lo + v_hi;
+				static bool r2_menu_glyph_logged = false;
+
+				for (u32 c = 0; c < 3; ++c)
+				{
+					v[c] = v_sum - v[c];
+				}
+
+				if (!r2_menu_glyph_logged)
+				{
+					r2_menu_glyph_logged = true;
+					rsx_log.notice("Remix r2-menu-glyph: vp=%016llx fp=%016llx albedo=%016llX t=%zu "
+						"pre_uv=[(%.6g,%.6g) (%.6g,%.6g) (%.6g,%.6g)] "
+						"post_uv=[(%.6g,%.6g) (%.6g,%.6g) (%.6g,%.6g)]",
+						m_current_vp_hash, m_current_fp_hash, entry->content_hash, t,
+						pre_u[0], pre_v[0], pre_u[1], pre_v[1], pre_u[2], pre_v[2],
+						u[0], v[0], u[1], v[1], u[2], v[2]);
+				}
 			}
 		}
 
@@ -15816,7 +16606,39 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 			else
 			{
 				++m_stats.gauge_anchor_absent;
-				defer_candidate = true;
+
+				// --- ROUND 32: narrow the deferral population to the branch that can actually pay --
+				// DEFERPREANCHOR was root-caused, shipped, and CONFIRMED by the user to stop the props
+				// sliding - then switched back off on 2026-08-16 because it cost ~14 fps, on its own
+				// pre-registered tripwire: MEASURED defer_buffered=543244 defer_fresh=149761
+				// defer_flip=393483, i.e. 72% of the buffering did no work at all. The launcher records
+				// that as "a genuine trade, not a defect".
+				//
+				// But the two branches that set defer_candidate are not equally likely to pay off, and
+                // nothing separated them. This branch is gauge_anchor_ABSENT: no anchor exists for this
+				// render source in THIS frame or the PREVIOUS one. The branch above is anchor_prev,
+				// where last frame's anchor exists - so that source demonstrably produces an anchor and
+				// this frame's is plausibly still to come. Holding an absent-source draw is a bet that
+				// an anchor will appear for a source that has not produced one in two frames.
+				//
+				// MEASURED size of the bet, from the round-31 run's own 'Remix live:' line:
+				// gauge_used=680753 gauge_prev=225700 gauge_absent=125966 - so absent is 125966 of the
+				// 351666 deferral population, 35.8%. Reproduced in the earlier session at
+				// prev=328430 absent=182985 = 35.8%. Excluding it removes a bit over a third of the
+				// buffering before any judgement about whether the rest pays.
+				//
+				// Default 1 (narrowing ON). This changes NOTHING at the shipped config because
+				// DEFERPREANCHOR=0 makes the whole path dead - it is staged so that when the user
+				// re-tests DEFERPREANCHOR=1 the cheap third is already gone. Set DEFERPREVONLY=0 to
+				// reproduce round 31's deferral population exactly.
+				if (remix_rsx::defer_prev_only_enabled())
+				{
+					++m_stats.defer_absent_declined;
+				}
+				else
+				{
+					defer_candidate = true;
+				}
 			}
 		}
 
@@ -15947,13 +16769,43 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 			viewmodel_draw = false;
 		}
 
+		// --- round 34: the tag and the placement are two decisions, not one ---------------------
+		//
+		// viewmodel_draw drives FOUR things below and only one of them is the tag. See
+		// remix_rsx::viewmodel_tag_only() for the measured derivation; the short version is that the
+		// viewmodel reference is latched from a viewmodel draw's own fused matrix, so dividing by it
+		// is a self-referential collapse to the identity and lands the arms at the world origin
+		// 2129 units from the eye, while the ordinary world path measurably places the same program
+		// 0.40 units from the eye with a unit basis.
+		//
+		// viewmodel_draw itself is deliberately NOT cleared: the submit site recomputes the verdict
+		// from the same inputs (see its 'Recomputed rather than assumed' note) and must still tag,
+		// still apply the basis operator and still emit the census. Only the three placement
+		// consumers read viewmodel_place.
+		const bool viewmodel_place = viewmodel_draw && !remix_rsx::viewmodel_tag_only();
+
+		// --- round 34: THIS ONE STAYS ON viewmodel_draw, AND IT IS NOT AN OVERSIGHT ----------------
+		//
+		// Caught in review of the round-34 diff. Every other consumer below moved to viewmodel_place,
+		// but the deferral exclusion has a second reason that survives VMTAGONLY: the flush path
+		// RECOMPUTES the instance transform - 'entry.info.transform = to_remix_transform(world);' in
+		// flush_deferred_for_anchor - and it does NOT re-run apply_viewmodel_basis, which lives at the
+		// submit site. So a deferred viewmodel draw would silently lose its basis correction, and the
+		// same draw would be placed differently depending on whether it was buffered. Not reachable at
+		// the shipped DEFERPREANCHOR=0, and this keeps it unreachable if that is ever re-armed.
+		//
+		// If the basis operator is ever wanted on deferred draws, the fix is to re-apply it inside the
+		// flush, not to relax this line.
 		if (viewmodel_draw)
 		{
 			// A viewmodel draw is placed relative to the weapon camera, so no world anchor for its
 			// render source will ever make it more correct. Take it back out of the deferral
 			// population rather than hold it for an event that cannot help it.
 			defer_candidate = false;
+		}
 
+		if (viewmodel_place)
+		{
 			const u32 vm_mode = remix_rsx::viewmodel_camera_mode();
 
 			++m_stats.viewmodel_cam_considered;
@@ -16069,7 +16921,12 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 		// armed the ladder and could be re-placed by a world anchor - the exact relocation the
 		// comment says cannot happen. The neighbouring 'defer_candidate = false;' handles the same
 		// case for the deferral; this is its missing twin.
-		if (remix_rsx::tail_rescue_enabled() && remix_rsx::gauge_anchor_enabled() && !viewmodel_draw
+		// Round 34: viewmodel_place, not viewmodel_draw. The exclusion above is argued from PLACEMENT
+		// ("it is placed relative to the weapon camera and no world anchor can make it more correct"),
+		// which is exactly the premise RPCS3_REMIX_VMTAGONLY=1 removes - with the tag decoupled the
+		// draw IS a world draw and is entitled to the ladder that places it. This is the same gate
+		// round 28 found deleting the arms through the VMPAIRVP route, and PROJSPLIT lives behind it.
+		if (remix_rsx::tail_rescue_enabled() && remix_rsx::gauge_anchor_enabled() && !viewmodel_place
 			&& (m_ref_pick_source == ref_source::camera || m_ref_pick_source == ref_source::anchor_prev))
 		{
 			rescue_valid = true;
@@ -16739,6 +17596,26 @@ void RemixGSRender::submit_subdraw()
 		++m_stats.ui_forced;
 	}
 
+	// --- round 36: the same override keyed on a (vp, fp) PAIR, for the helmet ------------------
+	//
+	// The helmet's vertex program draws most of the scene (47,399 census lines, 31 fragment
+	// programs, 230 distinct vertex counts on its largest fp), so the vp-only list above cannot
+	// aim at it; the pair narrows it to 1,833 lines, 96.4% of them the helmet itself. Full
+	// derivation and the stated risk on ui_force_pair_matches() in RemixTransforms.h.
+	//
+	// m_current_fp_hash is fresh here: it is written once per draw clause at :3766, before
+	// draw_call.begin() and before any sub-draw, so it names THIS clause's fragment program and
+	// not the previous one's. Counted separately from ui_forced on purpose - a shared counter
+	// could not answer "did the pair match" independently of "did the list match", which is
+	// exactly the question round 35's cat_hidepair had to be split out to answer.
+	if (!screen_space && !remix_rsx::keep_ui_enabled()
+		&& remix_rsx::ui_force_pair_matches(m_current_vp_hash, m_current_fp_hash)
+		&& !rsx::method_registers.depth_write_enabled())
+	{
+		screen_space = true;
+		++m_stats.ui_forced_pair;
+	}
+
 	// The title's 2D draws are no longer thrown away: they are rasterized into the overlay
 	// buffer, which needs their positions, so the pre-decode early-out only applies when the
 	// compositor is unavailable.
@@ -16764,6 +17641,13 @@ void RemixGSRender::submit_subdraw()
 		++m_stats.skip_layout;
 		return;
 	}
+
+	// ROUND 32: 'decode' opens here and is stopped just before audit_vertex_extent below. It covers
+	// the index widen/rebase, strip_to_list, the non-native primitive expansion, the per-vertex
+	// position decode with its w_divide, and the index bounds check - five untimed O(vertex_count)
+	// loops that run on every sub-draw before any gate can refuse it. RAII closes it on the
+	// skip_layout returns inside the span so a refusing draw is not counted as free.
+	scope_us decode_timer{ m_timing.decode };
 
 	// --- build a u32 triangle list ------------------------------------------------------
 	m_scratch_indices.clear();
@@ -17082,8 +17966,26 @@ void RemixGSRender::submit_subdraw()
 		}
 	}
 
+	decode_timer.stop();
+
 	// Every draw, skinned or not: do these vertices form one object?
-	audit_vertex_extent(first_vertex, vertex_count, positions, w_divide);
+	// ROUND 32: timed as 'audit', and skippable. audit_vertex_extent makes FOUR separate passes over
+	// the decoded positions and audit_world_extent (further down, same accumulator) walks the whole
+	// index list transforming each vertex into world space. Neither places, refuses or textures
+	// anything by default - they are diagnostics that feed census lines - so unlike every other
+	// child of 'draw' this one is removable rather than merely measurable.
+	//
+	// RPCS3_REMIX_DRAWAUDIT defaults to 1, i.e. current behaviour bit-for-bit. Ship the measurement
+	// first: set it to 0 only after 'audit' on the timing line says the saving is worth losing the
+	// census, and note that VTXREFUSE and the sky/extent rules read the audit's results, so 0 is not
+	// free - it is a trade whose size the timer is there to state.
+	const bool run_audits = remix_rsx::draw_audit_enabled();
+
+	if (run_audits)
+	{
+		scope_us audit_timer{ m_timing.audit };
+		audit_vertex_extent(first_vertex, vertex_count, positions, w_divide);
+	}
 
 	// RPCS3_REMIX_VTXREFUSE=1 drops a draw the audit called incoherent instead of submitting it.
 	// Deliberately off by default and deliberately not landed as a fix: whether these draws reach
@@ -18399,7 +19301,9 @@ void RemixGSRender::submit_subdraw()
 	// vertex-coloured rather than textured, albedo_texture_unit() returns -1 and it reached Remix
 	// with a null material - i.e. as an opaque *white* shell, drawn with a translation-free
 	// camera-locked matrix, which is exactly the "white untextured dome surrounding me" report.
-	// Tagged SKY it renders as the sky instead of as world geometry enclosing the player.
+	// The external path independently force-hides API SKY instances when rtx.skyMode=0. In the
+	// local Numos runtime, mode 0 is SkyboxRasterization and supplies no procedural replacement.
+	// Tagged SKY therefore renders as the sky instead of as world geometry enclosing the player.
 	//
 	// The '!material' half of that test was Haze-specific and wrong as a general rule. A sky dome
 	// is allowed to be textured, and Resistance 2's (NPEA00431) is: it carries cloud and water
@@ -18453,12 +19357,56 @@ void RemixGSRender::submit_subdraw()
 		}
 	}
 
+	// Resistance 2's material-less ca-family streak is an exact post-transform gate. Its decoded
+	// positions span the signed-16-bit range after particle replay and otherwise reach submission.
+	const bool r2_ca_streak_program_surface =
+		(m_current_vp_hash == 0xca526d308f1650bbull
+			&& m_current_fp_hash == 0x0959708055e4675cull
+			&& rsx::method_registers.surface_offset(0) == 0x00880000
+			&& rsx::method_registers.surface_clip_width() == 1280
+			&& rsx::method_registers.surface_clip_height() == 704)
+		|| (m_current_vp_hash == 0x3152b710c603e12dull
+			&& m_current_fp_hash == 0x9d9c032c40818182ull
+			&& (rsx::method_registers.surface_offset(0) == 0x02124d80
+				|| rsx::method_registers.surface_offset(0) == 0x01f24d80
+				|| rsx::method_registers.surface_offset(0) == 0x02324d80)
+			&& rsx::method_registers.surface_clip_width() == 1024
+			&& rsx::method_registers.surface_clip_height() == 1024);
+	const bool r2_ca_vp_match = m_current_vp_hash == 0xca526d308f1650bbull
+		|| m_current_vp_hash == 0x3152b710c603e12dull;
+	const bool r2_ca_fp_match = m_current_fp_hash == 0x0959708055e4675cull
+		|| m_current_fp_hash == 0x9d9c032c40818182ull;
+	const bool r2_ca_hash_pair =
+		(m_current_vp_hash == 0xca526d308f1650bbull && m_current_fp_hash == 0x0959708055e4675cull)
+		|| (m_current_vp_hash == 0x3152b710c603e12dull && m_current_fp_hash == 0x9d9c032c40818182ull);
+	const bool r2_ca_surface_match = rsx::method_registers.surface_offset(0) == 0x00880000
+		|| rsx::method_registers.surface_offset(0) == 0x02124d80
+		|| rsx::method_registers.surface_offset(0) == 0x01f24d80
+		|| rsx::method_registers.surface_offset(0) == 0x02324d80;
+	const bool r2_ca_clip_match =
+		(rsx::method_registers.surface_clip_width() == 1280 && rsx::method_registers.surface_clip_height() == 704)
+		|| (rsx::method_registers.surface_clip_width() == 1024 && rsx::method_registers.surface_clip_height() == 1024);
+	const bool r2_ca_candidate =
+		Emu.GetTitleID() == "NPEA00431"
+		&& r2_ca_streak_program_surface
+		&& albedo_hash == 0
+		&& rsx::method_registers.depth_write_enabled()
+		&& !rsx::method_registers.blend_enabled()
+		&& draw_call.primitive == rsx::primitive_type::triangles;
+
 	// Resolve placement before creating the immutable Remix mesh. The old order paid CreateMesh
 	// (and retained the handle) first, then rejected draws whose projective camera residue could
 	// not be reduced to an affine world transform. Haze emits that population heavily while the
 	// camera turns, so invisible/refused draws were minting dozens of BLASes per frame.
 	remixapi_Transform transform = s_identity_transform;
+	// ROUND 32: 'xform' is per_draw_transform alone - ~1250 lines, fourteen exits, the matcher replay,
+	// the gauge divide and a single-precision cofactor mat4_invert. It is the only child of 'draw'
+	// whose cost is INVARIANT to vertex count, which makes it the discriminator: if xform tracks
+	// draw count while decode/hash/audit track vertex count, the two are separable in one run.
+	// A plain pair rather than a scope object because this is one call with no returns between.
+	const u64 t_xform = now_us();
 	const bool world_resolved = per_draw_transform(transform);
+	m_timing.xform += now_us() - t_xform;
 
 	// Round 27: the particle replay wrote WORLD-space positions, because in both families the matrix
 	// that follows the expansion is the fused view*projection in c0..c3 - there is no object->world
@@ -18982,6 +19930,15 @@ void RemixGSRender::submit_subdraw()
 		vertex_hash = rpcs3::hash64(vertex_hash, words[i]);
 	}
 
+	// ROUND 32: 'hash' opens here and is stopped just before the m_meshes.find(hash) lookup below.
+	// It covers the static-index key build, the per-triangle union accumulation (a set lookup plus a
+	// try_emplace per vertex), the union re-hash (three floats and a colour per vertex plus one hash
+	// per index) and the skin-palette hashing. The source already nominated the union re-hash as the
+	// leading suspect for the unattributed cost; this is the timer that either confirms it or clears
+	// it. RAII closes it on the two static-index dropped exits and the poisoned exit, which is the
+	// whole reason it is a scope object - those are refusal paths that do the hashing work first.
+	scope_us hash_timer{ m_timing.hash };
+
 	const bool static_index_source = world_resolved && !skinned
 		&& remix_rsx::static_index_vp_matches(m_current_vp_hash);
 	// Union only the opaque pass that establishes the surface. Haze redraws the same quarry
@@ -19370,6 +20327,8 @@ void RemixGSRender::submit_subdraw()
 		return;
 	}
 
+	hash_timer.stop();
+
 	auto it = m_meshes.find(hash);
 
 	if (it != m_meshes.end())
@@ -19737,6 +20696,14 @@ void RemixGSRender::submit_subdraw()
 		f32 anchor = 0.f;
 		f32 units_per_vertex = 0.f;
 
+		// ROUND 36. |AABB centre - eye|, the quantity `anchor` was always meant to be. `anchor` is
+		// |translation - eye|, which for an absolute-world draw (identity-ish transform, world-space
+		// vertices) is |eye| and nothing else - that is why the newly-reachable levels read
+		// anchor=2137.85 against limit=4 with the camera 2137 units from the origin, and why their
+		// domes are never tagged SKY and render black. Computed unconditionally, at every mode, so
+		// the census can print it BESIDE anchor= on the same rows the old test judged.
+		f32 centre_anchor = 0.f;
+
 		// Whether the camera is inside the draw's transformed bounding box. Computed here rather
 		// than inside the backdrop rule that consumes it, so that an ordinary census run - no env
 		// var set - already reports it per program and the rule can be judged before it is armed.
@@ -19775,7 +20742,14 @@ void RemixGSRender::submit_subdraw()
 				{
 					inside = false;
 				}
+
+				// ROUND 36. Accumulated inside the same loop that already has `centre`, so the new
+				// quantity costs three multiplies and cannot drift from the box the extent test and
+				// the `inside` test are using.
+				centre_anchor += (centre - eye[i]) * (centre - eye[i]);
 			}
+
+			centre_anchor = std::sqrt(centre_anchor);
 
 			const f32 dx = transform.matrix[0][3] - eye[0];
 			const f32 dy = transform.matrix[1][3] - eye[1];
@@ -19791,6 +20765,45 @@ void RemixGSRender::submit_subdraw()
 		}
 
 		const f32 anchor_limit = remix_rsx::sky_max_anchor();
+
+		// --- round 36: WHICH QUANTITY the anchor test compares ---------------------------------
+		//
+		// Mode 0 reproduces the round-13..35 expression exactly, so SKYANCHORMODE=0 is the
+		// bit-for-bit revert and the shipped default. The alternatives exist because the legacy
+		// quantity is |transform.translation - eye|, and an absolute-world dome's translation IS
+		// the world origin - so on those levels the test evaluates |eye|, a property of where the
+		// player is standing rather than of the draw. MEASURED on the newly-reachable levels:
+		// anchor=2137.85 against limit=4 with the camera 2137 units out. Full derivation, the
+		// pre-registered refutation and the revert line: sky_anchor_mode() in RemixTransforms.h.
+		//
+		// Resolved into one bool ahead of the chain rather than as four extra else-if arms, so
+		// there stays exactly ONE reject_anchor site, ONE counter increment and ONE census row per
+		// outcome - a mode that skipped an increment would be invisible.
+		const auto within_limit = [anchor_limit](f32 value)
+		{
+			return !(anchor_limit > 0.f && (!std::isfinite(value) || value > anchor_limit));
+		};
+
+		bool anchor_ok = true;
+
+		switch (remix_rsx::sky_anchor_mode())
+		{
+		case 1:
+			anchor_ok = within_limit(centre_anchor);
+			break;
+		case 2:
+			// Scale-free and translation-free: does this thing SURROUND the camera. A dome does,
+			// whether it is authored on the eye or at the world origin; ground does not, because
+			// the eye stands above it. sky_max_anchor() is deliberately not consulted here.
+			anchor_ok = inside;
+			break;
+		case 3:
+			anchor_ok = inside || within_limit(anchor);
+			break;
+		default:
+			anchor_ok = within_limit(anchor);
+			break;
+		}
 
 		sky_outcome outcome = sky_outcome::tagged;
 
@@ -19809,7 +20822,7 @@ void RemixGSRender::submit_subdraw()
 			outcome = sky_outcome::reject_extent;
 			++m_stats.sky_refused_extent;
 		}
-		else if (anchor_limit > 0.f && (!std::isfinite(anchor) || anchor > anchor_limit))
+		else if (!anchor_ok)
 		{
 			outcome = sky_outcome::reject_anchor;
 			++m_stats.sky_refused_anchor;
@@ -19964,9 +20977,6 @@ void RemixGSRender::submit_subdraw()
 						report_sky_hash_census(albedo_hash, hash_entry, true, extent, units_per_vertex, vertex_count);
 					}
 
-					// Mode 1 stops here: matched is the preview of what mode 2 would tag, with the
-					// image untouched, which is the measurement the geometric rules never had
-					// before they were widened.
 					if (remix_rsx::sky_hash_mode() >= 2)
 					{
 						is_sky = true;
@@ -19980,7 +20990,7 @@ void RemixGSRender::submit_subdraw()
 		if (sky_census)
 		{
 			report_sky_census(outcome, vertex_count, !sky_depth_ok, sky_lo, sky_hi, transform,
-				extent, anchor, measured, inside, units_per_vertex, albedo_hash);
+				extent, anchor, centre_anchor, measured, inside, units_per_vertex, albedo_hash);
 		}
 	}
 
@@ -20258,9 +21268,99 @@ void RemixGSRender::submit_subdraw()
 	m_skip_census_dist = skip_census_dist;
 	m_skip_census_albedo = albedo_hash;
 
-	if (!audit_world_extent(transform, skinned, vertex_count, is_sky))
+	// ROUND 32: same 'audit' accumulator as audit_vertex_extent - one field for the whole diagnostic
+	// family, so the timing line answers "what do the audits cost" in one number rather than two
+	// that have to be added.
+	//
+	// Skipping this one also drops the wext refusal, which is a real gate rather than a census. That
+	// is defensible on THIS title and only because it is measured: the round-31 run's 'Remix live:'
+	// line reads wext_refused=0 for the whole session, so the gate never fired and skipping it
+	// cannot change what is submitted. On a title where wext_refused is non-zero, DRAWAUDIT=0 WOULD
+	// change the picture - check that counter before using the knob anywhere else.
+	// R2's visible backdrop is a documented depth-writing pass, not a SKY instance: this external
+	// draw path force-hides API SKY independently of rtx.skyMode. Mode 0 expects the authored
+	// rasterized sky, while mode 1 supplies procedural Numos. Exempt only the exact
+	// title/program/material tuple from this world-extent refusal so it remains a visible world
+	// backdrop; all other R2 geometry continues through the median gate.
+	const bool r2_visible_backdrop =
+		Emu.GetTitleID() == "NPEA00431"
+		&& m_current_vp_hash == 0xc87769e09c995db9ull
+		&& m_current_fp_hash == 0x7dd5992e46047fcbull
+		&& albedo_hash == 0x3C3244A70BAB2E48ull
+		&& rsx::method_registers.depth_write_enabled();
+
+	// Keep the final extent state draw-local even when the normal audit knob is disabled; otherwise
+	// r2-final-extent and later watches can reuse the preceding draw's measurement.
+	m_streak_extent = 0.f;
+	m_streak_raw_extent = 0.f;
+	m_streak_flagged = false;
+	m_streak_measured = false;
+	const auto r2_candidate_probe = [&](const char* stage)
 	{
-		return;
+		static u32 r2_candidate_probe_lines = 0;
+		if (!r2_ca_hash_pair || r2_candidate_probe_lines >= 32)
+		{
+			return;
+		}
+
+		++r2_candidate_probe_lines;
+		rsx_log.notice("Remix r2-candidate-probe: stage=%s title=%d vp=%d fp=%d pair=%d surface=%d clip=%d "
+			"albedo=%016llX albedo0=%d dw=%d blend=%d prim=%u prim_triangles=%d candidate=%d measured=%d "
+			"raw_extent=%.6g finite=%d",
+			stage,
+			Emu.GetTitleID() == "NPEA00431" ? 1 : 0,
+			r2_ca_vp_match ? 1 : 0, r2_ca_fp_match ? 1 : 0, r2_ca_hash_pair ? 1 : 0,
+			r2_ca_surface_match ? 1 : 0, r2_ca_clip_match ? 1 : 0,
+			albedo_hash, albedo_hash == 0 ? 1 : 0,
+			rsx::method_registers.depth_write_enabled() ? 1 : 0,
+			rsx::method_registers.blend_enabled() ? 1 : 0,
+			static_cast<u32>(draw_call.primitive), draw_call.primitive == rsx::primitive_type::triangles ? 1 : 0,
+			r2_ca_candidate ? 1 : 0, m_streak_measured ? 1 : 0,
+			static_cast<f64>(m_streak_raw_extent), std::isfinite(m_streak_raw_extent) ? 1 : 0);
+	};
+	r2_candidate_probe("before-audit");
+
+	if (run_audits || r2_ca_candidate)
+	{
+		scope_us audit_timer{ m_timing.audit };
+
+		if (!audit_world_extent(transform, skinned, vertex_count, is_sky || r2_visible_backdrop))
+		{
+			r2_candidate_probe("after-audit-fail");
+			audit_timer.stop();
+			return;
+		}
+
+		r2_candidate_probe("after-audit");
+
+		if (r2_ca_candidate && m_streak_measured && std::isfinite(m_streak_raw_extent)
+			&& m_streak_raw_extent > 30000.f)
+		{
+			static bool r2_ca_streak_late_logged = false;
+
+			if (!r2_ca_streak_late_logged)
+			{
+				r2_ca_streak_late_logged = true;
+				rsx_log.notice("Remix r2-streak-late: vp=%016llx fp=%016llx albedo=%016llX "
+					"vtx=%u idx=%zu prim=%u cmd=%u dw=%d blend=%d extent=%.6g raw_extent=%.6g "
+					"median=%.6g surface=%08x target=%u clip=%ux%u",
+					m_current_vp_hash, m_current_fp_hash, albedo_hash, vertex_count,
+					m_scratch_indices.size(), static_cast<u32>(draw_call.primitive),
+					static_cast<u32>(draw_call.command),
+					rsx::method_registers.depth_write_enabled() ? 1 : 0,
+					rsx::method_registers.blend_enabled() ? 1 : 0,
+					static_cast<f64>(m_streak_extent), static_cast<f64>(m_streak_raw_extent),
+					static_cast<f64>(m_world_extent_median), rsx::method_registers.surface_offset(0),
+					static_cast<u32>(rsx::method_registers.surface_color_target()),
+					rsx::method_registers.surface_clip_width(), rsx::method_registers.surface_clip_height());
+			}
+
+			audit_timer.stop();
+			++m_stats.skip_vp;
+			report_skip_census("r2streak-late", albedo_hash, m_streak_extent, skip_census_dist);
+			note_watch("r2streak-late", albedo_hash, m_streak_extent, skip_census_dist, false, "r2streak");
+			return;
+		}
 	}
 
 	// --- round 7: name the giant-geometry family -----------------------------------------------
@@ -20391,9 +21491,20 @@ void RemixGSRender::submit_subdraw()
 		// runtime that is actually DEPLOYED, and two of the three gates below were already
 		// satisfied - so the list is kept, with each item's measured verdict attached.
 		//
-		// WHICH RUNTIME: bin/remix/d3d9.dll is byte-identical (sha256
-		// 36a5641af4fa848ef9348ca2fffcd6ff9141ac87007264fb16c6f194a34b0de7) to
-		// dxvk-remix-numos3/_output/d3d9.dll, NOT to dxvk-remix-ppsspp's. That distinction is
+		// WHICH RUNTIME - ROUND 34, RE-MEASURED FROM THE BYTES BECAUSE THIS PARAGRAPH WENT STALE.
+		// bin/remix/d3d9.dll is sha256
+		// 16a0b512f33ebb66a89ac703e75289d9e008558a13d2c9a6a5455b0be7c40858 (fnv1a 09653f484ec94dc0),
+		// NOT the 36a5641af4fa848e... this block used to name and NOT byte-identical to
+		// dxvk-remix-numos3/_output/d3d9.dll (f75a70d76b850829..., fnv1a 5c5478cd184f4b0a) any more.
+		// It IS the same CODE: toRtDrawState is byte-identical across all 15,328 bytes at the same
+		// RVA 0x001ED290, and the only .text difference in the whole 240 MB is
+		// ImGui_ImplWin32_WndProcHandler at RVA 0x003823C0 (the _output build has the null-bd guard,
+		// the deployed one does not). The bit-26 arm is present in the DEPLOYED file, verified by
+		// disassembly: 'bt eax,0x1a' at 0x001ED30C followed by 'mov ebx,1' (CameraType::ViewModel)
+		// and 'mov [rbp+0x1f4],eax' (DrawCallState::cameraType). API version 0.1000.1
+		// (mov eax,0x03E80001 at RVA 0x000EDCD1). So this whole path is LIVE on the deployed build.
+		//
+		// The ppsspp contrast below still stands and is still worth keeping. That distinction is
 		// load-bearing and is the single easiest way to reach a wrong conclusion here: ppsspp
 		// hardcodes 'prototype.cameraType = CameraType::Main' (its rtx_remix_api.cpp:887) and its
 		// categoryToCameraType returns only Sky or Main, so on THAT runtime the VIEW_MODEL bit is
@@ -20438,8 +21549,19 @@ void RemixGSRender::submit_subdraw()
 		// the flip that separates them. With RPCS3_REMIX_VMBASIS=0 they are identical and the line
 		// is a pure measurement.
 		const remixapi_Transform vm_pre = transform;
-		apply_viewmodel_basis(transform);
-		report_viewmodel_basis_census(vm_pre, transform, vertex_count);
+		f32 vm_pivot[3]{};
+		u32 vm_pivot_source = 0;
+		apply_viewmodel_basis(transform, vm_pivot, vm_pivot_source);
+
+		// ROUND 36. Snapshotted between the two operators so the census can attribute dbasis= to
+		// the flip and drot= to the rotation instead of reporting their sum as one number.
+		const remixapi_Transform vm_mid = transform;
+		f32 vm_rot_pivot[3]{};
+		u32 vm_rot_pivot_source = 7;
+		apply_viewmodel_rotation(transform, vm_rot_pivot, vm_rot_pivot_source);
+
+		report_viewmodel_basis_census(vm_pre, vm_mid, transform, vertex_count, vm_pivot,
+			vm_pivot_source, vm_rot_pivot, vm_rot_pivot_source);
 	}
 
 	instance.mesh = it->second.handle;
@@ -21265,6 +22387,51 @@ void RemixGSRender::submit_subdraw()
 
 	if (!deferred)
 	{
+		// Diagnostic only: identify every distinct oversized R2 final shape that reaches the
+		// submission boundary. This deliberately does not alter the draw decision.
+		if (Emu.GetTitleID() == "NPEA00431" && m_streak_measured && std::isfinite(m_streak_raw_extent)
+			&& m_streak_raw_extent > 30000.f)
+		{
+			static std::unordered_set<u64> r2_final_extent_seen;
+			static u32 r2_final_extent_lines = 0;
+			constexpr u32 r2_final_extent_max_lines = 64;
+			const u32 surface = rsx::method_registers.surface_offset(0);
+			const u32 target = static_cast<u32>(rsx::method_registers.surface_color_target());
+			const u32 clip_width = rsx::method_registers.surface_clip_width();
+			const u32 clip_height = rsx::method_registers.surface_clip_height();
+			const bool depth_write = rsx::method_registers.depth_write_enabled();
+			const bool blend = rsx::method_registers.blend_enabled();
+			const u32 primitive = static_cast<u32>(draw_call.primitive);
+			const u32 command = static_cast<u32>(draw_call.command);
+			u64 shape_key = rpcs3::hash64(m_current_vp_hash, m_current_fp_hash);
+			shape_key = rpcs3::hash64(shape_key, albedo_hash);
+			shape_key = rpcs3::hash64(shape_key, hash);
+			shape_key = rpcs3::hash64(shape_key, (u64{vertex_count} << 32) | m_scratch_indices.size());
+			shape_key = rpcs3::hash64(shape_key, (u64{primitive} << 32) | command);
+			shape_key = rpcs3::hash64(shape_key, (u64{depth_write} << 1) | u64{blend});
+			shape_key = rpcs3::hash64(shape_key, surface);
+			shape_key = rpcs3::hash64(shape_key, target);
+			shape_key = rpcs3::hash64(shape_key, (u64{clip_width} << 32) | clip_height);
+			shape_key = rpcs3::hash64(shape_key, std::bit_cast<u32>(m_streak_extent));
+			shape_key = rpcs3::hash64(shape_key, std::bit_cast<u32>(m_streak_raw_extent));
+			shape_key = rpcs3::hash64(shape_key, std::bit_cast<u32>(m_world_extent_median));
+
+			if (r2_final_extent_lines < r2_final_extent_max_lines
+				&& r2_final_extent_seen.insert(shape_key).second)
+			{
+				++r2_final_extent_lines;
+				rsx_log.notice("Remix r2-final-extent: vp=%016llx fp=%016llx albedo=%016llX "
+					"vtx=%u idx=%zu prim=%u cmd=%u dw=%d blend=%d mesh=%016llx "
+					"extent=%.6g raw_extent=%.6g median=%.6g surface=%08x target=%u clip=%ux%u "
+					"frame=%llu key=%016llx line=%u/%u",
+					m_current_vp_hash, m_current_fp_hash, albedo_hash, vertex_count,
+					m_scratch_indices.size(), primitive, command, depth_write ? 1 : 0, blend ? 1 : 0,
+					hash, static_cast<f64>(m_streak_extent), static_cast<f64>(m_streak_raw_extent),
+					static_cast<f64>(m_world_extent_median), surface, target, clip_width, clip_height,
+					m_frame_counter, shape_key, r2_final_extent_lines, r2_final_extent_max_lines);
+			}
+		}
+
 		// ROUND 31. Third of the three children of the unattributed 'draw' time, and the one that
 		// is not ours: this is the Remix runtime's own per-instance submission.
 		// READ THE SCOPE BEFORE DRAWING A CONCLUSION FROM IT. This counter covers THIS call site
@@ -22504,13 +23671,21 @@ void RemixGSRender::log_stats()
 		"vmcam_considered=%llu vmcam_applied=%llu vmcam_fallback=%llu vmcam_refused=%llu "
 		"vmcam_diverted=%llu vmcam_unusable=%llu vmcam_conflict=%llu vmcam_latched=%llu vmcam_held=%llu "
 		"vmcam_census=%u vmcam_mode=%u | "
-		"cat_hidden=%llu cat_particle=%llu cat_decal=%llu cat_smoothnormals=%llu | "
+		// Round 35 inserts cat_hidepair IMMEDIATELY AFTER cat_hidden, and the argument goes in the
+		// same position - one specifier, one argument, adjacent, which is the only shape of edit to
+		// this line that cannot shift an unrelated pair.
+		"cat_hidden=%llu cat_hidepair=%llu cat_particle=%llu cat_decal=%llu cat_smoothnormals=%llu | "
 		"blend_chained=%llu blend_translucent=%llu blend_unmapped=%llu blend_rtopaque=%llu "
 		"blend_arescued=%llu blend_astranded=%llu blend_pairs={%s} | "
 		"tex_bound=%llu tex_none=%llu tex_no_unit=%llu tex_unit_retry=%llu tex_albedo_ucode=%llu tex_albedo_guess=%llu tex_retry_refused=%llu tex_unit_substituted=%llu uv_applied=%llu uv_none=%llu uv_absent=%llu uv_layout=%llu uv_memory=%llu uv_fallback=%llu uv_ucode=%llu uv_heuristic=%llu uv_nonfinite=%llu vcol_applied=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_tombstone=%llu tex_rehashed=%llu tex_refreshed=%llu mat_created=%llu tex_retry_unsupported=%llu mat_untested=%llu tex_tomb_transient=%llu tex_key_dup=%llu uv_scale_ucode=%llu uv_scale_fixed=%llu uv_scale_refuse=%llu/%llu/%llu/%llu/%llu uv_affine_general=%llu uv_affine_lanes=%llu uv_tiled=%llu | "
 		"ui_draws=%llu ui_skipped=%llu ui_no_colour=%llu ui_rt=%llu ui_prims=%llu ui_frames=%llu ui_ndc=%llu ui_unit=%llu ui_pixel=%llu ui_nospace=%llu ui_ortho2d=%llu "
 		"ui_vpydown=%llu ui_vpyup=%llu ui_vpfallback=%llu ui_vflip_ndc=%llu/%llu ui_vflip_pixel=%llu/%llu ui_vflip_abstain=%llu | "
-		"ui_forced=%llu uiforce_vps=%u vm_pair_far=%llu vmpairmaxdist=%.4g "
+		"ui_forced=%llu uiforce_vps=%u "
+		// Round 36 inserts ui_forced_pair IMMEDIATELY AFTER uiforce_vps, and its argument goes in
+		// the matching position below. Adjacent on purpose: the pair route only makes sense read
+		// beside the list route it narrows.
+		"ui_forced_pair=%llu uiforcepairvp=%016llx uiforcepairfp=%016llx "
+		"vm_pair_far=%llu vmpairmaxdist=%.4g "
 		"sun_sky_examined=%llu sun_sky_solved=%llu sun_sky_refused=%llu sun_sky_slots=%u "
 		"sunmap_entries=%u sunsky_mode=%u sunskypeak=%u sunskydown=%u sunsky_up=%llu worldidexempt=%u | "
 		"zcull_av=%llu zcull_av_handled=%llu",
@@ -22681,6 +23856,7 @@ void RemixGSRender::log_stats()
 		m_viewmodel_camera_census_lines,
 		remix_rsx::viewmodel_camera_mode(),
 		m_stats.cat_hidden,
+		m_stats.cat_hide_pair,
 		m_stats.cat_particle,
 		m_stats.cat_decal,
 		m_stats.cat_smooth_normals,
@@ -22764,6 +23940,13 @@ void RemixGSRender::log_stats()
 		// proof its knob is armed and doing work rather than a number that needs interpreting.
 		m_stats.ui_forced,
 		remix_rsx::ui_force_vp_count(),
+		// Round 36's triple, in the order of
+		// "ui_forced_pair=%llu uiforcepairvp=%016llx uiforcepairfp=%016llx" above. The two hashes
+		// print the PARSED value, so a mistyped hash that parses to 0 - which silently disarms the
+		// route - is visible here rather than only as a zero count.
+		m_stats.ui_forced_pair,
+		remix_rsx::ui_force_pair_vp_hash(),
+		remix_rsx::ui_force_pair_fp_hash(),
 		m_stats.vm_pair_far,
 		static_cast<f64>(remix_rsx::viewmodel_pair_max_distance()),
 		m_stats.sun_sky_examined,
@@ -22790,7 +23973,21 @@ void RemixGSRender::log_stats()
 		const auto ms = [n](u64 us) { return static_cast<f64>(us) / 1000.0 / n; };
 
 		rsx_log.notice(
-			"Remix timing: frames=%llu frame_ms=%.2f | flip=%.2f (overlay=%.2f submit=%.2f present=%.2f) | draw=%.2f (ui=%.2f mesh_create=%.2f tex_bind=%.2f uv=%.2f draw_instance=%.2f rest=%.2f) | deferred_instance=%.2f | other=%.2f | ui_px/frame=%.0f | mesh_creates/frame=%.1f peak=%llu buckets=%llu/%llu/%llu/%llu/%llu",
+			"Remix timing: frames=%llu frame_ms=%.2f | flip=%.2f (overlay=%.2f submit=%.2f present=%.2f)"
+			// ROUND 32: decode/audit/hash/xform are new and are placed INSIDE the draw=(..) group,
+			// against their own format text rather than appended to the end of the argument list -
+			// rounds 18 and 19 both shipped an ordering bug here by appending. They are siblings of
+			// the five that were already here, so rest= below subtracts all nine.
+			" | draw=%.2f (ui=%.2f mesh_create=%.2f tex_bind=%.2f uv=%.2f draw_instance=%.2f"
+			" decode=%.2f audit=%.2f hash=%.2f xform=%.2f rest=%.2f) | deferred_instance=%.2f"
+			// ROUND 32: scene= and meshes= answer "which level was this sample taken in", which the
+			// line could not say. The round-31 log's three largest frame_ms samples were all
+			// indistinguishable boot/menu windows (draw=0.00, overlay~26 ms, ui_px~2M) and there was
+			// no way to tell them from a real slow level - so the worst-frame analysis was being
+			// done on the wrong frames. scene= is m_active_camera.position, freshly written by
+			// apply_gauge_anchor_camera earlier in this same flip().
+			" | other=%.2f | scene=[%.4g %.4g %.4g] meshes=%llu | ui_px/frame=%.0f"
+			" | mesh_creates/frame=%.1f peak=%llu buckets=%llu/%llu/%llu/%llu/%llu",
 			m_timing.frames,
 			ms(m_timing.window),
 			ms(m_timing.flip),
@@ -22803,14 +24000,25 @@ void RemixGSRender::log_stats()
 			ms(m_timing.tex_bind),
 			ms(m_timing.uv),
 			ms(m_timing.draw_instance),
-			// The part of 'draw' none of the five children claim. Saturating subtraction: these are
+			ms(m_timing.decode),
+			ms(m_timing.audit),
+			ms(m_timing.hash),
+			ms(m_timing.xform),
+			// The part of 'draw' none of the nine children claim. Saturating subtraction: these are
 			// independent accumulators and a child that double-counts must read as 0 here, never wrap.
+			// A rest= of exactly 0.00 alongside a large draw= is therefore NOT "fully attributed" -
+			// it is the overflow tell, and it means one of the nine is double-counting.
 			ms(m_timing.draw - std::min(m_timing.draw,
-				m_timing.ui + m_timing.mesh_create + m_timing.tex_bind + m_timing.uv + m_timing.draw_instance)),
+				m_timing.ui + m_timing.mesh_create + m_timing.tex_bind + m_timing.uv + m_timing.draw_instance
+				+ m_timing.decode + m_timing.audit + m_timing.hash + m_timing.xform)),
 			// NOT a child of 'draw' - see frame_timing. Its own field so re-enabling DEFERPREANCHOR
 			// cannot silently move Remix submission cost into 'rest'.
 			ms(m_timing.deferred_instance),
 			ms(m_timing.window > m_timing.flip ? m_timing.window - m_timing.flip : 0),
+			m_active_camera.valid ? static_cast<f64>(m_active_camera.position[0]) : 0.0,
+			m_active_camera.valid ? static_cast<f64>(m_active_camera.position[1]) : 0.0,
+			m_active_camera.valid ? static_cast<f64>(m_active_camera.position[2]) : 0.0,
+			static_cast<u64>(m_meshes.size()),
 			static_cast<f64>(m_compositor.pixels()) / n,
 			static_cast<f64>(m_timing.mesh_creates) / n,
 			m_timing.mesh_creates_peak,
@@ -22864,9 +24072,52 @@ void RemixGSRender::log_stats()
 			// dropped = never submitted, and invisible with no refusal line anywhere. peak == budget
 			// on every line of a run means the budget is the binding constraint, which is the
 			// condition RPCS3_REMIX_STATICINDEXBUDGET exists to relieve.
+			// --- ROUND 32: the SECOND axis, without which a budget sweep cannot be judged -----------
+			// Round 31 correctly refused to raise the budget past 8 because the cost model omitted
+			// BLAS residency: every rebuild mints a new union mesh hash and orphans the old one, so
+			// doubling the budget doubles the rate at which union BLASes are created AND the rate at
+			// which they go idle. Nothing on any line said how many of the `entries` currently hold a
+			// live mesh, so "did raising the budget help" and "did raising the budget cost VRAM"
+			// could not be read from the same run.
+			//
+			// The triple below sums to entries= exactly, mirroring the stale+dropped==deferred
+			// invariant above, using the same derivation the submit path itself uses:
+			//   resident = mesh_hash != 0 and present in m_meshes  (a live union BLAS)
+			//   evicted  = mesh_hash != 0 and NOT in m_meshes      (the reaper took it -> next draw
+			//              of this entry takes the `dropped` exit and renders nothing)
+			//   nomesh   = mesh_hash == 0                          (never committed a union at all;
+			//              the second-skin/material-pointer case, also a `dropped` exit)
+			// So `dropped` is predicted by evicted+nomesh, and `resident` is what BLAS memory pays
+			// for. One pass over a container measured at 470 entries, once per stats window - not
+			// per frame - so it cannot itself move the frame time it is being read against.
+			//
+			// NOT global mesh counts: meshes_live/created/destroyed are ALREADY on 'Remix stats:'
+			// (meshes_live=) and 'Remix live:' (mesh_live=), and adding them a third time here is
+			// exactly the duplicate-counter defect this project already shipped once.
+			u64 static_resident = 0;
+			u64 static_evicted = 0;
+			u64 static_nomesh = 0;
+
+			for (const auto& [key, entry] : m_static_indices)
+			{
+				if (entry.mesh_hash == 0)
+				{
+					++static_nomesh;
+				}
+				else if (m_meshes.find(entry.mesh_hash) != m_meshes.end())
+				{
+					++static_resident;
+				}
+				else
+				{
+					++static_evicted;
+				}
+			}
+
 			const std::string line = fmt::format(
 				"Remix static-index: entries=%llu triangles=%llu rebuilds=%llu deferred=%llu "
-				"stale=%llu dropped=%llu peak=%u budget=%u",
+				"stale=%llu dropped=%llu peak=%u budget=%u "
+				"resident=%llu evicted=%llu nomesh=%llu",
 				static_cast<u64>(m_static_indices.size()),
 				m_static_index_triangles,
 				m_static_index_rebuild_total,
@@ -22874,7 +24125,10 @@ void RemixGSRender::log_stats()
 				m_static_index_deferred_stale,
 				m_static_index_deferred_dropped,
 				m_static_index_rebuild_peak,
-				remix_rsx::static_index_rebuild_budget());
+				remix_rsx::static_index_rebuild_budget(),
+				static_resident,
+				static_evicted,
+				static_nomesh);
 
 			rsx_log.notice("%s", line);
 
@@ -23072,7 +24326,11 @@ void RemixGSRender::log_stats()
 			// too late in its frame and full flip-deferral is the round-6 case. spilled/skinned are
 			// the two populations that took the old immediate path anyway.
 			"defer_buffered=%llu defer_fresh=%llu defer_flip=%llu defer_spilled=%llu "
-			"defer_skinned=%llu nectar_published=%llu | "
+			// ROUND 32: defer_absent_declined is inserted against its own text HERE, between
+			// defer_skinned and nectar_published, rather than appended at the end of the argument list
+			// - it belongs to the defer group and rounds 18/19 both shipped an ordering bug by
+			// appending. Its argument goes in the matching position below.
+			"defer_skinned=%llu defer_absent_declined=%llu nectar_published=%llu | "
 			// Round 6, primary 1 - the untextured 41 per cent. shadowonly vs colorunit IS the verdict:
 			// colorunit ~0 means these draws sample nothing but depth buffers and should not be
 			// submitted as white surfaces at all; colorunit large means the walk was refusing
@@ -23258,6 +24516,25 @@ void RemixGSRender::log_stats()
 			// viewmodel; projsplitvdelta != 0 means the proj_split cross is gated on its own premise
 			// instead of on the is_affine check that provably cannot refuse it.
 			"vmbasis=%u vmbasismax=%u vmdepthoffset=%.4g projsplitvdelta=%.4g "
+			// Round 34. vmbasispivot names the pivot the basis operator reflects about (0 = the eye,
+			// which was measured throwing the viewmodel 2537..2564 units away); vmtagonly=1 severs
+			// the three PLACEMENT consumers of the viewmodel verdict and keeps only the tag. Both
+			// print the CLAMPED value, so a launcher armed outside the clamp shows up here - that is
+			// the diff round 31 and round 32 each lost a round to not making.
+			"vmbasispivot=%u vmtagonly=%u "
+			// Round 36, same reason again, and this triple needs it MORE than the others: VMROTDEG
+			// is taken mod 360, so VMROTDEG=360 parses to 0 and silently means OFF, and VMROTAXIS
+			// is clamped to 6 so a fat-fingered 16 runs as 6 (model Z) rather than being refused.
+			// Both are invisible anywhere else.
+			"vmrotaxis=%u vmrotdeg=%u vmrotpivot=%u "
+			// Round 35, and it is the SAME reason round 34's pair above is here. hidepairmode prints
+			// the CLAMPED value (ceiling 2), so HIDEPAIRMODE=3 silently running as mode 2 -
+			// THIRD_PERSON_PLAYER_MODEL, an entirely different behaviour from HIDDEN - is visible
+			// instead of silent. The two hashes print the PARSED value, so a typo or a pasted prefix
+			// that parses to 0 shows as 0 here and names which half disarmed the route: an
+			// armed-looking launcher that hides nothing is exactly the misconfiguration the
+			// neighbouring vmpairvps/vmpairalbedos fields exist to make un-missable.
+			"hidepairvp=%016llx hidepairfp=%016llx hidepairmode=%u "
 			// Round 20. Both are LIST SIZES, and the pair gate needs BOTH non-zero to do anything at
 			// all - vmpairvps=1 vmpairalbedos=0 is an armed-looking launcher that tags nothing, which
 			// is the misconfiguration this field exists to make un-missable.
@@ -23425,6 +24702,7 @@ void RemixGSRender::log_stats()
 			m_stats.defer_flushed_flip,
 			m_stats.defer_spilled,
 			m_stats.defer_skipped_skinned,
+			m_stats.defer_absent_declined,
 			m_stats.nectar_published,
 			m_stats.tex_none_shadowonly,
 			m_stats.tex_none_colorunit,
@@ -23593,6 +24871,19 @@ void RemixGSRender::log_stats()
 			remix_rsx::viewmodel_basis_census_max(),
 			static_cast<f64>(remix_rsx::viewmodel_depth_offset_max()),
 			static_cast<f64>(remix_rsx::proj_split_view_delta_max()),
+			// Round 34's pair, in the order of "vmbasispivot=%u vmtagonly=%u" above.
+			remix_rsx::viewmodel_basis_pivot(),
+			remix_rsx::viewmodel_tag_only() ? 1u : 0u,
+			// Round 36's triple, in the order of
+			// "vmrotaxis=%u vmrotdeg=%u vmrotpivot=%u" above. All three are the CLAMPED values.
+			remix_rsx::viewmodel_rotate_axis(),
+			remix_rsx::viewmodel_rotate_degrees(),
+			remix_rsx::viewmodel_rotate_pivot(),
+			// Round 35's triple, in the order of
+			// "hidepairvp=%016llx hidepairfp=%016llx hidepairmode=%u" above.
+			remix_rsx::hide_pair_vp_hash(),
+			remix_rsx::hide_pair_fp_hash(),
+			remix_rsx::hide_pair_mode(),
 			remix_rsx::viewmodel_pair_vp_count(),
 			remix_rsx::viewmodel_pair_albedo_count(),
 			remix_rsx::alpha_state_census_max(),

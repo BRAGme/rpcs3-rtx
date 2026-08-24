@@ -865,6 +865,10 @@ private:
 		u64 viewmodel_cam_held = 0;
 
 		u64 cat_hidden = 0;
+		// Round 35. Kept SEPARATE from cat_hidden on purpose: cat_hidden was already 2617 in the
+		// round-34 run from the albedo list, so a shared counter could not answer "did the new
+		// (vp, fp) route fire at all". Counts matches, whichever mode they took.
+		u64 cat_hide_pair = 0;
 		u64 cat_particle = 0;
 		u64 cat_decal = 0;
 		// Not a hash-list category: this is the global "Generate Smooth Normals" toggle, so in a
@@ -950,6 +954,13 @@ private:
 		// make the payload non-POD) and frames that hit DEFERPREANCHORMAX.
 		u64 defer_skipped_skinned = 0;
 		u64 defer_spilled = 0;
+		// --- round 32: the deferral candidates NOT taken, because the bet is unlikely to pay ---------
+		// Draws on a render source with no anchor in this frame OR the previous one, which
+		// RPCS3_REMIX_DEFERPREVONLY (default 1) declines to buffer. MEASURED at 35.8% of the deferral
+		// population in both of the round-31 sessions (gauge_absent / (gauge_prev + gauge_absent)).
+		// Non-zero here with DEFERPREANCHOR=0 is expected and harmless - the count is taken at the
+		// election, which runs regardless; it only changes behaviour when deferral is enabled.
+		u64 defer_absent_declined = 0;
 
 		// --- round 5: nectar publish gate --------------------------------------------------------
 		// Flips on which haze.nectar_disruption was published as "1". 0 at NECTARMODE=0.
@@ -1298,6 +1309,13 @@ private:
 		// list is empty. skip_screen_space counts them too - this is the forced SUBSET of it.
 		u64 ui_forced = 0;
 
+		// Round 36. The (RPCS3_REMIX_UIFORCEPAIRVP, RPCS3_REMIX_UIFORCEPAIRFP) subset of the same
+		// override - the helmet route. Structurally 0 while either half is blank, so a 0 here means
+		// "not armed or the hashes are wrong", never "the mechanism is broken". Kept separate from
+		// ui_forced above for the reason round 35 had to split cat_hidepair out of cat_hidden: a
+		// shared counter cannot say WHICH key matched.
+		u64 ui_forced_pair = 0;
+
 		// Round 23. Sky-dome draws examined by the per-level sun derivation, and the ways it ends:
 		// a solution written, or the draw rejected for having too few vertices / no usable UV match
 		// / no valid camera, and since round 24 also for deriving a sun at or below the horizon.
@@ -1371,6 +1389,27 @@ private:
 		// dividing uv by units-walked would be wrong by that factor. (Corrected by review.)
 		u64 uv = 0;
 		u64 draw_instance = 0; // guarded_draw_instance at the per-draw submit, summed over the frame
+		// --- round 32: split 'rest', which is where the frame actually goes -----------------------
+		// MEASURED in the round-31 log's worst window that submitted geometry (bin\log\RPCS3.log,
+		// frames=38): draw=50.88 ms/frame of a 53.03 ms frame, and the five children above account
+		// for ui=2.53 mesh_create=0.14 tex_bind=1.11 uv=5.67 draw_instance=0.48 - leaving
+		// rest=40.96 ms/frame, i.e. 80.5% of 'draw' and 77% of the whole frame, attributed to
+		// nothing. That is the entire remaining Haze perf story and round 31 could not name it.
+		//
+		// These four are siblings of the five above (all inside submit_subdraw, none overlapping),
+		// so 'rest' stays a valid saturating residual and shrinks by exactly what they capture.
+		// Chosen because each is a single contiguous span of O(vertex_count) work that runs on
+		// EVERY sub-draw before any gate - which is the shape a 40 ms residual has to have.
+		//
+		// 'audit' is the one to watch: audit_vertex_extent makes four separate passes over the
+		// decoded positions and audit_world_extent walks the whole index list transforming each
+		// vertex into world space, and BOTH are pure diagnostics. If audit dominates, the fix is a
+		// knob that skips them (RPCS3_REMIX_DRAWAUDIT) rather than an optimisation - which is why
+		// the timer and that knob ship together. Every other child here is load-bearing work.
+		u64 decode = 0;   // index build + strip expansion + ATTR0 map + per-vertex position decode
+		u64 audit = 0;    // audit_vertex_extent + audit_world_extent, both diagnostics
+		u64 hash = 0;     // static-index union accumulation + mesh-identity/union re-hash
+		u64 xform = 0;    // per_draw_transform: matcher replay, gauge divide, mat4_invert
 		// submit_deferred's OWN DrawInstance, which is NOT a child of 'draw' and must never be added
 		// to draw_instance above. Its two callers sit in two different parents - one on the draw path
 		// (write_gauge_anchor -> flush_deferred_for_anchor) and one inside flip
@@ -1686,10 +1725,15 @@ private:
 	// big thing and a thousand small ones is named by its big one. Bounded twice over: the 2x rule
 	// makes re-emission monotone, and s_max_sky_census_lines stops the whole census, including the
 	// bounding-box scan that feeds it, once the budget is spent.
+	//
+	// ROUND 36. centre_anchor is |AABB centre - eye|, printed as canchor= BESIDE the existing
+	// anchor= (which is |translation - eye|), so the quantity the new SKYANCHORMODE compares and
+	// the quantity the old test compared are visible on the SAME row at every mode. That is what
+	// makes the switch auditable from one run instead of two.
 	void report_sky_census(sky_outcome outcome, u32 vertex_count, bool depth_write,
 		const f32 (&lo)[3], const f32 (&hi)[3], const remixapi_Transform& transform,
-		f32 world_extent, f32 anchor, bool measured, bool camera_inside, f32 units_per_vertex,
-		u64 albedo_hash);
+		f32 world_extent, f32 anchor, f32 centre_anchor, bool measured, bool camera_inside,
+		f32 units_per_vertex, u64 albedo_hash);
 
 	// --- albedo-hash sky rule (sky_hash_mode) -----------------------------------------------
 	// What the rule knows about one albedo content hash. 'dome' and 'other' partition every
@@ -1833,10 +1877,42 @@ private:
 	// right/up/forward metres. That last triple is the measurement nineteen rounds have been
 	// missing: its sign pattern names the wrong axes directly instead of by eye.
 	//
-	// Deduped per vp and bounded by RPCS3_REMIX_VMBASISMAX, like every census here.
-	void apply_viewmodel_basis(remixapi_Transform& transform) const;
+	// Deduped per (vp, albedo) since round 20 and bounded by RPCS3_REMIX_VMBASISMAX, like every
+	// census here.
+	//
+	// ROUND 34. The pivot is now selectable (RPCS3_REMIX_VMBASISPIVOT) because the eye pivot was
+	// measured displacing the viewmodel 2537..2564 units on all six lines this census emitted on
+	// 2026-08-17 - the sentence above about "only reorient it" is true of the 3x3 and false of the
+	// whole affine map whenever the transform's translation is not the eye, which on this title it
+	// never is. apply_viewmodel_basis reports the pivot it chose back to the caller rather than
+	// storing it, because it is const and the one caller passes it straight into the census.
+	//   pivot_source: 0 = eye, 1 = geometry centroid, 2 = transform translation,
+	//                 3 = centroid requested but unmeasurable, fell back to the eye.
+	void apply_viewmodel_basis(remixapi_Transform& transform, f32 (&pivot_out)[3],
+		u32& pivot_source) const;
+
+	// ROUND 36. The sign mask above cannot express the fix: MEASURED over 287 'Remix vmbasis:'
+	// lines, every near-eye VIEW_MODEL-tagged draw is submitted BEHIND the eye (fwd -0.06..-0.81 in
+	// the camera's own left-handed frame, against fwd +0.08..+0.48 for the one near-eye group that
+	// is not tagged), with its basis a 118..179 degree rotation about the camera's RIGHT axis. One
+	// operator explains both - a 180 degree rotation about that axis THROUGH THE EYE - and a mask
+	// pivoted at the centroid can only undo the turning half, which is why VMBASIS=6 came out
+	// "facing the right way, just upside down". Axis+angle, camera space or model space, own pivot.
+	// Runs after apply_viewmodel_basis and is independent of it. Derivation, clamps and the
+	// pre-registered readings: viewmodel_rotate_axis() in RemixTransforms.h.
+	//   pivot_source: 0 = raw eye, 1 = centroid, 2 = translation, 3 = anchor-frame eye,
+	//                 4 = centroid unmeasurable and fell back to the raw eye, 5 = model space,
+	//                 6 = camera invalid (did not run), 7 = knob off (did not run).
+	void apply_viewmodel_rotation(remixapi_Transform& transform, f32 (&pivot_out)[3],
+		u32& pivot_source) const;
+
+	// ROUND 36. 'mid' is the transform BETWEEN the two operators - after apply_viewmodel_basis and
+	// before apply_viewmodel_rotation - so dbasis= keeps its round-34 meaning (what the flip did)
+	// and drot= is the new operator's own delta. Passing only (pre, post) would have silently
+	// re-pointed dbasis at the sum of both.
 	void report_viewmodel_basis_census(const remixapi_Transform& pre,
-		const remixapi_Transform& post, u32 vertex_count);
+		const remixapi_Transform& mid, const remixapi_Transform& post, u32 vertex_count,
+		const f32 (&pivot)[3], u32 pivot_source, const f32 (&rot_pivot)[3], u32 rot_pivot_source);
 
 	std::unordered_set<u64> m_viewmodel_basis_census_seen;
 	u32 m_viewmodel_basis_census_lines = 0;

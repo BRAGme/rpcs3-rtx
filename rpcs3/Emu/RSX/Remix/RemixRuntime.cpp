@@ -21,12 +21,16 @@
 //   remix_c.h     : blob ae61b5db53fa40e1563a47b07822cbbcd4122e9f, 55351 bytes
 //                   SHA-256 693334BE266D380BFE324FCBF2675849E98757CCC5BEB4224A2ED9FB20C6C4F5
 //                   (byte-identical to public/include/remix/remix_c.h at that commit)
-//   Runtime asset : local build of that commit -- NOT the Remix_Plus_v1.5.1 release zip, which
-//                   predates the VIEW_MODEL category bit this backend relies on. Deployed to
-//                   <exe dir>\remix\; d3d9.dll is 240657408 bytes,
-//                   SHA-256 36A5641AF4FA848EF9348CA2FFFCD6FF9141AC87007264FB16C6F194A34B0DE7.
+//   Runtime asset : local build of that commit. Deployed to <exe dir>\remix\; d3d9.dll is
+//                   240657408 bytes,
+//                   SHA-256 16A0B512F33EBB66A89AC703E75289D9E008558A13D2C9A6A5455B0BE7C40858.
+//                   ROUND 34 RE-BASELINE: this block used to name
+//                   36A5641AF4FA848E... / fnv1a 63656dfe3da8f069, and no file on this machine
+//                   hashes to that -- it was an earlier incremental link of the same tree, since
+//                   overwritten, which is why the load-time warning fired on every run from
+//                   2026-08-16 onward and was read as noise for many rounds.
 //                   For this exact binary log_dll_identity prints
-//                   "size=240657408 fnv1a=63656dfe3da8f069", so a run's log line can be
+//                   "size=240657408 fnv1a=09653f484ec94dc0", so a run's log line can be
 //                   compared against this block character for character, with no rehashing
 //                   and no access to the build tree. Both values are mirrored below in
 //                   vendored_runtime_size / vendored_runtime_fnv1a, which warn at load if the
@@ -34,9 +38,18 @@
 //                   FNV-1a is not collision-resistant and is only meant to answer "is this the
 //                   binary the comment describes"; the SHA-256 above stays the identity for
 //                   anything stronger. Built from a dirty
-//                   tree (12 files modified, none of them remix_c.h or the API implementation,
-//                   so the surface still matches the header above), which means the commit
-//                   alone does not reproduce it -- identify the binary by hash.
+//                   tree (17 files modified as of round 34, none of them remix_c.h or the API
+//                   implementation -- verified by `git status --porcelain` on
+//                   src/dxvk/rtx_render/rtx_remix_api.cpp and public/include/remix/remix_c.h,
+//                   both clean -- so the surface still matches the header above), which means the
+//                   commit alone does not reproduce it -- identify the binary by hash.
+//                   RETRACTED CLAIM: this block used to say the Remix_Plus_v1.5.1 release zip
+//                   "predates the VIEW_MODEL category bit this backend relies on". Not supported.
+//                   The July CI build kept at bin\remix\d3d9.dll.bak-0729 (242589696 bytes,
+//                   SHA-256 7EA6282B5A242DD9..., API 0.1000.0) ALREADY carries a bit-26 arm
+//                   (bt eax,0x1a at RVA 0x001FAEB6), and 6476faea's own message says
+//                   "Both values match the remix-plus-1.5.1 tag, which already carried this work."
+//                   What 6476faea adds on top is the Sky->Main clamp and the 0.1000.1 bump.
 //
 // Never update bin\remix\ without re-vendoring remix_c.h in the same commit.
 // ---------------------------------------------------------------------------------------------
@@ -114,8 +127,33 @@ namespace remix_rsx
 		// The runtime described by the provenance block at the top of this file. Kept next to the
 		// check that uses them so the two cannot drift apart; both must be updated whenever
 		// bin\remix\ is redeployed, in the same commit as the re-vendored remix_c.h.
+		//
+		// ROUND 34: RE-BASELINED ON THE FILE THAT IS ACTUALLY DEPLOYED, and the old value is recorded
+		// here rather than deleted because the warning it produced was a TRUE positive that nobody
+		// read for many rounds. Old: 0x63656dfe3da8f069, described as sha256 36A5641AF4FA848E...
+		// No file anywhere on this machine hashes to that value - it was an earlier incremental link
+		// of the same tree (same PDB GUID 228D2E7A-E41C-451F-8C80-D8B7ADD7E065, a lower Age) that has
+		// since been overwritten. New value is the deployed bin\remix\d3d9.dll, sha256
+		// 16a0b512f33ebb66a89ac703e75289d9e008558a13d2c9a6a5455b0be7c40858, PDB Age 48, PE
+		// TimeDateStamp 0x6A81B564 = 2026-08-16 13:04:36Z.
+		//
+		// The size was ALREADY correct at 240657408 and needed no change - which is why the warning
+		// fired on the hash alone and read as noise. Reconciled so a future mismatch means something.
+		//
+		// FOR THE RECORD, MEASURED: the API surface of the deployed file is identical to
+		// dxvk-remix-numos3\_output\d3d9.dll (fnv1a 5c5478cd184f4b0a). toRtDrawState is byte-identical
+		// across all 15,328 bytes; a whole-file diff is 2,282 bytes over 9 regions, eight of which are
+		// build stamps (PE TimeDateStamp, OptionalHeader CheckSum, debug-directory timestamps, the
+		// RSDS Age byte 0x30 -> 0x31, .pdata/xdata fixups) and the ninth is
+		// ImGui_ImplWin32_WndProcHandler at RVA 0x003823C0. So the "header and runtime may have come
+		// apart" warning was true of the BYTES and false of the INTERFACE.
+		//
+		// PDB TRAP, worth more than this constant: bin\remix\d3d9.pdb has GUID
+		// 04C3AFFD-472B-4565-9AA0-08EBE452E439 Age 24, which is d3d9.dll.bak-0729's PDB, NOT the
+		// deployed DLL's. Symbolizing a crash in the deployed runtime with it gives WRONG function
+		// names. The matching lineage is dxvk-remix-numos3\_output\d3d9.pdb (GUID 228D2E7A..., Age 49).
 		constexpr u64 vendored_runtime_size  = 240657408;
-		constexpr u64 vendored_runtime_fnv1a = 0x63656dfe3da8f069;
+		constexpr u64 vendored_runtime_fnv1a = 0x09653f484ec94dc0;
 
 		// Identity of the DLL actually loaded, so a report can say which binary produced a run.
 		void log_dll_identity(const std::wstring& path)
