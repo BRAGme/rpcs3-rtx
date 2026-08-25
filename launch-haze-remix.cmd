@@ -5,8 +5,37 @@ set "RPCS3_REMIX_CAMLOCKVP=7F3D3ABCEFC8B057"
 set "RPCS3_REMIX_CAMFALLBACKVP=AD7CE9D672A0BF6B"
 set "RPCS3_REMIX_CAMFALLBACKVP2=0214281B9A7A412D"
 set "RPCS3_REMIX_CAMHOLD=900"
-set "RPCS3_REMIX_CAMTRACE=0"
-set "RPCS3_REMIX_SKIPVP=4D5A87BFFBCE0717"
+rem ROUND 40: turned ON. "fov still isn't fixed" has been on the defect list for five
+rem rounds and THE FOV HAS NEVER BEEN MEASURED - this knob is the only thing that
+rem prints it ("Remix camera trace: ... fov=%%.3f aspect=%%.5f near=%%.6g"), and it has
+rem been 0. MEASURED: zero "fov=" tokens anywhere in bin\log\RPCS3.log for the whole
+rem round-39 run. The main camera's FOV is taken straight from the guest projection
+rem (no constant, no knob: to_camera_matrix is a plain copy and guarded_setup_camera
+rem validates nothing), so the number this prints IS what Remix is being told.
+rem Read it, compare against 72.000 horizontal / 44.634 vertical (the values the
+rem viewmodel code quotes for the world camera), and put this back to 0.
+rem REVERT: set "RPCS3_REMIX_CAMTRACE=0"
+set "RPCS3_REMIX_CAMTRACE=1"
+rem ============================ ROUND 40 - STAGE 2 RUN AT LAST ======================
+rem 4D5A87BFFBCE0717 has been dropped WHOLESALE since before the forge record began.
+rem It is one of the four programs the WDIVWALK decode fix repaired (the other three
+rem are 57A12323F22F4988, 96EDAAED0C27FD05, 1D9A973AF5CD1514), so the reason it was
+rem dropped - undecoded quantised positions, i.e. giant geometry - has been fixed for
+rem several rounds. The "STAGE 2" block further down in this file has been asking for
+rem this relaunch ever since.
+rem MEASURED that it is eating MAIN-PASS geometry, not an aux pass. From the round-39
+rem run's own skip census:
+rem   Remix skip-census: gate=skipvp vp=4d5a87bffbce0717 fp=97c0b2e9be86fd48 clip=1024x576
+rem   Remix skip-census: gate=skipvp vp=4d5a87bffbce0717 fp=aa5f822213201b4b clip=1024x576
+rem clip=1024x576 IS the main pass (mainclip=1024x576 on the live line). skip vp=24569
+rem draws over the run. This is the strongest single candidate for the copper plant's
+rem missing wooden plank floor - "just a black void floor" is what a dropped program
+rem looks like.
+rem WATCH: whatever it draws comes back, now decoded. If ANYTHING appears at absurd
+rem   scale, this line is the first thing to put back. Also watch wext_refused= and
+rem   wext_max= on the live line (they read 0 and 24906.5 before this change).
+rem REVERT: set "RPCS3_REMIX_SKIPVP=4D5A87BFFBCE0717"
+set "RPCS3_REMIX_SKIPVP="
 set "RPCS3_REMIX_SKIPALBEDO=0"
 rem A/B 2026-08-14 RESTORED. Blanking these two made NPC weapons render at absurd
 rem scale: this pair suppresses that draw rather than fixing it. Blank them again to
@@ -114,8 +143,12 @@ rem rather than the translation.
 set "RPCS3_REMIX_WORLDIDMAXT=32"
 set "RPCS3_REMIX_WORLDIDMAXB=0"
 rem ====================================================================================
-set "RPCS3_REMIX_GUESTLIGHTVP=830D7D1B9681C475"
-set "RPCS3_REMIX_GUESTLIGHTFP=BD80201C29B6B01E"
+rem DEAD LINES - neutralised 2026-08-25 (round 40). Both of these are re-assigned
+rem further down (~:708/:709) and in a .cmd the LAST assignment wins, so editing them
+rem here does nothing. Exactly the trap the GUESTLIGHTRADIUS/GUESTLIGHTRADIANCE block
+rem below already records. EDIT THE LATER LINES; the banner is the arbiter.
+rem set "RPCS3_REMIX_GUESTLIGHTVP=830D7D1B9681C475"
+rem set "RPCS3_REMIX_GUESTLIGHTFP=BD80201C29B6B01E"
 rem 2026-08-17 BLANKED on request: "remove the added lights that are on the doors".
 rem This list is what injects synthetic sphere lights at guest fixture geometry,
 rem and D7FD9D0C0D7CF184 was its only entry - so the door lights are these.
@@ -126,6 +159,41 @@ rem EMISSIVE line instead, and expect glradiance/glradius to stop mattering.
 rem WATCH: guest_lights= dropping to 0 on the live line; Light Statistics in the
 rem Remix menu losing its Sphere Lights.
 rem REVERT: set "RPCS3_REMIX_GUESTLIGHTALBEDO=D7FD9D0C0D7CF184"
+rem ============================ ROUND 40 ============================================
+rem BLANKING THIS LINE ON 2026-08-17 SILENTLY KILLED EVERY GUEST LIGHT IN THE GAME,
+rem INCLUDING GUESTLIGHTALBEDO2 - and nothing said so. The arming test in
+rem maybe_inject_guest_light was `guest_light_albedo_any() && ... && (primary || glow)`,
+rem and guest_light_albedo_any() reads ONLY this list. With it blank the leading term
+rem was false for every draw in the process, so the glow_match half - i.e. the whole of
+rem GUESTLIGHTALBEDO2 below - was unreachable dead code.
+rem MEASURED on the round-39 run (64,139 flips, 15,526,016 draws): the live line read
+rem   glalbedos=0  guest_lights=0  guest_light_match=0  guest_light_capped=0
+rem i.e. NOT ONE analytical light was created from the guest all session. That is why
+rem "floor-recessed lights cast no light" and "only some bulbs are lit" - none of them
+rem emit. Round 40 fixed the arming test (one line, RemixGSRender.cpp) so ALBEDO2 can
+rem reach the rule at all, and arms this list with YOUR OWN light-bulb pick.
+rem 71D189E9B559A7F9 = the "light bulb" you Ctrl+Clicked (vtx=124 extent=1.731). It is
+rem also on RPCS3_REMIX_EMISSIVE at intensity 30, which makes the bulb GLOW; this line
+rem is what makes it LIGHT THE ROOM. Those are two different mechanisms.
+rem WATCH: guest_lights= on "Remix live:" must be > 0, and "Remix guest-light:" lines
+rem   must appear in bin\remix_dump.log with pos=/radius=/rgb=.
+rem REVERT (back to round 39 exactly): set "RPCS3_REMIX_GUESTLIGHTALBEDO="
+rem ============================ ROUND 41 - BLANKED AGAIN, ON MEASUREMENT ============
+rem Round 40 armed the bulb texture here and it DID create lights - guest_lights=31, the
+rem first non-zero in the project. But it created the WRONG lights, and the log says why.
+rem MEASURED, all 31 "Remix guest-light:" lines, ONE albedo on ONE (vp,fp) pair:
+rem   extent 0.5385 0.5396 0.5399 0.5389 1.731 0.5579 0.5646 0.5607 0.5579
+rem   extent 7.893 8.047 8.095 8.453 8.456 8.469 10.02 11.16 12.54 14.52 14.58 20.33
+rem          21.59 21.62 21.64 21.6 22.17 30.08 30.11 30.13 58.94 83.18
+rem A 154x spread on ONE texture. The 83.18 row produced radius=29.1 at the AABB centre of
+rem an 83-unit mesh - that is the "too big and not aligned with the bulbs" disc in your
+rem screenshot. 71D189E9B559A7F9 is a texture the bulbs SHARE with a large prop.
+rem It is also NOT in the "Remix light-candidate:" census at all, i.e. the backend own
+rem fixture classifier never nominated it. We were keying on a texture nothing recommended.
+rem The replacement is GUESTLIGHTAUTO=2 further down - "light where a GLOW CARD is drawn" -
+rem which needs no list, carries each lamp own colour and its own radius, and is the only
+rem rule that can reproduce "only SOME bulbs are lit".
+rem REVERT to round 40: set "RPCS3_REMIX_GUESTLIGHTALBEDO=71D189E9B559A7F9"
 set "RPCS3_REMIX_GUESTLIGHTALBEDO="
 set "RPCS3_REMIX_GUESTLIGHTALBEDO2=C2F33F7E5105DAE7"
 rem DEAD LINES - neutralised 2026-08-16. Both of these are re-assigned further
@@ -640,12 +708,37 @@ rem 2026-08-15 REVERTED: blanking these put lights on DOORS and sheet-metal cove
 rem instead of bulbs - the albedo hash is NOT the fixture identity on Haze, it is
 rem shared with other props, so the vp+fp narrowing WAS load-bearing. Blank them
 rem again only if a fixture drawn by a different program is confirmed by a pick.
-set "RPCS3_REMIX_GUESTLIGHTVP=830D7D1B9681C475"
-set "RPCS3_REMIX_GUESTLIGHTFP=BD80201C29B6B01E"
+rem ============================ ROUND 40 ============================================
+rem THAT PRECONDITION IS NOW MET, BY YOUR OWN PICK. The light bulb you Ctrl+Clicked is
+rem   vp=c1d482dcd1b03ed0 fp=796bc90574f89ca1 albedo=71D189E9B559A7F9 vtx=124 ext=1.731
+rem which is a DIFFERENT program from the 830d7d1b/bd80201c pair armed here - so with
+rem the old pair the bulb could never produce a light no matter what was on the albedo
+rem list. Re-pointed at the bulb's own pair. The 830d7d1b family loses nothing: it was
+rem producing zero lights anyway (guest_lights=0 all last run).
+rem KNOWN LIMIT, and it is the next round's job: this vp/fp narrowing is a single
+rem GLOBAL pair ANDed against BOTH albedo rules, so only one fixture family can be lit
+rem per run. The right shape is parallel comma lists (the UIFORCEPAIRVP2/FP2 idiom),
+rem which pairs entry i of VP with entry i of FP and would let the bulbs and the
+rem floor-recessed fittings be lit at the same time.
+rem DO NOT simply blank these two: 71D189E9B559A7F9 is bound by 8 distinct (vp,fp)
+rem pairs in the log, one of which is the SMOKE program ad7ce9d6/aa0fe222 - blanking
+rem would put a sphere light inside every smoke puff. That is the same failure the
+rem 2026-08-15 note above records for the door texture.
+rem REVERT: set them back to 830D7D1B9681C475 / BD80201C29B6B01E.
+set "RPCS3_REMIX_GUESTLIGHTVP=C1D482DCD1B03ED0"
+set "RPCS3_REMIX_GUESTLIGHTFP=796BC90574F89CA1"
 rem 2) Radiance. 30 on a 0.2-unit sphere is a nightlight. THIS IS THE BRIGHTNESS
 rem    KNOB - sweep it 50 / 150 / 400 with a relaunch, no rebuild. Too bright:
 rem    drop to 30 and set GUESTLIGHTCOLOR=0 for round-4 behaviour.
-set "RPCS3_REMIX_GUESTLIGHTRADIANCE=150"
+rem ROUND 41: raised 150 -> 1200 because the EMITTER SHRANK. Radiance is per unit area, so
+rem a sphere light total power goes as radius squared (INFERRED from the sphere-light model,
+rem not measured on screen). Round 40 ran radius 0.6; round 41 runs max(0.1, extent x 0.5),
+rem which on the measured glow cards (extent 0.09 .. 0.33) is about 0.10 .. 0.17.
+rem (0.6/0.15)^2 = 16, so equal power would want ~2400 and 1200 is a deliberate half-step -
+rem expect it slightly DIMMER than round 40 rather than blown out.
+rem THIS IS THE ONLY BRIGHTNESS KNOB. Too dark: 2400, then 4800. Too bright: 600, then 300.
+rem REVERT: set "RPCS3_REMIX_GUESTLIGHTRADIANCE=150"
+set "RPCS3_REMIX_GUESTLIGHTRADIANCE=1200"
 rem 3) Radius. The old fixed 0.2 sphere sat at the CENTRE of a 2.6-unit lamp
 rem    housing, i.e. inside its own shade, where the path tracer occluded it with
 rem    the lamp mesh itself. The sphere now scales with the draw's own extent.
@@ -655,8 +748,19 @@ rem 2026-08-15 REVERTED to a fixed radius: 0.35 x extent gave ~7-8 units on the
 rem draws it matched (one sphere filling half the screen in the debug view).
 rem 0 = use GUESTLIGHTRADIUS below, which is now 0.6 - big enough to clear a
 rem 2.6-unit lamp housing, small enough to read as a bulb.
-set "RPCS3_REMIX_GUESTLIGHTRADIUSSCALE=0"
-set "RPCS3_REMIX_GUESTLIGHTRADIUS=0.6"
+rem ROUND 41: THE EMITTER IS NOW THE SIZE OF THE MESH IT CAME FROM.
+rem Two problems, both measured. (a) SCALE=0 does NOT mean "use the fixed radius" - env_float
+rem REJECTS 0 and falls back to the accessor default, which is 0.35, and the banner has been
+rem echoing glradiusscale=0.35 all along. The accessor own comment claims otherwise and is
+rem wrong. Written explicitly now so the file and the behaviour agree.
+rem (b) RADIUS=0.6 is a FLOOR, and at world scale ~1 unit = 1 m that is a 60 cm emitter
+rem forced onto every fixture however small. On the measured 0.54-extent bulbs the floor won
+rem outright: the light sphere was LARGER THAN THE BULB. That is the other half of "too big".
+rem 0.5 x extent is exactly the mesh own half-extent, i.e. a sphere that fills the bulb and
+rem no more; 0.1 is a floor low enough never to bind on a real fixture.
+rem REVERT: SCALE=0 and RADIUS=0.6 (note SCALE=0 really means 0.35).
+set "RPCS3_REMIX_GUESTLIGHTRADIUSSCALE=0.5"
+set "RPCS3_REMIX_GUESTLIGHTRADIUS=0.1"
 rem Tint the light by the mean colour of the fixture's own texture, normalised so
 rem brightness is unchanged - only hue moves. 0 restores the fixed warm constant.
 set "RPCS3_REMIX_GUESTLIGHTCOLOR=1"
@@ -666,7 +770,13 @@ rem stop existing when you turn around.
 set "RPCS3_REMIX_GUESTLIGHTIDLE=0"
 rem Live guest-light cap (was hardcoded at 64). Raise if guest_light_capped starts
 rem climbing on the "Remix live:" line AND the extra lights are wanted.
-set "RPCS3_REMIX_GUESTLIGHTMAX=64"
+rem ROUND 41: 64 -> 128. GUESTLIGHTAUTO=2 lights every glow card in a level rather than one
+rem listed texture, and GUESTLIGHTIDLE=0 keeps them forever, so the cap is now reachable.
+rem WATCH guest_light_capped= on "Remix live:" - if it climbs, either the rule over-matches
+rem (that is the pre-registered refutation of the glow-card hypothesis) or raise this again.
+rem Clamp is 4096, so 128 is nowhere near a ceiling.
+rem REVERT: set "RPCS3_REMIX_GUESTLIGHTMAX=64"
+set "RPCS3_REMIX_GUESTLIGHTMAX=128"
 rem MORE LIGHTS, NO REBUILD: Ctrl+Click any unlit lamp/fixture, copy albedo= from
 rem the "Remix picked:" line in bin\remix_dump.log, and append it here and to
 rem EMISSIVE below (comma-separated, up to 16 each). Relaunch.
@@ -722,7 +832,24 @@ set "RPCS3_REMIX_EMISSIVEINTENSITY=1"
 rem TEMPORARY - a light stuck to the camera so you can play while tuning the real
 rem fixture lights. SET THIS BACK TO 0 once the room is lit by its own lamps; it
 rem flattens shadows and is not what the level should look like.
-set "RPCS3_REMIX_CAMLIGHT=12"
+rem ============================ ROUND 40 ============================================
+rem THIS KNOB HAS DONE NOTHING SINCE ROUND 5 AND THE COMMENT ABOVE IS FALSE.
+rem place_debug_light used DestroyLight-then-CreateLight on the same hash 0x3 every
+rem frame. MEASURED against the deployed runtime's own tree (dxvk-remix-numos3
+rem @6476faea): remixapi_DestroyLight only QUEUES the handle (rtx_remix_api.cpp:1613);
+rem the queue drains in Present and the erase lands in prepareSceneData's flush loop
+rem (rtx_fork_light.cpp:46-60) - i.e. AFTER the create, deleting the light that had
+rem just been made, before it could ever be linearized. The DrawLightInstance
+rem activation went with it. RemixGSRender.cpp has said so in a comment since round 23
+rem and left it deliberately.
+rem ROUND 40 FIXED THE MECHANISM (destroy removed, same-hash create, isDynamic=1 -
+rem exactly what the sun already does and what 'Remix sun-submit: destroys=0
+rem draw=SUCCESS' proves works), and ARMS IT AT 0 so the newly-working light stays off
+rem until you ask for it. At 12 it would now really behave the way this file's own
+rem source comment warns: "it blew out everything near the player and crushed
+rem everything far from them".
+rem TO TRY IT: 2 or 3, not 12. It is a real light now.
+set "RPCS3_REMIX_CAMLIGHT=0"
 rem
 rem === THE SUN'S DIRECTION - hand-tune here until round 14 derives it ==========
 rem This is the light you are actually seeing. It is NOT Remix's fallback light:
@@ -1090,7 +1217,31 @@ rem 1 turns every censused candidate into a real light through the existing
 rem dedup/cap machinery. OFF by default: the last time fixture identity was
 rem generalised this way it put lights on doors. Read the census FIRST, then flip
 rem this to 1 in the same sitting if the candidates look right.
-set "RPCS3_REMIX_GUESTLIGHTAUTO=0"
+rem ============================ ROUND 41 - THIS IS THE LIGHT FIX ====================
+rem MODE 2 = GLOW CARDS ONLY, and it replaces the albedo list entirely.
+rem The "Remix light-candidate:" census separates two populations cleanly (MEASURED, round-40
+rem run, grouped by albedo+state):
+rem   F613BD83DAF2B4E2 glowcard n=82 vtx=[22,23,26]  lum=0.8155 rgb=[0.8424 0.8314 0.5781]
+rem   0F86FCEDC4226D3B glowcard n=64 vtx=[4]         lum=0.9375 rgb=[0.9375 0.9375 0.9375]
+rem   A0D0AB03F0BB1D3C glowcard n=59 vtx=[200,36,64] lum=1
+rem   9CA366166DF12A90 glowcard n=27 vtx=[116,12,16] lum=0.9813 rgb=[1 1 0.7412]
+rem   9E95F66ECE26BE29 fixture  n=23 vtx=[216,8,846] lum=0.7226
+rem   16B46EA28EEDFC8E fixture  n=22 vtx=[8]         lum=0.7223
+rem Glow cards are small ADDITIVE billboards carrying the game own lamp tints; "fixture" rows
+rem are the big opaque housings at a flat metal lum ~0.72. Mode 2 takes only the cards.
+rem THE HYPOTHESIS (INFERRED - this run is the test): Haze draws a glow card over a fixture
+rem that is LIT and omits it for one that is not. If so this reproduces the raster reference
+rem "not every bulb is lit" with NO list, and each light gets the card own measured colour
+rem and its own extent-derived radius for free.
+rem It also retires the (vp,fp) key here: F613BD83DAF2B4E2 alone is drawn by 5 vertex and 12
+rem fragment programs, so no pair can name it. Mode 2 ignores GUESTLIGHTVP/FP entirely.
+rem PRE-REGISTERED REFUTATION: if the plant ends up with far more lights than it has visibly
+rem lit fixtures, or guest_light_capped= starts climbing, the glow card is NOT the "is lit"
+rem signal and this is wrong. guest_lights= and guest_light_capped= size it directly.
+rem MODE 1 = the old whole-census population (fixtures AND cards) - that is what put lights
+rem on doors in August. Do not use 1 as a fallback; use 0.
+rem REVERT: set "RPCS3_REMIX_GUESTLIGHTAUTO=0"
+set "RPCS3_REMIX_GUESTLIGHTAUTO=2"
 rem
 rem === DEFERPREANCHOR is deliberately LEFT OFF (set to 0 above) ================
 rem Round 6's verdict: off stays the baseline. 47% of buffered draws (367,629 of
@@ -1350,6 +1501,30 @@ rem argument only, i.e. from round 6's neutral grey 2x2. That is the flat grey.
 rem FPVCOL=0 restores the old parity fill for every draw, bit-exactly, and the
 rem pulse must go back to grey with it. That A/B is the whole attribution.
 set "RPCS3_REMIX_FPVCOL=1"
+rem ============================ ROUND 41 - THE WHITE WALLS AND THE GREY SMOKE =======
+rem RPCS3_REMIX_FPVCOLHOP lets the fragment classifier step BACKWARDS through identity temp
+rem copies before it decides. Default 0 in code (round-40 behaviour bit-exactly); armed at 4
+rem here so this run tests it.
+rem WHY: MEASURED, every one of 192 "Remix alphastate:" rows reads tcolor=1/0/3 - "colour =
+rem albedo texture, vertex colour DISCARDED" - while 22 of 47 vertex programs, the wall
+rem program ad7ce9d672a0bf6b among them, carry a fully replayable route=scaled
+rem slots=[c[18].x..w]. The vertex side is ready; the FRAGMENT classifier is the gate, and it
+rem recognises exactly TWO shapes in the whole title (fpclass=1/1/0, fpvcol_applied=698 of
+rem 5,783,237 draws = 0.012%%). If Haze paints a neutral base texture and carries the copper
+rem tint per-vertex, "walls white not albedo" IS this, and so is the uncoloured lava smoke.
+rem WHY IT IS SAFE: an identity copy is an unconditional MOV of a temp with identity swizzle
+rem and no negate/abs - the identity function. Hopping one cannot admit a shape the
+rem classifier did not already recognise; it only reaches programs that build the recognised
+rem shape in a temp and export it. It CANNOT mis-classify.
+rem WHY IT MAY NOT BE ENOUGH, pre-registered: a program doing real arithmetic between the
+rem modulate and the export (a fog lerp, a specular add, a MAD) is not reached and stays
+rem "other". THE READING: fpclass= on "Remix live:" must move off 1/1/0, and "Remix fpvcol:"
+rem lines must show hops= greater than 0. If fpclass stays 1/1/0 the hop is not the gate -
+rem and the NEW "Remix fpother:" census in bin\remix_dump.log then names the terminal
+rem instruction of every unclassified program, which is the data the real widening needs.
+rem WATCH ALSO: vcol_applied= should rise well above its 1.47%% of placed draws.
+rem REVERT: set "RPCS3_REMIX_FPVCOLHOP=0"
+set "RPCS3_REMIX_FPVCOLHOP=4"
 rem The mesh-hash half, severable on its own: let the ATTR3 decode run on a
 rem TEXTURED draw when its fragment program proves 'MUL out, <TEX>, COL0'.
 rem Vertex colour is hashed into the mesh key, so an ANIMATED vertex colour makes
@@ -1361,7 +1536,28 @@ rem their texture by a vertex colour that is evidently near-zero - most likely t
 rem meshes carry no COL0 attribute at all and the replay is feeding zeros. Off =
 rem textured draws sample the texture only, which is how the gauges looked before
 rem round 9. Set to 1 to reproduce.
-set "RPCS3_REMIX_VCOLMOD=0"
+rem ============================ ROUND 41 - TURNED BACK ON, WITH THE BLACK GUARD =====
+rem VCOLMOD=0 is what made the FPVCOLHOP work above a NO-OP: fp_wants_vcol ANDs this knob
+rem in, so with it at 0 no textured draw ever reaches apply_vertex_colour no matter what
+rem the fragment classifier decides. Arming the hop without arming this would have shipped
+rem a change that could not alter one pixel.
+rem THE 2026-08-15 BLACK-HUD NOTE ABOVE IS NOW ROOT-CAUSED, not guessed. "Remix vcolroute:"
+rem names exactly two constant-route programs on this title and one of them resolves to
+rem   vp=b01bfce3fc580e3b route=constant cval=[0 0 0 1]
+rem i.e. a constant vertex colour of PURE BLACK. On an untextured draw that constant IS the
+rem colour and round 12 is right to replay it. On a TEXTURED draw it reaches Remix as a
+rem Modulate factor, and a Modulate by zero cannot make a surface more correct - it deletes
+rem it. That is the black gauge, exactly.
+rem Round 41 adds RPCS3_REMIX_VCOLCONSTBLACK (default 1): refuse a constant-route colour
+rem that resolves under 1/255 on a TEXTURED draw, leaving the albedo unmodified. The
+rem untextured path is bit-exact. Counter vcol_const_black= on "Remix live:".
+rem IF THE HUD GAUGES GO BLACK ANYWAY: set "RPCS3_REMIX_VCOLMOD=0" - one line, done - and
+rem   report vcol_const_black=. If that counter is 0 the black came from somewhere else and
+rem   the guard is aimed at the wrong mechanism, which is the pre-registered refutation.
+rem WATCH: mesh_created= on the live line. Vertex colour is hashed into the mesh key, so an
+rem   ANIMATED vertex colour mints a mesh per step. It was 582,659 with this off.
+rem REVERT: set "RPCS3_REMIX_VCOLMOD=0"
+set "RPCS3_REMIX_VCOLMOD=1"
 rem
 rem === THE SELVA CANOPY ========================================================
 rem A third matcher pass, tried LAST, for a fused group whose row scalars read
@@ -2173,6 +2369,183 @@ rem WATCH FOR: this is the A/B that attributes any lighting change. 0 keeps the
 rem   emissive look and keeps the occlusion, i.e. keeps today's sunless scene.
 rem REVERT: 0.
 set "RPCS3_REMIX_SKYEMISSIVEBLEND=1"
+rem
+rem ==========================================================================
+rem === ROUND 39: RPCS3_REMIX_SKYCLASSIFY - the sky WITHOUT a hash list ======
+rem ==========================================================================
+rem THE DEFECT. The six hashes above are the whole reason any sky renders. A
+rem dome whose texture hash is not on that list gets an ordinary opaque
+rem material, no emission, and renders BLACK. haze_domes.csv - mined from the
+rem game's own archives - names SIXTEEN distinct dome resources, so about ten
+rem of them are black and the only cure has been to visit the level and
+rem Ctrl+Click the sky. MEASURED in bin\remix_dump.log: 14,726 stats lines read
+rem "mat_skyemissive=0 mat_skyunordered=0" - entire sessions in which the
+rem sky-emissive material was never created once - while sessions on a listed
+rem level reach 43.
+rem
+rem THE ARCHIVES CANNOT FIX IT: the mining round recovered the dome NAMES but
+rem name -> texture hash is not recoverable (assets are keyed by an unrecovered
+rem name hash; all 28,278 cached.pak members were scanned for every dome name,
+rem zero hits). So the domes must be identified at RUNTIME, by shape.
+rem
+rem WHAT IT DOES. Per albedo hash: a draw is dome-shaped when it writes no
+rem depth, the camera is INSIDE its transformed AABB, its world extent is in
+rem [SKYEXTENT, SKYCLASSIFYMAXEXT], its vertex count is at or below
+rem SKYCLASSIFYMAXVTX and its extent-per-vertex is at or above SKYCLASSIFYUPV.
+rem A hash that has been dome-shaped SKYCLASSIFYMIN times, has never been seen
+rem on a non-dome draw, and has been known for SKYCLASSIFYSETTLE frames is
+rem PROMOTED into the sky-emissive set - exactly as if you had typed it into
+rem RPCS3_REMIX_SKYEMISSIVE above. Same material, same intensity, same blend
+rem type, and it also unlocks the per-level SUN (the peak_uv walk that feeds
+rem derive_sky_sun is gated on the same predicate).
+rem
+rem WHY NOT THE EXISTING SKYHASH RULE, WHICH ALREADY DOES THIS SHAPE. Because
+rem it REJECTS the two domes we have ground truth for. MEASURED, every
+rem "Remix sky-hash-census:" line in the log:
+rem   albedo=D1A6D1B27ADE6232 reject:mixed vtx=304 wext=26351.6 upv=86.68
+rem   albedo=CDFE11B12552EA2D reject:mixed vtx=372 wext=27194.1 upv=73.10
+rem Both are on YOUR list above. Its units-per-vertex floor is 100 and those
+rem domes' own latitude bands measure 86.68 and 73.10, so the coarse bands of a
+rem tessellated dome disqualify their own texture. Structural, not tuning.
+rem
+rem MODE 2 = PROMOTE (armed here). 1 = census only, image-identical. 0 = off.
+rem 3 = promote and ignore the disqualification. The ceiling is 3, i.e. ABOVE
+rem the armed 2, deliberately - a clamp equal to the armed value is the trap
+rem that has now cost five rounds.
+rem
+rem READ, on "Remix live:" in bin\remix_dump.log (also on "Remix stats:" in
+rem bin\log\RPCS3.log after exit):
+rem   skyclassify_armed     hashes the rule accepted. haze_domes.csv holds 16
+rem                         distinct dome resources, but only 12 outside
+rem                         multiplayer - so 8..20 over a full single-player
+rem                         pass is expected. ABOVE ~28 = over-matching -> raise
+rem                         SKYCLASSIFYMAXEXT or SKYCLASSIFYMINVTX first - upv
+rem                         is nearly redundant with the vertex ceiling.
+rem   skyclassify_promoted  of those, the ones NOT already on your list.
+rem   armed MINUS promoted  = how many ground-truth domes the rule agreed with.
+rem                         IF THIS IS 0 THE RULE FOUND NOTHING YOU HAD ALREADY
+rem                         FOUND BY HAND, which is a reason to distrust it.
+rem   skyclassify_entries   material rebuilds performed. 0 with promoted > 0
+rem                         means the rebuild reached no resident texture and
+rem                         the dome will stay black.
+rem   skyclassify_failed    every resident entry refused the rebuild. The
+rem                         promotion was WITHDRAWN and will retry. Expect 0.
+rem   skyclassify_overflow  the 64-entry promoted set is full. Expect 0; if
+rem                         not, the title has more dome textures than the
+rem                         array holds - raise the array, not a threshold.
+rem
+rem READ THIS BEFORE ANY COUNTER ABOVE. In bin\log\RPCS3.log:
+rem   Remix skypromote: content=<albedo> mat AAAA -> BBBB ok
+rem The two hashes MUST differ. A promotion rebuilds the material for a texture
+rem that already has one, and material_hash is derived from the content hash and
+rem the wrap/alpha state - none of which a promotion changes. Without the fold
+rem this round added, CreateMaterial would be handed two different definitions
+rem under ONE hash, and this file already records (round 7) that aliasing them
+rem makes the winner DRAW-ORDER DEPENDENT: the dome could stay black while
+rem skyclassify_promoted, skyclassify_entries AND mat_skyemissive all report
+rem success. If that line ever reads IDENTICAL - THE FOLD DID NOT FIRE, stop and
+rem set SKYCLASSIFY=1; no counter on the live line can see that failure.
+rem NOTE mat_skyemissive is no longer a 'did the dome attach' test: a promotion
+rem rebuilds every entry aliasing the content hash (~45 on this title), so one
+rem dome moves it by tens. Use skyclassify_entries and Remix skypromote:.
+rem   skyclassify_settling  arm attempts held by the settle window. Non-zero
+rem                         then falling is the window working.
+rem   skyclassify_rejected  DRAWS carrying a disqualified hash, not hashes - it
+rem                         climbs with traffic. The count of distinct refused
+rem                         textures is the number of "reject:mixed" lines.
+rem REPLAYED BEFORE SHIPPING: applying every gate above to every
+rem "Remix sky-census:" row in the 969 MB log admits 18 distinct albedo hashes,
+rem and ALL SIX of the hand-listed dome hashes are among them - the ground-truth
+rem check passing on historical data before this play-test sees it. The other 12
+rem are candidates, not confirmations: the census carries no draw counts, so it
+rem cannot evaluate the 8-draw / no-disqualification / settle-window rule that
+rem actually arms a hash. EXPECT THE LIVE NUMBER TO BE LOWER THAN 18.
+rem
+rem And "Remix skyclassify:" names each hash, with vp=, vtx=, wext=, upv=,
+rem listed= and the CAMERA POSITION at the moment it armed - that last field is
+rem how a dome hash gets attributed to a level, because nothing in the guest
+rem signal carries a level name.
+rem
+rem PRE-REGISTERED, and check them in this order:
+rem   1. D1A6D1B27ADE6232 and CDFE11B12552EA2D must both appear on
+rem      "Remix skyclassify:" as ARMED:listed. They are ground truth and the
+rem      OLD rule rejects both. If they do not arm, the upv floor is still
+rem      wrong and nothing else this round claims is worth reading.
+rem   2. RAVINE MUST ARM NOTHING NEW. haze_domes.csv: all six jungle_ravine
+rem      backgrounds read "(no skyModel authored)". A BLACK SKY IN RAVINE IS
+rem      CORRECT. Any hash arming there is a false positive and it is the
+rem      cheapest place in the game to see one.
+rem   3. On the other levels the sky should stop being black without the sun
+rem      changing - the sun is a separate path and this round did not move it.
+rem
+rem BLAST RADIUS: a promoted hash becomes EMISSIVE and stops occluding (blend
+rem type kEmissive). If a wall, a water plane or a fog card starts glowing and
+rem stops casting shadow, this knob did it - read "Remix skyclassify:" for the
+rem albedo and check it against what is glowing.
+rem REVERT (no rebuild): set "RPCS3_REMIX_SKYCLASSIFY=1" - census only, keeps
+rem   every number above and changes no pixel. 0 turns even the census off.
+rem ============================ ROUND 40 - DROPPED TO 1 ==========================
+rem THE ROUND-39 RUN FAILED ITS OWN PRE-REGISTERED CHECK. MEASURED, 64,139 flips:
+rem   skyclassify_armed=1  skyclassify_promoted=1  skyclassify_entries=1
+rem   Remix skyclassify: albedo=23A3978F1405B16E ARMED dome=61 other=0 agree=1 |
+rem     vp=af06f6d32ec048ee vtx=152 wext=24728.6 upv=162.688 inside=1 |
+rem     listed=0 promoted=1 | cam=[1746.6 -71.676 1049] frame=59921
+rem Round 39 pre-registered "armed - promoted > 0, and if it is 0 the rule found
+rem nothing the user had already found by hand - distrust it". It is 0, and
+rem listed=0 says the one hash it did arm is NOT on your SKYEMISSIVE list.
+rem It also armed at cam=[1746.6 -71.676 1049], which is INSIDE the copper-plant
+rem region your other picks came from (X 1746..1806, Z 1049..1228) - i.e. the
+rem exact level you report as having white walls that vanish at angles. A
+rem promoted hash becomes emissive AND STOPS OCCLUDING, which is what "white"
+rem plus "disappears at angles" looks like from a path tracer.
+rem HONEST CAVEAT: the census argues it IS a real backdrop - 2048x512, raw box
+rem [-12370..12370], 61 of 61 draws dome-shaped. So this may be a correct
+rem promotion. That is exactly why it is an A/B and not a deletion.
+rem TEST: with this at 1 nothing is rebuilt and no pixel changes from the
+rem classifier. If the plant walls stop being white / stop vanishing, this was
+rem it. If they are unchanged, put it back to 2 and the classifier is cleared.
+set "RPCS3_REMIX_SKYCLASSIFY=1"
+rem
+rem --- the four thresholds, each with the measurement behind it -------------
+rem MAXEXT 4.0e6. MEASURED: the candidate set contains a family at wext 1.22e9
+rem   .. 1.12e18 which cannot be geometry - the mined scene descriptor sets
+rem   farPlane 14000, so the world fits in ~1.4e4 units. The largest row
+rem   carrying a hash YOU listed as a dome is 2.14e6 (35C2353F6B3CE2A8). The
+rem   gap 2.14e6 -> 1.22e9 is 570x wide, so this is a round number in a wide
+rem   gap, not a tuned one. Do NOT lower it below ~3e6: three of your six
+rem   listed domes live in the million-unit family and a "sensible" ceiling
+rem   would delete them.
+set "RPCS3_REMIX_SKYCLASSIFYMAXEXT=4000000"
+rem MAXVTX 1024. MEASURED terrain in the candidate set: 2714..12875 vertices.
+rem   MEASURED domes: 33..747. 1024 sits 2.65x below the lowest terrain row.
+set "RPCS3_REMIX_SKYCLASSIFYMAXVTX=1024"
+rem MINVTX 16 - a FLOOR, and it exists because replaying the gates over the log
+rem   named one concrete false positive: albedo AC936E2F25F147B0 on
+rem   vp=3c9186d8e026cec5 is a FOUR-VERTEX quad spanning 32,331 units with the
+rem   camera inside it. That is a full-screen backdrop card, not a dome. The
+rem   smallest vertex count on any hand-listed dome row is 33, so 16 drops that
+rem   quad and nothing else (admitted set 19 hashes -> 18).
+set "RPCS3_REMIX_SKYCLASSIFYMINVTX=16"
+rem UPV 60. MEASURED lowest units-per-vertex on any row carrying a hand-listed
+rem   dome hash, after the extent and vertex gates: 73.09. MEASURED highest on
+rem   any row the vertex ceiling excludes: 23.57. 60 sits between, a 3.1x gap.
+rem   HONEST LIMIT: on this data upv is nearly REDUNDANT with the vertex
+rem   ceiling - every row the ceiling excludes is also under 60 - so most of the
+rem   separating power is the extent bounds, the vertex bounds and "inside".
+rem   Raise toward 73 if something that is not sky starts glowing; lower toward
+rem   50 if a level's sky stays black while its dome is clearly being drawn.
+set "RPCS3_REMIX_SKYCLASSIFYUPV=60"
+rem MIN 8 dome-shaped draws to arm - the same count the older SKYHASH rule
+rem   uses, and for the same reason: one dome-shaped draw is what a large flat
+rem   effect card looks like for a single frame.
+set "RPCS3_REMIX_SKYCLASSIFYMIN=8"
+rem SETTLE 60 frames (~2 s at 30 fps) between first sight and arming. This is
+rem   the guard on the one failure the rule cannot undo: a material rebuilt
+rem   emissive cannot be rebuilt back, so a texture that is SHARED with world
+rem   geometry must get the chance to disqualify itself first. Raise it if a
+rem   shared texture still slips through; lower it if a level is left too
+rem   briefly for its dome to arm at all (watch skyclassify_settling).
+set "RPCS3_REMIX_SKYCLASSIFYSETTLE=60"
 rem
 rem === THE VIEWMODEL CAMERA - why the tag has never done anything ===========
 rem Round 12's reading, that vmcam_applied=0 meant the camera was missing, was

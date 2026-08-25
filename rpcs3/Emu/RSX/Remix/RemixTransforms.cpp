@@ -7933,6 +7933,16 @@ namespace remix_rsx
 		constexpr u32 s_max_fp_instructions = 512;
 	}
 
+	// --- ROUND 41 ------------------------------------------------------------------------------
+	// Clamped to 8. A chain of identity copies longer than that is not a compiler artefact, it is a
+	// different program shape, and following it would be exactly the "widen until something
+	// matches" mistake RETRYUNSUP already cost this project one round for.
+	u32 fp_vcol_hop_budget()
+	{
+		static const u32 value = std::min(env_u32(L"RPCS3_REMIX_FPVCOLHOP", 0), 8u);
+		return value;
+	}
+
 	fp_fingerprint scan_fragment_program(const void* ucode, u32 ucode_length, bool fp32_outputs)
 	{
 		fp_fingerprint result{};
@@ -8409,6 +8419,64 @@ namespace remix_rsx
 				rgb_index = last_writer(out_reg, 0x7, static_cast<u32>(code.size()));
 			}
 
+			// --- ROUND 41: step backwards through identity temp copies before classifying --------
+			// An identity copy is an UNCONDITIONAL MOV of a TEMP with identity swizzle and no
+			// negate and no abs. That is the identity function, so replacing the copy with its own
+			// producer cannot change what the program computes, and hopping one therefore cannot
+			// admit a shape this classifier did not already recognise - it only reaches programs
+			// that build the recognised shape in a temp and then export it. That safety is the
+			// whole design: RPCS3_REMIX_RETRYUNSUP is on record in this project as the cost of
+			// widening a matcher until something matched, and this widening cannot mis-match.
+			//
+			// It is also LIMITED, and that limit is the pre-registered way for this to fail: a
+			// program that does real arithmetic between the modulate and the export - a fog lerp, a
+			// specular add, a saturate through MAD - is NOT reached and stays 'other'. If
+			// fpclass= does not move off 1/1/0 with FPVCOLHOP armed, the hop is not the gate and
+			// the 'Remix fpother:' census below is the data the next widening has to be built on.
+			const auto is_identity_copy = [&](const fp_instr& in) -> bool
+			{
+				return in.opcode == RSX_FP_OPCODE_MOV
+					&& in.writes
+					&& in.exec_lt && in.exec_eq && in.exec_gr
+					&& in.src_type[0] == RSX_FP_REGISTER_TYPE_TEMP
+					&& in.src_swizzle[0] == identity_swizzle
+					&& !(in.src_neg & 1u)
+					&& !(in.src_abs & 1u);
+			};
+
+			u8 hops_used = 0;
+
+			const auto hop_copies = [&](s32 index, u8 mask) -> s32
+			{
+				const u32 budget = fp_vcol_hop_budget();
+
+				for (u32 h = 0; h < budget && index >= 0; ++h)
+				{
+					const fp_instr& in = code[index];
+
+					if (!is_identity_copy(in))
+					{
+						break;
+					}
+
+					// Strictly earlier than `index` by last_writer's own contract, so this
+					// terminates even without the budget.
+					const s32 next = last_writer(in.src_reg[0], mask, static_cast<u32>(index));
+
+					if (next < 0)
+					{
+						break;
+					}
+
+					index = next;
+					hops_used = std::max<u8>(hops_used, static_cast<u8>(h + 1));
+				}
+
+				return index;
+			};
+
+			rgb_index = hop_copies(rgb_index, 0x7);
+
 			// One instruction, classified. 'index' is its position so the modulate arm can walk
 			// backwards from it for the sampled temp.
 			const auto classify = [&](s32 index) -> std::pair<fp_out_source, u8>
@@ -8452,7 +8520,10 @@ namespace remix_rsx
 						return false;
 					}
 
-					const s32 writer = last_writer(out.src_reg[s], 0x7, static_cast<u32>(index));
+					// ROUND 41: the same identity-copy hop. 'MUL out, rB, COL0' where rB was
+					// MOV'd from the sampled rA is the same modulate written one temp apart.
+					const s32 writer = hop_copies(
+						last_writer(out.src_reg[s], 0x7, static_cast<u32>(index)), 0x7);
 					return writer >= 0 && code[writer].sample;
 				};
 
@@ -8477,9 +8548,68 @@ namespace remix_rsx
 			const auto [rgb_class, rgb_attr] = classify(rgb_index);
 			result.out_rgb_source = rgb_class;
 
-			const s32 alpha_index = last_writer(out_reg, 0x8, static_cast<u32>(code.size()));
+			const s32 alpha_index = hop_copies(
+				last_writer(out_reg, 0x8, static_cast<u32>(code.size())), 0x8);
 			const auto [alpha_class, alpha_attr] = classify(alpha_index);
 			result.out_alpha_source = alpha_class;
+
+			// --- ROUND 41: record WHY, when the answer is 'other' --------------------------------
+			// Populated only on the failing arm so a classified program costs nothing. This is the
+			// evidence the next widening is designed from - the terminal instruction's opcode and
+			// the kind of each of its operands - instead of another round of guessing at shapes.
+			result.out_rgb_hops = hops_used;
+
+			if (rgb_class == fp_out_source::other && rgb_index >= 0)
+			{
+				const fp_instr& term = code[rgb_index];
+
+				result.out_rgb_opcode = static_cast<u8>(term.opcode);
+				result.out_rgb_predicated = !(term.exec_lt && term.exec_eq && term.exec_gr);
+				result.out_rgb_srccount = term.source_count;
+
+				for (u32 slot = 0; slot < 3; ++slot)
+				{
+					result.out_rgb_srctype[slot] = term.src_type[slot];
+
+					u8 kind = 0;
+
+					if (term.src_swizzle[slot] != identity_swizzle)
+					{
+						kind |= 0x08;
+					}
+
+					if (term.src_neg & (1u << slot))
+					{
+						kind |= 0x10;
+					}
+
+					if (term.src_abs & (1u << slot))
+					{
+						kind |= 0x20;
+					}
+
+					if (term.src_type[slot] == RSX_FP_REGISTER_TYPE_INPUT
+						&& (term.attr_reg == 1 || term.attr_reg == 2))
+					{
+						kind |= 0x01;
+					}
+
+					if (term.src_type[slot] == RSX_FP_REGISTER_TYPE_TEMP)
+					{
+						kind |= 0x04;
+
+						const s32 writer = hop_copies(
+							last_writer(term.src_reg[slot], 0x7, static_cast<u32>(rgb_index)), 0x7);
+
+						if (writer >= 0 && code[writer].sample)
+						{
+							kind |= 0x02;
+						}
+					}
+
+					result.out_rgb_srckind[slot] = kind;
+				}
+			}
 
 			// rgb wins the attribute when both classified; they can only disagree if two different
 			// instructions wrote the two halves, which is exactly the asymmetric case the two
@@ -10903,11 +11033,45 @@ namespace remix_rsx
 		}
 	}
 
-	bool sky_emissive_albedo_matches(u64 hash)
+	bool sky_emissive_listed(u64 hash)
 	{
+		// ROUND 39. The ENV LIST alone - what the user actually typed into RPCS3_REMIX_SKYEMISSIVE.
+		// Split out from sky_emissive_albedo_matches() because that predicate now also answers
+		// "...or the classifier promoted it", and a census field labelled 'listed' that silently
+		// took the wider answer would make the play-test's ground-truth check unfalsifiable.
+		if (hash == 0)
+		{
+			return false;
+		}
+
 		const sky_emissive_albedo_list& list = sky_emissive_albedos();
 		const auto end = list.values.begin() + list.count;
-		return hash != 0 && std::find(list.values.begin(), end, hash) != end;
+		return std::find(list.values.begin(), end, hash) != end;
+	}
+
+	bool sky_emissive_albedo_matches(u64 hash)
+	{
+		if (hash == 0)
+		{
+			return false;
+		}
+
+		const sky_emissive_albedo_list& list = sky_emissive_albedos();
+		const auto end = list.values.begin() + list.count;
+
+		if (std::find(list.values.begin(), end, hash) != end)
+		{
+			return true;
+		}
+
+		// ROUND 39. The runtime-learned half. Deliberately folded in HERE rather than at the two
+		// call sites, because this one predicate is what three separate features already ask:
+		// texture_cache::upload's emissive material (RemixTextures.cpp, the sky_emissive local),
+		// texture_cache::upload's peak_uv walk (the gate on entry.peak_uv, which is in turn the
+		// gate on derive_sky_sun) and the 'Remix skyemissive:' census. Extending the predicate
+		// gives all three to a classified dome at once; extending the call sites would have given
+		// them to one and left the other two silently keyed on the hand-written list.
+		return sky_emissive_promoted(hash);
 	}
 
 	u32 sky_emissive_albedo_count()
@@ -10929,6 +11093,162 @@ namespace remix_rsx
 	{
 		static const u32 value = env_u32(L"RPCS3_REMIX_SKYEMISSIVEBLEND", 1);
 		return value != 0;
+	}
+
+	// --- round 39: the RUNTIME-LEARNED half of the sky-emissive set ---------------------------
+	// Derivation, the measurement behind every threshold and the pre-registered refutation are all
+	// in RemixTransforms.h on sky_classify_mode(). This is only the storage.
+	//
+	// A fixed array and not an unordered_set for the same reason every other list in this file is
+	// one: the read happens on the texture upload path and on the sky census, both of which run on
+	// the RSX thread, and a bounded linear scan of at most 64 u64s is cheaper than a hash lookup at
+	// this size. 64 is 4x the 16 domes haze_domes.csv says the whole title has, so the bound is not
+	// a limit anything is expected to reach - and if it IS reached, sky_promote_overflow says so
+	// rather than the set silently going quiet.
+	namespace
+	{
+		struct sky_promoted_list
+		{
+			std::array<u64, 64> values{};
+			u32 count = 0;
+			u32 overflow = 0;
+		};
+
+		sky_promoted_list& sky_promoted()
+		{
+			static sky_promoted_list list{};
+			return list;
+		}
+	}
+
+	bool sky_emissive_promoted(u64 hash)
+	{
+		if (hash == 0)
+		{
+			return false;
+		}
+
+		const sky_promoted_list& list = sky_promoted();
+		return std::find(list.values.begin(), list.values.begin() + list.count, hash)
+			!= list.values.begin() + list.count;
+	}
+
+	bool sky_emissive_promote(u64 hash)
+	{
+		if (hash == 0 || sky_emissive_promoted(hash))
+		{
+			return false;
+		}
+
+		sky_promoted_list& list = sky_promoted();
+
+		if (list.count >= list.values.size())
+		{
+			++list.overflow;
+			return false;
+		}
+
+		list.values[list.count++] = hash;
+		return true;
+	}
+
+	bool sky_emissive_unpromote(u64 hash)
+	{
+		// ROUND 39. Used on exactly one path: the promotion was recorded, every resident texture
+		// entry then REFUSED the material rebuild, and leaving the hash in the set would re-key
+		// every later mesh under an identity whose material never actually changed - a permanent
+		// black dome that the counters would report as a success. Undoing it costs nothing
+		// because the mesh key fold is read on the NEXT frame, never within the draw that
+		// promoted, so no mesh can have moved yet.
+		//
+		// This is the ONLY way an entry leaves the set, and it runs before any consumer has seen
+		// the membership - so sky_emissive_promoted() stays monotone from the point of view of
+		// the mesh key, which is what makes folding it into a cache key safe.
+		if (hash == 0)
+		{
+			return false;
+		}
+
+		sky_promoted_list& list = sky_promoted();
+		const auto end = list.values.begin() + list.count;
+		const auto it = std::find(list.values.begin(), end, hash);
+
+		if (it == end)
+		{
+			return false;
+		}
+
+		*it = list.values[list.count - 1];
+		list.values[--list.count] = 0;
+		return true;
+	}
+
+	u32 sky_emissive_promoted_count()
+	{
+		return sky_promoted().count;
+	}
+
+	u32 sky_emissive_promote_overflow()
+	{
+		return sky_promoted().overflow;
+	}
+
+	u32 sky_classify_mode()
+	{
+		// Default 1 = measure and name, tag nothing, promote nothing: image-identical to round 38
+		// by construction. 0 is the hard off (not even the census). 2 promotes. 3 promotes while
+		// ignoring the disqualification, which is a real fourth behaviour and not a reserved value
+		// - the ceiling is deliberately ABOVE the value the launcher arms, because a clamp that
+		// equals the armed value makes a saturated knob and a tuned one print identically. That
+		// trap has now cost this project five rounds (STATICINDEXBUDGET most recently, [1,64]
+		// against an armed 64).
+		static const u32 value = std::min<u32>(env_u32(L"RPCS3_REMIX_SKYCLASSIFY", 1), 3u);
+		return value;
+	}
+
+	f32 sky_classify_max_extent()
+	{
+		// Negative sentinel for "unset", like every other float knob here - env_float rejects 0
+		// outright, so 0 could never mean "no ceiling" through that path.
+		static const f32 env = env_float(L"RPCS3_REMIX_SKYCLASSIFYMAXEXT", -1.f);
+		return env >= 0.f ? env : 4.0e6f;
+	}
+
+	u32 sky_classify_max_vertices()
+	{
+		static const u32 value = std::min<u32>(env_u32(L"RPCS3_REMIX_SKYCLASSIFYMAXVTX", 1024), 65535u);
+		return value;
+	}
+
+	u32 sky_classify_min_vertices()
+	{
+		// Floor, not ceiling, and it exists because the census named one concrete false positive:
+		// albedo AC936E2F25F147B0 on vp=3c9186d8e026cec5 is a FOUR-VERTEX quad spanning 32,331
+		// world units with the camera inside it. That is a full-screen backdrop card, not a dome.
+		// MEASURED: the smallest vertex count on any row carrying a hand-listed dome hash is 33,
+		// so 16 removes that quad and touches nothing else - replaying every gate over every
+		// 'Remix sky-census:' row in the 969 MB log takes the admitted set from 19 distinct hashes
+		// to 18, and the one it drops is exactly AC936E2F25F147B0.
+		static const u32 value = std::min<u32>(env_u32(L"RPCS3_REMIX_SKYCLASSIFYMINVTX", 16), 4096u);
+		return value;
+	}
+
+	f32 sky_classify_units_per_vertex()
+	{
+		static const u32 value = std::min<u32>(env_u32(L"RPCS3_REMIX_SKYCLASSIFYUPV", 60), 1000000u);
+		return static_cast<f32>(value);
+	}
+
+	u32 sky_classify_min_draws()
+	{
+		static const u32 value = std::clamp<u32>(env_u32(L"RPCS3_REMIX_SKYCLASSIFYMIN", 8), 1u, 4096u);
+		return value;
+	}
+
+	u32 sky_classify_settle_frames()
+	{
+		static const u32 value = std::min<u32>(env_u32(L"RPCS3_REMIX_SKYCLASSIFYSETTLE", 60), 1000000u);
+		return value;
 	}
 
 	namespace
@@ -11124,6 +11444,17 @@ namespace remix_rsx
 		return value != 0;
 	}
 
+	// --- ROUND 41 -------------------------------------------------------------------------------
+	// Refuse a CONSTANT-route vertex colour whose resolved RGB is (near) black on a TEXTURED draw.
+	// Default ON. Full derivation at the guard site in apply_vertex_colour; the short version is
+	// that `Remix vcolroute:` measures cval=[0 0 0 1] on vp=b01bfce3fc580e3b, and modulating an
+	// albedo by that can only delete it. 0 restores round-40 behaviour on that branch exactly.
+	bool vcol_constant_black_guard_enabled()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_VCOLCONSTBLACK", 1);
+		return value != 0;
+	}
+
 	bool vertex_colour_modulate_enabled()
 	{
 		// Severable independently of FPVCOL because it is the half that changes MESH CONTENT
@@ -11253,12 +11584,70 @@ namespace remix_rsx
 		return value;
 	}
 
+	// --- ROUND 41: the extent ceiling now applies to an explicitly LISTED albedo too -------------
+	// It always applied to the census and to GUESTLIGHTAUTO; it did not apply to a hash the user
+	// named on GUESTLIGHTALBEDO/ALBEDO2, and nothing in the file ever argued for that exemption.
+	// MEASURED why it matters, round-40 play-test, all 31 'Remix guest-light:' lines, one albedo
+	// (71D189E9B559A7F9) on one (vp, fp) pair: world extent spans 0.5385 .. 83.18, a 154x range.
+	// Nine rows sit at 0.5385 .. 1.731 (the bulbs; 1.731 is the user's own pick) and twenty-two sit
+	// at 7.893 .. 83.18 (a large mesh sharing the texture). The gap 1.731 -> 7.893 is 4.6x and the
+	// default ceiling of 6 lands inside it, so this separates the two populations on measured data
+	// rather than on taste. The 83.18 row produced radius=29.1 - the "too big, not aligned with the
+	// bulbs" light in the user's screenshot.
+	//
+	// Default ON because the round-40 behaviour is wrong on this title and on any title where one
+	// texture is shared between a fixture and a larger prop. 0 restores round 40 bit-exactly.
+	bool guest_light_list_extent_enabled()
+	{
+		static const bool value = env_u32(L"RPCS3_REMIX_GUESTLIGHTLISTEXT", 1) != 0;
+		return value;
+	}
+
+	// --- ROUND 41: mode 2 is "glow cards only", and it is the discriminator ----------------------
+	// 0 = off (default, round-40 behaviour). 1 = the whole census population, fixtures AND glow
+	// cards - the round-6 meaning, unchanged. 2 = glow cards only.
+	//
+	// Why 2 exists, MEASURED over the round-40 play-test's 'Remix light-candidate:' rows grouped by
+	// (albedo, state):
+	//
+	//   F613BD83DAF2B4E2  glowcard  n=82  vtx=[22,23,26]   lum=0.8155  rgb=[0.8424 0.8314 0.5781]
+	//   0F86FCEDC4226D3B  glowcard  n=64  vtx=[4]          lum=0.9375  rgb=[0.9375 0.9375 0.9375]
+	//   A0D0AB03F0BB1D3C  glowcard  n=59  vtx=[200,36,64]  lum=1
+	//   099D2DA136CEA2C4  glowcard  n=53  vtx=[40]         lum=0.9938
+	//   9CA366166DF12A90  glowcard  n=27  vtx=[116,12,16]  lum=0.9813  rgb=[1 1 0.7412]
+	//   9E95F66ECE26BE29  fixture   n=23  vtx=[216,8,846]  lum=0.7226
+	//   16B46EA28EEDFC8E  fixture   n=22  vtx=[8]          lum=0.7223
+	//
+	// Two separable populations. The glow cards are small additive billboards (4..200 vertices)
+	// carrying the game's own lamp tints - warm white, yellow, pure white. The 'fixture' rows are
+	// the large opaque housings (216, 846 vertices) at a flat lum ~0.72, which is the housing's
+	// metal, not a light.
+	//
+	// THE HYPOTHESIS THIS MODE TESTS, and it is INFERRED, not measured: Haze draws an additive glow
+	// card over a fixture that is LIT and omits it for one that is not. If that holds, "create a
+	// light where a glow card is drawn" reproduces the raster reference's "only some bulbs are lit"
+	// with no per-bulb list at all, and gives each light the card's own measured mean_rgb and its
+	// own extent-derived radius for free.
+	//
+	// It also retires the (vp, fp) key for this population: F613BD83DAF2B4E2 alone is drawn by FIVE
+	// vertex programs and TWELVE fragment programs, so no single pair can name it. Mode 2 does not
+	// consult vp_ok/fp_ok at all - those gate trigger_match only.
+	//
+	// REFUTING READING, pre-registered: if the plant ends up with many more lights than it has
+	// visibly lit fixtures, or guest_light_capped starts climbing, the card is not the "is lit"
+	// signal and the discriminator is something else. guest_lights= and guest_light_capped= on
+	// 'Remix live:' size it directly.
+	u32 guest_light_auto_mode()
+	{
+		static const u32 value = std::min(env_u32(L"RPCS3_REMIX_GUESTLIGHTAUTO", 0), 2u);
+		return value;
+	}
+
 	bool guest_light_auto_enabled()
 	{
 		// Default OFF, deliberately: the last generalisation of fixture identity put lights on
 		// doors. The census ships armed, the behaviour does not.
-		static const u32 value = env_u32(L"RPCS3_REMIX_GUESTLIGHTAUTO", 0);
-		return value != 0;
+		return guest_light_auto_mode() != 0;
 	}
 
 	u32 nectar_mode()

@@ -345,7 +345,69 @@ namespace remix_rsx
 			guarded_destroy_texture(m_storage.api.DestroyTexture, handle);
 		}
 
+		probe_set_config_variable();
+
 		return true;
+	}
+
+	// --- ROUND 39: is rtx.* reachable from THIS client, at runtime? --------------------------------
+	//
+	// Why this probe exists rather than a design built on the answer. Haze authors per-zone fog
+	// (fogCol / fogNear / fogFar / fogIntensity) and the question was whether a remixapi client can
+	// set fog at all. Reading the deployed runtime's source (dxvk-remix-numos3, branch numos3, HEAD
+	// 6476faea - the tree RemixRuntime.cpp:143 records as matching the deployed d3d9.dll) gives a
+	// split answer, and the useful half of it depends entirely on one function pointer:
+	//
+	//   NOT REACHABLE - D3D9 fixed-function fog. FogState has exactly one producer in the whole
+	//     tree, setFogState() in src/d3d9/d3d9_rtx_utils.cpp:245, called only from
+	//     src/d3d9/d3d9_rtx.cpp:686. rtx_remix_api.cpp:900 default-constructs DrawCallState, so
+	//     fogState.mode stays D3DFOG_NONE for every external draw, forever. The conf options that
+	//     look like the answer - rtx.enableFog / rtx.fogColorScale / rtx.maxFogDistance,
+	//     rtx_composite.h:90-92 - only SCALE that state, and composite.slangh:33-36 returns
+	//     vec4(0.0) when fogMode == D3DFOG_NONE. They multiply a hard zero. This is the same shape
+	//     as sky rasterization, ignoreTextures and terrain baking: the option parses and the
+	//     feature never runs. THREE ROUNDS OF THIS PROJECT HAVE BEEN LOST TO THAT PATTERN.
+	//
+	//   REACHABLE - global volumetrics. RtxGlobalVolumetrics::getVolumeArgs
+	//     (rtx_global_volumetrics.cpp:467, called per frame from rtx_context.cpp:1365) reads
+	//     transmittanceColor(), transmittanceMeasurementDistanceMeters(), singleScatteringAlbedo()
+	//     and anisotropy() DIRECTLY from RtxOption values. The D3D9 fog only ever overrides them,
+	//     behind a gate (`fogState.mode != D3DFOG_NONE`, :483-486) an external draw cannot open -
+	//     and volumetrics stay ON in that case rather than off, because shouldConvertToPhysicalFog
+	//     returns true immediately for D3DFOG_NONE (:445).
+	//
+	// So per-zone fog COLOUR and DENSITY are reachable and per-zone fogNear is not - there is no
+	// start distance anywhere in VolumeArgs. But every word of that is INFERRED from source, and
+	// the one thing it all hangs on is whether remixapi_Interface::SetConfigVariable is actually
+	// populated in the DEPLOYED build. Nothing in this project has ever called it.
+	//
+	// The probe is deliberately a NEGATIVE one and changes no option. rtx_remix_api.cpp:1653 looks
+	// the key up with RtxOptionImpl::getOptionByFullName and returns GENERAL_FAILURE when it is
+	// unknown, so a deliberately invalid key exercises the whole dispatch - pointer, marshalling,
+	// return path - and provably writes nothing. A SUCCESS here would be the alarming result: it
+	// would mean the slot is misrouted into some other function that accepted our arguments.
+	void runtime::probe_set_config_variable()
+	{
+		if (!m_storage.api.SetConfigVariable)
+		{
+			rsx_log.notice("Remix: SetConfigVariable slot is NULL -- runtime rtx.* options are not "
+				"settable from this client, so per-zone volumetric fog is unreachable");
+			return;
+		}
+
+		const u32 status = guarded_set_config_variable(m_storage.api.SetConfigVariable,
+			"rtx.rpcs3.probeKeyThatCannotExist", "0");
+
+		// GENERAL_FAILURE is the PASS. Reported at notice level either way, with the reading
+		// spelled out, because a bare error code on this line will be read months from now by
+		// somebody deciding whether fog is worth attempting.
+		rsx_log.notice("Remix: SetConfigVariable probe returned %s (%u) -- %s",
+			error_name(status), status,
+			(status == REMIXAPI_ERROR_CODE_SUCCESS)
+				? "UNEXPECTED SUCCESS on a key that cannot exist: treat the slot as misrouted and "
+				  "do NOT drive rtx.* options through it"
+				: "expected: the slot is live and rejected an unknown key, so rtx.volumetrics.* "
+				  "IS settable at runtime from this client");
 	}
 
 	void runtime::shutdown()

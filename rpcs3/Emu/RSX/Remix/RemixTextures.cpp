@@ -966,79 +966,12 @@ namespace remix_rsx
 		return true;
 	}
 
-	bool texture_cache::upload(const remixapi_Interface& api, texture_entry& entry)
+	// ROUND 39. Moved out of upload() verbatim so promote_sky_emissive() can re-run it on a
+	// texture that was already uploaded before its dome-ness was known. Body unchanged; the only
+	// edit is the enclosing signature and the loss of one level of indentation is deliberately NOT
+	// taken, so a diff of this block against round 38 is empty.
+	void texture_cache::measure_peak_uv(texture_entry& entry)
 	{
-		// --- round 7: RPCS3_REMIX_CLAMPALBEDO, the UI seam lever ----------------------------------
-		// Applied HERE and not at the entry.wrap_* assignment: the list is keyed on the CONTENT
-		// hash, which only exists once the guest bytes have been decoded and hashed. Everything
-		// downstream reads entry.wrap_u/wrap_v and therefore picks this up for free - the material
-		// identity below folds non-default wrap into material_hash (so the clamped variant cannot
-		// alias the repeat one), material.wrapModeU/V carry it to the GPU sampler for the
-		// world-space-UI route, and the CPU compositor's address_coordinate reads the same two
-		// fields for the 2D route. One list entry closes both routes for that texture.
-		//
-		// Overriding real guest state is normally the bug class this backend exists to avoid, which
-		// is why this is a manual, empty-by-default list rather than a heuristic: the guest's wrap
-		// mode is correctly decoded and faithfully replayed, and the only thing wrong with it is
-		// that a nearest-sampled atlas has no bilinear seam bound the way real RSX does.
-		//
-		// Round 8: the counter says LISTED-AND-CREATED, not "the wrap actually moved". Two ways it
-		// used to lie, both of which make tex_wrap_forced=0 unreadable against its own header
-		// comment ("separates a typo'd hash from a list that is simply empty"): it skipped any
-		// texture the guest had already bound CLAMP (a correct list entry, zero count), and it
-		// counted before CreateTexture, so an upload that failed still counted. Incremented below,
-		// beside m_stats.created.
-		const bool clamp_listed = clamp_albedo_matches(entry.content_hash);
-
-		if (clamp_listed)
-		{
-			entry.wrap_u = 0;
-			entry.wrap_v = 0;
-		}
-
-		const remixapi_Format format = textures_linear()
-			? REMIXAPI_FORMAT_B8G8R8A8_UNORM
-			: REMIXAPI_FORMAT_B8G8R8A8_SRGB;
-
-		// Measured here rather than in the decoders: every format path converges on this buffer,
-		// so one pass covers BC, direct, B8 and the 16-bit expansions without touching any of
-		// them. Once per upload, not per draw.
-		{
-			u8 lo = 255;
-			u8 hi = 0;
-
-			// Mean colour accumulated in the same walk. u64 sums: a 2048x2048 texture is 4.2M
-			// texels, and 4.2M * 255 overflows u32 on the first channel.
-			u64 sum_b = 0;
-			u64 sum_g = 0;
-			u64 sum_r = 0;
-			u64 texels = 0;
-
-			for (usz i = 3; i < entry.pixels.size(); i += 4)
-			{
-				const u8 a = entry.pixels[i];
-				lo = std::min(lo, a);
-				hi = std::max(hi, a);
-
-				// BGRA8 - the upload format below is B8G8R8A8, so index 0 is blue.
-				sum_b += entry.pixels[i - 3];
-				sum_g += entry.pixels[i - 2];
-				sum_r += entry.pixels[i - 1];
-				++texels;
-			}
-
-			entry.alpha_min = lo;
-			entry.alpha_max = hi;
-
-			if (texels != 0)
-			{
-				const f64 scale = 1.0 / (255.0 * static_cast<f64>(texels));
-				entry.mean_rgb[0] = static_cast<f32>(static_cast<f64>(sum_r) * scale);
-				entry.mean_rgb[1] = static_cast<f32>(static_cast<f64>(sum_g) * scale);
-				entry.mean_rgb[2] = static_cast<f32>(static_cast<f64>(sum_b) * scale);
-			}
-		}
-
 		// --- round 23: where the sun sits INSIDE the sky dome's texture ------------------------
 		// Only for the dome textures RPCS3_REMIX_SKYEMISSIVE names. Two extra walks of the buffer
 		// for one or two textures per level, once per upload; every other texture skips the block
@@ -1113,35 +1046,14 @@ namespace remix_rsx
 			}
 		}
 
-		remixapi_TextureInfo info{};
-		info.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_INFO;
-		info.pNext = nullptr;
-		info.hash = entry.content_hash;
-		info.width = entry.width;
-		info.height = entry.height;
-		info.depth = 1;
-		info.mipLevels = 1;
-		info.format = format;
-		info.data = entry.pixels.data();
-		info.dataSize = entry.pixels.size();
+	}
 
-		const u32 tex_status = guarded_create_texture(api.CreateTexture, &info, &entry.texture);
-
-		if (tex_status != REMIXAPI_ERROR_CODE_SUCCESS || !entry.texture)
-		{
-			rsx_log.error("Remix: CreateTexture failed for %ux%u hash %016llx (%s)",
-				entry.width, entry.height, entry.content_hash, error_name(tex_status));
-			entry.texture = nullptr;
-			return false;
-		}
-
-		++m_stats.created;
-
-		if (clamp_listed)
-		{
-			++m_stats.wrap_forced;
-		}
-
+	// ROUND 39. Moved out of upload() so it has two callers: upload() as before, and
+	// promote_sky_emissive(), which rebuilds ONLY the material for a texture that has just been
+	// classified as a sky dome. Body unchanged except the CreateMaterial failure arm, which no
+	// longer destroys the texture - see the comment there.
+	bool texture_cache::build_material(const remixapi_Interface& api, texture_entry& entry)
+	{
 		// The fork resolves this pseudo-path against the texture manager's hash table, which
 		// remixapi_CreateTexture just populated with entry.content_hash
 		// (rtx_fork_api_entry.cpp textureHashPathLookup). That is what puts an API texture in
@@ -1210,7 +1122,42 @@ namespace remix_rsx
 				material_hash = 1;
 			}
 		}
+
+		// --- ROUND 39, AND THIS IS WHAT MAKES THE PROMOTION VISIBLE AT ALL --------------------
+		// promote_sky_emissive() calls this function a SECOND time for a texture that already has
+		// a material, to give it the emissive definition. Every input to material_hash above is
+		// unchanged by a promotion - content hash, wrap modes, alpha func and ref are all
+		// properties of the texture, not of the classification - so without this fold the second
+		// CreateMaterial would declare a DIFFERENT definition under the SAME hash.
+		//
+		// The comment twelve lines above records what happens then, as measured fact rather than
+		// as a worry: aliasing CreateMaterial definitions made the winning wrap state DRAW-ORDER
+		// DEPENDENT. If the first (non-emissive) definition won, the dome would stay black while
+		// skyclassify_promoted, skyclassify_entries and mat_skyemissive all reported success -
+		// a counter reporting a change that never reached the screen, which is this project's
+		// most expensive recurring failure. None of round 39's new counters can see it.
+		//
+		// Applied ON TOP of the wrap/alpha fold and ONLY for a promoted hash, deliberately. A
+		// fifth byte added to material_state unconditionally would move the identity of every
+		// non-default-wrap material in the title, and material_hash is the MODDING SURFACE - it
+		// is the 'mat_<HASH>' a replacement in mod.usda targets. Unpromoted materials keep the
+		// hash they have always had, bit for bit.
+		//
+		// CONSEQUENCE, stated because it is a real one: a promoted dome's material hash is no
+		// longer equal to its albedo content hash. promote_sky_emissive() logs both values per
+		// rebuilt entry so the new identity is discoverable rather than merely different.
+		if (sky_emissive_promoted(entry.content_hash))
+		{
+			static constexpr u8 sky_tag[] = { 'S', 'K', 'Y', 'E' };
+			material_hash = fnv_bytes(sky_tag, sizeof(sky_tag), material_hash);
+			if (material_hash == 0)
+			{
+				material_hash = 1;
+			}
+		}
 		material.hash = material_hash;
+		// ROUND 39. Recorded before CreateMaterial so a caller can compare it across a rebuild.
+		entry.material_hash = material_hash;
 		material.albedoTexture = albedo_path;
 		material.normalTexture = nullptr;
 		material.tangentTexture = nullptr;
@@ -1365,8 +1312,126 @@ namespace remix_rsx
 
 		if (mat_status != REMIXAPI_ERROR_CODE_SUCCESS || !entry.material)
 		{
+			// ROUND 39. The texture is NOT destroyed here any more, because this body now has a
+			// second caller (promote_sky_emissive) for which the texture is already live and
+			// shared. upload() does the destroy on a false return, which is where it always
+			// belonged: this function creates a material and nothing else.
 			rsx_log.error("Remix: CreateMaterial failed for hash %016llx (%s)",
 				entry.content_hash, error_name(mat_status));
+			entry.material = nullptr;
+			return false;
+		}
+
+		++m_stats.materials;
+		return true;
+	}
+
+	bool texture_cache::upload(const remixapi_Interface& api, texture_entry& entry)
+	{
+		// --- round 7: RPCS3_REMIX_CLAMPALBEDO, the UI seam lever ----------------------------------
+		// Applied HERE and not at the entry.wrap_* assignment: the list is keyed on the CONTENT
+		// hash, which only exists once the guest bytes have been decoded and hashed. Everything
+		// downstream reads entry.wrap_u/wrap_v and therefore picks this up for free - the material
+		// identity below folds non-default wrap into material_hash (so the clamped variant cannot
+		// alias the repeat one), material.wrapModeU/V carry it to the GPU sampler for the
+		// world-space-UI route, and the CPU compositor's address_coordinate reads the same two
+		// fields for the 2D route. One list entry closes both routes for that texture.
+		//
+		// Overriding real guest state is normally the bug class this backend exists to avoid, which
+		// is why this is a manual, empty-by-default list rather than a heuristic: the guest's wrap
+		// mode is correctly decoded and faithfully replayed, and the only thing wrong with it is
+		// that a nearest-sampled atlas has no bilinear seam bound the way real RSX does.
+		//
+		// Round 8: the counter says LISTED-AND-CREATED, not "the wrap actually moved". Two ways it
+		// used to lie, both of which make tex_wrap_forced=0 unreadable against its own header
+		// comment ("separates a typo'd hash from a list that is simply empty"): it skipped any
+		// texture the guest had already bound CLAMP (a correct list entry, zero count), and it
+		// counted before CreateTexture, so an upload that failed still counted. Incremented below,
+		// beside m_stats.created.
+		const bool clamp_listed = clamp_albedo_matches(entry.content_hash);
+
+		if (clamp_listed)
+		{
+			entry.wrap_u = 0;
+			entry.wrap_v = 0;
+		}
+
+		const remixapi_Format format = textures_linear()
+			? REMIXAPI_FORMAT_B8G8R8A8_UNORM
+			: REMIXAPI_FORMAT_B8G8R8A8_SRGB;
+
+		// Measured here rather than in the decoders: every format path converges on this buffer,
+		// so one pass covers BC, direct, B8 and the 16-bit expansions without touching any of
+		// them. Once per upload, not per draw.
+		{
+			u8 lo = 255;
+			u8 hi = 0;
+
+			// Mean colour accumulated in the same walk. u64 sums: a 2048x2048 texture is 4.2M
+			// texels, and 4.2M * 255 overflows u32 on the first channel.
+			u64 sum_b = 0;
+			u64 sum_g = 0;
+			u64 sum_r = 0;
+			u64 texels = 0;
+
+			for (usz i = 3; i < entry.pixels.size(); i += 4)
+			{
+				const u8 a = entry.pixels[i];
+				lo = std::min(lo, a);
+				hi = std::max(hi, a);
+
+				// BGRA8 - the upload format below is B8G8R8A8, so index 0 is blue.
+				sum_b += entry.pixels[i - 3];
+				sum_g += entry.pixels[i - 2];
+				sum_r += entry.pixels[i - 1];
+				++texels;
+			}
+
+			entry.alpha_min = lo;
+			entry.alpha_max = hi;
+
+			if (texels != 0)
+			{
+				const f64 scale = 1.0 / (255.0 * static_cast<f64>(texels));
+				entry.mean_rgb[0] = static_cast<f32>(static_cast<f64>(sum_r) * scale);
+				entry.mean_rgb[1] = static_cast<f32>(static_cast<f64>(sum_g) * scale);
+				entry.mean_rgb[2] = static_cast<f32>(static_cast<f64>(sum_b) * scale);
+			}
+		}
+
+		measure_peak_uv(entry);
+
+		remixapi_TextureInfo info{};
+		info.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_INFO;
+		info.pNext = nullptr;
+		info.hash = entry.content_hash;
+		info.width = entry.width;
+		info.height = entry.height;
+		info.depth = 1;
+		info.mipLevels = 1;
+		info.format = format;
+		info.data = entry.pixels.data();
+		info.dataSize = entry.pixels.size();
+
+		const u32 tex_status = guarded_create_texture(api.CreateTexture, &info, &entry.texture);
+
+		if (tex_status != REMIXAPI_ERROR_CODE_SUCCESS || !entry.texture)
+		{
+			rsx_log.error("Remix: CreateTexture failed for %ux%u hash %016llx (%s)",
+				entry.width, entry.height, entry.content_hash, error_name(tex_status));
+			entry.texture = nullptr;
+			return false;
+		}
+
+		++m_stats.created;
+
+		if (clamp_listed)
+		{
+			++m_stats.wrap_forced;
+		}
+
+		if (!build_material(api, entry))
+		{
 			guarded_destroy_texture(api.DestroyTexture, entry.texture);
 			entry.texture = nullptr;
 			entry.material = nullptr;
@@ -1374,8 +1439,92 @@ namespace remix_rsx
 			return false;
 		}
 
-		++m_stats.materials;
 		return true;
+	}
+
+	// --- ROUND 39: give an already-uploaded texture the sky dome's material -----------------------
+	//
+	// The ordering this exists to fix. A dome's texture is uploaded - and its material created - on
+	// the FIRST draw that binds it, which is strictly before submit_subdraw() has the world-space
+	// AABB it needs to decide the draw is a dome. So by the time the classifier says "this is a
+	// sky", the material already exists and is not emissive, and every later bind() is a cache hit
+	// that returns that same handle. Without this the promotion would be a no-op for the whole run.
+	//
+	// The old material handle is ORPHANED, never destroyed. RemixGSRender::mesh_entry::material
+	// records why in full: "The Remix mesh object bakes its surface's material at CreateMesh and
+	// there is no API to re-point it afterwards", so meshes created before this call are still
+	// submitting the old handle and destroying it is the dangling-handle failure the round-9 reap
+	// split exists to prevent. Round 17 already established orphaning as this cache's answer to
+	// exactly that (the TEXSTALEEVICT arm), and priced it: one material per event. Here the event
+	// count is bounded by the number of distinct domes the title has, which haze_domes.csv puts at
+	// 16 - so the whole lifetime cost is at most a few dozen orphaned materials.
+	//
+	// The mesh side is closed separately and MUST be, or this function's work is invisible: the
+	// mesh key folds sky_emissive_promoted() so a promoted albedo re-keys once and the next draw
+	// creates a mesh carrying the NEW material. See the fold in RemixGSRender's mesh key build.
+	u32 texture_cache::promote_sky_emissive(const remixapi_Interface& api, u64 content_hash)
+	{
+		if (content_hash == 0)
+		{
+			return 0;
+		}
+
+		u32 rebuilt = 0;
+
+		// A linear walk of the whole cache, once per newly-classified dome. m_entries is keyed on
+		// the texture DESCRIPTOR, not the content hash, and this title puts ~45 live entries on one
+		// content hash (tex_key_dup 11,212 of tex_created 11,467), so a keyed lookup is not
+		// available and every one of those aliases needs the new material or the dome flickers
+		// between them.
+		for (auto& [key, entry] : m_entries)
+		{
+			if (entry.content_hash != content_hash || entry.unsupported || !entry.texture)
+			{
+				continue;
+			}
+
+			// peak_uv is what gates derive_sky_sun(), and its walk in upload() was skipped for this
+			// texture because the hash was not on the list yet. Re-take it now; the CPU pixels are
+			// still resident (the cache keeps them for the compositor).
+			measure_peak_uv(entry);
+
+			remixapi_MaterialHandle previous = entry.material;
+
+			const u64 previous_hash = entry.material_hash;
+
+			if (!build_material(api, entry))
+			{
+				// build_material has already nulled entry.material. Put the old one back rather
+				// than leaving the entry material-less: a stale emissive-less material is a dome
+				// that stays black, an absent one is a draw that renders untextured grey.
+				entry.material = previous;
+				entry.material_hash = previous_hash;
+				++m_stats.sky_promote_failed;
+				continue;
+			}
+
+			// ROUND 39. The two hashes MUST differ, and this line is the proof rather than the
+			// assumption. build_material folds a promoted hash's identity so the second
+			// CreateMaterial cannot alias the first - without that fold the runtime is handed two
+			// different definitions under one hash and which one wins is draw-order dependent,
+			// i.e. the dome could stay black while every counter reported success. Printed once
+			// per rebuilt entry, and it is also how a modder finds the promoted dome's new
+			// mat_<HASH>, which is no longer equal to its albedo content hash.
+			rsx_log.notice("Remix skypromote: content=%016llX mat %016llX -> %016llX %s (%ux%u)",
+				entry.content_hash, previous_hash, entry.material_hash,
+				(previous_hash == entry.material_hash) ? "IDENTICAL - THE FOLD DID NOT FIRE" : "ok",
+				entry.width, entry.height);
+
+			if (previous && previous != entry.material)
+			{
+				++m_stats.sky_promote_orphans;
+			}
+
+			++m_stats.sky_promote_entries;
+			++rebuilt;
+		}
+
+		return rebuilt;
 	}
 
 	bool texture_cache::has_idle(u64 frame) const

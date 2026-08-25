@@ -790,6 +790,27 @@ namespace remix_rsx
 				(out_rgb_source == fp_out_source::vcol_pass ||
 				 out_rgb_source == fp_out_source::vcol_modulate);
 		}
+
+		// --- ROUND 41: why the classifier said 'other', and how far it had to walk ---------------
+		// The classifier reaches two shapes in the whole of Haze - MEASURED fpclass=1/1/0 on a
+		// 64,139-flip run, i.e. ONE vcol_pass program and ONE vcol_modulate program, with
+		// fpvcol_applied=698 of 5,783,237 submitted draws (0.012%). Everything else is 'other', and
+		// 'other' is what makes every textured surface ship the parity fill tcolor=1/0/3 (colour =
+		// texture, vertex colour discarded) - MEASURED on 192 of 192 'Remix alphastate:' rows.
+		// Meanwhile 22 of 47 vertex programs, the wall program ad7ce9d672a0bf6b among them, carry a
+		// fully replayable route=scaled slots=[c[18].x..w]. The vertex side is ready and the
+		// fragment side is the gate.
+		//
+		// These fields exist so the NEXT widening is designed on the terminal instruction's actual
+		// shape instead of on a guess. Populated only when the rgb walk ended in 'other'.
+		u8 out_rgb_hops = 0;          // identity-MOV copies the walk stepped through (FPVCOLHOP)
+		u8 out_rgb_opcode = 0xFF;     // terminal instruction's opcode, 0xFF = no writer found
+		u8 out_rgb_srccount = 0;
+		bool out_rgb_predicated = false;
+		u8 out_rgb_srctype[3] = { 0xFF, 0xFF, 0xFF };
+		// Bit per source slot: 0x1 clean COL0/COL1 read, 0x2 temp whose writer sampled a texture,
+		// 0x4 temp (any), 0x8 non-identity swizzle, 0x10 negated, 0x20 abs.
+		u8 out_rgb_srckind[3] = {};
 	};
 
 	// Reads the fragment ucode and reports which sampled units feed the final colour. 'ucode' is
@@ -797,6 +818,16 @@ namespace remix_rsx
 	// and 'fp32_outputs' the CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS bit, which is what decides
 	// whether COL0 is R0 or H0 (FragmentProgramDecompiler.cpp:64-82). Never throws; anything it
 	// cannot follow comes back with colour_mask 0 and a reason in 'note'.
+	// RPCS3_REMIX_FPVCOLHOP=<max hops> (default 0 = OFF, round-40 behaviour bit-exactly).
+	// Lets scan_fragment_program's output walk step BACKWARDS through identity temp copies before
+	// it classifies. An identity copy is an unconditional MOV of a TEMP with identity swizzle and
+	// no neg/abs - the identity function - so hopping one cannot admit a shape the classifier did
+	// not already recognise; it only admits programs that write the recognised shape into a temp
+	// and then copy it out. That makes this a strictly safe widening, and also a LIMITED one: a
+	// program that does real arithmetic (fog, specular, a lerp) between the modulate and the export
+	// will not be reached and must stay 'other'. Clamped to 8.
+	u32 fp_vcol_hop_budget();
+
 	fp_fingerprint scan_fragment_program(const void* ucode, u32 ucode_length, bool fp32_outputs);
 
 	// Compact disassembly of the instructions that feed HPOS. This is the diagnostic that
@@ -1682,6 +1713,9 @@ namespace remix_rsx
 	// rtx.worldSpaceUiTextures, WorldUI's override runs AFTER material creation and wins, so this
 	// knob is inert. It only takes effect once the conf entry is removed. See round14-inbox.md.
 	bool sky_emissive_albedo_matches(u64 hash);
+	// ROUND 39. The env list ONLY, with the runtime-promoted set deliberately excluded. Any census
+	// field labelled 'listed' must use THIS - see its definition.
+	bool sky_emissive_listed(u64 hash);
 	u32 sky_emissive_albedo_count();
 	f32 sky_emissive_intensity();
 
@@ -1693,6 +1727,151 @@ namespace remix_rsx
 	// emissive look and the occlusion, which is the A/B that attributes any lighting change to
 	// this mechanism rather than to the intensity. Inert while the list is empty.
 	bool sky_emissive_blend_enabled();
+
+	// --- ROUND 39: the sky by CLASSIFICATION instead of a hand-written hash whitelist ----------
+	//
+	// THE DEFECT, stated as a mechanism. A dome renders as a lit sky only if its texture CONTENT
+	// hash is on RPCS3_REMIX_SKYEMISSIVE, because that list is what makes its material emissive
+	// (RemixTextures.cpp, the `sky_emissive` local in texture_cache::upload). The launcher carries
+	// six hashes. haze_domes.csv - mined from the title's own archives - names SIXTEEN distinct
+	// dome resources game-wide, so roughly ten of them have no emissive material and render black,
+	// and the only way to extend the list is for the user to visit the level and Ctrl+click the
+	// sky. MEASURED against bin\remix_dump.log: `mat_skyemissive=0 mat_skyunordered=0` on 14,726
+	// stats lines - whole sessions in which the emissive material was never created once - against
+	// non-zero values up to 43 on the sessions whose level does have a listed dome.
+	//
+	// THE ARCHIVES CANNOT CLOSE IT. The mining round recovered the dome NAMES but not their texture
+	// hashes: assets are keyed by an unrecovered name hash, and a scan of all 28,278 cached.pak
+	// members for every dome name returned zero hits. So the identification must happen at runtime.
+	//
+	// WHY THIS IS NOT THE EXISTING sky_hash_mode() RULE, AND THE PRE-REGISTERED TEST THAT SAYS SO.
+	// sky_hash_mode() already learns "albedo hashes that only ever appear on dome-shaped draws",
+	// has shipped at mode 1 (measure) for several rounds, and would have been the obvious thing to
+	// promote. IT REJECTS THE TWO DOMES WE HAVE GROUND TRUTH FOR. MEASURED over every
+	// 'Remix sky-hash-census:' line in bin\remix_dump.log:
+	//
+	//     albedo=D1A6D1B27ADE6232  reject:mixed  vp=af06f6d32ec048ee vtx=304 wext=26351.6 upv=86.68
+	//     albedo=CDFE11B12552EA2D  reject:mixed  vp=af06f6d32ec048ee vtx=372 wext=27194.1 upv=73.10
+	//
+	// Both are on the user's own SKYEMISSIVE list, i.e. both are domes the user identified by
+	// clicking the sky in game. The rule disqualified them because its units-per-vertex floor is
+	// s_sky_backdrop_min_units_per_vertex = 100 and their own latitude bands measure 86.68 and
+	// 73.10 - and one non-dome draw disqualifies a hash for the life of the process. A tessellated
+	// dome is a stack of bands of DIFFERING density, so the strictest rule is guaranteed to be
+	// disqualified by its own coarser bands. That is a structural incompatibility, not a tuning
+	// miss, and it is why this is a second rule rather than a mode on the first.
+	//
+	// THE PREDICATE, and where each threshold's number comes from. Population: every
+	// 'Remix sky-census:' line in the whole 969 MB log, parsed to unique rows, filtered to
+	// depth_write=0 AND inside=1 AND wext >= sky_min_extent() - 187 unique rows, 23 vertex
+	// programs, 46 albedo hashes.
+	//
+	//   depth_write == 0   A dome writes no depth. Already the sky_candidate gate; kept because it
+	//                      is the cheapest of the four and the only one that is a statement about
+	//                      the guest's own render state rather than about geometry.
+	//   camera INSIDE the transformed AABB, not |translation - eye|. The legacy `anchor` quantity
+	//                      collapses to |eye| for an absolute-world draw - round 36 measured
+	//                      anchor=2137.85 against limit=4 - so it is dead for exactly the levels
+	//                      this round exists to fix. `inside` is scale-free and translation-free.
+	//   wext in [sky_min_extent(), sky_classify_max_extent()]
+	//                      The CEILING is new and it is load-bearing. MEASURED: the candidate set
+	//                      contains a family at wext 1.22e9 .. 1.12e18 (vp 8eae853c96f5a07e,
+	//                      f352d7dafa72d0e0, 595b8e2fa69b566b, 5c9cfb394074a479) which cannot be
+	//                      geometry - the mined scene_descriptor_template.vms sets farPlane 14000,
+	//                      so the entire world fits in ~1.4e4 units. The largest row that carries
+	//                      a hash the user hand-listed as a dome is 2.14e6 (35C2353F6B3CE2A8).
+	//                      Default 4.0e6 sits in a gap that is 570x wide (2.14e6 -> 1.22e9), which
+	//                      is why it is a round number and not a tuned one.
+	//                      NOTE the ceiling deliberately does NOT exclude the million-unit family:
+	//                      three hashes in it (35C2353F6B3CE2A8, 174F4F689CF2A3D8,
+	//                      3213E0CC136ED294) are on the user's hand-written list, so they are
+	//                      domes drawn at ~100x the scale of Haze's af06f6d32ec048ee dome. An
+	//                      extent ceiling tight enough to be "sensible" would delete them.
+	//   vertex_count in [sky_classify_min_vertices(), sky_classify_max_vertices()]
+	//                      MEASURED terrain in the candidate set: 2714..12875 vertices (vp
+	//                      2c62e34057e58c21, 487c71da8d277fb0, aae8e0d5ae292dd4, 788113cb1bad5321).
+	//                      MEASURED domes: 33..747. The CEILING of 1024 sits between, 2.65x below
+	//                      the lowest terrain row. The FLOOR of 16 exists because the census named
+	//                      one concrete false positive: albedo AC936E2F25F147B0 on
+	//                      vp=3c9186d8e026cec5 is a FOUR-VERTEX quad spanning 32,331 units with the
+	//                      camera inside it - a full-screen backdrop card, not a dome.
+	//   upv >= sky_classify_units_per_vertex()
+	//                      MEASURED lowest units-per-vertex on any row carrying a hand-listed dome
+	//                      hash, after the extent and vertex gates: 73.09 (CDFE11B12552EA2D).
+	//                      MEASURED highest on any row the vertex ceiling excludes: 23.57. Default
+	//                      60 is between them, a 3.1x gap.
+	//                      BUT STATE THE LIMIT HONESTLY: on this data upv is very nearly REDUNDANT
+	//                      with the vertex ceiling - every row the ceiling excludes also has
+	//                      upv < 60 - so its independent contribution is small and the separating
+	//                      power is really coming from the extent bounds, the vertex bounds and
+	//                      `inside`. An earlier draft of this block claimed a 1.34x gap between
+	//                      "terrain at 49.28" and "domes at 66.12"; both rows were mis-assigned
+	//                      (the 66.12 row carries albedo=0, the 49.28 row is inside the vertex
+	//                      gate) and that claim is withdrawn.
+	//
+	//
+	// REPLAYED BEFORE SHIPPING, which is the closest thing to a dry run this rule can have. Applying
+	// every gate above to every 'Remix sky-census:' row in the 969 MB log admits 19 distinct albedo
+	// hashes with the vertex floor off and 18 with it on. ALL SIX hand-listed dome hashes are among
+	// them, which is the ground-truth check passing on historical data before the play-test sees it.
+	// The other 12 are candidates, not confirmations - the census is deduplicated per (program,
+	// outcome) and carries no draw counts, so it cannot evaluate the 8-draw, no-disqualification,
+	// settle-window rule that actually arms a hash. Expect the live number to be LOWER than 18.
+	//
+	// PER-HASH, NOT PER-DRAW, and that is forced rather than chosen: emissiveness is a property of
+	// the MATERIAL, which is per texture, so a texture admitted on one draw glows on all of them.
+	// A hash arms when it has been dome-shaped on sky_classify_min_draws() draws, has never been
+	// seen on a disqualifying draw, and has been known for at least sky_classify_settle_frames()
+	// frames. The settle window is the guard against the one failure this rule can produce that
+	// cannot be undone - a material rebuilt emissive cannot be rebuilt back - and it is sized from
+	// the sky_hash census's own observation that a shared texture's disqualifying draw arrives
+	// within the first second.
+	//
+	// PRE-REGISTERED, AND THE REFUTATION IS NAMED. haze_domes.csv says 16 distinct dome resources
+	// exist, of which only 12 appear outside multiplayer (mp_caves_sky, mp_mcv_sky, mp_pow_sky and
+	// mp_shanty_sky are MP-only). A dome RESOURCE may bind more than one texture, so the expected
+	// count of armed hashes over a full single-player pass is 8..20 and MUST NOT exceed ~28; above that the rule is
+	// over-matching and sky_classify_units_per_vertex() is the knob. Two sharper checks:
+	//   1. D1A6D1B27ADE6232 and CDFE11B12552EA2D must ARM. They are ground truth and the existing
+	//      sky_hash rule rejects both. If they do not arm, the upv floor is still wrong and this
+	//      round has not fixed the thing it claims to.
+	//   2. RAVINE HAS NO DOME AUTHORED (haze_domes.csv: six jungle_ravine backgrounds, all
+	//      "(no skyModel authored)"). A black sky there is CORRECT. Any hash arming in Ravine is a
+	//      false positive, and it is the cheapest place in the game to see one.
+	//
+	//   RPCS3_REMIX_SKYCLASSIFY=0|1|2|3   default 1
+	//     0 off entirely. 1 census only - names what mode 2 would admit and promotes nothing.
+	//     QUALIFIED, because the unqualified claim is false: mode 1 mutates no material, no mesh
+	//     key and no category, but it is not bit-identical in every configuration. This rule's
+	//     gate widens the condition under which submit_subdraw walks the vertex bounding box, so
+	//     with SKYHASH=0, SKYBACKDROP=0 and a textured draw that sky_allows_textured() excludes -
+	//     a combination the shipped launcher does not use - mode 1 costs a walk that round 38 did
+	//     not pay. No pixel changes either way; the cost does.
+	//     2 promote. 3 promote and ignore the disqualification (arm on the dome count alone).
+	//   RPCS3_REMIX_SKYCLASSIFYMAXEXT=<world units>   default 4.0e6
+	//   RPCS3_REMIX_SKYCLASSIFYMINVTX=<n>             default 16
+	//   RPCS3_REMIX_SKYCLASSIFYMAXVTX=<n>             default 1024
+	//   RPCS3_REMIX_SKYCLASSIFYUPV=<world units>      default 60
+	//   RPCS3_REMIX_SKYCLASSIFYMIN=<draws>            default 8
+	//   RPCS3_REMIX_SKYCLASSIFYSETTLE=<frames>        default 60
+	u32 sky_classify_mode();
+	f32 sky_classify_max_extent();
+	u32 sky_classify_max_vertices();
+	u32 sky_classify_min_vertices();
+	f32 sky_classify_units_per_vertex();
+	u32 sky_classify_min_draws();
+	u32 sky_classify_settle_frames();
+
+	// The learned set itself. sky_emissive_albedo_matches() returns true for anything in here, so
+	// promoting a hash is exactly equivalent to having typed it into RPCS3_REMIX_SKYEMISSIVE at
+	// launch - same material, same intensity, same blend type, same peak_uv walk, same per-level
+	// sun. Monotone: nothing is ever un-promoted, which is what lets the mesh key fold membership
+	// in as a stable bit (see RemixGSRender's mesh key build).
+	bool sky_emissive_promote(u64 hash);
+	bool sky_emissive_promoted(u64 hash);
+	bool sky_emissive_unpromote(u64 hash);
+	u32 sky_emissive_promoted_count();
+	u32 sky_emissive_promote_overflow();
 
 	// RPCS3_REMIX_FPCENSUSVP=<hex>[,<hex>...] (bound 4, default empty = off): census only. Emits
 	// one 'Remix fpcandidate:' line per (vp, albedo) the listed program draws, carrying the
@@ -1965,6 +2144,10 @@ namespace remix_rsx
 	// the vertex colour is hashed into the mesh key, so an ANIMATED vertex colour makes a new mesh
 	// per animation step. Watch 'mesh_created' on the live line. 0 restores the '!material' gate.
 	// Counter: vcol_mod_applied.
+	// RPCS3_REMIX_VCOLCONSTBLACK=0/1 (default 1). Refuse a constant-route vertex colour that
+	// resolves to (near) black on a TEXTURED draw - a Modulate by zero deletes the surface. This is
+	// the guard that makes RPCS3_REMIX_VCOLMOD=1 safe again after the 2026-08-15 black-HUD note.
+	bool vcol_constant_black_guard_enabled();
 	bool vertex_colour_modulate_enabled();
 
 	// RPCS3_REMIX_UCODESTORE=1 (default): write the raw vertex ucode of every program whose
@@ -2064,10 +2247,19 @@ namespace remix_rsx
 	f32 guest_light_lum();
 	f32 guest_light_max_extent();
 
+	// RPCS3_REMIX_GUESTLIGHTLISTEXT=0/1 (default 1). Apply guest_light_max_extent() to an
+	// explicitly listed albedo as well as to the census/AUTO population. See the derivation on the
+	// definition: one Haze bulb texture spans 0.5385 .. 83.18 units of world extent.
+	bool guest_light_list_extent_enabled();
+
 	// RPCS3_REMIX_GUESTLIGHTAUTO=0 (default): 1 treats every census-qualifying draw above as a
 	// fixture trigger, through the existing dedup / cap / idle machinery, without needing its albedo
 	// on GUESTLIGHTALBEDO. Default OFF because the census has to name the population before it is
 	// trusted; flipping it on is a launcher edit inside the same sitting.
+	// RPCS3_REMIX_GUESTLIGHTAUTO: 0 = off (default), 1 = whole census population (fixtures AND glow
+	// cards, the round-6 meaning), 2 = GLOW CARDS ONLY. Clamped to 2. See the definition for the
+	// measured two-population split behind mode 2.
+	u32 guest_light_auto_mode();
 	bool guest_light_auto_enabled();
 
 	u64 nectar_disruption_vp_hash();

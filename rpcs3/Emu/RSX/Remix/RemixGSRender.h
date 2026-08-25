@@ -776,6 +776,59 @@ private:
 		u64 sky_hash_rejected = 0;
 		u64 sky_hash_tracked = 0;
 
+		// --- ROUND 39: the dome classifier -----------------------------------------------------
+		// Read in this order; each pair is a different question and reading them out of order is
+		// how the last four rounds mis-attributed a sky result.
+		//
+		//   skyclassify_seen      draws that reached the rule at all (albedo != 0, mode != 0).
+		//   skyclassify_dome      of those, the ones whose own geometry passed every gate.
+		//   skyclassify_tracked   unique hashes in the table.
+		//   skyclassify_armed     hashes that met the draw count, the settle window and the
+		//                         no-disqualification rule. THIS is the number to check against
+		//                         haze_domes.csv: 16 dome resources exist but only 12 outside
+		//                         multiplayer, so 8..20 is expected over a full single-player
+		//                         pass and anything above ~28 is over-matching.
+		//   skyclassify_promoted  of those, the ones actually inserted into the emissive set. It is
+		//                         BELOW armed by exactly the number of hashes that were already on
+		//                         RPCS3_REMIX_SKYEMISSIVE - so armed-minus-promoted is the count of
+		//                         ground-truth domes the classifier agreed with, and if it is 0 the
+		//                         rule found nothing the user had already found by hand, which is a
+		//                         reason to distrust it rather than to celebrate it.
+		//   skyclassify_rejected  DRAWS carrying a hash that a non-dome draw disqualified - not
+		//                         hashes. It is incremented on every later draw of a disqualified
+		//                         hash, so it climbs with traffic and says nothing about how many
+		//                         textures were refused. The count of DISTINCT refused hashes is
+		//                         the number of 'reject:mixed' lines in 'Remix skyclassify:'.
+		//                         (Same per-draw convention as sky_hash_rejected above.)
+		//   skyclassify_settling  arm attempts refused only because the settle window had not
+		//                         elapsed. Non-zero and then falling is the window working; stuck
+		//                         high at the end of a session means SKYCLASSIFYSETTLE is too long
+		//                         for how briefly the level is visited.
+		//   skyclassify_entries   texture-cache entries whose material the promotion rebuilt. This
+		//                         is the number that says the promotion REACHED the material; 0
+		//                         with skyclassify_promoted > 0 means the texture was not resident
+		//                         and the rebuild found nothing to do.
+		u64 skyclassify_seen = 0;
+		u64 skyclassify_dome = 0;
+		u64 skyclassify_tracked = 0;
+		u64 skyclassify_armed = 0;
+		u64 skyclassify_promoted = 0;
+		u64 skyclassify_rejected = 0;
+		u64 skyclassify_settling = 0;
+		u64 skyclassify_entries = 0;
+
+		// ROUND 39, both added when arming was moved to latch on SUCCESS rather than on intent.
+		//   skyclassify_overflow  arm attempts refused because the 64-entry promoted array is
+		//                         full. Nothing was promoted and nothing latched, so the hash is
+		//                         retried. Non-zero means the title has more dome textures than
+		//                         the array holds - raise the array, not a threshold.
+		//   skyclassify_failed    arm attempts where the hash entered the set but EVERY resident
+		//                         texture entry refused the material rebuild. The promotion is
+		//                         withdrawn and retried. Non-zero is the case that would
+		//                         otherwise be a permanently black dome reported as a success.
+		u64 skyclassify_overflow = 0;
+		u64 skyclassify_failed = 0;
+
 		// Viewmodel detection (viewmodel_mode), added after 81af315. 'considered' is every draw
 		// that reached the test, and the three buckets below partition it exactly:
 		//
@@ -943,6 +996,18 @@ private:
 		// Matches refused because m_guest_lights was already at GUESTLIGHTMAX. Non-zero is the
 		// "light spam from a shared fixture texture" risk firing - trim the list.
 		u64 guest_light_capped = 0;
+		// --- round 41 -----------------------------------------------------------------------
+		// Matches refused because the draw's WORLD EXTENT exceeded GUESTLIGHTMAXEXT. The round-40
+		// run made this necessary: RPCS3_REMIX_GUESTLIGHTALBEDO=71D189E9B559A7F9 is a bulb texture,
+		// and 'Remix guest-light:' recorded 31 lights on it whose extent ranged 0.5385 .. 83.18 -
+		// a 154x spread on ONE albedo. The 0.54 .. 1.73 rows are the bulbs; the 7.89 .. 83.18 rows
+		// are a large mesh sharing the texture, and the biggest of them produced a 29.1-unit sphere
+		// the user saw as "too big and not aligned with the bulbs". small_enough already existed
+		// and gated the census and the AUTO trigger; it did NOT gate an explicitly listed albedo,
+		// which was an oversight rather than a decision - no comment ever argued for the exemption.
+		// guest_light_match still counts the match, so match - toobig is the accepted population
+		// and the two cannot be confused. RPCS3_REMIX_GUESTLIGHTLISTEXT=0 restores round 40.
+		u64 guest_light_toobig = 0;
 
 		// --- round 5: alpha-to-coverage (the cutout mechanism this backend never read) -----------
 		// Draws whose fragment shader control word carries RSX_SHADER_CONTROL_ALPHA_TO_COVERAGE,
@@ -1193,6 +1258,16 @@ private:
 		// than from a mesh attribute. Round 11 refused this shape as 'computed' and the draws
 		// rendered white. RPCS3_REMIX_VCOLCONST=0 drives it to 0 and restores that white.
 		u64 vcol_const_applied = 0;
+		// --- round 41 ---------------------------------------------------------------------
+		// Constant-route replays REFUSED on a textured draw because the resolved RGB is (near)
+		// black. MEASURED motivation: `Remix vcolroute:` names two constant-route programs on
+		// this title and one of them resolves to `cval=[0 0 0 1]` - pure black
+		// (vp=b01bfce3fc580e3b). RPCS3_REMIX_VCOLMOD was turned off on 2026-08-15 because "the
+		// HUD gauges render BLACK with this on", and a Modulate by [0 0 0] is exactly that.
+		// Refusing leaves the decode loop's white, i.e. the texture unmodified, which is the
+		// same "a missing tint is better than a wrong one" identity this file applies to a
+		// missing texture and to an unproven alpha.
+		u64 vcol_const_black = 0;
 
 		// Draws whose per-vertex atmospheric fade was replayed (the backdrop haze card).
 		u64 hazefade_applied = 0;
@@ -1790,6 +1865,69 @@ private:
 	u32 m_sky_hash_census_lines = 0;
 	static constexpr u32 s_max_sky_hash_census_lines = 64;
 
+	// --- ROUND 39: the dome CLASSIFIER (remix_rsx::sky_classify_mode) -------------------------
+	// Full derivation, every measured threshold and the pre-registered refutation are on
+	// sky_classify_mode() in RemixTransforms.h. This is the per-hash bookkeeping only.
+	//
+	// Deliberately a SECOND table beside m_sky_hash_seen rather than a mode on it. The two rules
+	// disagree on the two hashes we have ground truth for - sky_hash rejects D1A6D1B27ADE6232 and
+	// CDFE11B12552EA2D because its units-per-vertex floor is 100 and their own bands measure 86.68
+	// and 73.10 - so sharing a table would make the disagreement invisible and would let one rule's
+	// disqualification silence the other's. Two tables, two censuses, two sets of counters, and the
+	// A/B between them is readable in one run.
+	struct sky_classify_entry
+	{
+		u32 dome = 0;
+		u32 other = 0;
+
+		// The frame this hash was first seen at all. The settle window is measured from here, not
+		// from the first dome-shaped draw: the risk being guarded against is a texture that is
+		// shared with world geometry, and the shared draw can arrive before or after the dome one.
+		u64 first_frame = 0;
+
+		// The program that first drew it dome-shaped, and the shape of that draw, so the census can
+		// be checked against what is on screen without a second lookup.
+		u64 vp = 0;
+		f32 extent = 0.f;
+		f32 units_per_vertex = 0.f;
+		u32 vertices = 0;
+
+		// Latched once. 'promoted' is the state that matters; 'reported' only bounds the log.
+		bool promoted = false;
+		bool reported_armed = false;
+		bool reported_mixed = false;
+	};
+
+	// One line per hash per transition. Prints whether the hash was ALREADY on
+	// RPCS3_REMIX_SKYEMISSIVE, which is the ground-truth check: D1A6D1B27ADE6232 and
+	// CDFE11B12552EA2D must both appear with listed=1 armed=1 or the upv floor is still wrong.
+	// 'listed' MUST be sampled by the caller BEFORE the promotion runs. Re-querying
+	// sky_emissive_albedo_matches() inside this function would read 1 for every armed hash at
+	// mode 2, because promotion has by then inserted it - the field would say "the rule agreed
+	// with the user" about hashes the rule found on its own, which is the exact opposite of what
+	// it is for. Caught before this shipped; the parameter exists so it cannot come back.
+	void report_sky_classify_census(u64 albedo_hash, const sky_classify_entry& entry,
+		const char* verdict, f32 world_extent, f32 units_per_vertex, u32 vertex_count,
+		bool camera_inside, bool depth_write, bool listed, bool armed);
+
+	// Same 4096 headroom as m_sky_hash_seen and for the same reason - only hashes that have been
+	// dome-shaped at least once are ever inserted.
+	static constexpr usz s_max_sky_classify_tracked = 4096;
+
+	std::unordered_map<u64, sky_classify_entry> m_sky_classify_seen;
+
+	// ROUND 39. TWO budgets, not one. 'reject:mixed' fires on the first disqualifying draw of any
+	// tracked hash while 'ARMED' needs eight dome draws plus a settle window, so a single shared
+	// ceiling is exhausted by rejects before one ARMED line exists - and the ARMED line is the
+	// deliverable, because it is the only place the camera position is printed and therefore the
+	// only way to attribute a dome hash to a level. m_sky_classify_census_lines is kept as the
+	// total for the stats field; the two below are what actually gate.
+	u32 m_sky_classify_census_lines = 0;
+	u32 m_sky_classify_armed_lines = 0;
+	u32 m_sky_classify_reject_lines = 0;
+	static constexpr u32 s_max_sky_classify_armed_lines = 48;
+	static constexpr u32 s_max_sky_classify_reject_lines = 32;
+
 	// --- viewmodel (viewmodel_mode) --------------------------------------------------------
 	enum class viewmodel_outcome
 	{
@@ -1989,7 +2127,10 @@ private:
 	// Fills m_scratch_vertices' colours from ATTR3 for draws that resolved no material, so
 	// vertex-coloured geometry stops reaching Remix as flat white. Like apply_texcoords it must
 	// run before the mesh content hash, which covers the colour.
-	void apply_vertex_colour(u32 first_vertex, u32 vertex_count);
+	// ROUND 41: `textured` is the caller's `material != nullptr`. Needed by the constant-route
+	// black guard - modulating an albedo by a constant black deletes it, while flooding an
+	// UNTEXTURED draw with the same constant is the round-12 behaviour that has always been right.
+	void apply_vertex_colour(u32 first_vertex, u32 vertex_count, bool textured);
 
 	// The textured counterpart, for alpha only. Writes ATTR3's alpha into m_scratch_vertices'
 	// colour alpha and leaves RGB white, so no tint is guessed at - only the channel the draw
@@ -3274,6 +3415,15 @@ private:
 	std::unordered_set<u64> m_lightcand_seen;
 	u32 m_lightcand_lines = 0;
 	u64 m_lightcand_window = umax;
+
+	// --- ROUND 41: 'Remix fpother:' ------------------------------------------------------------
+	// One line per fragment program whose output-colour walk ended in 'other'. No dedup set is
+	// needed: the block that emits it runs inside the m_fp_fingerprints cache MISS, i.e. exactly
+	// once per unique fragment program for the life of the process. Not per window either - the
+	// program set is fixed, so a second window would print nothing new. 64 covers the 47 programs
+	// this title's own vcolroute census names with room to spare.
+	static constexpr u32 s_max_fpother_lines = 64;
+	u32 m_fpother_lines = 0;
 
 	// One line per contesting vertex program per window for gauge_anchor_contested, which went from
 	// 0 for four rounds to 5,467 in the newest run. First-draw-wins is measurably fragile and the

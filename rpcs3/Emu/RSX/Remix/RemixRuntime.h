@@ -51,6 +51,12 @@ namespace remix_rsx
 		bool check_fork_slots();
 		bool probe_create_texture();
 
+		// ROUND 39. Negative probe of remixapi_Interface::SetConfigVariable, the only route by
+		// which this client could ever drive rtx.* options (per-zone volumetric fog is the reason
+		// it was asked). Writes nothing and gates nothing - it reports, and the reading is spelled
+		// out in full on the definition.
+		void probe_set_config_variable();
+
 		interface_storage m_storage{};
 		HMODULE m_dll = nullptr;
 		bool m_ok = false;

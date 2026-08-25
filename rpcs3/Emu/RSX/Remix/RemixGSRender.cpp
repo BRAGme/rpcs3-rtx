@@ -849,7 +849,14 @@ void RemixGSRender::on_init_thread()
 			// Round 13. skyemissive is the LIST SIZE, not a bool: 0 means the sky path is entirely
 			// off and every mat_skyemissive counter below is expected to be 0 with it. fpcensusvp
 			// likewise gates the 'Remix fpcandidate:' lines.
-			"skyemissive=%u skyemissiveint=%.4g skyemissiveblend=%d fpcensusvp=%u "
+			"skyemissive=%u skyemissiveint=%.4g skyemissiveblend=%d "
+			// ROUND 39. The dome classifier's six knobs plus the live size of the learned set, all
+			// printing the CLAMPED value so a SKYCLASSIFY=9 that is silently running as mode 3 is
+			// visible here rather than nowhere. skyclassifyset= is not a knob - it is how many hashes
+			// the rule has promoted so far, echoed beside the thresholds that promoted them.
+			"skyclassify=%u skyclassifymaxext=%.4g skyclassifyminvtx=%u skyclassifymaxvtx=%u skyclassifyupv=%.4g "
+			"skyclassifymin=%u skyclassifysettle=%u skyclassifyset=%u "
+			"fpcensusvp=%u "
 			// Round 14. suntrack=0 is the shipped default and means the distant sun keeps
 			// sun_direction()'s static aim - so a run whose sun does not follow the level is
 			// answered by this one field. suncardalbedos is the LIST SIZE: 0 with suntrack=1 is an
@@ -982,6 +989,16 @@ void RemixGSRender::on_init_thread()
 			remix_rsx::sky_emissive_albedo_count(),
 			static_cast<f64>(remix_rsx::sky_emissive_intensity()),
 			remix_rsx::sky_emissive_blend_enabled() ? 1 : 0,
+			// ROUND 39. Eight arguments for the eight specifiers above, same order: mode, maxext,
+			// minvtx, maxvtx, upv, min, settle, set.
+			remix_rsx::sky_classify_mode(),
+			static_cast<f64>(remix_rsx::sky_classify_max_extent()),
+			remix_rsx::sky_classify_min_vertices(),
+			remix_rsx::sky_classify_max_vertices(),
+			static_cast<f64>(remix_rsx::sky_classify_units_per_vertex()),
+			remix_rsx::sky_classify_min_draws(),
+			remix_rsx::sky_classify_settle_frames(),
+			remix_rsx::sky_emissive_promoted_count(),
 			remix_rsx::fp_census_vp_count(),
 			remix_rsx::sun_track_mode(),
 			remix_rsx::sun_card_albedo_count(),
@@ -3967,12 +3984,44 @@ void RemixGSRender::place_debug_light(const f32 (&position)[3])
 {
 	const auto& api = m_remix.api();
 
-	if (m_debug_light)
-	{
-		remix_rsx::guarded_destroy_light(api.DestroyLight, m_debug_light);
-		m_debug_light = nullptr;
-	}
-
+	// --- ROUND 40: the destroy is REMOVED, because it is what made this light inert -------------
+	// The note at the tail of update_sun_light() has said since round 23 that this function's
+	// destroy-then-create makes the camera fill "inert ... erased at every Present", and left it
+	// alone on purpose so the sun A/B would not be confounded. That A/B is long finished, and the
+	// mechanism is now MEASURED end to end against the deployed runtime's own tree
+	// (dxvk-remix-numos3, branch numos3, HEAD 6476faea):
+	//
+	//   remixapi_DestroyLight only QUEUES (rtx_remix_api.cpp:1613, s_pendingLightDestroys.push_back)
+	//   -> drained in remixapi_Present (:2123) -> unregisterPersistentExternalLight +
+	//      removeExternalLight (:2136-2137) -> deferred AGAIN to m_pendingExternalLightErases
+	//      (rtx_fork_light.cpp:191) -> erased in the flush loop (rtx_fork_light.cpp:46-60), which
+	//      runs inside prepareSceneData BEFORE linearization.
+	//
+	// So the order every frame was: queue destroy -> create emplaces immediately
+	// (rtx_remix_api.cpp:1536-1539) -> Present queues the erase -> the flush erases THE LIGHT THIS
+	// FUNCTION JUST CREATED, before it can be linearized. The DrawLightInstance activation was
+	// dropped with it, because the pending-activate loop (rtx_fork_light.cpp:79-86) requires the
+	// handle to still be in m_externalLights. The tombstone guard at rtx_remix_api.cpp:2127-2128
+	// covers only remixapi_CreateLightBatched, which this is not, so it could never protect it.
+	//
+	// Re-aiming is just CreateLight with the SAME hash: addExternalLight (rtx_light_manager.cpp:
+	// 722-732) updates an existing handle in place. That is exactly what update_sun_light() does,
+	// and the sun's own instrument proves it works - 'Remix sun-submit: ... retargets=1 destroys=0
+	// draw=SUCCESS' on every sampled frame of the round-39 play-test.
+	//
+	// isDynamic is now REQUIRED here and was not before. This light is UPDATED every frame, which
+	// is the one lifecycle static sleep actually bites: with isDynamic == 0 updateLightStaticSleep
+	// (rtx_fork_light.cpp:143-146) stops copying the new data once isStaticCount reaches
+	// getNumFramesToPutLightsToSleep() == numFramesToKeepLights()/2 == 50 (rtx_options.h:2492 over
+	// the default 100 at :647, with no override in bin\rtx.conf or bin\user.conf), and isStaticCount
+	// is never reset for an external light. The light would then keep emitting from a pose 50 frames
+	// stale - silent, not dark. The guest fixture lights in maybe_inject_guest_light deliberately do
+	// NOT need this: they are created once and never updated, so addExternalLight takes the emplace
+	// arm (rtx_light_manager.cpp:728-730) and updateLightStaticSleep is never called for them at all.
+	//
+	// SAFETY: RPCS3_REMIX_CAMLIGHT is armed at 0 in the launcher, so `camera_light_radiance() > 0.f`
+	// at the per-frame call site is false and none of this runs until somebody asks for it. The
+	// other caller (create_debug_scene) runs once with m_debug_light already null.
 	remixapi_LightInfoSphereEXT sphere_light{};
 	sphere_light.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
 	sphere_light.pNext = nullptr;
@@ -4000,11 +4049,27 @@ void RemixGSRender::place_debug_light(const f32 (&position)[3])
 	// RPCS3_REMIX_LIGHTRADIANCE covers it, and the right value is scene-scale dependent.
 	light_info.radiance = { radiance, radiance, radiance };
 
-	const u32 status = remix_rsx::guarded_create_light(api.CreateLight, &light_info, &m_debug_light);
-	if (status != REMIXAPI_ERROR_CODE_SUCCESS || !m_debug_light)
+	// ROUND 40. Required because this light is re-created every frame under the same hash - see the
+	// long note at the top of this function. The sun sets it for exactly the same reason.
+	light_info.isDynamic = 1;
+
+	// Into a LOCAL first. The old code passed &m_debug_light straight in, so a failed re-create on
+	// frame N could leave the member holding a handle the runtime had already rejected, or null out
+	// a light that was working a moment ago. Same reasoning update_sun_light() states for not
+	// setting m_sun_failed on a failed retarget: one bad frame must not turn a tracking miss into a
+	// dark scene.
+	remixapi_LightHandle handle = nullptr;
+	const u32 status = remix_rsx::guarded_create_light(api.CreateLight, &light_info, &handle);
+
+	if (status == REMIXAPI_ERROR_CODE_SUCCESS && handle)
 	{
+		m_debug_light = handle;
+	}
+	else if (!m_debug_light)
+	{
+		// Only shout when there is nothing to fall back on. A per-frame caller must not be able to
+		// flood the log once the light exists.
 		rsx_log.error("Remix: CreateLight failed (%s)", remix_rsx::error_name(status));
-		m_debug_light = nullptr;
 	}
 }
 
@@ -4088,11 +4153,14 @@ bool RemixGSRender::ensure_sun_light()
 //    722-732) updates an existing handle in place; it is destroy-then-create that fails, because
 //    DestroyLight is deferred to Present and lands after the create.
 //
-// place_debug_light (the CAMLIGHT camera fill, hash 0x3) still uses destroy-then-create every frame
-// and is therefore inert for the same reason - it is erased at every Present. That is left alone
-// deliberately: fixing it in the same round would turn a light that has contributed nothing since
-// round 5 back on, and confound the A/B on this one. The hysteresis below is what keeps the
-// re-aim from being a per-frame cost.
+// place_debug_light (the CAMLIGHT camera fill, hash 0x3) USED to use destroy-then-create every frame
+// and was therefore inert for the same reason - erased at every Present. Round 23 left it alone so
+// fixing it would not confound this function's A/B. ROUND 40 FIXED IT: the destroy is gone, the
+// create re-uses hash 0x3 exactly as this function does, and isDynamic is set because that light -
+// unlike the guest fixture lights - really is updated every frame. RPCS3_REMIX_CAMLIGHT is armed at
+// 0, so the now-working path stays switched off until somebody asks for it. Read the note at the top
+// of place_debug_light for the full runtime derivation.
+// The hysteresis below is what keeps the re-aim from being a per-frame cost.
 // --- round 23: a PER-LEVEL sun, solved from the sky dome's own texture ---------------------------
 //
 // The user's question was literally "where is the sun's texture positioned on each map" - and on this
@@ -5163,8 +5231,45 @@ void RemixGSRender::maybe_inject_guest_light(u64 vp_hash, u64 fp_hash, u64 albed
 	const bool vp_ok = configured_vp == 0 || vp_hash == configured_vp;
 	const bool fp_ok = configured_fp == 0 || fp_hash == configured_fp;
 
-	const bool trigger_match = remix_rsx::guest_light_albedo_any() && vp_ok && fp_ok
-		&& (primary_match || glow_match);
+	// --- ROUND 40: GUESTLIGHTALBEDO2 WAS UNREACHABLE, AND THAT IS WHY THE TITLE HAS NO LIGHTS -----
+	// guest_light_albedo_any() reads ONLY the primary GUESTLIGHTALBEDO list
+	// (RemixTransforms.cpp, `return guest_light_albedos().count != 0;`). With that list blank -
+	// which is how the launcher has shipped - this leading term was false for every draw in the
+	// process, so the whole `glow_match` half, i.e. the entire GUESTLIGHTALBEDO2 rule, was dead
+	// code that could never be reached no matter what hash was armed.
+	//
+	// MEASURED, round-39 build E4E2A9A4EDAECE2A over 64,139 flips / 15,526,016 draws with
+	// RPCS3_REMIX_GUESTLIGHTALBEDO2=C2F33F7E5105DAE7 armed: the live line reads `glalbedos=0`
+	// (the primary list parsed zero entries) and `guest_lights=0 guest_light_match=0
+	// guest_light_capped=0 guest_light_reaped=0`. Not one analytical light was created from the
+	// guest all session, which is the mechanism behind "floor-recessed lights cast no light" and
+	// "only some bulbs are lit" - none of them are, because none of them emit.
+	//
+	// The fix is the arming test, not the rule. configured_albedo2 != 0 is to the second list
+	// exactly what guest_light_albedo_any() is to the first, and glow_match already re-checks it
+	// together with its blend/no-depth-write state, so this restores reachability and cannot
+	// widen either rule by one draw. guest_light_albedo_any() has exactly ONE consumer - this
+	// expression - so nothing else moves.
+	const bool guest_light_armed = remix_rsx::guest_light_albedo_any() || configured_albedo2 != 0;
+
+	// --- ROUND 41: the vp/fp narrowing now applies to the PRIMARY list ONLY ---------------------
+	// It was ANDed against BOTH rules, which made the two lists share one global program pair and
+	// meant only one fixture family could ever be lit per run. That is fatal to the ALBEDO2 rule in
+	// particular, because the glow card this round arms - F613BD83DAF2B4E2, the warm
+	// mean_rgb=[0.8424 0.8314 0.5781] sprite - is MEASURED on EIGHT different vertex programs in the
+	// round-40 log (830d7d1b, f39f5046, 15ad6129, 57a12323 and four more), so no single pair can
+	// name it and any pair that is armed for the bulbs excludes it.
+	//
+	// Severing it for the glow rule and not for the primary one is not a convenience: the two rules
+	// have different amounts of built-in selectivity. The primary rule is albedo alone, and the
+	// launcher's 2026-08-15 note records by measurement that an albedo alone is NOT the fixture
+	// identity on Haze (it put lights on doors and sheet-metal covers), so it keeps the narrowing.
+	// glow_match already carries its own state discriminator - blend enabled AND depth write off -
+	// which is the very thing the vp/fp pair was standing in for, plus the round-41 extent ceiling
+	// below. Round 16 makes the same argument for SUNCARDVP in as many words: "the albedo must match
+	// AND, when the program list is non-empty, the program must match too".
+	const bool trigger_match = guest_light_armed
+		&& ((primary_match && vp_ok && fp_ok) || glow_match);
 
 	// --- round 6: the discriminator census ------------------------------------------------------
 	// Measure before generalising. The last attempt to widen fixture identity (albedo alone, no
@@ -5206,7 +5311,13 @@ void RemixGSRender::maybe_inject_guest_light(u64 vp_hash, u64 fp_hash, u64 albed
 	const u64 lightcand_window = m_frame_counter / s_stats_interval_flips;
 	const bool census_wanted = census_candidate
 		&& (m_lightcand_window != lightcand_window || m_lightcand_lines < s_max_lightcand_lines);
-	const bool auto_wanted = census_candidate && remix_rsx::guest_light_auto_enabled();
+	// ROUND 41. Mode 2 narrows the AUTO population to glow cards only - the measured "this fixture
+	// is lit" signal - and drops the opaque housings, which are the larger, flat-lum rows the census
+	// separates cleanly. state_glow IS the discriminator; see guest_light_auto_mode(). Mode 1 keeps
+	// the round-6 meaning exactly, so an old run stays comparable.
+	const u32 auto_mode = remix_rsx::guest_light_auto_mode();
+	const bool auto_wanted = census_candidate && auto_mode != 0
+		&& (auto_mode != 2 || state_glow);
 
 	// --- round 14: the sun card, hosted here on purpose -----------------------------------------
 	// This function has already decided it is looking at a bright textured draw and is about to pay
@@ -5316,12 +5427,36 @@ void RemixGSRender::maybe_inject_guest_light(u64 vp_hash, u64 fp_hash, u64 albed
 	// census has to name the population before it is believed.
 	const bool auto_trigger = auto_wanted && small_enough;
 
+	// --- ROUND 41: an explicitly listed albedo is now size-gated as well -------------------------
+	// small_enough is computed above and has always gated the census and the AUTO trigger; it did
+	// not gate trigger_match, and no comment in this file ever argued for the exemption. MEASURED
+	// consequence on the round-40 build: 31 lights on ONE albedo whose world extent spanned
+	// 0.5385 .. 83.18, the largest of them a 29.1-unit sphere placed at the AABB centre of an
+	// 83-unit mesh - i.e. nowhere near any bulb. Full derivation on
+	// guest_light_list_extent_enabled().
+	//
+	// Placed AFTER the bounding-box walk because world_extent does not exist before it, and after
+	// the census call so that a rejected draw is still NAMED on 'Remix light-candidate:' - a size
+	// rejection that also silenced the instrument would be self-concealing.
+	//
+	// guest_light_match is deliberately left where it is, upstream of this: it means "the rule
+	// matched", and match - toobig is the accepted population. Folding the rejection into it would
+	// make a wrong list and an over-sized fixture read as the same number.
+	const bool trigger_size_ok = !remix_rsx::guest_light_list_extent_enabled() || small_enough;
+
+	if (trigger_match && !trigger_size_ok)
+	{
+		++m_stats.guest_light_toobig;
+	}
+
+	const bool trigger_accepted = trigger_match && trigger_size_ok;
+
 	if (auto_trigger && !trigger_match)
 	{
 		++m_stats.guest_light_match;
 	}
 
-	if (!trigger_match && !auto_trigger)
+	if (!trigger_accepted && !auto_trigger)
 	{
 		return;
 	}
@@ -6224,6 +6359,111 @@ void RemixGSRender::report_sky_hash_census(u64 albedo_hash, const sky_hash_entry
 
 	// Mirrored for the same reason the sky census is: RPCS3.log is locked while the emulator runs,
 	// and this census exists to be read against what is on screen during an ordinary run.
+	if (fs::file out{ fs::get_executable_dir() + "remix_dump.log", fs::write + fs::create + fs::append })
+	{
+		out.write(line + '\n');
+	}
+}
+
+// ROUND 39. The dome classifier's census, and it is the deliverable of this half of the round: the
+// counters say how many hashes armed, this says WHICH, with the shape of the draw that armed them
+// and the camera position at the moment it happened.
+//
+// The camera position is on the line for one reason and it is the thing that unblocks the next
+// round. Nothing in this backend knows what LEVEL it is in - there is no level-name string anywhere
+// in the guest signal (searched: zero hits for any level name across the whole 969 MB dump) - so a
+// dome hash cannot be attributed to a level from the log alone. The eye position can be, because
+// the user knows where they were standing. One pass over the ten levels therefore produces the
+// dome-hash-to-level mapping that a per-level sun or fog table needs and that this project does not
+// yet have for 14 of its 16 domes.
+//
+// verdict is one of "ARMED", "ARMED:listed" or "reject:mixed". ARMED:listed is the ground-truth
+// check and must be read first: D1A6D1B27ADE6232 and CDFE11B12552EA2D are hashes the user
+// identified as sky by clicking them in game, the existing sky_hash rule rejects BOTH (measured
+// upv 86.68 and 73.10 against its floor of 100), and if they do not appear here as ARMED:listed
+// then this rule's units-per-vertex floor is wrong too and nothing else on the line is worth
+// reading.
+void RemixGSRender::report_sky_classify_census(u64 albedo_hash, const sky_classify_entry& entry,
+	const char* verdict, f32 world_extent, f32 units_per_vertex, u32 vertex_count,
+	bool camera_inside, bool depth_write, bool listed, bool armed)
+{
+	// --- ROUND 39: TWO BUDGETS, AND THE SPLIT IS THE WHOLE POINT ------------------------------
+	// A single shared ceiling starves the deliverable. 'reject:mixed' fires on the FIRST
+	// disqualifying draw of any tracked hash, while 'ARMED' needs eight dome-shaped draws plus a
+	// settle window - so with up to s_max_sky_classify_tracked hashes in play the rejects will
+	// normally exhaust a shared budget before a single ARMED line exists.
+	//
+	// The ARMED line IS the deliverable: it is the only place the CAMERA POSITION is printed, and
+	// that is the mechanism for attributing a dome hash to a level - which nothing else in this
+	// backend can do, because no level name appears anywhere in the guest signal. Losing it to a
+	// flood of rejects would silently cost the round its per-level sun and fog unblock.
+	u32& lines = armed ? m_sky_classify_armed_lines : m_sky_classify_reject_lines;
+	const u32 cap = armed ? s_max_sky_classify_armed_lines : s_max_sky_classify_reject_lines;
+
+	if (lines >= cap)
+	{
+		return;
+	}
+
+	++lines;
+	++m_sky_classify_census_lines;
+
+	const u32 total = entry.dome + entry.other;
+
+	const std::string line = fmt::format(
+		"Remix skyclassify: albedo=%016llX %s dome=%u other=%u total=%u agree=%.4g | "
+		"vp=%016llx vtx=%u wext=%.6g upv=%.6g inside=%d depth_write=%d | "
+		"minext=%.6g maxext=%.6g minvtx=%u maxvtx=%u upvmin=%.6g need=%u settle=%u mode=%u | "
+		"listed=%d promoted=%u armed=%llu setsize=%u overflow=%u | "
+		"cam=[%.5g %.5g %.5g] first_frame=%llu frame=%llu line=%u/%u",
+		albedo_hash,
+		verdict,
+		entry.dome,
+		entry.other,
+		total,
+		// dome / total. The distance below 1.0 is the per-draw false-positive risk of arming it.
+		total ? static_cast<f64>(entry.dome) / static_cast<f64>(total) : 0.0,
+		entry.vp,
+		vertex_count,
+		static_cast<f64>(world_extent),
+		static_cast<f64>(units_per_vertex),
+		camera_inside ? 1 : 0,
+		depth_write ? 1 : 0,
+		// Every threshold the verdict was reached against, printed beside the value it judged, so
+		// a line can be re-judged without knowing which launcher produced it. The clamped values,
+		// not the raw environment strings.
+		static_cast<f64>(remix_rsx::sky_min_extent()),
+		static_cast<f64>(remix_rsx::sky_classify_max_extent()),
+		remix_rsx::sky_classify_min_vertices(),
+		remix_rsx::sky_classify_max_vertices(),
+		static_cast<f64>(remix_rsx::sky_classify_units_per_vertex()),
+		remix_rsx::sky_classify_min_draws(),
+		remix_rsx::sky_classify_settle_frames(),
+		remix_rsx::sky_classify_mode(),
+		// listed=1 says the hash was already on RPCS3_REMIX_SKYEMISSIVE BEFORE this rule touched
+		// it, i.e. this line is the rule agreeing with ground truth rather than adding anything.
+		// Passed in, never re-queried: at mode 2 the promotion has already inserted the hash by
+		// the time this runs, so a re-query would report 1 for every armed hash and the
+		// ground-truth check would silently become a tautology.
+		listed ? 1 : 0,
+		static_cast<u32>(m_stats.skyclassify_promoted),
+		m_stats.skyclassify_armed,
+		remix_rsx::sky_emissive_promoted_count(),
+		remix_rsx::sky_emissive_promote_overflow(),
+		static_cast<f64>(m_active_camera.position[0]),
+		static_cast<f64>(m_active_camera.position[1]),
+		static_cast<f64>(m_active_camera.position[2]),
+		entry.first_frame,
+		m_frame_counter,
+		lines,
+		cap);
+
+	rsx_log.notice("%s", line);
+
+	// Mirrored into remix_dump.log for the same reason every other census here is: RPCS3.log is
+	// held with an exclusive lock while the emulator runs, and this line has to be readable during
+	// the play-test that judges it, not only after the emulator exits. That distinction cost round
+	// 37 a pre-registration.
 	if (fs::file out{ fs::get_executable_dir() + "remix_dump.log", fs::write + fs::create + fs::append })
 	{
 		out.write(line + '\n');
@@ -7741,9 +7981,17 @@ void RemixGSRender::report_sky_emissive_census(u64 albedo_hash, u32 vertex_count
 	// 16-line budget is spent on whichever sixteen (program, texture) pairs the level happens to
 	// submit first, and the dome - which draws once per frame among thousands - may never get a
 	// line. 'tagged_sky' is the classifier's own verdict, so an over-tag also shows up here.
-	const bool listed = remix_rsx::sky_emissive_albedo_matches(albedo_hash);
+	// ROUND 39, AND THIS FIELD WAS ABOUT TO BECOME A TAUTOLOGY. This function's doc block says
+	// 'listed' is a statement about the env var, and it must stay one:
+	// sky_emissive_albedo_matches() now ALSO returns true for hashes the round-39 classifier
+	// promoted at runtime, so reading it here would print listed=1 for every promoted hash and the
+	// play-test's ground-truth check - 'do the two known domes appear as listed?' - could not
+	// fail. sky_emissive_listed() is the env list alone.
+	const bool listed = remix_rsx::sky_emissive_listed(albedo_hash);
 
-	if (!tagged_sky && !listed)
+	// The GATE keeps the wider question, deliberately: a promoted dome should still get a line
+	// here even though it is not 'listed'. Two different questions, two different predicates.
+	if (!tagged_sky && !listed && !remix_rsx::sky_emissive_promoted(albedo_hash))
 	{
 		return;
 	}
@@ -10657,7 +10905,7 @@ void RemixGSRender::report_vcol_route()
 		s_max_vcol_route_lines));
 }
 
-void RemixGSRender::apply_vertex_colour(u32 first_vertex, u32 vertex_count)
+void RemixGSRender::apply_vertex_colour(u32 first_vertex, u32 vertex_count, bool textured)
 {
 	// Every vertex leaves the decode loop with color = 0xFFFFFFFF, so a draw that resolves no
 	// albedo material reaches Remix as pure white. Some of those draws are not untextured by
@@ -10710,6 +10958,30 @@ void RemixGSRender::apply_vertex_colour(u32 first_vertex, u32 vertex_count)
 		if (!resolve_constant_vertex_colour(rgba))
 		{
 			++m_stats.vcol_route_blocked;
+			return;
+		}
+
+		// --- ROUND 41: a constant BLACK must not be modulated into a texture --------------------
+		// This is the mechanism behind the 2026-08-15 note on RPCS3_REMIX_VCOLMOD - "the HUD gauges
+		// render BLACK with this on" - and it is now measured rather than suspected. `Remix
+		// vcolroute:` names exactly two constant-route programs on this title and one of them,
+		// vp=b01bfce3fc580e3b, resolves to cval=[0 0 0 1]: pure black. On an UNTEXTURED draw that
+		// constant is the whole colour and round 12 is right to replay it. On a TEXTURED draw it
+		// reaches Remix as a Modulate factor, and a Modulate by zero cannot make a surface more
+		// correct - it can only delete it.
+		//
+		// So the guard is scoped to textured draws only and leaves the untextured path bit-exact.
+		// Refusing leaves the decode loop's white, i.e. the albedo unmodified, which is the same
+		// identity this file already chooses for a missing texture and for an alpha the route
+		// cannot prove ("an alpha the guest never computes ... resolves to opacity 0").
+		//
+		// 1/255 is the threshold because the pack below quantises to 8 bits: anything under it
+		// packs to 0 regardless, so this refuses exactly the values that would have been black.
+		// RPCS3_REMIX_VCOLCONSTBLACK=0 restores round-40 behaviour on this branch.
+		if (textured && remix_rsx::vcol_constant_black_guard_enabled()
+			&& std::max({ rgba[0], rgba[1], rgba[2] }) < (1.f / 255.f))
+		{
+			++m_stats.vcol_const_black;
 			return;
 		}
 
@@ -19519,7 +19791,7 @@ void RemixGSRender::submit_subdraw()
 	if (material && fp_wants_vcol)
 	{
 		const u64 before = m_stats.vcol_applied;
-		apply_vertex_colour(first_vertex, vertex_count);
+		apply_vertex_colour(first_vertex, vertex_count, true);
 
 		if (m_stats.vcol_applied != before)
 		{
@@ -19529,7 +19801,7 @@ void RemixGSRender::submit_subdraw()
 
 	if (!material)
 	{
-		apply_vertex_colour(first_vertex, vertex_count);
+		apply_vertex_colour(first_vertex, vertex_count, false);
 	}
 	else if (!remix_rsx::alpha_state_disabled() && rsx::method_registers.blend_enabled()
 		&& m_scratch_albedo_alpha_min == m_scratch_albedo_alpha_max)
@@ -19770,7 +20042,16 @@ void RemixGSRender::submit_subdraw()
 		&& remix_rsx::sky_hash_mode() != 0
 		&& remix_rsx::sky_min_extent() > 0.f;
 
-	if (sky_candidate || sky_census || sky_backdrop || sky_hash)
+	// ROUND 39. The classifier's own gate, and it is deliberately the same shape as sky_hash's:
+	// every textured draw, whatever its depth state, because a rule that learns per hash cannot
+	// disqualify a hash from a draw it never measured. sky_texture_ok is NOT consulted for the same
+	// reason it is not consulted above - it asks whether the *anchored* rule may look at a textured
+	// draw, and this rule is about textures by construction.
+	const bool sky_classify = albedo_hash != 0
+		&& remix_rsx::sky_classify_mode() != 0
+		&& remix_rsx::sky_min_extent() > 0.f;
+
+	if (sky_candidate || sky_census || sky_backdrop || sky_hash || sky_classify)
 	{
 		for (const remixapi_HardcodedVertex& v : m_scratch_vertices)
 		{
@@ -20696,6 +20977,28 @@ void RemixGSRender::submit_subdraw()
 		if (albedo_hash)
 		{
 			hash = rpcs3::hash64(hash, albedo_hash);
+
+			// --- ROUND 39: the half of the dome promotion that is not in the texture cache -----
+			// texture_cache::promote_sky_emissive rebuilds the MATERIAL of a newly-classified
+			// dome, but a Remix mesh bakes its surface's material at CreateMesh and there is no
+			// API to re-point it - mesh_entry::material says so in full. The mesh key is content-
+			// derived and the content does not change when a material does, so without this fold
+			// every already-created mesh keeps submitting the old, non-emissive handle and the
+			// promotion is invisible: the dome would stay black for the rest of the session.
+			//
+			// Folding membership in re-keys the dome exactly ONCE, at promotion, and the old mesh
+			// entry then ages out through the ordinary reaper. Nothing is destroyed and nothing
+			// dangles, which is why this is the fold and not an erase - erasing mesh entries is
+			// what turns a static-index entry into the invisible 'dropped' exit that round 38
+			// measured behind the vanishing plant walls.
+			//
+			// Safe as a key because sky_emissive_promoted() is MONOTONE: a hash is never
+			// un-promoted, so this bit flips false->true once and never back. A predicate that
+			// could flip both ways here would churn the mesh cache every frame.
+			if (remix_rsx::sky_emissive_promoted(albedo_hash))
+			{
+				hash = rpcs3::hash64(hash, 0x534B59454D495300ull);
+			}
 		}
 		else if (m_scratch_fp_selflit)
 		{
@@ -21104,7 +21407,7 @@ void RemixGSRender::submit_subdraw()
 	// applies to the geometry itself. RPCS3_REMIX_SKYANCHOR=0 drops the anchor requirement.
 	bool is_sky = false;
 
-	if (sky_candidate || sky_census || sky_backdrop || sky_hash)
+	if (sky_candidate || sky_census || sky_backdrop || sky_hash || sky_classify)
 	{
 		// Counted here rather than at the bounding box, so that candidates is exactly the sum of
 		// the four refusals plus the cat_sky increments made below - the RPCS3_REMIX_CAT_SKY hash
@@ -21407,6 +21710,180 @@ void RemixGSRender::submit_subdraw()
 						is_sky = true;
 						outcome = sky_outcome::tagged_hash;
 						++m_stats.sky_hash_tagged;
+					}
+				}
+			}
+		}
+
+		// --- ROUND 39: the dome CLASSIFIER (sky_classify_mode) -------------------------------
+		// This rule does NOT set is_sky and must never be made to. SKY is a camera selection, not
+		// a visibility one - RemixTransforms.h's own category table already says so ("SKY (selects
+		// the sky camera; does NOT hide - see above)") and the deployed runtime's source confirms
+		// it for external draws specifically: rtx_remix_api.cpp:915 reads
+		//   prototype.cameraType = (cameraType == CameraType::Sky) ? CameraType::Main : cameraType;
+		// with the comment "promoting them to CameraType::Sky here would hide the instance with
+		// nothing left to draw it", and the hide at rtx_instance_manager.cpp:1005 is gated on
+		// drawCall.cameraType == CameraType::Sky, which an external draw can therefore never be.
+		// What makes a dome VISIBLE as a sky is its material being emissive, and that is decided in
+		// texture_cache::upload against RPCS3_REMIX_SKYEMISSIVE. So this rule's entire output is
+		// one insertion into that set.
+		//
+		// WHY THE BLACK SKY IS THE MATERIAL AND NOT THE CATEGORY, measured rather than argued.
+		// Over bin\remix_dump.log, 14,726 stats lines read `mat_skyemissive=0 mat_skyunordered=0`
+		// - whole sessions in which the sky-emissive material was never created once - while other
+		// sessions reach 43. The list has six hashes; haze_domes.csv names sixteen dome resources.
+		// A dome whose hash is absent gets an ordinary opaque material and no emission, which is
+		// the black the user is reporting.
+		if (sky_classify)
+		{
+			++m_stats.skyclassify_seen;
+
+			// Every gate, in one expression, so there is exactly one definition of dome-shaped and
+			// the census cannot print a verdict the rule did not reach. Each threshold's measured
+			// justification is on sky_classify_mode() in RemixTransforms.h - do not re-tune one
+			// here without reading its measured gap first. The widest is the extent ceiling (570x),
+			// then the vertex ceiling (2.65x), then upv (3.1x) - and upv is nearly REDUNDANT with
+			// the vertex ceiling on the data these were derived from, so it is not the first lever.
+			const bool dome_shaped = measured
+				&& sky_depth_ok
+				&& inside
+				&& std::isfinite(extent)
+				&& extent >= remix_rsx::sky_min_extent()
+				&& extent <= remix_rsx::sky_classify_max_extent()
+				&& vertex_count >= remix_rsx::sky_classify_min_vertices()
+				&& vertex_count <= remix_rsx::sky_classify_max_vertices()
+				&& units_per_vertex >= remix_rsx::sky_classify_units_per_vertex();
+
+			auto it = m_sky_classify_seen.find(albedo_hash);
+
+			// Inserted only on a dome-shaped draw, which is what keeps the table small - the same
+			// asymmetry sky_hash_mode() documents, and it has the same stated cost: a texture used
+			// on world geometry BEFORE its first dome-shaped draw contributes nothing to 'other'
+			// until the next world draw carrying it. The settle window below is what turns that
+			// from a hazard into a delay, because a shared texture's world draws are submitted
+			// every frame and the window is 60 of them.
+			if (it == m_sky_classify_seen.end() && dome_shaped
+				&& m_sky_classify_seen.size() < s_max_sky_classify_tracked)
+			{
+				it = m_sky_classify_seen.emplace(albedo_hash, sky_classify_entry{}).first;
+				it->second.first_frame = m_frame_counter;
+				it->second.vp = m_current_vp_hash;
+				it->second.extent = extent;
+				it->second.units_per_vertex = units_per_vertex;
+				it->second.vertices = vertex_count;
+				++m_stats.skyclassify_tracked;
+			}
+
+			if (it != m_sky_classify_seen.end())
+			{
+				sky_classify_entry& classify_entry = it->second;
+
+				if (dome_shaped)
+				{
+					++classify_entry.dome;
+					++m_stats.skyclassify_dome;
+				}
+				else
+				{
+					++classify_entry.other;
+				}
+
+				if (classify_entry.other != 0 && remix_rsx::sky_classify_mode() < 3)
+				{
+					++m_stats.skyclassify_rejected;
+
+					if (!classify_entry.reported_mixed)
+					{
+						classify_entry.reported_mixed = true;
+						report_sky_classify_census(albedo_hash, classify_entry, "reject:mixed",
+							extent, units_per_vertex, vertex_count, inside, !sky_depth_ok,
+							remix_rsx::sky_emissive_listed(albedo_hash), false);
+					}
+				}
+				else if (!classify_entry.promoted
+					&& classify_entry.dome >= remix_rsx::sky_classify_min_draws())
+				{
+					// The settle window, and it is the guard on the ONE failure this rule can
+					// produce that cannot be undone: a material rebuilt emissive cannot be rebuilt
+					// back, so a hash that arms and is only later found to be shared has already
+					// glowed. Measured from first sight rather than from the first dome draw,
+					// because the disqualifying draw may arrive on either side of it.
+					if (m_frame_counter < classify_entry.first_frame
+						+ remix_rsx::sky_classify_settle_frames())
+					{
+						++m_stats.skyclassify_settling;
+					}
+					else
+					{
+						// A hash the user already typed into RPCS3_REMIX_SKYEMISSIVE needs no
+						// promotion and no material rebuild - it has been emissive since its first
+						// upload. It is still counted as ARMED, and that is the point: those are
+						// the ground-truth domes, and whether this rule agrees with them is the
+						// only check on it that does not depend on this rule being right.
+						const bool already = remix_rsx::sky_emissive_albedo_matches(albedo_hash);
+
+						// --- ROUND 39: LATCH ON SUCCESS, NOT ON INTENT ------------------------
+						// The first draft set classify_entry.promoted and incremented
+						// skyclassify_armed BEFORE the rebuild was known to have worked. Two ways
+						// that fails permanently and silently: the promoted array is full (the
+						// hash never enters the set, so nothing is ever emissive) and every
+						// resident entry refuses CreateMaterial (the hash IS in the set, so every
+						// later mesh re-keys under an identity whose material never changed - a
+						// black dome reported as a success by three counters). Neither retried,
+						// because `promoted` had already latched.
+						//
+						// Undoing is safe precisely here and nowhere later: the mesh key fold
+						// reads sky_emissive_promoted() EARLIER in submit_subdraw than this
+						// block runs, so a hash promoted on this draw cannot have moved a mesh
+						// key until the next frame. Withdrawing it now is invisible.
+						bool armed_ok = true;
+
+						if (!already && remix_rsx::sky_classify_mode() >= 2)
+						{
+							armed_ok = false;
+
+							if (!remix_rsx::sky_emissive_promote(albedo_hash))
+							{
+								// Array full. Counted, not latched, so a later draw retries and
+								// skyclassify_armed never over-reports.
+								++m_stats.skyclassify_overflow;
+							}
+							else
+							{
+								const u64 failed_before = m_textures.stats().sky_promote_failed;
+								const u32 rebuilt =
+									m_textures.promote_sky_emissive(m_remix.api(), albedo_hash);
+								const u64 failed =
+									m_textures.stats().sky_promote_failed - failed_before;
+
+								if (rebuilt == 0 && failed != 0)
+								{
+									remix_rsx::sky_emissive_unpromote(albedo_hash);
+									++m_stats.skyclassify_failed;
+								}
+								else
+								{
+									// rebuilt == 0 && failed == 0 is SUCCESS, not a miss: no entry
+									// for this content hash is resident, so there was no material
+									// to rebuild and the next upload() will build the emissive one
+									// from the promoted set directly.
+									++m_stats.skyclassify_promoted;
+									m_stats.skyclassify_entries += rebuilt;
+									armed_ok = true;
+								}
+							}
+						}
+
+						if (armed_ok)
+						{
+							classify_entry.promoted = true;
+							++m_stats.skyclassify_armed;
+
+							report_sky_classify_census(albedo_hash, classify_entry,
+								already ? "ARMED:listed" : "ARMED", extent, units_per_vertex,
+								vertex_count, inside, !sky_depth_ok, already, true);
+							classify_entry.reported_armed = true;
+						}
 					}
 				}
 			}
@@ -23063,7 +23540,7 @@ const remix_rsx::fp_fingerprint& RemixGSRender::fp_fingerprint_for(u64 fp_hash)
 			{
 				dump_line(fmt::format(
 					"Remix fpvcol: fp=%016llx class=%s alpha=%s attr=COL%u replay=%d sampled=0x%02x "
-					"instrs=%u fp32=%u frame=%llu",
+					"instrs=%u fp32=%u hops=%u frame=%llu",
 					fp_hash,
 					remix_rsx::fp_out_source_name(fp.out_rgb_source),
 					remix_rsx::fp_out_source_name(fp.out_alpha_source),
@@ -23072,6 +23549,43 @@ const remix_rsx::fp_fingerprint& RemixGSRender::fp_fingerprint_for(u64 fp_hash)
 					u32{fp.sampled_mask},
 					fp.instructions,
 					fp32_outputs ? 1 : 0,
+					u32{fp.out_rgb_hops},
+					m_frame_counter));
+			}
+			// --- ROUND 41: the OTHER half of the census, which never existed ---------------------
+			// 'Remix fpvcol:' has only ever printed the programs that DID classify, so a title whose
+			// answer is "two of them" produced two lines and no way to see what the other hundred
+			// and forty look like. MEASURED on Haze: fpclass=1/1/0 and fpvcol_applied=698 of
+			// 5,783,237 submitted draws (0.012%), while every one of 192 'Remix alphastate:' rows
+			// ships the parity fill tcolor=1/0/3 - colour = texture, vertex colour discarded - and
+			// 22 of 47 vertex programs carry a fully replayable route=scaled. The fragment side is
+			// the gate and this line is what says what it is gating on.
+			//
+			// kind= is a bitfield per source slot: 1 clean COL0/COL1 read, 2 temp whose writer
+			// sampled a texture, 4 temp (any), 8 non-identity swizzle, 0x10 negated, 0x20 abs. A
+			// row reading 'op=MUL k0=2 k1=1' is the modulate shape and should already have
+			// classified; a row reading op=MAD, or k1=9 (COL0 but swizzled), names the exact
+			// widening the next round has to write. Bounded to 64 lines per run.
+			else if (m_fpother_lines < s_max_fpother_lines)
+			{
+				++m_fpother_lines;
+
+				dump_line(fmt::format(
+					"Remix fpother: fp=%016llx op=%u srcs=%u pred=%u hops=%u "
+					"t0=%u t1=%u t2=%u k0=0x%02x k1=0x%02x k2=0x%02x "
+					"sampled=0x%02x instrs=%u fp32=%u line=%u/%u frame=%llu",
+					fp_hash,
+					u32{fp.out_rgb_opcode},
+					u32{fp.out_rgb_srccount},
+					fp.out_rgb_predicated ? 1u : 0u,
+					u32{fp.out_rgb_hops},
+					u32{fp.out_rgb_srctype[0]}, u32{fp.out_rgb_srctype[1]}, u32{fp.out_rgb_srctype[2]},
+					u32{fp.out_rgb_srckind[0]}, u32{fp.out_rgb_srckind[1]}, u32{fp.out_rgb_srckind[2]},
+					u32{fp.sampled_mask},
+					fp.instructions,
+					fp32_outputs ? 1 : 0,
+					m_fpother_lines,
+					s_max_fpother_lines,
 					m_frame_counter));
 			}
 		}
@@ -24090,6 +24604,15 @@ void RemixGSRender::log_stats()
 		"sky_backdrop_hit=%llu sky_backdrop_dw=%llu sky_backdrop_mode=%u sky_learned_ring=%llu | "
 		"skyhash_considered=%llu skyhash_dome=%llu skyhash_matched=%llu skyhash_tagged=%llu "
 		"skyhash_rejected=%llu skyhash_tracked=%llu skyhash_census=%u skyhash_mode=%u | "
+		// ROUND 39. The dome classifier, mirroring the identical group on 'Remix live:'. Present on
+		// BOTH lines deliberately: 'Remix stats:' goes only to bin\log\RPCS3.log, which is held
+		// with an exclusive lock while the emulator runs, so anything a play-test has to judge must
+		// also be on the live line. Round 37 lost a pre-registration to exactly that split.
+		"skyclassify_seen=%llu skyclassify_dome=%llu skyclassify_tracked=%llu "
+		"skyclassify_armed=%llu skyclassify_promoted=%llu skyclassify_rejected=%llu "
+		"skyclassify_settling=%llu skyclassify_entries=%llu skyclassify_orphans=%llu "
+		"skyclassify_overflow=%llu skyclassify_failed=%llu "
+		"skyclassify_census=%u skyclassify_set=%u skyclassify_mode=%u | "
 		"vm_tagged=%llu vm_considered=%llu vm_fullrange=%llu vm_offset=%llu vm_far=%llu vm_noanchor=%llu "
 		"vm_tagged_hash=%llu vm_hash_anchor_refused=%llu vm_list=%u "
 		"vm_census=%u vm_mode=%u | "
@@ -24266,6 +24789,23 @@ void RemixGSRender::log_stats()
 		m_stats.sky_hash_tracked,
 		m_sky_hash_census_lines,
 		remix_rsx::sky_hash_mode(),
+		// ROUND 39. Fourteen arguments for the fourteen specifiers inserted above, same order:
+		// seen, dome, tracked, armed, promoted, rejected, settling, entries, orphans, overflow,
+		// failed, census, set, mode. The last three are %u; the first eleven are %llu.
+		m_stats.skyclassify_seen,
+		m_stats.skyclassify_dome,
+		m_stats.skyclassify_tracked,
+		m_stats.skyclassify_armed,
+		m_stats.skyclassify_promoted,
+		m_stats.skyclassify_rejected,
+		m_stats.skyclassify_settling,
+		m_stats.skyclassify_entries,
+		m_textures.stats().sky_promote_orphans,
+		m_stats.skyclassify_overflow,
+		m_stats.skyclassify_failed,
+		m_sky_classify_census_lines,
+		remix_rsx::sky_emissive_promoted_count(),
+		remix_rsx::sky_classify_mode(),
 		m_stats.viewmodel_tagged,
 		m_stats.viewmodel_considered,
 		m_stats.viewmodel_refused_full_range,
@@ -24693,7 +25233,7 @@ void RemixGSRender::log_stats()
 			"reap_kept=%llu reap_freed=%llu | "
 			// Round 9: the effects family. fpvcol_applied climbing while an effect is on screen is
 			// the fix firing on it; fp_vcol_pass/mod are the PROGRAM counts behind it.
-			"fpvcol_applied=%llu vcol_mod=%llu fpclass=%llu/%llu/%llu ucode_stored=%llu/%llu "
+			"fpvcol_applied=%llu vcol_mod=%llu vcol_const_black=%llu fpclass=%llu/%llu/%llu ucode_stored=%llu/%llu "
 			"madmix=%llu/%llu "
 			// Round 17: the Selva tree tops. programs/draws. Zero with madlanemap=1 on the banner
 			// means the arm is armed but the canopy programs never reached the matcher this run.
@@ -24763,7 +25303,7 @@ void RemixGSRender::log_stats()
 			// creation line went to the exclusively locked RPCS3.log); match is how often the
 			// albedo trigger fired; capped non-zero is the shared-texture spam risk firing;
 			// mat_emissive is how many fixture materials are glowing.
-			"guest_lights=%llu guest_light_match=%llu guest_light_capped=%llu guest_light_reaped=%llu "
+			"guest_lights=%llu guest_light_match=%llu guest_light_capped=%llu guest_light_toobig=%llu guest_light_reaped=%llu "
 			"mat_emissive=%llu | "
 			// Alpha to coverage: the two detection bits and the replay. ctrl/reg both 0 across a
 			// run is the negative verdict on the cutout theory, with bytes behind it.
@@ -24892,11 +25432,35 @@ void RemixGSRender::log_stats()
 			"vcol_const=%llu | "
 			// Round 13. mat_skyemissive is the sky dome's emissive material - a strict subset of
 			// mat_emissive above - and mat_skyunordered the subset of THAT which also declared
-			// BlendType::kEmissive, i.e. the ones that stopped occluding the sun. Expect both to be
-			// 1 with the list armed. mat_skyemissive=0 with a non-empty list means the hash never
-			// reached CreateMaterial (wrong hash, or the texture never decoded); the two disagreeing
-			// means RPCS3_REMIX_SKYEMISSIVEBLEND is off.
+			// BlendType::kEmissive, i.e. the ones that stopped occluding the sun. The two
+			// disagreeing means RPCS3_REMIX_SKYEMISSIVEBLEND is off.
+			//
+			// ROUND 39 CHANGED WHAT THIS NUMBER MEANS AND THE OLD READING NO LONGER HOLDS. It used
+			// to be ~1 per listed dome, so 'expect 1' was a usable 'did the dome attach?' test.
+			// promote_sky_emissive() now rebuilds the material of EVERY texture-cache entry
+			// carrying the promoted content hash, and this title aliases roughly 45 descriptor
+			// entries onto one content hash (tex_key_dup 11,212 of tex_created 11,467) - so a
+			// single promoted dome moves this counter by tens, not by one. Use
+			// skyclassify_entries for the rebuild count and 'Remix skypromote:' for the per-entry
+			// proof; mat_skyemissive is now only a floor on 'something emissive was built'.
 			"mat_skyemissive=%llu mat_skyunordered=%llu | "
+			// ROUND 39, the dome classifier. Read skyclassify_armed FIRST and against
+			// haze_domes.csv, which holds 16 distinct dome resources of which only 12 appear
+			// outside multiplayer: 8..20 over a full single-player pass is expected and anything
+			// past ~28 is over-matching, in which
+			// case look at SKYCLASSIFYMAXEXT and SKYCLASSIFYMINVTX before SKYCLASSIFYUPV - upv is
+			// nearly redundant with the vertex ceiling on the data all three were derived from.
+			// armed MINUS promoted is the count of hashes the rule agreed with the user about -
+			// hashes already on RPCS3_REMIX_SKYEMISSIVE - and if that difference is 0 the rule
+			// found nothing the user had already found by hand, which is a reason to distrust it.
+			// skyclassify_entries is the material rebuilds the promotion actually performed: 0
+			// while promoted > 0 means the rebuild reached no resident texture and the dome will
+			// stay black. skyclassify_settling non-zero then falling is the settle window working.
+			"skyclassify_seen=%llu skyclassify_dome=%llu skyclassify_tracked=%llu "
+			"skyclassify_armed=%llu skyclassify_promoted=%llu skyclassify_rejected=%llu "
+			"skyclassify_settling=%llu skyclassify_entries=%llu skyclassify_orphans=%llu "
+			"skyclassify_overflow=%llu skyclassify_failed=%llu "
+			"skyclassify_set=%u skyclassify_mode=%u | "
 			// Round 14. suncard_seen is the SHAPE census population and climbs with SUNTRACK=0 -
 			// it decides nothing. suncard_pinned is the strict subset on RPCS3_REMIX_SUNCARDALBEDO
 			// and MUST climb once that list is filled, or the pin is wrong and everything after it
@@ -25003,7 +25567,14 @@ void RemixGSRender::log_stats()
 			// Round 13. Same rule again: skyemissive=0 means the sky path is off, and every
 			// mat_skyemissive/mat_skyunordered above is 0 for that reason rather than for a
 			// failure. skyemissiveblend=0 is the "keep the glow, keep the occlusion" A/B.
-			"skyemissive=%u skyemissiveint=%.4g skyemissiveblend=%d fpcensusvp=%u "
+			"skyemissive=%u skyemissiveint=%.4g skyemissiveblend=%d "
+			// ROUND 39. The dome classifier's six knobs plus the live size of the learned set, all
+			// printing the CLAMPED value so a SKYCLASSIFY=9 that is silently running as mode 3 is
+			// visible here rather than nowhere. skyclassifyset= is not a knob - it is how many hashes
+			// the rule has promoted so far, echoed beside the thresholds that promoted them.
+			"skyclassify=%u skyclassifymaxext=%.4g skyclassifyminvtx=%u skyclassifymaxvtx=%u skyclassifyupv=%.4g "
+			"skyclassifymin=%u skyclassifysettle=%u skyclassifyset=%u "
+			"fpcensusvp=%u "
 			// Round 14, echoed beside the suncard_* counters above for the same reason every other
 			// knob is echoed: a counter reading 0 has two entirely different meanings depending on
 			// whether the knob that feeds it was armed.
@@ -25095,6 +25666,7 @@ void RemixGSRender::log_stats()
 			m_textures.stats().reap_freed,
 			m_stats.fpvcol_applied,
 			m_stats.vcol_mod_applied,
+			m_stats.vcol_const_black,
 			m_stats.fp_vcol_pass,
 			m_stats.fp_vcol_mod,
 			m_stats.fp_vcol_col1,
@@ -25150,6 +25722,7 @@ void RemixGSRender::log_stats()
 			static_cast<u64>(m_guest_lights.size()),
 			m_stats.guest_light_match,
 			m_stats.guest_light_capped,
+			m_stats.guest_light_toobig,
 			m_stats.guest_lights_reaped,
 			m_textures.stats().materials_emissive,
 			m_stats.a2c_ctrl,
@@ -25232,6 +25805,22 @@ void RemixGSRender::log_stats()
 			m_stats.vcol_const_applied,
 			m_textures.stats().materials_sky_emissive,
 			m_textures.stats().materials_sky_unordered,
+			// ROUND 39. Thirteen arguments for the thirteen specifiers inserted above, in the same
+			// order: seen, dome, tracked, armed, promoted, rejected, settling, entries, orphans,
+			// overflow, failed, set, mode. The last two are %u and are the only non-%llu pair.
+			m_stats.skyclassify_seen,
+			m_stats.skyclassify_dome,
+			m_stats.skyclassify_tracked,
+			m_stats.skyclassify_armed,
+			m_stats.skyclassify_promoted,
+			m_stats.skyclassify_rejected,
+			m_stats.skyclassify_settling,
+			m_stats.skyclassify_entries,
+			m_textures.stats().sky_promote_orphans,
+			m_stats.skyclassify_overflow,
+			m_stats.skyclassify_failed,
+			remix_rsx::sky_emissive_promoted_count(),
+			remix_rsx::sky_classify_mode(),
 			m_stats.suncard_seen,
 			m_stats.suncard_pinned,
 			m_stats.suncard_elected,
@@ -25360,6 +25949,16 @@ void RemixGSRender::log_stats()
 			remix_rsx::sky_emissive_albedo_count(),
 			static_cast<f64>(remix_rsx::sky_emissive_intensity()),
 			remix_rsx::sky_emissive_blend_enabled() ? 1 : 0,
+			// ROUND 39. Eight arguments for the eight specifiers above, same order: mode, maxext,
+			// minvtx, maxvtx, upv, min, settle, set.
+			remix_rsx::sky_classify_mode(),
+			static_cast<f64>(remix_rsx::sky_classify_max_extent()),
+			remix_rsx::sky_classify_min_vertices(),
+			remix_rsx::sky_classify_max_vertices(),
+			static_cast<f64>(remix_rsx::sky_classify_units_per_vertex()),
+			remix_rsx::sky_classify_min_draws(),
+			remix_rsx::sky_classify_settle_frames(),
+			remix_rsx::sky_emissive_promoted_count(),
 			remix_rsx::fp_census_vp_count(),
 			remix_rsx::sun_track_mode(),
 			remix_rsx::sun_card_albedo_count(),

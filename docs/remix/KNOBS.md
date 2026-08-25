@@ -1151,6 +1151,1325 @@ refutation has two independent derivations, not one.
   carried forward as "the fp does not partition the rig" — but it partitions the body from the rig
   perfectly. Re-test a rejected key against the new question.
 
+## Round 41 (2026-08-25)
+
+Deployed: `bin\rpcs3.exe` = `bin\rpcs3-next.exe` = **`49D31EEA1D767004`**. Runtime `bin\remix\d3d9.dll`
+**UNCHANGED at `16A0B512F33EBB66`** — nothing deployed into `bin\remix\`.
+
+Tree at both ends: HEAD `4fdaecd67`, rounds 37-41 uncommitted. **The tree did not move.** Both exes read
+`46D3DF83376C0391` at the start, exactly what round 40 recorded.
+
+Round 40's build was play-tested. **The guest-light fix landed** — `guest_lights=31`, `guest_light_match=826`,
+non-zero for the first time in the project. **And the user's verdict was "nothing got fixed", which is fair:**
+the lights that appeared were the wrong lights, and everything else round 40 shipped was a knob A/B.
+
+---
+
+### TASK 1 — the light exists but was keyed on the wrong texture. Three separate defects, all measured
+
+#### 1a. One albedo, a 154× spread of world extents, and no size gate on a listed hash
+
+MEASURED, all 31 `Remix guest-light:` lines of the round-40 run. Every one is the same albedo
+(`71D189E9B559A7F9`) on the same `(vp, fp)` pair, and their world extents are:
+
+```
+0.5385  0.5389  0.5396  0.5399  0.5579  0.5579  0.5607  0.5646  1.731
+7.893  8.047  8.095  8.453  8.456  8.469  10.02  11.16  12.54  14.52  14.58
+20.33  21.60  21.62  21.64  21.59  22.17  30.08  30.11  30.13  58.94  83.18
+```
+
+**Nine rows at 0.54 .. 1.73 and twenty-two at 7.89 .. 83.18**, with a **4.6× gap** between them. The small
+group are the bulbs (1.731 is the user's own Ctrl+Click). The large group is a different mesh sharing the
+texture. The 83.18 row produced `radius=29.1` placed at the AABB centre of an 83-unit mesh — **that is the
+"too big and not aligned with the bulbs" disc in the user's screenshot**, and its position is not wrong so
+much as meaningless: the centroid of an 83-unit object is not where any bulb is.
+
+`small_enough` (`world_extent <= GUESTLIGHTMAXEXT`, default 6) already existed and already gated the census
+and the AUTO trigger. It **did not gate an explicitly listed albedo**, and no comment in the file ever argued
+for that exemption — it is an oversight, not a decision. Round 41 applies it, behind
+`RPCS3_REMIX_GUESTLIGHTLISTEXT` (default 1; 0 restores round 40 bit-exactly) with a new counter
+`guest_light_toobig` on `Remix live:`. The default ceiling of 6 lands inside the measured 4.6× gap, so the
+separation is on data rather than taste.
+
+`guest_light_match` deliberately stays upstream of the rejection: **match − toobig is the accepted
+population**, and folding the rejection into `match` would make "wrong list" and "over-sized fixture" read as
+the same number.
+
+#### 1b. The radius was a constant, and on a small bulb the emitter was bigger than the bulb
+
+`sphere.radius = max(GUESTLIGHTRADIUS, world_extent × GUESTLIGHTRADIUSSCALE)`. The launcher armed
+`RADIUS=0.6` and `RADIUSSCALE=0`, and at world scale ≈ 1 unit = 1 m that is a **60 cm** emitter forced on
+every fixture. On the measured 0.54-extent bulbs the floor won outright — the light sphere was **larger than
+the bulb**.
+
+**`RADIUSSCALE=0` never meant what the file says it meant.** `env_float` rejects 0 and returns the accessor's
+fallback of **0.35**, and the live banner has been echoing `glradiusscale=0.35` all along. The accessor's own
+comment claims "0 falls back here and the caller then takes `max(fixed, 0)` = the fixed radius", which is
+wrong: the fallback is 0.35, not 0. Round 40 recorded this trap and left it; round 41 writes the value
+explicitly so the file and the behaviour agree.
+
+Now `RADIUSSCALE=0.5`, `RADIUS=0.1` — the emitter is exactly the mesh's own half-extent, a sphere that fills
+the fixture and no more, with a floor low enough never to bind on a real one.
+
+**Radiance follows, and this is INFERRED, not measured on screen.** A sphere light's radiance is per unit
+area, so total power goes as r². Round 40 ran r = 0.6; round 41 runs ≈ 0.10 .. 0.17 on the measured glow
+cards. `(0.6/0.15)² = 16`, so equal power would want ~2400. `GUESTLIGHTRADIANCE` is armed at **1200**, a
+deliberate half-step — expect *slightly dimmer* than round 40 rather than blown out. It is the only
+brightness knob; too dark → 2400 then 4800, too bright → 600 then 300.
+
+#### 1c. The discriminator for "only SOME bulbs are lit" — and it needs no list at all
+
+MEASURED, `Remix light-candidate:` grouped by (albedo, state):
+
+| albedo | state | n | vtx | lum | mean_rgb |
+| --- | --- | --- | --- | --- | --- |
+| `F613BD83DAF2B4E2` | glowcard | 82 | 22, 23, 26 | 0.8155 | `[0.8424 0.8314 0.5781]` warm white |
+| `0F86FCEDC4226D3B` | glowcard | 64 | 4 | 0.9375 | `[0.9375 0.9375 0.9375]` |
+| `A0D0AB03F0BB1D3C` | glowcard | 59 | 200, 36, 64 | 1 | `[1 1 1]` |
+| `577B02B123B0F15F` | glowcard | 53 | 80 | 1 | `[1 1 1]` |
+| `099D2DA136CEA2C4` | glowcard | 53 | 40 | 0.9938 | |
+| `9CA366166DF12A90` | glowcard | 27 | 116, 12, 16 | 0.9813 | `[1 1 0.7412]` yellow |
+| `9E95F66ECE26BE29` | **fixture** | 23 | 216, 8, 846 | 0.7226 | |
+| `16B46EA28EEDFC8E` | **fixture** | 22 | 8 | 0.7223 | |
+
+Three facts settle it:
+
+1. **`71D189E9B559A7F9` — the hash round 40 armed — is not in the census at all.** The backend's own fixture
+   classifier never nominated it. We were creating lights keyed on a texture nothing recommended.
+2. Every `blend=1 depth_write=0` row is a **glow card**: a small additive billboard (4 .. 200 vertices)
+   carrying the game's own lamp tint. None of them is the bulb texture.
+3. `state=fixture` is a separate, larger, opaque population (216 and 846 vertices) at a flat `lum ≈ 0.72` —
+   the housing's metal, not a light.
+
+**The hypothesis, INFERRED and this run is the test:** Haze draws an additive glow card over a fixture that
+is **lit** and omits it for one that is not. If that holds, the rule is *"create a light where a glow card is
+drawn"*, which reproduces the raster reference's "not every bulb is lit" **with no per-bulb list**, and gives
+each light the card's own measured `mean_rgb` and its own extent-derived radius for free.
+
+Shipped as `RPCS3_REMIX_GUESTLIGHTAUTO=2` — glow cards only. Mode 1 keeps the round-6 meaning (fixtures **and**
+cards) exactly, so old runs stay comparable; mode 1 is what put lights on doors in August, so **0, not 1, is
+the fallback**.
+
+It also retires the `(vp, fp)` key for this population: `F613BD83DAF2B4E2` alone is drawn by **five vertex
+programs and twelve fragment programs**, so no single pair can name it. Mode 2 does not consult
+`vp_ok`/`fp_ok` at all — those gate `trigger_match` only.
+
+**PRE-REGISTERED REFUTATION:** if the plant ends up with far more lights than it has visibly lit fixtures, or
+`guest_light_capped` starts climbing, the glow card is not the "is lit" signal and the discriminator is
+something else. `guest_lights=` and `guest_light_capped=` on `Remix live:` size it directly.
+`GUESTLIGHTMAX` raised 64 → 128 because mode 2 lights a whole level rather than one texture and
+`GUESTLIGHTIDLE=0` keeps them forever; the clamp is 4096, so 128 is nowhere near a ceiling.
+
+#### 1d. And the vp/fp narrowing now applies to the primary list only
+
+It was ANDed against **both** albedo rules, which made the two lists share one global program pair and meant
+only one fixture family could ever be lit per run. Severed for the glow rule and kept for the primary one,
+because the two carry different amounts of built-in selectivity: the primary rule is albedo alone, and the
+launcher's 2026-08-15 note records by measurement that an albedo alone is **not** the fixture identity on
+Haze (it put lights on doors); `glow_match` already carries its own state discriminator — blend enabled AND
+depth write off — which is the very thing the vp/fp pair was standing in for. Round 16 makes the same
+argument for `SUNCARDVP` in as many words.
+
+---
+
+### TASK 2 — the white walls and the uncoloured lava: the fix, and the no-op it nearly was
+
+Round 40's diagnosis stands and is unchanged: every one of 192 `Remix alphastate:` rows reads
+`tcolor=1/0/3` (*colour = albedo texture, vertex colour discarded*) while 22 of 47 vertex programs — the wall
+program `ad7ce9d672a0bf6b` among them — carry a fully replayable `route=scaled slots=[c[18].x..w]`. The gate
+is the **fragment** classifier, which recognises two shapes in the whole title (`fpclass=1/1/0`,
+`fpvcol_applied=698` of 5,783,237 submitted draws = 0.012%).
+
+#### 2a. `RPCS3_REMIX_FPVCOLHOP` — step through identity temp copies before classifying
+
+`scan_fragment_program` classifies the **last** instruction writing `col0.rgb` and accepts only
+`MOV out, COL0` or `MUL out, tex, COL0`. A program that builds the recognised shape in a temp and then
+copies it out — `MUL rB, rA, COL0` … `MOV col0, rB` — is `other`.
+
+The hop walks backwards through **identity copies**: an unconditional `MOV` of a `TEMP` with identity
+swizzle and no negate and no abs. **That is the identity function**, so replacing a copy with its own
+producer cannot change what the program computes, and hopping one **cannot admit a shape the classifier did
+not already recognise**. It only reaches programs that write the recognised shape and then export it. That
+safety is the whole design — `RPCS3_REMIX_RETRYUNSUP` is on record in this project as the cost of widening a
+matcher until something matched, and this widening cannot mis-match. Applied to the rgb walk, the alpha walk
+and to `is_sampled_temp`'s producer lookup. Clamped to 8, armed at 4, **default 0** (round-40 behaviour
+bit-exactly).
+
+**PRE-REGISTERED, and this is how it fails:** a program doing real arithmetic between the modulate and the
+export — a fog lerp, a specular add, a `MAD` — is not reached and stays `other`. **The reading is `fpclass=`
+on `Remix live:` moving off `1/1/0`, and `hops=` > 0 on `Remix fpvcol:` lines.** If `fpclass` stays `1/1/0`
+the hop is not the gate.
+
+#### 2b. The census that never existed: `Remix fpother:`
+
+`Remix fpvcol:` has only ever printed programs that **did** classify, so a title whose answer is "two of
+them" produced two lines and no way to see what the other hundred and forty look like. The new line prints,
+once per unique fragment program (it sits inside the `m_fp_fingerprints` cache miss, so no dedup set is
+needed), the terminal instruction the walk ended on: opcode, source count, predication, hops used, each
+slot's register type, and a `kind` bitfield — `1` clean COL0/COL1 read, `2` temp whose writer sampled a
+texture, `4` temp, `8` non-identity swizzle, `0x10` negated, `0x20` abs.
+
+A row reading `op=MUL k0=2 k1=1` is the modulate shape and should already have classified; a row reading
+`op=MAD`, or `k1=9` (COL0 but swizzled), **names the exact widening the next round has to write**. Bounded to
+64 lines. This is the deliverable if 2a does not reach.
+
+#### 2c. `VCOLMOD=0` would have made all of it a no-op, and the reason it was 0 is now root-caused
+
+`fp_wants_vcol = vertex_colour_modulate_enabled() && fp_vertex_colour_replay_enabled() && vcol_replayable()`.
+**`RPCS3_REMIX_VCOLMOD` was armed at 0**, so no textured draw reaches `apply_vertex_colour` whatever the
+classifier decides. Arming the hop without arming this would have shipped a change that could not alter one
+pixel — the exact defect class this project has shipped before.
+
+It was turned off on 2026-08-15 with the note *"the HUD gauges render BLACK with this on … most likely those
+meshes carry no COL0 attribute at all and the replay is feeding zeros"*. That guess is wrong in its
+mechanism and right in its symptom, and the real mechanism is measured: `Remix vcolroute:` names exactly two
+constant-route programs on this title and one of them resolves to
+
+```
+vp=b01bfce3fc580e3b route=constant cval=[0 0 0 1]
+```
+
+**a constant vertex colour of pure black.** ("No COL0 attribute" cannot be it — `map_attribute(3, …) != ok`
+already returns without writing.) On an untextured draw that constant *is* the colour and round 12 is right
+to replay it. On a **textured** draw it reaches Remix as a Modulate factor, and a Modulate by zero cannot
+make a surface more correct — it can only delete it.
+
+`RPCS3_REMIX_VCOLCONSTBLACK` (default 1) refuses a constant-route replay whose resolved RGB is under
+`1/255` **on a textured draw only**; the untextured path is bit-exact. `1/255` is the threshold because the
+pack quantises to 8 bits, so it refuses exactly the values that would have packed to 0. Refusing leaves the
+decode loop's white, i.e. the albedo unmodified — the same identity this file already chooses for a missing
+texture and for an alpha the route cannot prove. Counter `vcol_const_black` on `Remix live:`.
+`apply_vertex_colour` grew a `textured` parameter for it; both call sites pass their own `material != 0`.
+
+**If the gauges go black anyway: `VCOLMOD=0`, one line.** And report `vcol_const_black` — **if that counter
+is 0, the black came from somewhere else and the guard is aimed at the wrong mechanism.** That is the
+pre-registered refutation.
+
+**Second watch: `mesh_created=`.** Vertex colour is hashed into the mesh key, so an animated vertex colour
+mints a mesh per step. It was **582,659** with `VCOLMOD` off.
+
+---
+
+### TASK 3 — THE CHAPTER LIST — the premise was wrong, and that is this round's most useful result
+
+**Do not go hunting for a "second consumer" until you have read this.** The brief for round 41 stated that
+the `Unlock All Chapters` patch is provably applied and that the list is still truncated, therefore round 39
+found one of at least two paths. The patch *is* applied — the log shows `Applied patch` for all five Haze
+entries under the matching hash, with per-anchor entry counts `(<- 1)` and `(<- 2)` matching the `be32` line
+counts exactly. **But the patch has never once been observed to unlock the list on its own.**
+
+**MEASURED from file mtimes, SHA1s and the round-39 transcript timestamps (local TZ = UTC-5):**
+
+| local time, 22 Aug | event |
+| --- | --- |
+| 00:40:29 | **15 chapter gates re-zeroed in all four pak members** (`15 gates -> 0`) |
+| 00:41:17 | verified `gates all0=True n=15` |
+| 00:50:43 | `patch.yml` backed up, chapter patch written |
+| 00:51:53 | that round writes: *"revert the archives but keep the patch. If 15 chapters still list, the patch alone carries it"* |
+| 00:57:31 | play-test: **all 15 chapters list, all stars lit** — **with the archives still edited** |
+| 01:18:57 | all six paks restored to stock — **and no play-test after** |
+
+The decisive "revert the archives, keep the patch" test **was proposed and never run**. Every Haze archive is
+now byte-identical to its pristine backup (`71423f03.pak` `35fd02d8…`, `71423f03.pak.00` `e396850b…`,
+`misc.pak` `3b6ed5f8…`, `patched.pak` `1579f0f0…`), so the stock gate values are live and the list is
+truncated. The one effect cleanly attributable to the PPU patch is the **star pips**. This contradicts
+`reference_haze_unlock_chapters.md`, which claims the two PPU patches work with data 100% stock — **that
+claim was never verified and should be corrected.**
+
+### And the mask gate is provably not the limiter
+
+Recovered verbatim from the round-39 capstone output (MEASURED-FROM-RECORD; the ELF itself is gone, see
+below). The function starts at **`0x4dd830`**, not `0x4dd840`:
+
+```
+0x004dd830  5484103a  slwi   r4, r4, 2
+0x004dd834  38840110  addi   r4, r4, 0x110
+0x004dd838  7c8407b4  extsw  r4, r4
+0x004dd83c  7c632214  add    r3, r3, r4
+0x004dd840  80630004  lwz    r3, 4(r3)      <- the patch target
+0x004dd844  4e800020  blr
+```
+
+`u32 GetChapterMask(void* profile, int idx)` → `*(u32*)(profile + 0x110 + idx*4 + 4)`. A six-instruction
+leaf; `li r3, 0x7fff` cannot fault. A full-image `bl` scan finds **exactly three callers** — `0xabb4c`,
+`0x4f4a00`, `0x4f4a24` — all of `0x4dd830`, so the patch reaches every one and there is no unpatched sibling.
+
+The list builder is `feflCallbackSelectChapterBuildChapterList` @ **`0xab1a0`**, and its gate is:
+
+```
+0x000abb4c  bl    0x4dd830      ; r3 = mask
+0x000abb54  lwz   r0, 0(r24)    ; onlyDisplayOnceChapterUnlocked
+0x000abb68  slw   r0, r25, r0
+0x000abb74  and   r9, r0, r3
+0x000abb80  cmpwi r9, 0
+0x000abb94  beq   0xabce0       ; bit clear -> skip
+```
+
+The gate values are **MEASURED as exactly 0..14** (`levelselect_full.res`, member `6ba2da6d`, plaintext,
+9484 B, decoded independently twice). With `r25 = 1` and the mask forced to `0x7FFF`,
+`(1 << g) & 0x7FFF != 0` for every `g` in `[0, 14]`. **This test cannot truncate the list.** That is the
+pre-registered refutation firing, and it is why the membership filter is most likely a *different* comparison
+against the same `onlyDisplayOnceChapterUnlocked` field — which explains why zeroing the field worked and
+widening the mask did not.
+
+### The untraced lead: `0x4f4b40`, and it matches the user's own observation
+
+`CheckPointLoad` @ `0x179b48`:
+
+```
+0x00179b90  mr   r4, r28        ; r28 = chapter index just loaded
+0x00179b9c  bl   0x4f4b40       ; <- records the chapter as a plain integer?
+0x00179bc0  slw  r5, r5, r0     ; 1 << (chapter-1)
+0x00179bd0  bl   0x4f4a90       ; -> 0x4dd770
+0x00179c08  bl   0x4f49b8       ; per-player fold, mask 0x7FFF
+```
+
+The completion path at `0x647280` calls the same pair with **`li r4, 0xf`** (chapter 15) and `li r5, 0x4000`.
+So `0x4f4b40(profile, chapterIndex, x)` is written on every checkpoint load with the current chapter and
+hard-coded to 15 on completion — exactly the shape of a "furthest chapter reached" integer, and exactly what
+the user describes when they say the list tracks their furthest checkpoint. **`0x4f4b40` has never been
+disassembled and its readers have never been enumerated. That is the first thing round 42 should do.**
+
+Sibling accessors already counted: `0x4dd848` (OR into the halfword at `profile+0x110`) 2 callers,
+`0x4dd858` (bit test on it) 1 caller `0x4f48f0`, `0x4dd878` (`lwz r3, 0x1cc(r3)`) 8 callers.
+
+### BLOCKER: the decrypted ELF is gone, and no second offset is being shipped without it
+
+It was at `…\scratchpad\haze\eboot\EBOOT.elf` (16,167,616 B, 22 Aug 00:43); that subtree no longer exists.
+Searched C:, D:, E:, F: for `*.elf` > 2 MB plus name matches under `rpcs3\bin`, `AppData\Local\Temp`,
+`.claude` and `E:\PS3 Games` — only RPCS3's own `bin\test\*.elf` and unrelated PS2 files. The Ghidra MCP
+refused connection on `127.0.0.1:8080`, so there is no fallback. The SELF cannot be read directly: section
+entries 0 and 1 of `dev_hdd0\game\BLUS30094\USRDIR\EBOOT.BIN` are `encrypted=1 compressed=0` at file
+offsets `0xa80` / `0xde0a80`, and the word at the mapped location for vaddr `0x4dd840` reads `0x8c6cd243` —
+high entropy, not an `lwz`.
+
+**Proposing a patch offset that cannot be read from the file would violate this project's own reporting
+standard, so none is proposed.** Two grounded options instead:
+
+1. **Zero-risk and the only thing ever observed to work:** re-apply the archive gate-zeroing. All four
+   members, v1.00 id set (`c4e3`) on disc and v1.36 (`c514`) on HDD. The exact tooling and chunk-table
+   handling are in the round-39 transcript.
+2. **To find the real gate**, regenerate the ELF headlessly (this is the command the earlier round ran; it
+   does not boot the title, but it *does* run `rpcs3-next.exe`, so run it deliberately rather than as a side
+   effect):
+   ```
+   SP=".../scratchpad/haze"; mkdir -p "$SP/eboot"
+   cp ".../bin/dev_hdd0/game/BLUS30094/USRDIR/EBOOT.BIN" "$SP/eboot/EBOOT.BIN"
+   cd ".../bin" && ./rpcs3-next.exe --decrypt "$SP/eboot/EBOOT.BIN"
+   ```
+   Then, in order: disassemble `0x4f4b40`; `bl`-scan for its callers and for any getter reading the same
+   field; and dump `feflCallbackSelectChapterBuildChapterList` from `0xab2b0` through `0xabd00` — the
+   recorded window stops at `0xabbc0`, so the loop bound and any second compare are still unseen.
+   `vaddr = file_offset + 0x10000` is confirmed: PH0 reads `off=0x0 vaddr=0x10000 filesz=0xddc748`.
+
+One cheap fully-grounded throwaway if a test is wanted first: change `0x004dd840` to `0x3860ffff`
+(`li r3, -1`). Same instruction form, cannot fault, widens the mask past bit 14 — it covers the cases
+`gate >= 15` or `r25 != 1`. **By the analysis above it should NOT help**, so a null result is further
+confirmation that the gate is not the limiter. Nothing under `bin\patches\` was modified this round.
+
+---
+
+### Clamp audit — every knob this round touched, against its armed value
+
+| knob | armed | reader / clamp | headroom |
+| --- | --- | --- | --- |
+| `GUESTLIGHTLISTEXT` | 1 (default) | `env_u32(…, 1) != 0` | boolean |
+| `GUESTLIGHTAUTO` | **2** | `min(env_u32(…, 0), 2)` | **at the ceiling — and 2 is a real mode, not a reserved value.** Mode 3 does not exist; if a third is ever added the clamp must move with it |
+| `GUESTLIGHTMAX` | 128 | `clamp(env, 1, 4096)` | 32× |
+| `GUESTLIGHTRADIUS` | 0.1 | `env_float(…, 0.2)` | ok, > 0 |
+| `GUESTLIGHTRADIUSSCALE` | **0.5** | `env_float(…, 0.35)` | ok — and it is now written explicitly, so the `0`-means-fixed trap can no longer fire |
+| `GUESTLIGHTRADIANCE` | 1200 | `env_float(…, 30)` | ok |
+| `GUESTLIGHTMAXEXT` | 6 | `env_float(…, 6)` | **armed at its own default — a no-op line, kept for documentation** |
+| `GUESTLIGHTLUM` | 0.7 | `env_float(…, 0.7)` | **armed at its own default** |
+| `FPVCOLHOP` | 4 | `min(env_u32(…, 0), 8)` | 2× |
+| `VCOLCONSTBLACK` | 1 (default) | `env_u32(…, 1) != 0` | boolean |
+| `VCOLMOD` | 1 | `env_u32(…, 1) != 0` | **armed at its own default — the launcher line is now a no-op, and that is deliberate: the line documents the black-HUD history and is the one-line revert** |
+
+`GUESTLIGHTAUTO=2` sitting exactly at its clamp ceiling is called out on purpose — that is the
+`STATICINDEXBUDGET` trap's shape. It is safe here because 2 is the highest **defined** mode, not a value the
+clamp is silently truncating; a sweep upward is meaningless rather than blocked.
+
+### Instrument notes worth keeping
+
+- **A knob that ANDs into the gate you are widening will silently swallow the widening.** `VCOLMOD=0` would
+  have made every line of task 2 unobservable. Before shipping a matcher change, grep the full boolean chain
+  the matcher's result feeds and check every term is armed.
+- **A census that prints only its successes cannot tell you why it is failing.** `Remix fpvcol:` printed two
+  lines for two classified programs and was read for rounds as "the classifier works". `Remix fpother:` is
+  the missing half.
+- **"Most likely X" in a knob's disable note is a hypothesis, not a finding, and it will be inherited as
+  fact.** The 2026-08-15 black-HUD note blamed a missing COL0 attribute; the code already returns on that
+  case, and the real cause was a constant route resolving to `[0 0 0 1]` — which the `Remix vcolroute:`
+  census had been printing all along.
+- **When one texture is shared between a fixture and a prop, extent separates them and the hash cannot.**
+  0.54 .. 1.73 against 7.89 .. 83.18 on one albedo, with a 4.6× gap.
+
+## Round 40 (2026-08-25)
+
+Deployed: `bin\rpcs3.exe` = `bin\rpcs3-next.exe` = **`46D3DF83376C0391`**. Runtime `bin\remix\d3d9.dll`
+**UNCHANGED at `16A0B512F33EBB66`** — nothing deployed into `bin\remix\`.
+
+Tree at both ends of the round: HEAD `4fdaecd67`, rounds 37-39 uncommitted. **The tree did not move this
+round.** Both exes read `E4E2A9A4EDAECE2A` at the start, which is exactly what round 39 recorded.
+
+**The round-39 build got a real play-test.** `bin\log\RPCS3.log` (44 MB, unlocked) and `bin\remix_dump.log`
+(996 MB) hold a complete 64,139-flip / 15,526,016-draw session ending 2026-08-25 09:38, with 14 Ctrl+Click
+picks. Everything below is measured against that run unless it says otherwise.
+
+---
+
+### TASK 1 — THE HEADLINE. Haze has had **no analytical lights at all**, and there are two independent reasons
+
+This is the finding of the round and it retires a large part of the standing lighting defect list at once.
+MEASURED, final `Remix live:` line of the round-39 run:
+
+```
+guest_lights=0  guest_light_match=0  guest_light_capped=0  guest_light_reaped=0   mat_emissive=419
+glalbedos=0  glradiance=150  glradius=0.6  glmax=64
+```
+
+Zero guest lights across 64,139 flips. And the camera fill that was supposed to be covering for them is
+inert. So the entire lighting budget of every level is **one distant sun** plus emissive materials.
+
+#### 1a. `GUESTLIGHTALBEDO2` was unreachable dead code, and blanking one launcher line in August killed every light in the game
+
+`maybe_inject_guest_light` armed on
+
+```cpp
+const bool trigger_match = remix_rsx::guest_light_albedo_any() && vp_ok && fp_ok
+    && (primary_match || glow_match);
+```
+
+`guest_light_albedo_any()` is `return guest_light_albedos().count != 0;` and reads **only** the primary
+`RPCS3_REMIX_GUESTLIGHTALBEDO` list. On 2026-08-17 that list was blanked at the user's request ("remove the
+added lights that are on the doors") — its only entry was the door hash. From that moment the leading term
+was false for **every draw in the process**, so `glow_match`, i.e. the whole of `GUESTLIGHTALBEDO2`, could
+never be reached no matter what was armed. The launcher's own note said to watch `guest_lights=` drop to 0.
+It dropped to 0 and stayed there, and nothing connected that to the second list also dying.
+
+`guest_light_albedo_any()` has **exactly one consumer** — that expression — so the fix is local:
+
+```cpp
+const bool guest_light_armed = remix_rsx::guest_light_albedo_any() || configured_albedo2 != 0;
+```
+
+`glow_match` already re-checks `configured_albedo2 != 0` together with its blend / no-depth-write state, so
+this restores reachability and widens neither rule by one draw.
+
+#### 1b. `RPCS3_REMIX_CAMLIGHT` has done nothing since round 5, and the launcher comment saying otherwise is false
+
+`place_debug_light` did `DestroyLight(0x3)` then `CreateLight(0x3)` every frame. MEASURED against the
+deployed runtime's own tree (`dxvk-remix-numos3`, branch `numos3`, HEAD `6476faea`):
+
+- `remixapi_DestroyLight` only **queues** — `rtx_remix_api.cpp:1613`, `s_pendingLightDestroys.push_back(handle);`
+  is the entire body.
+- It drains in `remixapi_Present` (`:2123`) → `unregisterPersistentExternalLight` + `removeExternalLight`
+  (`:2136-2137`) → deferred **again** to `m_pendingExternalLightErases` (`rtx_fork_light.cpp:191`) → erased in
+  the flush loop (`rtx_fork_light.cpp:46-60`), which runs inside `prepareSceneData` **before** linearization.
+
+So the per-frame order was: queue destroy → create emplaces immediately (`rtx_remix_api.cpp:1536-1539`) →
+Present queues the erase → the flush erases **the light this function just created**. The
+`DrawLightInstance` activation went with it, because the pending-activate loop (`rtx_fork_light.cpp:79-86`)
+requires the handle to still be in `m_externalLights`. The tombstone guard at `rtx_remix_api.cpp:2127-2128`
+covers only `remixapi_CreateLightBatched`, which this is not.
+
+`RemixGSRender.cpp` has carried a comment saying exactly this since round 23 and left it deliberately so the
+sun A/B would not be confounded. **Round 40 fixed it**: destroy removed, same-hash create (what
+`update_sun_light` already does, and `Remix sun-submit: retargets=1 destroys=0 draw=SUCCESS` proves works),
+handle committed through a local so a failed re-create cannot null a working light, and `isDynamic = 1`.
+
+**`isDynamic` is required here and is NOT required on the guest fixture lights**, and getting that backwards
+would have been a silent no-op fix. MEASURED in the fork:
+
+| light | lifecycle | `addExternalLight` arm | `updateLightStaticSleep` | verdict |
+| --- | --- | --- | --- | --- |
+| guest fixture | created once, never updated | emplace (`rtx_light_manager.cpp:728-730`) | **never called** | `isDynamic=0` is **harmless** |
+| camera fill (0x3) | re-created every frame | existing (`:724-727`) | called every frame | `isDynamic=0` **freezes it after 50 updates** |
+| sun (0x4) | re-created on retarget | existing | called | already sets `isDynamic=1`, correct |
+
+`getNumFramesToPutLightsToSleep()` = `numFramesToKeepLights()/2` = **50** (`rtx_options.h:2492` over the
+default 100 at `:647`); no override in `bin\rtx.conf` or `bin\user.conf`. And `isStaticCount` is **never
+reset** for an external light — the only reset (`rtx_light_manager.cpp:556`) is on the game-converted
+`m_lights` path. Static sleep is also **not a cull**: `rtx_fork_light.cpp:143-146` merely skips the
+`*light = newLight` copy, so a slept light keeps emitting from stale data — silent, not dark.
+
+**The one filter that does remove an external light from the frame** is
+`light.getColorAndIntensity().w <= 0` (`rtx_light_manager.cpp:378`, `:424`), zero only when
+`max(r,g,b) < FLT_MIN`. If a guest light ever appears to contribute nothing, check that, not `isDynamic`.
+
+`garbageCollectionInternal` never iterates `m_externalLights` (it walks `m_lights` at `:112` and
+`m_externallyTrackedLights` at `:135`), so API lights are structurally exempt from GC.
+
+#### 1c. What is actually lighting the level today
+
+MEASURED, `Remix sun-submit:` at frames 62400 / 63000 / 63600:
+
+```
+travel=[0.58884 -0.075284 0.80473] radiance=3 angle=0.5 aimed=1 retargets=1 destroys=0 draw=SUCCESS
+```
+
+One distant sun, **radiance 3**, aimed nearly **horizontally** (`y = -0.075`) after a single `SUNSKY`
+retarget — not the armed `SUNDIR=0.1223,-0.9444,-0.3051`. Plus `mat_emissive=419`. That is the whole of it.
+An interior lit by one grazing distant light, with auto-exposure lifting a nearly-unlit scene, is a
+sufficient explanation for **"walls white"** and **"black void floor"** at the same time, and it is the
+first hypothesis that accounts for both without needing a texture defect.
+
+#### 1d. What is armed, and the pre-registered readings
+
+| knob | was | now | why |
+| --- | --- | --- | --- |
+| `GUESTLIGHTALBEDO` | *(blank)* | `71D189E9B559A7F9` | the user's own light-bulb pick |
+| `GUESTLIGHTVP` | `830D7D1B9681C475` | `C1D482DCD1B03ED0` | the bulb's own program |
+| `GUESTLIGHTFP` | `BD80201C29B6B01E` | `796BC90574F89CA1` | the bulb's own program |
+| `CAMLIGHT` | `12` (inert) | `0` | the mechanism now works; 12 would blow out everything near the player |
+
+The bulb pick is `vp=c1d482dcd1b03ed0 fp=796bc90574f89ca1 albedo=71D189E9B559A7F9 vtx=124 ext=1.731`,
+which is a **different program** from the pair that was armed — so the bulb could never have produced a
+light even with the arming bug fixed. The launcher's own 2026-08-15 note set the precondition for moving
+these ("blank them again only if a fixture drawn by a different program is confirmed by a pick"); this pick
+is that confirmation.
+
+**PRE-REGISTERED. `guest_lights=` on `Remix live:` must be > 0 and `Remix guest-light:` lines must appear in
+`bin\remix_dump.log`. If `guest_lights` is still 0, this whole task is wrong and nothing else in it is worth
+reading.** `guest_light_match=0` with `guest_lights=0` means the (vp, fp, albedo) triple still misses;
+`guest_light_match>0` with `guest_lights=0` means `CreateLight` refused.
+
+**KNOWN LIMIT, and it is the next round's job.** The vp/fp narrowing is a single **global** pair ANDed
+against **both** albedo rules, so only one fixture family can be lit per run. The right shape is parallel
+comma lists (the `UIFORCEPAIRVP2`/`FP2` idiom, entry *i* of VP paired with entry *i* of FP), which would let
+the bulbs and the floor-recessed fittings be lit together. **Do not just blank `GUESTLIGHTVP`/`FP`**:
+`71D189E9B559A7F9` is bound by 8 distinct (vp, fp) pairs in the log, one of which is the smoke program
+`ad7ce9d6/aa0fe222` — blanking would put a sphere light inside every smoke puff, which is the same failure
+the 2026-08-15 door note records.
+
+---
+
+### TASK 2 — three standing explanations for the white / vanishing plant walls are REFUTED
+
+#### 2a. The static-index budget is no longer the mechanism. This contradicts rounds 34 and 38
+
+Round 34 concluded *"the white walls are the static-index budget, not culling"*, and round 38 named eviction
+as the real limiter with both `dropped` exits gated on the budget. MEASURED at `STATICINDEXBUDGET=128`, last
+`Remix static-index:` line of the run:
+
+```
+entries=7419 triangles=1471247 rebuilds=9657 deferred=122 stale=1 dropped=121
+peak=128 budget=128 resident=171 evicted=7248 nomesh=0
+```
+
+Every one of those is **cumulative** (only `m_static_index_rebuilds` resets, per frame). So:
+
+- `peak == budget == 128` — round 38's pre-registered check ("`peak=` must stop pinning at `budget=`")
+  **failed**: the per-frame budget is still reached.
+- But `dropped=121` in **15,526,016 draws = 0.00078%**, and `stale=1`. Raising the budget 8 → 128 took the
+  observable consequence of saturation to essentially zero even though saturation still occurs.
+- `evicted=7248 / entries=7419 = 97.7%` reproduces round 38's 98.9% — **and it does not matter**. An evicted
+  entry that is drawn again is simply rebuilt (`union_exists` false → budget available → rebuild); that is
+  what `rebuilds=9657` is. It only becomes the invisible `dropped` exit when the budget is *also* spent, and
+  that happened 121 times all session.
+
+**A saturated high-water mark is not a saturated budget.** `m_static_index_rebuild_peak` is a monotone
+max and can read `budget` after a single frame in 64,139. Round 38 read the peak and inferred the cost; the
+cost has its own counter and it is three orders of magnitude too small.
+
+#### 2b. The texture path is not producing white either
+
+MEASURED, and every identity below is exact to the unit:
+
+```
+tex_unsupported 2,155,582 − tex_tombstone 2,155,581               =         1 fresh refusal
+tex_retry_refused 1,923,563 + tex_unit_retry 232,019              = 2,155,582
+tex_none 3,763,672 − tex_no_unit 1,840,109                        = 1,923,563
+notex_skip 3,667,916 + notex_world 93,080 + notex_mat_applied 2,676 = 3,763,672
+```
+
+So the 2.16 M "unsupported" hits are **one** texture descriptor plus 2,155,581 tombstone re-hits of it. The
+whole 44 MB `RPCS3.log` contains exactly **one** `Remix texrefuse:` line — `format fmt=92 2048x2048`, i.e.
+`CELL_GCM_TEXTURE_DEPTH16`, the shadow map. Corroborated over 11,936 `Remix notex:` census rows: 3,145
+`class=retry-refused reason=format fmt=0xb2 dims=2048x2048` and 8,791 `class=no-unit`; **100% of format
+refusals are that one shadow map**, on four half-res programs at `clip=512x288`, never the main pass.
+
+Every format a PS3 wall diffuse uses is supported — DXT1 `0x86`, DXT23 `0x87`, DXT45 `0x88`, A8R8G8B8
+`0x85`, D8R8G8B8 `0x9E`. The refused set is depth buffers, HILO normal maps and float formats.
+
+And a material-less draw does **not** render white today: `notex_mat_applied=2,676` of 2,676 eligible got the
+**grey 0.5** neutral material (`NOTEXMAT=1`, `Remix notexmat: created ok (albedo 0.5 linear, SRGB)`), 97.5%
+were skipped outright, 2.5% were world-refused. The "a material-less surface renders WHITE" comment
+describes pre-`NOTEXMAT` behaviour.
+
+All 14 picks read `material=1 albedo_unit=0` with sane UVs, and `uv_applied/tex_bound = 99.03%`.
+
+#### 2c. Also refuted: `mat_untested` does not mean the peak-UV walk was skipped
+
+`mat_untested=22832 / mat_created=23693 = 96.4%` is set at `RemixTextures.cpp` `if (!alpha_tested)` from
+`rsx::method_registers.alpha_test_enabled()`. It means 96.4% of materials were created while the RSX alpha
+test was **off**, which is a statement about where transparency comes from on this title (the blend path:
+`blend_translucent=2,894,707`), not about UV measurement. `peak_uv` has no counter at all.
+
+#### 2d. What is armed instead
+
+Two armed knobs are now known to delete or de-occlude main-pass geometry, and both are A/B'd this round:
+
+- **`SKIPVP=` (was `4D5A87BFFBCE0717`).** That program has been dropped **wholesale since before the forge
+  record began**, and it is one of the four the `WDIVWALK` decode fix repaired (`57A12323F22F4988`,
+  `4D5A87BFFBCE0717`, `96EDAAED0C27FD05`, `1D9A973AF5CD1514`) — so the giant-geometry reason for dropping it
+  has been fixed for several rounds. The launcher's own "STAGE 2" block has been asking for this relaunch
+  ever since. MEASURED that it eats **main-pass** geometry, not an aux pass:
+  `gate=skipvp vp=4d5a87bffbce0717 fp=97c0b2e9be86fd48 clip=1024x576` and
+  `... fp=aa5f822213201b4b clip=1024x576`, against `mainclip=1024x576`. `skip vp=24569` draws over the run.
+  This is the strongest single candidate for the missing wooden plank floor.
+- **`SKYCLASSIFY=1` (was 2).** See task 3.
+
+#### 2e. A NEW live candidate for "white texture not albedo": the walls' vertex colour is thrown away
+
+MEASURED, and it is not a particle-only problem. **Every one of the 192 `Remix alphastate:` rows in the run
+reads `tcolor=1/0/3`** — `Arg1=Texture, Arg2=None, Modulate`, i.e. *"colour = albedo texture, vertex colour
+discarded"* — and `vcol_applied=93,778` of the 6,390,568 gauge-placed draws is **1.47%**.
+
+Meanwhile the `Remix vcolroute:` census says Haze's world geometry has a perfectly replayable vertex colour:
+of 47 classified programs, **19 are `route=scaled` and 3 are `route=passthrough`**, and the wall/world
+program itself reads
+
+```
+Remix vcolroute: vp=ad7ce9d672a0bf6b route=scaled alpha_from_attr=1 slots=[c[18].x;c[18].y;c[18].z;c[18].w]
+```
+
+so does the bulb program `c1d482dcd1b03ed0`, and so do `f39f5046`, `bd1c10df`, `d0b6a471`, `af06f6d3`,
+`a7505f7a`, `c2003391` — the whole world family. **ATTR3 × c[18] is available and is being discarded.**
+
+The gate is the FRAGMENT classifier, not the vertex one: `fp_wants_vcol` requires
+`m_current_fp_fingerprint->vcol_replayable()`, which is true only for `MOV out, COL0` and
+`TEX; MUL out, tex, COL0`. MEASURED `fpclass=1/1/0` — **two programs in the entire title**. The in-code
+reasoning is sound and explicit (*"a textured draw's ATTR3 modulates its albedo in the title's own fragment
+program with per-title semantics this backend does not read, so tinting one would be a guess"*); it is the
+narrowness of the classifier that is the defect.
+
+**If Haze authors a neutral base texture and carries the copper tint per-vertex — which is what
+`route=scaled alpha_from_attr=1` with a per-draw `c[18]` factor looks like — then "white texture not albedo"
+is literally this, and it is the same root cause as the uncoloured lava smoke in task 6.**
+
+**No zero-code lever exists for it.** `VCOLMOD=1` alone cannot help (`fp_wants_vcol` ANDs in the fragment
+gate); `FPVCOL=0` moves the wrong way; `FPVCOLROUTE` is the *vertex* route gate, a different predicate.
+Widening `scan_fragment_program` past its two hard-coded 1- and 2-instruction shapes is the unlock, and it
+unlocks the walls and the particles together. That is round 41's biggest single item.
+
+**The decisive measurement this round could not take: nobody has ever picked a white wall.** All 14 picks
+landed on textured objects that resolved correctly. No counter downstream of `CreateMaterial` exists, so
+nothing in the instrumentation can separate "the material is right and Remix renders it white anyway" from
+"the wrong texture is attached" from "the wall is skipped and something else shows through". One Ctrl+Click
+on the white wall answers it directly.
+
+---
+
+### TASK 3 — the round-39 sky classifier failed its own pre-registered check
+
+MEASURED, the single `Remix skyclassify:` line of the run:
+
+```
+albedo=23A3978F1405B16E ARMED dome=61 other=0 total=61 agree=1 |
+vp=af06f6d32ec048ee vtx=152 wext=24728.6 upv=162.688 inside=1 depth_write=0 |
+listed=0 promoted=1 armed=1 setsize=1 overflow=0 | cam=[1746.6 -71.676 1049] frame=59921
+```
+
+with `skyclassify_armed=1 promoted=1 entries=1 failed=0 overflow=0` and
+`Remix skypromote: content=23A3978F1405B16E mat 23A3978F1405B16E -> 87005760088C3126 ok (2048x512)` — the
+material-hash fold **did** fire, so round 39's aliasing guard works.
+
+Against round 39's own four checks:
+
+1. `D1A6D1B27ADE6232` / `CDFE11B12552EA2D` did **not** arm — but this session never left the plant, so this
+   is untested rather than failed.
+2. Ravine untested.
+3. `skyclassify_armed=1`, against a pre-registered band of **8..20**. Below the band.
+4. `armed − promoted = 0`, which round 39 pre-registered as **"a reason to distrust it, not a pass"**, and
+   `listed=0` confirms it: the one hash it found is not one the user had found by hand.
+
+It armed at `cam=[1746.6 -71.676 1049]`, inside the copper-plant region the other picks came from
+(X 1746..1806, Z 1049..1228) — the exact level reported as having white walls that vanish at angles. A
+promoted hash gets `blendType = 6` (`kEmissive`): *opacity → 0, emissive influence 1, occludes nothing*.
+Emissive **and** non-occluding is what "white" plus "disappears at angles" looks like.
+
+**Stated honestly: the census argues it is a real backdrop** — 2048×512, raw box `[-12370..12370]`, 61 of 61
+draws dome-shaped, `upv=162.7`. So this may well be a correct promotion. That is why it is an A/B and not a
+deletion. `SKYCLASSIFY=1` keeps every counter and changes no pixel.
+
+---
+
+### TASK 4 — props bounce on WALKING: the round-38 model is missing its translation term
+
+Round 38 modelled the residual as *"rotated about the eye by one frame of camera turn, so its displacement
+is (distance from eye) × (turn per frame)"*. That model predicts **no bounce at all when the player walks in
+a straight line**, which is exactly the user's report it fails to explain.
+
+The model is right about the mechanism and wrong about the terms. `world = fused(t) · A(t−1)⁻¹` where
+`A = V·P`, and Remix then renders with `V(t)P(t)`, so the composite error is
+`V(t)P(t)P(t−1)⁻¹V(t−1)⁻¹`, which with a constant projection is `V(t)V(t−1)⁻¹` — **a rigid transform with a
+rotation part and a translation part**. The translation part is one frame of camera *translation*. So a prop
+is displaced by roughly the distance the player moved that frame, in the opposite direction, whether or not
+they turned. That is the bounce.
+
+MEASURED that the population really is on the stale branch, from 180 `Remix pick-follow:` lines for the
+first-person arms (`vp=830d7d1b9681c475 albedo=86885A0E60751491`, vtx=3649):
+
+```
+180/180  ref=anchor_prev   frame − anchor_frame = 1   frame − cam_frame = 0   zfold=1
+```
+
+and run-wide `gauge_prev=1,029,650` with `gauge_prev_camfresh=1,013,828` = **98.46%** of those having a
+current-frame elected camera. The four gauge branches are mutually exclusive and partition the population
+exactly: `gauge_used 4,566,060 + gauge_cur_dims 396,132 + gauge_prev 1,029,650 + gauge_absent 398,726 =
+6,390,568 = world_ref_fresh 6,303,857 + world_ref_stale 86,711`. So the stale branch is **16.11%** of
+gauge-placed draws — *not* 22.6% of `gauge_used`, which is only the first branch and is the mistake this
+line is written out longhand to prevent.
+
+Residual jitter on the arms, n=4000 `Remix vmbasis:` frames, `cdist_pre` frame-to-frame |Δ|:
+`p50=0.00284  p95=0.07428  p99=0.10012  max=3.63`. At ~1 unit ≈ 1 m that is 7.4 cm at p95 and 10 cm at p99
+every frame.
+
+**PRE-REGISTERED TEST that separates the two models, and it needs no build.** Walk in a straight line
+without turning, past a near prop and a far prop.
+- Round 38's rotation-only model: **no bounce**, and any bounce that does occur scales with distance from
+  the eye.
+- The translation term: **bounce on both**, with an amplitude equal to the player's per-frame displacement,
+  roughly **independent of distance**.
+
+#### Round 38's "needs no new machinery — only a third branch here" is REFUTED
+
+The staged lever was: in the `anchor_prev` branch, when the elected camera is fresh, divide by the camera
+instead. `reference` already defaults to `&m_active_camera.reference_inverse`, so the branch itself is two
+lines. **But it is not free, and this is why it was not shipped this round.**
+
+`divide_anchor` is the **only** carrier of the f64 inverse. The high-precision divide is
+`if (divide_anchor && divide_anchor->inverse_f64_valid && gauge_f64_enabled())`, and
+`m_active_camera` has **no f64 twin** — `camera_state::reference_inverse` is `remix_rsx::mat4` (f32).
+Taking the camera reference therefore drops ~1.01 M draws/run out of the f64 path
+(`world_div_f64=5,991,842` today) into the f32 one, whose own in-tree measurement is *"~1.0 of translation
+error"* on an ill-conditioned anchor. Trading a measured **0.10-unit** p99 lag jitter for a possible
+**1.0-unit** precision error is a regression, not a fix.
+
+**The honest version of the lever is: give `camera_state` an f64 reference inverse computed at latch time,
+then add the third branch.** Seven assignment sites touch `reference_inverse`
+(`RemixGSRender.cpp:2693, 2978, 3440, 15946, 16191, 16238, 16486`). That is next round's work and it is
+worth doing — it is the one change that addresses "props bounce" and "viewmodel does not track" together.
+
+Second, independent viewmodel defect, unchanged this round: `zfold=1` on **180/180** arm draws — the anchor
+folded `0.49875/0.50125` while the arms render at `0.00125/0.00125`. Run-wide
+`gauge_zfold_mismatch=492,957` = 7.69/frame.
+
+---
+
+### TASK 5 — the viewmodel camera is NOT missing, and `VMCAMFOVX/Y` are NOT inert
+
+The brief carried `vmcam_considered=0` as evidence the VIEW_MODEL camera never runs. **Refuted, and the
+counter never touched the camera.** `m_stats.viewmodel_cam_considered` is incremented inside
+`per_draw_transform` behind `if (viewmodel_place)`, and
+`viewmodel_place = viewmodel_draw && !viewmodel_tag_only()` — with `VMTAGONLY=1` that is unconditionally
+false, so `considered / applied / fallback / refused / census` all stay 0 **by design**.
+`RemixTransforms.h` pre-registers exactly that: *"with 1 set, vm_tagged stays non-zero while
+vmcam_considered goes to ZERO"*. MEASURED `vm_tagged=106,243` with `vmcam_considered=0`. Prediction met.
+
+The real submission counters are on `Remix live:` only: **`vmcam_twin=29343 vmcam_real=29343`** against
+`cam_resolved=29343` — a VIEW_MODEL camera reached the runtime on **every frame the world camera resolved**,
+and 100% of them took the `vm_real` branch that carries the armed `60.001 / 36.132`. The knobs are live.
+They are simply **not echoed** on `Remix run-start:` (0 `VMCAMFOV` tokens in `RPCS3.log`), which is why five
+rounds could not tell.
+
+`cam_fallback=34,796` (54.25% of flips) is also not what it looks like: it **stops accumulating at frame
+34,848**. The single `Remix cam-elect:` line reads `latch_frame=34796 fallback=34796`; from frame 34,849 to
+64,139 the camera resolves at 100%. The 70° hardcoded FOV in `submit_debug_scene` is the menu/loading
+camera, not the gameplay one.
+
+**The gameplay FOV has never been measured.** `to_camera_matrix` is a plain copy (no transpose, unlike
+`to_remix_transform`) and `guarded_setup_camera` validates nothing, so whatever the guest projection carries
+is what Remix is told. The only line that prints it is behind `CAMTRACE`, which has been 0 — MEASURED zero
+`fov=` tokens anywhere in the run. **`CAMTRACE=1` is armed this round** for one session.
+
+One measurable oddity to carry forward: the elected camera is a **512×288** pass while world geometry
+anchors on **1024×576** — `Remix gauge: camclip=512x288 anchor_clip=1024x576 basis_delta=0.00391388`, which
+matches the predicted 512/510 ratio to four significant figures. Same aspect, so it is a scale
+disagreement, not an aspect error.
+
+---
+
+### TASK 6 — the lava smoke and bubbles are uncoloured at THREE independent gates, each sufficient
+
+Nothing was changed for this; it needs code the round did not have room for. The mechanism is now fully
+named, which is what round 41 needs.
+
+The one line that settles it, from `bin\remix_dump.log`:
+
+```
+Remix alphastate: albedo=099D2DA136CEA2C4 vp=2d5186a8011589b8 fp=50a10ad7974fdfd7 vtx=4 |
+  blend_on=1 src=1 dst=7 op=0 ... verdict=kept |
+  talpha=1/0/1 tcolor=1/0/3 vcbake=1 tfactor=0xFFFFFFFF
+```
+
+`tcolor=1/0/3` is `Arg1=Texture, Arg2=None, Modulate` — the **parity fill**, i.e. *"colour = albedo texture,
+vertex colour discarded"*. All five measured particle programs print the same triple, and every particle
+vertex ships `color = 0xFFFFFFFF`. The surface Remix receives is the raw albedo at full intensity, which is
+exactly "smoke is bright, bubbles look uncoloured".
+
+**Gate 1 — the fragment classifier names two programs in the entire title.** `fp_out_source` has three
+values and only two real shapes: `MOV out, COL0` (1 instruction) and `TEX; MUL out, tex, COL0`
+(2 instructions). Everything else is `other`. MEASURED `fpclass=1/1/0` and `fpvcol_applied=698` of
+**5,783,237** submitted draws = 0.012%. All 15 `Remix picked:` lines read `fpcol=other fpalpha=other
+fpvcol=0`. With `fpcol=other` the arg-source replay is skipped and the parity fill ships. The additive
+particle's own fragment ucode is on disk at `bin\remix_ucode\E07AC460430042B6.fp`, **256 bytes = 16
+instructions** — the classifier can only ever match 1- and 2-instruction shapes.
+
+**Gate 2 — `scan_vcol_route` misclassifies all six particle vertex programs as `computed`, and the fix is
+22 lines below the bail-out.** All six decode to the identical shape (indices given per program):
+
+```
+MUL rN.xyzw = ATTR3, c[467].xxxx
+MUL o1.xyz  = rN.xyz, c[66].xxxx      ; COL0.rgb = ATTR3.rgb x c[467].x x c[66].x
+MOV o1.w    = <computed fade ramp>    ; COL0.w is NOT ATTR3.w
+```
+
+`2D5186A8` 39/41/55 · `2FC99887` 37/38/57 · `4ECE0A28` 46/48/62 · `946A6296` 16/18/74 · `315E2138`
+28/29/49 · `391B10C3` 12/14/69.
+
+**So the hue IS per-vertex, in ATTR3** — both constants are scalar broadcasts and can only scale brightness.
+`RemixTransforms.cpp` bails at `if (vec_writemask(in) != 0xf || in.d3.index_const) { vcol_route::computed; }`
+where `in` is the **last** instruction writing `o1` — the `MOV o1.w`, mask `0x8`. The register is rejected
+wholesale because two instructions write different lanes of it. The code's own comment admits the blast
+radius: *"29 of the 82 cached programs land here (masks 0x7 and 0x8)."* And `vcol_lane_source` — a per-lane
+backward walker over MOV/MUL chains through temps, ≤3 hops, constant co-operands, i.e. **exactly this
+shape** — sits 22 lines further down and is never reached. It would have produced `scaled_chain` with
+`slots=[c[66].x|c[467].x]` and `alpha_from_attr=false`.
+
+Corroborated: `Remix vcolroute:` (47 lines) reads `route=computed` for **all six** particle programs, while
+the two picked programs read `route=scaled slots=[c[18].x;c[18].y;c[18].z;c[18].w]` — their vertex side is
+perfectly replayable.
+
+**Gate 3 — `VCOLMOD=0` keeps `apply_vertex_colour` off every textured draw**, so particle vertices ship
+`0xFFFFFFFF`. Ranked last because gate 1 also closes it: `fp_wants_vcol` requires `vcol_replayable()`, so
+flipping `VCOLMOD=1` alone changes nothing on these draws.
+
+**REFUTED as suspects, both named in the brief:**
+
+- **`fpvcol_skygate=83772` is not the particles.** The gate can only fire when `self_lit_shape` is already
+  true, which requires `!material` **and** `sampled_mask == 0`. Both picked particles have `material=1` and
+  `sampled=0x1f` / `0x1`. It is structurally impossible. What the 83,772 actually is: the 82-vertex sky
+  dome, 83772/64139 flips = **1.31 per frame**, one dome draw per frame.
+- **The additive blend translation is fine.** `blend_pairs` decodes as src/dst/**op** = count:
+  `6/7/0` SRC_ALPHA/ONE_MINUS_SRC_ALPHA = 1,839,343; `1/1/0` ONE/ONE = 694,748; `1/7/0` premultiplied =
+  247,105; **`6/1/0` SRC_ALPHA/ONE — the picked additive particle (`bsrc=770 bdst=1`) = 113,511**. None
+  carries the `*` verdict mark, `classify_blend` lists `(6<<8)|1` explicitly as `kept`, and the four sum to
+  2,894,707 = `blend_translucent` exactly, so the census is complete. **ADDITIVE is represented and
+  survives.**
+- **`vcol_const=0` does not mean `VCOLCONST` is inert.** The banner echoes `vcolconst=1`; the counter only
+  increments in `apply_vertex_colour`'s flat branch, which with `VCOLMOD=0` is reachable only for untextured
+  draws, and of the 6 constant-route programs three are already on `SKIPRTVP`/`SKIPUNTEXTUREDFPPAIRVP`. The
+  condition never occurred.
+
+**`blend_astranded=684,265`** is a textured blend-enabled draw whose albedo alpha is constant and whose
+ATTR3 alpha substitute also failed. Split, MEASURED from `Remix alphastate:`: `315e2138` (ribbon,
+`albedo_alpha=255..255`) and the picked additive `af06f6d3` (`alpha=255..255`) **are** in it; `2d5186a8`
+(0..197), `2fc99887`, `946a6296`, `391b10c3` are not.
+
+**LATENT BUG to fix at the same time as the gates, not after.** `apply_vertex_alpha` writes
+`color = 0x00FFFFFFu | (alpha << 24)` — it forces RGB to **white** — and it runs *after* the
+`material && fp_wants_vcol` call to `apply_vertex_colour`, as an independent `if`, not an `else`. The moment
+gates 1-3 open, any textured draw with a constant-alpha albedo will have its freshly replayed RGB
+overwritten white by the alpha rescue. It is harmless today only because the RGB is already white.
+
+**Two zero-code separating tests, for whoever runs this next** (do **not** run them in the same session as
+this round's light/geometry A/B):
+
+- `RPCS3_REMIX_FPVCOL=0` → **predicted pixel-identical**, because only 698 of 5.78 M draws take that path
+  and none is a particle. Any visible change refutes gate 1.
+- `RPCS3_REMIX_FPVCOLROUTE=0` → makes `vcol_route_replayable()` return unconditional true. Then Ctrl+Click a
+  smoke draw and read `tcolor=`. Still `1/0/3` ⇒ the route gate is not binding and gate 1 alone is.
+
+### Clamp audit — every knob this round touched, against its armed value
+
+| knob | armed | reader / clamp | verdict |
+| --- | --- | --- | --- |
+| `GUESTLIGHTALBEDO` | 1 hash | `std::array<u64,16>` list | 16× headroom |
+| `GUESTLIGHTVP` / `FP` | 16 hex | `read_hash_env`, `wchar_t[32]` | fits |
+| `GUESTLIGHTMAX` | 64 | `clamp(env, 1, 4096)` | 64× headroom |
+| `GUESTLIGHTRADIANCE` | 150 | `env_float`, default 30 | ok |
+| `GUESTLIGHTRADIUS` | 0.6 | `env_float`, default 0.2 | ok |
+| `CAMLIGHT` | **0** | `env_float(..., -1.f)` then `env >= 0 ? env : cfg` | **`env_float` rejects 0 → falls through to `g_cfg.video.remix.camera_light`, which is `0` in BOTH `bin\config\config.yml` and `custom_configs\config_BLUS30094.yml` (verified). So 0 really is off — but only because the config agrees.** |
+| `SKYCLASSIFY` | 1 | `min(env, 3)` | ok |
+| `CAMTRACE` | 1 | `wcstol != 0` | ok |
+| `SKIPVP` | *(blank)* | `read_hash_env` → 0 → gate off | ok |
+
+**A trap found and NOT changed, deliberately:** `GUESTLIGHTRADIUSSCALE=0` is read by `env_float` with a
+fallback of **0.35**, so the launcher's stated intent ("0 = use `GUESTLIGHTRADIUS`") is defeated — the live
+line echoes `glradiusscale=0.35` and the radius is `max(0.6, extent × 0.35)`. The accessor's own comment
+claims 0 "falls back here and the caller then takes `max(fixed, 0)` = the fixed radius", which is wrong: the
+fallback is 0.35, not 0. For the bulb (extent 1.731) this gives 0.606 instead of 0.600 and does not matter;
+for a 6-unit fixture it would give 2.1. Left alone this round so it cannot confound the first run in which
+guest lights exist at all.
+
+**Three knobs armed to their own shipped default, i.e. no-ops:** `NOTEXMAT=1` (default 1),
+`NOTEXCENSUS=1` (default 1), `TEXVERIFY=120` (default 120).
+
+### Instrument notes worth keeping
+
+- **`wdiv=` and `wdiv_shadowed=` are printed inside the `skip …` group of `Remix stats:` and are not
+  skips.** They are `m_stats.wdiv_draws` / `wdiv_shadowed_draws`, positive decode counters. `wdiv=12,934,988`
+  read as a refusal is a 12.9 M-draw phantom.
+- **A monotone high-water mark cannot price a per-frame budget.** `peak=budget` and `dropped=121` are both
+  true; only the second is a cost. Whenever a counter is a `std::max` over the run, find the cumulative twin
+  before concluding anything.
+- **`guest_light_albedo_any()` is the general shape of the bug in 1a: a cheap "is the feature armed" guard
+  that reads only one of the feature's two inputs.** When a rule grows a second input, grep the arming test,
+  not just the matching test.
+- **The camera-fill defect is the same class as the sun's, one lifecycle over.** `isDynamic` matters for
+  *updated* lights and not for *create-once* lights; `DestroyLight` matters for *same-frame re-create* and
+  not otherwise. Both were assumed uniform and neither is.
+
+## Round 39 (2026-08-24)
+
+Deployed: `bin\rpcs3.exe` = `bin\rpcs3-next.exe` = **`E4E2A9A4EDAECE2A`**. Runtime `bin\remix\d3d9.dll`
+**UNCHANGED at `16A0B512F33EBB66`** — nothing deployed into `bin\remix\`.
+
+MSBuild `Release|x64` exit **0**, **0 errors, 1 warning** — the pre-existing C4723 "potential divide by 0",
+now at `RemixGSRender.cpp:11197` (it was `:11067` in round 38; it moved because this round inserted lines
+above it). **Zero new warnings.**
+
+**THE TREE MOVED UNDER THIS ROUND, and this is the first time the concurrency trap has actually fired.**
+At the start HEAD was `44276ae06` with rounds 37–38 uncommitted and both exes at `447D3904D1E969B2`. By the
+first build HEAD read **`4fdaecd67`** *"Remix: unify viewmodel/prop drift as a one-frame donor lag"* — another
+session committed rounds 37–38 (source, `KNOBS.md`, `launch-haze-remix.cmd`, both inbox files) mid-round.
+**Nothing was lost**: a commit moves HEAD and the index, not the working tree, and no `checkout`/`reset`/
+`stash` was run here. Verified after the fact — `git diff --stat` against the new HEAD is exactly this
+round's additions, and the launcher still carries round 38's armed values (`GAUGECURDIMS=1`,
+`STATICINDEXBUDGET=128`, `UIFORCEPAIRVP2` with three slots). **The rule that saved it: hash and check at
+BOTH ends, and never run a git command that writes the working tree.**
+
+---
+
+### TASK 1 — the sky, by classification. Shipped as `RPCS3_REMIX_SKYCLASSIFY`
+
+#### The root cause is the material, and it is measured rather than argued
+
+A dome renders as a lit sky only if its texture **content hash** is on `RPCS3_REMIX_SKYEMISSIVE`, because
+that list is what makes its material emissive (`RemixTextures.cpp`, the `sky_emissive` local in
+`texture_cache::upload`). The launcher carries six hashes; `haze_domes.csv` names **sixteen** distinct dome
+resources game-wide.
+
+MEASURED over `bin\remix_dump.log`, `mat_skyemissive=`/`mat_skyunordered=` across every stats line:
+
+| reading | lines |
+| --- | --- |
+| `mat_skyemissive=0 mat_skyunordered=0` | **14,726** |
+| `mat_skyemissive=11` | 1,177 |
+| `mat_skyemissive=5` | 1,108 |
+| `mat_skyemissive=43` (largest seen) | 697 |
+
+Entire sessions in which the sky-emissive material was **never created once**, against sessions on a listed
+level that reach 43. That is the black sky, stated as a mechanism.
+
+#### The brief's stated constraint on `CATEGORY_BIT_SKY` is REFUTED against current bytes
+
+The round-39 brief carried forward that *"`CATEGORY_BIT_SKY` sets `m_isHidden` on this remixapi backend"*,
+which would have made "tag the dome as sky" an own-goal and forced a separate visibility mechanism. **That
+is not true of the deployed runtime.** `dxvk-remix-numos3` (branch `numos3`, HEAD `6476faea` — the tree
+`RemixRuntime.cpp:143` records as matching the deployed `d3d9.dll`):
+
+- `src/dxvk/rtx_render/rtx_remix_api.cpp:915` —
+  `prototype.cameraType = (cameraType == CameraType::Sky) ? CameraType::Main : cameraType;`
+  with the comment *"promoting them to CameraType::Sky here would hide the instance with nothing left to
+  draw it"*.
+- `src/dxvk/rtx_render/rtx_instance_manager.cpp:1005` — the hide is gated on
+  `drawCall.cameraType == CameraType::Sky`, which by the line above an external draw can never be.
+
+This backend's own header already said so and was not read: `RemixTransforms.h`'s category table reads
+`RPCS3_REMIX_CAT_SKY -> SKY (selects the sky camera; does NOT hide - see above)`. Corroborated from the log:
+`af06f6d32ec048ee` (Haze's dome program) carries `TAGGED` rows for `CDFE11B12552EA2D` — a hash the user
+identified by clicking the sky — on levels where the sky demonstrably works.
+
+**Named limit, because it is not free either.** `SceneManager::submitExternalDraw`
+(`rtx_scene_manager.cpp:2388`) still takes `getCamera(state.cameraType)` for `worldToView` / `viewToProjection`,
+and this backend never calls `SetupCamera` for `CameraType::Sky`. So a SKY-tagged external draw is placed by
+`objectToWorld` (correct) but carries an uninitialised sky camera's view/projection. Not this round's defect
+and not touched; recorded so the next round does not discover it as a surprise.
+
+#### The existing `SKYHASH` rule was the obvious lever and IT REJECTS OUR GROUND TRUTH
+
+`sky_hash_mode()` has shipped at mode 1 (measure, tag nothing) for several rounds and already learns "albedo
+hashes that only ever appear on dome-shaped draws". Promoting it looked like a two-line round. MEASURED, every
+`Remix sky-hash-census:` line in the log:
+
+```
+albedo=D1A6D1B27ADE6232  reject:mixed  dome=1 other=1  vp=af06f6d32ec048ee vtx=304 wext=26351.6 upv=86.68
+albedo=CDFE11B12552EA2D  reject:mixed  dome=1 other=1  vp=af06f6d32ec048ee vtx=372 wext=27194.1 upv=73.10
+```
+
+**Both are on the user's own `SKYEMISSIVE` list.** The rule's units-per-vertex floor is
+`s_sky_backdrop_min_units_per_vertex = 100` (`RemixGSRender.h:1737`) and those domes' own latitude bands
+measure 86.68 and 73.10 — and one non-dome draw disqualifies a hash for the life of the process. A tessellated
+dome is a stack of bands of **differing** density, so the strictest band disqualifies its own texture. That is
+structural, not a tuning miss, and it is why round 39 ships a second rule rather than a mode on the first.
+
+#### The predicate, and where every threshold's number comes from
+
+Population: every `Remix sky-census:` line in the whole 969 MB `bin\remix_dump.log`, parsed to unique rows,
+filtered to `depth_write=0 AND inside=1 AND wext >= 2000` — **187 unique rows, 23 vertex programs, 46 albedo
+hashes**. Four families fall out:
+
+| family | programs | `wext` | `vtx` | `upv` | what it is |
+| --- | --- | --- | --- | --- | --- |
+| A | `8eae853c96f5a07e`, `f352d7dafa72d0e0`, `595b8e2fa69b566b`, `5c9cfb394074a479` | 1.22e9 .. **1.12e18** | 8..420 | 8.5e6 .. 1.8e16 | broken transform — the mined `farPlane` is **14000**, so the world fits in ~1.4e4 units |
+| B | `d736a5bdc6e2552a`, `c1781a2e32aba35d`, `a426abcdd77da419`, `41c59a3a2bfc71bf`, `d4dcf86a2f42d60b` | 7.0e5 .. **2.14e6** | 42..266 | 6.2e3 .. 4.0e4 | **domes** — carries `35C2353F6B3CE2A8`, `174F4F689CF2A3D8`, `3213E0CC136ED294`, all hand-listed |
+| C | `af06f6d32ec048ee`, `fc0fac8afccec49a` | 2000 .. 2.09e5 | 33..747 | 3.4 .. 689 | **domes** — carries `D1A6D1B27ADE6232`, `CDFE11B12552EA2D` |
+| D | `2c62e34057e58c21`, `487c71da8d277fb0`, `aae8e0d5ae292dd4`, `788113cb1bad5321`, `333a616a4093f353` | 2.0e3 .. 7.8e4 | 96..**12875** | 4.7 .. **49.28** | terrain |
+
+So:
+
+| gate | value | measured justification | gap |
+| --- | --- | --- | --- |
+| `depth_write == 0` | — | domes write no depth; already the `sky_candidate` gate | — |
+| camera **inside** the transformed AABB | — | not `|translation − eye|`, which collapses to `|eye|` for an absolute-world draw (round 36: `anchor=2137.85` against `limit=4`) | — |
+| `wext >= SKYEXTENT` | 2000 | existing knob, config default, ceiling 1000000 | — |
+| `wext <= SKYCLASSIFYMAXEXT` | **4.0e6** | between family B's max **2.14e6** and family A's min **1.22e9** | **570×** |
+| `vtx <= SKYCLASSIFYMAXVTX` | **1024** | between the domes' max **747** and terrain's min **2714** | **3.6×** |
+| `vtx >= SKYCLASSIFYMINVTX` | **16** | the smallest hand-listed dome row is **33 vertices**; the floor drops one named false positive, a **4-vertex** quad spanning 32,331 units with the camera inside (`AC936E2F25F147B0` on `3c9186d8e026cec5`) | **2.1×** |
+| `upv >= SKYCLASSIFYUPV` | **60** | between **23.57** (highest on any row the vertex ceiling excludes) and **73.09** (lowest on any hand-listed dome row that clears the extent and vertex gates) | **3.1×** |
+
+**A CLAIM THIS ROUND MADE AND THEN WITHDREW.** An earlier draft of this section said the `upv` gate was the
+narrow one at 1.34×, between "terrain at 49.28" and "listed domes at 66.12". **Both rows were mis-assigned** —
+the 66.12 row carries `albedo=0000000000000000` (untextured, so not a listed-dome row at all) and the 49.28
+row sits *inside* the vertex ceiling rather than outside it. Re-measured properly the gap is 3.1×, and the
+more useful correction is this: **on this data `upv` is very nearly redundant with the vertex ceiling** —
+every row the ceiling excludes is also below 60 — so the separating power is really coming from the extent
+bounds, the vertex bounds and `inside`, not from `upv`. Caught by re-deriving the number for the report
+rather than trusting the one already written into the source.
+
+**Replayed before shipping**, which is the closest thing to a dry run this rule can have. Applying every gate
+to every `Remix sky-census:` row in the 969 MB log admits **19** distinct albedo hashes with the vertex floor
+off and **18** with it on. **All six hand-listed dome hashes are among them** — the ground-truth check passing
+on historical data before the play-test sees it. The other 12 are candidates, not confirmations: the census is
+deduplicated per (program, outcome) and carries no draw counts, so it cannot evaluate the 8-draw /
+no-disqualification / settle-window rule that actually arms a hash. **Expect the live number to be lower than
+18.**
+
+**The extent CEILING must not be tightened to something "sensible".** Three of the six hand-listed domes live
+in family B at 7e5..2.1e6, so a ceiling anywhere near the world's 1.4e4-unit size would delete them. That was
+this round's first design idea and the data refuted it.
+
+**`SKYANCHORMODE=1` is also wrong and the same data says so.** Haze's dome reads `canchor=4687..5360` — the
+AABB centre of a dome sits ~5000 units above an eye that is at its origin — so a `centre_anchor` limit of 4
+rejects it. Mode 2 (`inside`) is the right shape and is what this rule uses.
+
+#### Per-hash, not per-draw, and the one irreversible failure it can produce
+
+Emissiveness is a property of the **material**, which is per texture, so a hash admitted on one draw glows on
+all of them. A hash arms when it has been dome-shaped `SKYCLASSIFYMIN` times, has never been seen on a
+non-dome draw, **and has been known for `SKYCLASSIFYSETTLE` frames**. The settle window is the guard on the
+only failure that cannot be undone — a material rebuilt emissive cannot be rebuilt back — and it is sized
+from the older rule's own observation that a shared texture's disqualifying draw arrives inside the first
+second. MEASURED support for the hazard being real: `94EC83A8E7989A15` armed at `wext=2.15e6 upv=33605` and
+went `reject:mixed` **14 frames later** at `wext=21.86 upv=0.55`.
+
+#### The two halves of making a promotion actually reach the screen
+
+1. **The material.** `texture_cache::promote_sky_emissive()` (new) rebuilds the material of every live entry
+   carrying the hash, and re-runs the `peak_uv` walk. The ordering it exists to fix: a dome's texture is
+   uploaded — and its material created — on the *first* draw that binds it, which is strictly before
+   `submit_subdraw()` has the world-space AABB it needs. Without this the promotion is a no-op for the run.
+   The old material handle is **orphaned, never destroyed** — `mesh_entry::material` records that a Remix mesh
+   bakes its material at `CreateMesh` with no API to re-point it, so destroying it is the dangling-handle
+   failure the round-9 reap split exists to prevent. Round 17 already priced orphaning at one material per
+   event; here the event count is bounded by the title's 16 domes.
+   `upload()` was split into `measure_peak_uv()` + `build_material()` by a verbatim move, so both callers run
+   the same code. The only behavioural edit is that the `CreateMaterial` failure arm no longer destroys the
+   texture — `upload()` does, which is where it belonged.
+2. **The mesh.** The mesh key folds `sky_emissive_promoted()`. Without it every mesh created before the
+   promotion keeps submitting the old, non-emissive handle and the dome stays black regardless of what the
+   texture cache did. Safe as a key because promotion is **monotone** — the bit flips false→true once and
+   never back. Deliberately a re-key and not an erase: erasing mesh entries is what turns a static-index entry
+   into the invisible `dropped` exit round 38 measured behind the vanishing plant walls.
+
+`sky_emissive_albedo_matches()` now returns `list-match || promoted`, and that one edit is what gives a
+classified dome the emissive material, the `peak_uv` walk **and** the per-level sun at once — all three
+already asked exactly that predicate.
+
+#### An instrument defect, caught before it shipped
+
+The census's `listed=%d` field originally re-queried `sky_emissive_albedo_matches()`. At mode 2 the promotion
+has already inserted the hash by the time the census runs, so **every armed hash would have printed
+`listed=1`** — the ground-truth check would have silently become a tautology. `listed` is now sampled by the
+caller before the promotion and passed in; the parameter exists so it cannot come back.
+
+#### Pre-registered, in the order to check them
+
+1. **`D1A6D1B27ADE6232` and `CDFE11B12552EA2D` must both appear on `Remix skyclassify:` as `ARMED:listed`.**
+   They are ground truth and the OLD rule rejects both. If they do not arm, the `upv` floor is still wrong and
+   nothing else this round claims is worth reading.
+2. **Ravine must arm nothing.** `haze_domes.csv`: all six `jungle_ravine_stream/*` backgrounds read
+   `(no skyModel authored)`. **A black sky in Ravine is CORRECT.** Any hash arming there is a false positive
+   and it is the cheapest place in the game to see one.
+3. `skyclassify_armed` in **8..20** over a full single-player pass. MEASURED from `haze_domes.csv`: **16**
+   distinct dome resources exist game-wide but only **12** of them appear outside multiplayer
+   (`mp_caves_sky`, `mp_mcv_sky`, `mp_pow_sky`, `mp_shanty_sky` are MP-only), and a dome resource may bind
+   more than one texture. **Above ~28 is over-matching** → raise `SKYCLASSIFYUPV`.
+4. `skyclassify_armed − skyclassify_promoted` **> 0**. That difference is the count of hashes the rule agreed
+   with the user about. **If it is 0 the rule found nothing the user had already found by hand**, which is a
+   reason to distrust it rather than to celebrate it.
+
+#### Clamp audit — every ceiling against the value the launcher arms
+
+| knob | clamp | launcher arms | headroom |
+| --- | --- | --- | --- |
+| `SKYCLASSIFY` | `min(env, 3)` | **2** | ceiling is 3, and mode 3 is a real behaviour (promote, ignore disqualification), not a reserved value |
+| `SKYCLASSIFYMAXEXT` | `env_float`, negative sentinel, default 4.0e6 | **4000000** | no ceiling; `env_float` rejects 0, so 0 is not a usable value here |
+| `SKYCLASSIFYMAXVTX` | `min(env, 65535)` | **1024** | 64× |
+| `SKYCLASSIFYMINVTX` | `min(env, 4096)` | **16** | 256× |
+| `SKYCLASSIFYUPV` | `min(env, 1000000)` | **60** | 16667× |
+| `SKYCLASSIFYMIN` | `clamp(env, 1, 4096)` | **8** | 512× |
+| `SKYCLASSIFYSETTLE` | `min(env, 1000000)` | **60** | 16667× |
+
+No knob is armed at its ceiling. That is the `STATICINDEXBUDGET` trap, checked deliberately.
+
+---
+
+### TASK 2 — the pre-registered sun test could not be run, and that is the finding
+
+#### The test is CIRCULAR by construction
+
+The brief's test was: look up crashed_plane's zone in `haze_scene_env.csv`, apply a derived
+`sunAngle`+`sunTimeOfDay` → direction mapping, and check it reproduces the play-test-confirmed
+`RPCS3_REMIX_SUNMAP=D1A6D1B27ADE6232:0.5155,-0.5736,-0.6366`.
+
+MEASURED, `launch-haze-remix.cmd:3389-3436`: **that vector's azimuth was itself typed in from the authored
+`sunAngle` on 2026-08-17**, and only the Y term was ever swept by eye (16.5 "too low", 25 "a little low", 35
+**armed and confirmed**, 73.5 "too high"). Decomposing the ground truth confirms it exactly:
+
+```
+(0.5155, -0.5736, -0.6366)   |v| = 1.0000084
+  ->  azimuth = 128.9995 deg     elevation = 35.0013 deg     (round-trip error 0.0014 deg)
+```
+
+against crashed_plane's authored `sunAngle = 129.0`. **Testing `atan2(ground truth) ≈ sunAngle` re-measures a
+number that was copied from `sunAngle`.** It cannot validate anything.
+
+#### The elevation half runs, and fails to discriminate
+
+crashed_plane authors `sunAngle 129.0 / sunTimeOfDay 16.5` — MEASURED, **authored not inherited**, on all six
+of its sun-bearing zone records (`haze_scene_env.csv` rows 48–53). At `timeSunRise 5.0` / `timeSunSet 19.0`,
+`f = 0.82143`:
+
+| model | elevation | error vs the confirmed 35.0013° |
+| --- | --- | --- |
+| linear fold `90(1−|t−12|/7)` | 32.143° | 2.86° |
+| great circle `asin(sin 180f)` | 32.143° | 2.86° |
+| `90·cos(15(t−12))` | 34.442° | 0.56° |
+| half-sine `90 sin(πf)` | 47.883° | 12.88° |
+
+The play-test ladder establishes an accepted band of roughly **(25°, 73.5°)**, and **32.14° and 47.88° are
+both inside it**. One accepted value does not choose between them. The 0.56° fit is post-hoc curve selection,
+not evidence.
+
+Honest degrees of freedom: 3 up-axis × 4 azimuth origin × 2 handedness × 2 sign = **48 discrete** combinations
+plus ≥2 continuous (shape and amplitude of `f(t)`), against **one vector = two numbers**. Any (az, el) pair is
+reachable. **A single ground truth structurally cannot validate this mapping**, and no table was shipped on it.
+
+Note the constant-rate great circle has a *hard ceiling* of 32.143° at `t = 16.5` for any tilt whatsoever. The
+confirmed vector sits **2.86° above that ceiling**, which falsifies that model taken literally.
+
+#### One genuinely independent azimuth measurement exists, and it supports the direct reading
+
+`bin\remix_dump.log:1610776` carries an **image-derived** bearing for the crashed_plane dome, computed before
+the level files were cracked: `centroid_travel = [0.6193, -9.13e-9, -0.78515]` → bearing **128.265°**. An
+axis-origin or handedness choice can only add a multiple of 90° or flip sign — it cannot absorb a
+time-dependent sweep — so best-residual-over-all-conventions is a fair test:
+
+| model | predicted bearing | best residual vs 128.265° |
+| --- | --- | --- |
+| **direct, `az_sun = sunAngle`** | 129.0 | **0.74°** |
+| `eastAngle + 180f` sweep | 276.86 | 31.41° |
+
+**MEASURED and non-circular: the direct reading wins by 31° on this level**, despite the engine's own name for
+the field being `eastAngle`. A second dome (`CDFE11B12552EA2D`, bearing 280.166°) is inconclusive — it fits
+`sky_containership_inside` to 0.11° and the land-carrier assignment the launcher assumes to 30.17°, and the
+level cannot be resolved from the log because **no level-name string appears anywhere in the 969 MB dump**.
+
+#### THREE HARD BLOCKERS ON A PER-ZONE TABLE, all measured this round
+
+1. **Zone geometry was never recovered.** `haze_scene_env.csv`'s `zone_pos_0` is populated on **3 of 310** rows
+   and `zone_dimensions_*` on **0 of 310**. The brief's "camera position against `zone_pos`/`zone_dimensions`"
+   option is **dead** — there are no bounds to test against.
+2. **The dome-hash key collides.** `haze_domes.csv`: **quarry uses `backgrounds/skydomes/crashed_plane_dome`**,
+   the same dome as crashed_plane, while authoring a different `sunTimeOfDay` (16.75 against 16.5) and a very
+   different `sunIntensity` (3.89 against the inherited 2.0). A `SUNMAP` keyed on the dome's texture hash aims
+   quarry with crashed_plane's sun. That is a live limitation of the mechanism that already ships.
+3. **`sphericalH` is not per-zone at all.** MEASURED: **3 of 310** rows in `haze_scene_env.csv` carry it, all
+   three are `<shared>` template rows, **0 of 384** in `haze_level_scenes.csv`, and crashed_plane and
+   copperplant carry **zero**. Every single-player level inherits one template SH. **There is no per-zone
+   ambient SH to port** — the brief's third sun input does not exist.
+
+The per-zone authored table was produced anyway and is the round's Task-2 deliverable:
+`…\scratchpad\hazelight\haze_authored_env_by_zone.csv` (384 rows: level, zone, priority, blendDistance,
+sunAngle, sunTimeOfDay, eastAngle, timeOfDay, sunIntensity, sunRgb, sunCol, skyAmbientRgb, fogCol, fogNear,
+fogFar, fogIntensity, skyModel, both elevation predictions). Also MEASURED: `sunAngle`/`sunTimeOfDay` and
+`eastAngle`/`timeOfDay` are the **same two quantities in two record families** — they never co-occur in any of
+the 310/384 rows, and `07c4ac95.vms:986` authors `eastAngle 129.375 / timeOfDay 16.5` for the same level whose
+zone records author `sunAngle 129.0 / sunTimeOfDay 16.5`.
+
+#### Fog: reachable, but only one of the four authored fields
+
+The `src/d3d9/`-only trap was checked first and it **does** apply to the obvious mechanism:
+
+- **D3D9 fixed-function fog — UNREACHABLE.** `FogState` has exactly one producer in the whole runtime,
+  `setFogState()` at `src/d3d9/d3d9_rtx_utils.cpp:245`, called only from `src/d3d9/d3d9_rtx.cpp:686`.
+  `rtx_remix_api.cpp:900` default-constructs `DrawCallState`, so `fogState.mode` stays `D3DFOG_NONE` forever
+  for an external draw.
+- **`rtx.enableFog` / `rtx.fogColorScale` / `rtx.maxFogDistance` — PRESENT AND INERT.**
+  `rtx_composite.h:90-92` declares them and a real renderer pass reads them, but
+  `composite.slangh:33-36` returns `vec4(0.0)` when `fogMode == D3DFOG_NONE`. **They multiply a hard zero.**
+  This is the fourth instance of the sky/`ignoreTextures`/terrain pattern in this project.
+- **`rtx.volumetrics.*` — REACHABLE.** `RtxGlobalVolumetrics::getVolumeArgs`
+  (`rtx_global_volumetrics.cpp:467`, called per frame from `rtx_context.cpp:1365`) reads
+  `transmittanceColor()`, `transmittanceMeasurementDistanceMeters()`, `singleScatteringAlbedo()` and
+  `anisotropy()` **directly** from `RtxOption` values. D3D9 fog only *overrides* them behind a gate
+  (`fogState.mode != D3DFOG_NONE`, `:483-486`) an external draw cannot open — and volumetrics stay **on**, not
+  off, because `shouldConvertToPhysicalFog` returns true immediately for `D3DFOG_NONE` (`:445`).
+- **Runtime mutation exists**: `remixapi_SetConfigVariable` (`rtx_remix_api.cpp:1642`, bound at `:2582`) writes
+  into the user layer and `RtxOptionManager::applyPendingValues` runs every frame at `rtx_context.cpp:840`.
+  Latency one frame. Env vars are load-time only (`rtx_option_layer.cpp:698`); there is no conf hot-reload.
+
+Mapping Haze's four authored fog fields:
+
+| authored | Remix option | verdict |
+| --- | --- | --- |
+| `fogCol` | `rtx.volumetrics.singleScatteringAlbedo` (+ `transmittanceColor`) | reachable at runtime |
+| `fogIntensity` | `rtx.volumetrics.transmittanceMeasurementDistanceMeters` | reachable at runtime |
+| `fogFar` | `rtx.volumetrics.froxelMaxDistanceMeters` | approximate — it bounds froxel allocation, not fog end |
+| `fogNear` | *nothing* | **no equivalent.** Physical volumetrics are uniform from the camera outward; `VolumeArgs` has no start distance |
+
+**Shipped this round: a negative probe, not a fog implementation.** `runtime::probe_set_config_variable()`
+calls `SetConfigVariable` with `rtx.rpcs3.probeKeyThatCannotExist` — `rtx_remix_api.cpp:1653` looks keys up
+with `RtxOptionImpl::getOptionByFullName` and returns `GENERAL_FAILURE` for an unknown one, so the probe
+exercises pointer, marshalling and return path while **provably writing nothing**. `GENERAL_FAILURE` is the
+PASS; a `SUCCESS` would mean the slot is misrouted. Read it on `bin\log\RPCS3.log` at startup:
+`Remix: SetConfigVariable probe returned ...`.
+
+**Found while wiring it:** `guarded_set_config_variable` **already existed** in `RemixRuntime.h`/`.cpp` at
+HEAD, declared and defined and **never called from anywhere**. My first patch added a duplicate; it was
+removed. That is independent corroboration that this route has never been executed on this title.
+
+**Three named hazards before anyone builds fog on it.** (a) `remixapi_SetConfigVariable` takes only the
+remixapi mutex while the render thread walks `m_optionLayerValueQueue` under
+`RtxOptionImpl::getUpdateMutex()` — call it **on zone change only, never per frame**. (b) `RtxOptionLayer::save()`
+(`rtx_option_layer.cpp:376`) serialises the whole user layer, so clicking Save Settings in the Remix UI while
+zone fog is live bakes those values into `bin\user.conf`, where the layering trap makes them
+un-overridable from `rtx.conf`. (c) `bin\rtx.conf` has **zero** fog/volumetric keys and `bin\user.conf` has
+exactly two — `rtx.volumetrics.froxelDepthSlices = 48` (line 28) and
+`rtx.volumetrics.froxelGridResolutionScale = 8` (line 38), both written by `graphicsPreset = 4` and both
+grid-shape rather than appearance. **Nothing will fight a runtime set.**
+
+---
+
+### Post-review corrections — one of them would have made this round fail silently
+
+An independent review of the diff cleared the structural questions (the `upload()` refactor is
+behaviour-preserving, `promote_sky_emissive`'s iterator lifetime is safe, exit accounting is exact, no thread
+race, the `SetConfigVariable` probe cannot gate `m_fork_features`) and found **six** issues. All are fixed and
+the binary named above is the corrected one.
+
+**RISK-1 — the rebuilt material aliased the one it replaced, and every counter would have said it worked.**
+`material_hash` is derived from `content_hash` + `wrap_u`/`wrap_v`/`alpha_func`/`alpha_ref`, and **a promotion
+changes none of them** — they are properties of the texture, not of the classification. So
+`promote_sky_emissive` called `CreateMaterial` a second time with the **same hash and a different, emissive
+definition**. The comment twelve lines above the derivation already records what that costs, as measured fact:
+aliasing CreateMaterial definitions made the winning state **draw-order dependent**. If the first definition
+won, the dome would stay black while `skyclassify_promoted`, `skyclassify_entries` and `mat_skyemissive` all
+reported success — this project's most expensive recurring failure shape, and **none of this round's new
+counters could have seen it.**
+
+Fixed by folding the promoted bit into `material_hash`, in the same shape the wrap/alpha variant already uses.
+**Applied on top, and only for a promoted hash, deliberately**: a fifth byte added unconditionally to
+`material_state` would move the identity of every non-default-wrap material in the title, and `material_hash`
+is the **modding surface** — the `mat_<HASH>` a `mod.usda` replacement targets.
+
+**VERIFIED, not assumed**, by replicating `fnv_bytes`/`hash64` exactly and running the real hashes:
+
+| content hash | material before | material after |
+| --- | --- | --- |
+| `D1A6D1B27ADE6232` | `D1A6D1B27ADE6232` | `33B1BC70BA330E12` |
+| `CDFE11B12552EA2D` | `CDFE11B12552EA2D` | `6CDD81A0F713D131` |
+| `35C2353F6B3CE2A8` | `35C2353F6B3CE2A8` | `AFA7C3612AC248C0` |
+| `174F4F689CF2A3D8` | `174F4F689CF2A3D8` | `776CB30908D8EAF0` |
+| `3213E0CC136ED294` | `3213E0CC136ED294` | `072328D6474BC984` |
+| `32AE81D64BEA29CD` | `32AE81D64BEA29CD` | `BBC39485414A01D1` |
+
+All six listed hashes plus all twelve classifier candidates differ; **0 collisions in 18**. The
+non-default-wrap variant of `D1A6D1B27ADE6232` is `D480D8EA0874FFCD` unpromoted — **the round-38 value,
+unchanged** — and `AC64C1CB4F1537D1` promoted. A runtime self-check backs it up: `Remix skypromote:` prints the
+before/after pair per rebuilt entry and says **`IDENTICAL - THE FOLD DID NOT FIRE`** if they ever match.
+
+**Consequence, stated because it is real:** a promoted dome's material hash is no longer equal to its albedo
+content hash. `Remix skypromote:` is where a modder reads the new one.
+
+**RISK-3 — arming latched on intent, not on success.** `classify_entry.promoted` and the promoted-array insert
+both latched before the rebuild was known to have worked, so two failures were permanent and unretried: the
+array being full (nothing ever emissive) and every resident entry refusing `CreateMaterial` (the hash in the
+set, so every later mesh re-keys under an identity whose material never changed — a black dome reported as a
+success). Now the work runs first and `promoted` latches only on success; a total rebuild failure calls
+`sky_emissive_unpromote()`. **Undoing is safe exactly here**: the mesh-key fold reads `sky_emissive_promoted()`
+*earlier* in `submit_subdraw` than this block runs, so a hash promoted on this draw cannot have moved a mesh key
+until the next frame. New counters `skyclassify_overflow` and `skyclassify_failed` size both cases.
+
+**RISK-4 — the census budget starved the deliverable.** One shared 64-line ceiling, with `reject:mixed` firing
+on the *first* disqualifying draw of any of up to 4096 tracked hashes while `ARMED` needs 8 dome draws plus a
+60-frame settle. The rejects would normally exhaust the budget before a single `ARMED` line existed — and the
+`ARMED` line **is** the deliverable, because it is the only place the camera position is printed and therefore
+the only way to attribute a dome hash to a level. Split into two budgets: **48 for `ARMED`, 32 for rejects**.
+
+**RISK-6 — the ground-truth check could not fail.** The round-13 census in `report_sky_emissive_census` prints
+`listed=` from `sky_emissive_albedo_matches()`, which after this round also returns 1 for classifier-promoted
+hashes — while its own doc block says `listed` is a statement about the env var. New `sky_emissive_listed()`
+reads the env list alone and the census uses it; the *gate* keeps the wider predicate so a promoted dome still
+gets a line. **The identical hazard was guarded in the new census and missed in the old one.**
+
+**RISK-2, RISK-5, NIT-2, NIT-4 (comments, all corrected).** `RemixTextures.h` claimed "no mesh key moves
+because of this call" — wrong: the material handle is folded into both `static_key` and `union_hash`, and the
+ordinary mesh key is moved deliberately. The "mode 1 is image-identical" claim is now qualified — it mutates no
+material, mesh key or category, but it widens the condition under which the vertex bounding box is walked, so
+with `SKYHASH=0 SKYBACKDROP=0` it costs a walk round 38 did not pay (no pixel changes; the cost does). The
+argument-count comments said seven/eleven/twelve and now say eight/thirteen/fourteen. And **`mat_skyemissive`
+is no longer a "did the dome attach?" test**: `promote_sky_emissive` rebuilds every entry aliasing the content
+hash, ~45 on this title, so one dome moves it by tens — use `skyclassify_entries` and `Remix skypromote:`.
+
+### Knobs table additions
+
+| knob | default | what it does |
+| --- | --- | --- |
+| `RPCS3_REMIX_SKYCLASSIFY` | `1` (census only) | Classify sky domes from geometry per albedo hash and, at `2`, **promote** them into the sky-emissive set — equivalent to having typed the hash into `RPCS3_REMIX_SKYEMISSIVE`. `3` promotes while ignoring the disqualification. `1` is image-identical to round 38 and still produces every counter and every `Remix skyclassify:` line. `0` disables even the census. |
+| `RPCS3_REMIX_SKYCLASSIFYMAXEXT` | `4.0e6` | Upper world-extent bound. Rejects the 1.22e9..1.12e18 broken-transform family while keeping the 7e5..2.1e6 dome family that three hand-listed hashes live in. **Do not lower below ~3e6.** |
+| `RPCS3_REMIX_SKYCLASSIFYMAXVTX` | `1024` | Vertex ceiling. Domes measure 33..747, terrain 2714..12875. |
+| `RPCS3_REMIX_SKYCLASSIFYMINVTX` | `16` | Vertex floor. Drops one named false positive: a 4-vertex quad spanning 32,331 units with the camera inside it. |
+| `RPCS3_REMIX_SKYCLASSIFYUPV` | `60` | Extent-per-vertex floor. 3.1× gap (23.57 / 73.09), but **nearly redundant with the vertex ceiling on this data** — raise it toward 73 if a non-sky surface glows. |
+| `RPCS3_REMIX_SKYCLASSIFYMIN` | `8` | Dome-shaped draws needed to arm. |
+| `RPCS3_REMIX_SKYCLASSIFYSETTLE` | `60` frames | Delay between first sight and arming. Guards the one irreversible failure — a material rebuilt emissive cannot be rebuilt back. |
+| `Remix stats:` / `Remix live:` gain `skyclassify_*` | — | `seen`, `dome`, `tracked`, `armed`, `promoted`, `rejected`, `settling`, `entries`, `orphans`, `overflow`, `failed`, `set`, `mode` (+`census` on the stats line). On **both** lines deliberately — `Remix stats:` goes only to `RPCS3.log`, which is locked while the emulator runs. Audited position by position: `Remix run-start:` **130/130**, `Remix stats:` **277/277**, `Remix live:` **342/342** specifiers vs arguments, and every new specifier resolves to its intended argument. |
+| `knobs:` gains `skyclassify=` … `skyclassifyset=` | — | Seven fields on the boot banner and the flip-time repeat, printing the **clamped** values. |
+| `Remix skyclassify:` census | — | One line per hash per transition: verdict (`ARMED` / `ARMED:listed` / `reject:mixed`), `dome`/`other`/`agree`, `vp`, `vtx`, `wext`, `upv`, `inside`, `depth_write`, every threshold it was judged against, `listed=`, and **the camera position at the moment it armed** — which is the only way to attribute a dome hash to a level, since no level name exists anywhere in the guest signal. Ceiling 64 lines; a full budget is itself the finding. |
+| `runtime::probe_set_config_variable()` | always | Negative probe of `remixapi_Interface::SetConfigVariable` at startup. Writes nothing. `GENERAL_FAILURE` is the pass. |
+
+### Play-test card — round 39
+
+Launch as usual (`launch-haze-remix.cmd` → `bin\rpcs3-next.exe`, **`E4E2A9A4EDAECE2A`** — hash it). Round 38's
+knobs are all still armed and unchanged; its card still applies alongside this one.
+
+| what to look at | where to read it | one-line revert |
+| --- | --- | --- |
+| **Do the black skies come back on the levels that had them?** | `Remix live:` — `skyclassify_promoted` > 0 **and** `skyclassify_entries` > 0. Entries 0 with promoted > 0 = the rebuild found no resident texture and the sky stays black | `set "RPCS3_REMIX_SKYCLASSIFY=1"` |
+| **GROUND TRUTH, check this first** | `Remix skyclassify:` must carry `D1A6D1B27ADE6232` and `CDFE11B12552EA2D` as **`ARMED:listed`**. The old rule rejects both. If they are absent, `SKYCLASSIFYUPV` is still too high | `set "RPCS3_REMIX_SKYCLASSIFYUPV=50"` |
+| **RAVINE MUST STAY BLACK** | `haze_domes.csv` authors no dome there. Any new `Remix skyclassify:` line while in Ravine is a false positive | `set "RPCS3_REMIX_SKYCLASSIFY=1"` |
+| **Over-matching** | `skyclassify_armed` above ~28 (expected 8..20 — 12 of the title's 16 dome resources are reachable outside multiplayer) | `set "RPCS3_REMIX_SKYCLASSIFYUPV=66"` |
+| **Something that is not sky is glowing / has stopped casting shadow** | `Remix skyclassify:` names the albedo; check it against what glows | `set "RPCS3_REMIX_SKYCLASSIFY=1"` |
+| **A level is left too briefly for its dome to arm** | `skyclassify_settling` stuck high | `set "RPCS3_REMIX_SKYCLASSIFYSETTLE=15"` |
+| **Did the material rebuild actually take?** | `bin\log\RPCS3.log`: `Remix skypromote: content=... mat AAAA -> BBBB ok`. If it ever reads **`IDENTICAL - THE FOLD DID NOT FIRE`**, stop — the promotion is aliasing the material it replaces and whether the dome lights is draw-order dependent | `set "RPCS3_REMIX_SKYCLASSIFY=1"` |
+| **A promotion was refused** | `Remix live:` — `skyclassify_failed` > 0 (every resident entry refused the rebuild; the promotion was withdrawn and retries) or `skyclassify_overflow` > 0 (the 64-entry set is full) | — |
+| **Is fog reachable at all?** | `bin\log\RPCS3.log` at startup: `Remix: SetConfigVariable probe returned ...`. `GENERAL_FAILURE` = PASS. `SUCCESS` = the slot is misrouted, do not build on it | — |
+| **Please also record, per level, the `albedo=` from `Remix skyclassify:`** | this is what maps a dome hash to a level, and it is what unblocks per-level sun and fog | — |
+
 ## Round 38 (2026-08-24)
 
 Deployed: `bin\rpcs3.exe` = `bin\rpcs3-next.exe` = **`447D3904D1E969B2`**. Runtime `bin\remix\d3d9.dll`

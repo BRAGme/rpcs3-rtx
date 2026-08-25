@@ -53,6 +53,14 @@ namespace remix_rsx
 		remixapi_TextureHandle texture = nullptr;
 		remixapi_MaterialHandle material = nullptr;
 
+		// ROUND 39. The hash build_material() declared for `material`. Usually equal to
+		// content_hash; it differs for a non-default wrap/alpha variant and, since round 39, for a
+		// hash the sky classifier promoted - the promoted definition MUST get its own identity or
+		// it aliases the non-emissive one it is replacing and the winner is draw-order dependent.
+		// Recorded so a promotion can PROVE the two differ instead of assuming it, and so the
+		// promoted dome's mat_<HASH> is discoverable for a modder.
+		u64 material_hash = 0;
+
 		// FNV-1a over the raw guest mip-0 bytes, mixed with format and dimensions. This is
 		// the modder-facing identity: same content => same value across runs.
 		u64 content_hash = 0;
@@ -253,6 +261,23 @@ namespace remix_rsx
 		// to 0 and restores today's reap bit-exactly.
 		u64 reap_kept = 0;
 		u64 reap_freed = 0;
+
+		// ROUND 39. promote_sky_emissive()'s two numbers, and they answer different questions.
+		// sky_promote_entries: texture-cache entries whose material was rebuilt because their
+		// content hash was classified as a sky dome. This is per ENTRY, and this title aliases
+		// ~45 descriptor entries onto one content hash, so it is expected to be much larger than
+		// the number of domes - read it against skyclassify_armed on the live line, not instead
+		// of it. sky_promote_orphans: how many old material handles were left alive rather than
+		// destroyed (the mesh-lifetime rule; see promote_sky_emissive's comment). The two are
+		// equal unless a rebuild returned the same handle. Both stay 0 at SKYCLASSIFY<2.
+		u64 sky_promote_entries = 0;
+		u64 sky_promote_orphans = 0;
+
+		// ROUND 39. Entries whose material rebuild FAILED during a promotion. Non-zero here with
+		// sky_promote_entries at 0 for the same hash is the case the caller undoes: the hash is
+		// taken back out of the promoted set rather than left to re-key every later mesh under an
+		// identity whose material never changed.
+		u64 sky_promote_failed = 0;
 	};
 
 	// Per-draw albedo texture cache. Owns every remixapi texture and material it creates.
@@ -296,6 +321,26 @@ namespace remix_rsx
 		// ~65k mesh entries to build the live-material set: reap runs every flip, but in steady
 		// state it has work only once per TEXIDLE window per entry, because a kept entry is
 		// re-aged and a freed one is erased. Scans the texture entries only - the cheap side.
+		// ROUND 39. Rebuild the MATERIAL of every live entry carrying this content hash, so a
+		// texture that was uploaded before the sky classifier identified it still gets the dome's
+		// emissive material, its emissive blend type and its peak_uv measurement. The texture
+		// handle, the CPU pixels and content_hash are untouched, so no ALBEDO hash moves and no
+		// other content hash is affected.
+		//
+		// CORRECTED: an earlier version of this comment said "no mesh key moves because of this
+		// call". That is wrong, and it matters. The material HANDLE is folded into
+		// RemixGSRender's static_key and union_hash, so replacing it does move those keys - and
+		// the ordinary mesh key is moved DELIBERATELY as well, by folding
+		// sky_emissive_promoted() in, because a Remix mesh bakes its material at CreateMesh and
+		// nothing else could make the rebuilt material reach the screen. The accurate statement
+		// is that this call moves keys only for the promoted content hash.
+		//
+		// The old material handle is orphaned
+		// rather than destroyed; the full lifetime argument is on the definition. Returns the
+		// number of entries rebuilt. Idempotent in effect but not free, so the caller promotes a
+		// hash once.
+		u32 promote_sky_emissive(const remixapi_Interface& api, u64 content_hash);
+
 		bool has_idle(u64 frame) const;
 		void destroy_all(const remixapi_Interface& api);
 
@@ -314,6 +359,15 @@ namespace remix_rsx
 	private:
 		bool decode(const rsx::fragment_texture& tex, texture_entry& out);
 		bool upload(const remixapi_Interface& api, texture_entry& entry);
+
+		// ROUND 39. Both moved out of upload() verbatim so promote_sky_emissive() can re-run them
+		// on an entry that is already uploaded. measure_peak_uv walks the decoded pixels for the
+		// sun's position inside a dome texture and does nothing at all unless the content hash is
+		// on (or promoted into) RPCS3_REMIX_SKYEMISSIVE. build_material creates the Remix material
+		// and, unlike the code it was lifted from, does NOT destroy the texture when CreateMaterial
+		// fails - that belongs to upload(), which owns the texture it just created.
+		void measure_peak_uv(texture_entry& entry);
+		bool build_material(const remixapi_Interface& api, texture_entry& entry);
 
 		// One notice per distinct (format, dimensions, reason) a decode refuses. Without it
 		// 'tex_unsupported' is a single number that names neither the format nor the count of
