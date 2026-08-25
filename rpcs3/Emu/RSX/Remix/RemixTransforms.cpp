@@ -9523,6 +9523,16 @@ namespace remix_rsx
 		return value != 0;
 	}
 
+	bool gauge_cur_dims_enabled()
+	{
+		// env_u32 for the same reason its prev-frame twin gives: the useful setting is the explicit
+		// off, so a bare "1" and an unset variable must not mean different things. No clamp needed -
+		// this is a boolean and every non-zero armed value reads back as 1 on the knobs line.
+		// The full measured derivation is the doc block on the declaration in RemixTransforms.h.
+		static const u32 value = env_u32(L"RPCS3_REMIX_GAUGECURDIMS", 1);
+		return value != 0;
+	}
+
 	u32 gauge_cam_hold_frames()
 	{
 		// 30 frames is half a second at 60 fps: long enough to cover a burst of frames whose
@@ -10371,7 +10381,19 @@ namespace remix_rsx
 		// binding constraint for the whole session, and every deferral either renders a previous
 		// frame's subset or drops the draw entirely. Raised to 64 so the constraint can be relieved
 		// and measured. The default is unchanged, so a launcher that says 4 behaves exactly as before.
-		static const u32 value = std::clamp(env_u32(L"RPCS3_REMIX_STATICINDEXBUDGET", 4), 1u, 64u);
+		// --- ROUND 38: the clamp trap, a THIRD time. The launcher arms 64 and the ceiling WAS 64 ---
+		// This is the same defect round 31 hit (ceiling == default, so the knob could only be turned
+		// down) and round 33 hit again on SUNSPRITEHOLD. MEASURED in the last run of
+		// bin\remix_dump.log: "Remix static-index: entries=11498 ... deferred=841 stale=10
+		// dropped=831 peak=64 budget=64 resident=115 evicted=11376 nomesh=7". peak == budget ==
+		// the clamp ceiling means the budget was saturated and COULD NOT BE RAISED - "peak=64
+		// budget=64" was being read as a tuning result when it was the clamp reporting itself.
+		// Round 37's relieved reading (peak=56 budget=64 dropped=0) came from a 388-entry window;
+		// the 11,498-entry windows in the same log all read peak=64 budget=64 with dropped in the
+		// hundreds to thousands.
+		// 512 so a ladder exists. The launcher moves to 128 - one conservative step, matching the
+		// 4 -> 8 -> 32 -> 64 progression - NOT to the new ceiling.
+		static const u32 value = std::clamp(env_u32(L"RPCS3_REMIX_STATICINDEXBUDGET", 4), 1u, 512u);
 		return value;
 	}
 
@@ -12446,8 +12468,15 @@ namespace remix_rsx
 
 	u32 viewmodel_basis_census_max()
 	{
+		// ROUND 37: ceiling raised 96 -> 65536. The old ceiling was sized for the per-(vp, albedo)
+		// dedup, where 96 lines is more distinct objects than the title has. VMBASISEVERY drops that
+		// dedup to get a time series, and at ~1.5 KB a line 65536 is ~98 MB of dump - large, but the
+		// dump is already ~950 MB and a session that needs the whole budget is one deliberately armed
+		// for it. The launcher arms 4000. Round 31/32's lesson - a ceiling equal to the default, and
+		// a value armed 277x over its ceiling - is why this is stated against the armed value here:
+		// 4000 is inside 65536, so the knobs line must report 4000 back unchanged.
 		static const u32 value = env_u32(L"RPCS3_REMIX_VMBASISMAX", 24);
-		return std::min<u32>(value, 96u);
+		return std::min<u32>(value, 65536u);
 	}
 
 	// --- round 34: the pivot, and the decoupling of the tag from the placement --------------------
@@ -12707,6 +12736,94 @@ namespace remix_rsx
 				parse_bounded_hash_list<viewmodel_pair_albedo_list>(L"RPCS3_REMIX_VMPAIRALBEDO");
 			return list;
 		}
+
+		// --- round 37: the extra UI-force pairs --------------------------------------------------
+		// Paired POSITIONALLY: slot i of UIFORCEPAIRVP2 goes with slot i of UIFORCEPAIRFP2, and a
+		// slot whose partner is missing is not a pair and is ignored. NOT a cross product of the two
+		// lists, which is the failure mode round 20 hit when it keyed a route on a vp alone: the
+		// helmet's own vp 830d7d1b9681c475 draws 31 distinct fragment programs, so crossing two
+		// three-entry lists would force nine (vp, fp) combinations of which six are other geometry.
+		struct ui_force_pair_extra_list
+		{
+			std::array<u64, 8> values{};
+			u32 count = 0;
+		};
+
+		const ui_force_pair_extra_list& ui_force_pair_extra_vps()
+		{
+			static const ui_force_pair_extra_list list =
+				parse_bounded_hash_list<ui_force_pair_extra_list>(L"RPCS3_REMIX_UIFORCEPAIRVP2");
+			return list;
+		}
+
+		const ui_force_pair_extra_list& ui_force_pair_extra_fps()
+		{
+			static const ui_force_pair_extra_list list =
+				parse_bounded_hash_list<ui_force_pair_extra_list>(L"RPCS3_REMIX_UIFORCEPAIRFP2");
+			return list;
+		}
+	}
+
+	// --- round 37: the helmet is drawn by THREE (vp, fp) pairs and the round-36 knob held ONE -----
+	//
+	// MEASURED against the round-36 play-test's own log, not inferred. `ui_forced_pair` reads 14664
+	// and the cadence is EXACTLY one per frame over four consecutive 'Remix stats:' intervals
+	// (101/101, 99/99, 105/105, 104/104 frames vs increments), and 138 'Remix uiwrap:' lines carry
+	// vp=830d7d1b9681c475 fp=479890ff55f1d96e albedo=C61753D31FB96507 route=2d. So the round-36 route
+	// matched, composited and was never refused - `ui_skipped` froze at 5077 at frame 9678 and did
+	// not move for the following 13,800 frames. The mechanism works.
+	//
+	// What it does not do is cover the whole helmet. Albedo C61753D31FB96507 is submitted by three
+	// distinct pairs and two of them went down the world path untouched, which is the clipping the
+	// user has now reported five times:
+	//
+	//   830d7d1b9681c475 / 479890ff55f1d96e   138 lines   UI, forced          (round 36's pair)
+	//   f39f504649b6f442 / 4afa02b3dbbe9b7e    33 lines   WORLD, submitted    ALL 33 the helmet
+	//   830d7d1b9681c475 / 609a4216b89e296a     2 lines   WORLD, submitted
+	//
+	// The second pair is dedicated to the helmet - all 33 of its 'Remix fpcandidate:' lines carry
+	// that albedo and no other - and reads dw=0, so the existing !depth_write_enabled() guard admits
+	// it. It was never excluded on the merits; it was simply not in a key with one slot.
+	//
+	// This is the OR of the round-36 single pair and the positional list, so blanking
+	// RPCS3_REMIX_UIFORCEPAIRVP2 restores round 36 exactly and blanking UIFORCEPAIRVP as well
+	// restores round 35. Two independent reverts, which is what the play-test card needs.
+	bool ui_force_pair_any_matches(u64 vp_hash, u64 fp_hash)
+	{
+		if (ui_force_pair_matches(vp_hash, fp_hash))
+		{
+			return true;
+		}
+
+		const ui_force_pair_extra_list& vps = ui_force_pair_extra_vps();
+		const ui_force_pair_extra_list& fps = ui_force_pair_extra_fps();
+
+		// An empty EITHER half disarms the extra route, and a short half bounds the pairing - so a
+		// list of three vps against two fps forces two pairs, never three with a zero partner.
+		const u32 pairs = std::min<u32>(vps.count, fps.count);
+
+		if (pairs == 0 || vp_hash == 0 || fp_hash == 0)
+		{
+			return false;
+		}
+
+		for (u32 i = 0; i < pairs; ++i)
+		{
+			if (vp_hash == vps.values[i] && fp_hash == fps.values[i])
+			{
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	// For the knobs line, so a list that failed to parse is visible as a count rather than as an
+	// absence of behaviour. Reports the number of COMPLETE extra pairs, which is the number the
+	// route can actually match - a mismatched pair of lists reads short here and nowhere else.
+	u32 ui_force_pair_extra_count()
+	{
+		return std::min<u32>(ui_force_pair_extra_vps().count, ui_force_pair_extra_fps().count);
 	}
 
 	bool viewmodel_pair_matches(u64 vp_hash, u64 albedo_hash)
@@ -13045,6 +13162,60 @@ namespace remix_rsx
 
 			return parsed;
 		}
+	}
+
+	// --- round 37: the pivot offset, the basis lock and the census time series --------------------
+	//
+	// Defined HERE and not beside viewmodel_rotate_axis() at the top of this file for one mechanical
+	// reason: env_float_signed lives in the anonymous namespace that closes immediately above, so a
+	// definition placed with its siblings would not see it and would silently fall back to env_float,
+	// which rejects 0 - the exact defect (round 32's SKYANCHOR=0) that env_float_signed exists to
+	// prevent. Declarations for all five are with the round-36 block in RemixTransforms.h, which is
+	// where the derivations and the pre-registered readings are written.
+	//
+	// No clamp on the three offsets. They are signed world units of order one, a wrong value is
+	// visible in the first second of a play-test, and every clamp this project has added to a knob of
+	// this shape has since cost a round to unpick.
+	f32 viewmodel_rotate_pivot_right()
+	{
+		static const f32 value = env_float_signed(L"RPCS3_REMIX_VMROTPIVOTRIGHT", 0.f);
+		return value;
+	}
+
+	f32 viewmodel_rotate_pivot_up()
+	{
+		static const f32 value = env_float_signed(L"RPCS3_REMIX_VMROTPIVOTUP", 0.f);
+		return value;
+	}
+
+	f32 viewmodel_rotate_pivot_fwd()
+	{
+		static const f32 value = env_float_signed(L"RPCS3_REMIX_VMROTPIVOTFWD", 0.f);
+		return value;
+	}
+
+	// env_u32, not env_float_signed: 0 is OFF and the value is an enum, not a measurement.
+	// Clamp stated against the armed value, per the round-31/32 lesson: the launcher arms 0 (off)
+	// against a ceiling of 2, so the knobs line must report 0 back unchanged.
+	u32 viewmodel_rotate_lock()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_VMROTLOCK", 0);
+		return std::min<u32>(value, 2u);
+	}
+
+	// env_u32: 0 is OFF (keep the round-19..36 per-(vp, albedo) dedup) and must survive the reader.
+	// No ceiling - VMBASISMAX is the bound that matters and it has one. The launcher arms 1.
+	u32 viewmodel_basis_census_every()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_VMBASISEVERY", 0);
+		return value;
+	}
+
+	// 0 = any vertex count. No ceiling: a vertex count is an identity, not a magnitude.
+	u32 viewmodel_basis_census_vtx()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_VMBASISVTX", 0);
+		return value;
 	}
 
 	f32 sun_card_min_elevation()

@@ -203,6 +203,22 @@ private:
 		// offsets really do move between frames on this title.
 		u64 gauge_prev_exact = 0;
 		u64 gauge_prev_dims = 0;
+		// --- ROUND 38: the three numbers that decide whether the stale-divisor fix can fire -------
+		// gauge_cur_dims: draws rescued by RPCS3_REMIX_GAUGECURDIMS - the exact-key CURRENT-frame
+		//   lookup missed, but a this-frame anchor of the same (target, clip) shape existed and was
+		//   used instead of last frame's. These draws never reach gauge_anchor_prev, so
+		//   gauge_used + gauge_cur_dims + gauge_prev + gauge_absent is the whole population.
+		// gauge_cur_avail: how often that this-frame same-shape anchor EXISTED at that moment,
+		//   counted whether or not the knob is armed. This is the availability measurement, and it
+		//   is the one to read first: gauge_cur_avail == 0 means the route is structurally dead on
+		//   this title (every such draw is issued before ANY donor of its shape) and no value of
+		//   GAUGECURDIMS can change anything. gauge_cur_avail >= gauge_cur_dims always.
+		// gauge_prev_camfresh: prev-branch draws whose ELECTED camera was latched this frame. The
+		//   size of the untried alternative - divide by the fresh elected camera rather than by a
+		//   stale anchor. Measurement only; nothing consumes it yet.
+		u64 gauge_cur_dims = 0;
+		u64 gauge_cur_avail = 0;
+		u64 gauge_prev_camfresh = 0;
 		// Flips whose submitted camera came from the *previous* frame's anchor, and flips that had
 		// neither and kept the last anchor-derived split rather than falling back to the elected
 		// gauge. gauge_cam + gauge_cam_prev + gauge_cam_held approaching one per flip is the
@@ -1905,6 +1921,17 @@ private:
 	//                 6 = camera invalid (did not run), 7 = knob off (did not run).
 	void apply_viewmodel_rotation(remixapi_Transform& transform, f32 (&pivot_out)[3],
 		u32& pivot_source) const;
+
+	// ROUND 37. The second half of the operator, called from the tail of apply_viewmodel_rotation
+	// when RPCS3_REMIX_VMROTLOCK is armed, about the SAME pivot so it can only turn the instance and
+	// never move it. cam_axis is the camera's three world-space axes, already normalised, passed in
+	// rather than re-extracted so the two halves cannot drift apart under a later edit.
+	//   mode 1 = replace the object 3x3 with the camera's basis (column lengths preserved)
+	//   mode 2 = align only the object's X column to the camera's right axis, minimal rotation
+	// Derivation and why relpost=0 afterwards is NOT the evidence: viewmodel_rotate_lock() in
+	// RemixTransforms.h.
+	void apply_viewmodel_lock(remixapi_Transform& transform, const f32 (&cam_axis)[3][3],
+		const f32 (&pivot)[3], u32 mode) const;
 
 	// ROUND 36. 'mid' is the transform BETWEEN the two operators - after apply_viewmodel_basis and
 	// before apply_viewmodel_rotation - so dbasis= keeps its round-34 meaning (what the flip did)

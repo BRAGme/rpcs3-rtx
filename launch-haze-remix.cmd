@@ -242,7 +242,39 @@ rem one needs a budget slot to come back, so 1168 unions at 8 slots/frame is
 rem >=146 frames and MESHIDLE re-evicts anything out of view for 10 s. That is
 rem a treadmill. A longer idle window scoped to static-index UNION meshes only
 rem would relieve the budget more cheaply, but it is a code change, not a knob.
-set "RPCS3_REMIX_STATICINDEXBUDGET=64"
+rem
+rem ===== ROUND 38: 64 WAS THE CLAMP CEILING, NOT A TUNING RESULT ==========================
+rem THE CLAMP TRAP, A THIRD TIME (round 31: this same knob, ceiling == default; round 33:
+rem SUNSPRITEHOLD armed 277x over its ceiling). RemixTransforms.cpp clamped this to
+rem [1, 64] and the launcher armed 64, so "peak=64 budget=64" on every big window was the
+rem CLAMP REPORTING ITSELF and the knob could only ever be turned DOWN. Ceiling raised to 512
+rem this round so a ladder exists at all.
+rem MEASURED, last run in bin\remix_dump.log:
+rem   entries=11498 triangles=2252883 rebuilds=12228 deferred=841 stale=10 dropped=831
+rem   peak=64 budget=64 resident=115 evicted=11376 nomesh=7
+rem Round 37 reported the budget "relieved" from peak=56 budget=64 dropped=0 - that reading
+rem came from a 388-ENTRY window. Every 11,498-entry window in the same log reads
+rem peak=64 budget=64 with dropped in the hundreds to thousands. Both readings are real; they
+rem are different scenes, and the small one is not the one the plant walls are in.
+rem THE REAL LIMITER IS NOT THE BUDGET, IT IS THE EVICTION POPULATION. resident=115 against
+rem entries=11498 means 98.9% of static-index entries hold a mesh_hash whose mesh the reaper
+rem has already freed, and this file's own accounting (RemixGSRender.cpp, above the
+rem resident/evicted/nomesh loop) states what that costs: "evicted = mesh_hash != 0 and NOT in
+rem m_meshes (the reaper took it -> next draw of this entry takes the `dropped` exit and
+rem renders nothing)". Both drop exits return BEFORE the refusal accounting, which is why the
+rem missing walls have never appeared in 'Remix world-refused:'.
+rem 128 is ONE conservative step (the ladder has been 4 -> 8 -> 32 -> 64), not a jump to the
+rem new ceiling: it doubles how many evicted entries can be rebuilt per frame.
+rem WATCH TOGETHER: 'Remix static-index:' peak= dropped= resident=, and 'Remix live:'
+rem mesh_live= / mesh_created= beside the frame rate. If peak= stops pinning at budget= and
+rem dropped= falls, the step worked. If mesh_live climbs across the session, stop here.
+rem LADDER if 128 helps but not enough: 256, then 512. If it does NOT help, the answer is the
+rem reaper, not the budget: MESHIDLE=600 (~20 s at 30 fps) is what evicts them, and the
+rem untaken lever is a longer idle window scoped to static-index UNION meshes only, which is
+rem a code change and NOT this knob.
+rem REVERT: set "RPCS3_REMIX_STATICINDEXBUDGET=64"
+set "RPCS3_REMIX_STATICINDEXBUDGET=128"
+rem ======================================================================================
 rem 2026-08-15 IDLE-REAPER EXPERIMENT. Textures degrade to flat white after ~30s
 rem standing still, and this reproduces with TEXREHASH off, so it is a real
 rem residency bug. Both idle thresholds raised 3600 -> 36000 frames (~72s -> ~12min
@@ -354,6 +386,61 @@ rem pass shape (target + clip size) alone: surface offsets move between frames
 rem when the title double-buffers, the pass shape does not. This-frame lookups
 rem keep the exact key. Read gauge_prev_exact / gauge_prev_dims. 0 = exact only.
 set "RPCS3_REMIX_GAUGEPREVDIMS=1"
+rem ===== ROUND 38: THE STALE DIVISOR. This is the round's headline fix. ==================
+rem A draw whose render source has not produced its identity-donor draw YET this frame is
+rem divided by LAST frame's anchor and then rendered with THIS frame's camera. The residual
+rem is D = V(t)*V(t-1)^-1, which for a point p is p -> eye + (p - eye)*dR: a rotation about
+rem the eye by ONE FRAME OF CAMERA TURN. So the displacement is
+rem     (distance from the eye) x (turn per frame)
+rem and the SAME defect reads as a millimetre wobble on the weapon, a hand-width jiggle on a
+rem dumpster, and metres on a light fixture across the room. Four separate user reports.
+rem
+rem MEASURED (round 38, bin\remix_dump.log, round-37 build 56A0A57DA51FF02E):
+rem   * 4000 CONSECUTIVE 'Remix vmbasis:' frames (frames 12311..16395, vtx=3649, one line per
+rem     frame). Express the recovered viewmodel 3x3 in the camera basis of frame t+s and
+rem     measure its frame-to-frame change. s=-1 is a STRICT minimum:
+rem         s    median   mean     p95
+rem        -3    0.2844   0.4819   1.7876
+rem        -2    0.3031   0.4676   1.4879
+rem        -1    0.2287   0.3750   1.2348   <- the gun is aligned to LAST frame's camera
+rem         0    0.2984   0.4655   1.5531
+rem        +1    0.2855   0.4773   1.8047
+rem     s=-2 and s=+1 are both worse than s=-1, so this is one frame and not "any
+rem     decorrelation helps". Restricted to the 328 frames where the camera turned >1 deg the
+rem     same shape holds and steepens (-1: 0.3484/0.4791, 0: 0.3879/0.6472, +1: 0.4882/0.9985).
+rem   * All 48 'Remix picked:'/'pick-deep:' lines for the family the user reports as jiggling
+rem     (vp=830d7d1b9681c475 fp=c61b0b9586dd67fb - the dumpsters, the lockers AND the
+rem     teleporting light fixture) read ref=anchor_prev, anchor_frame == frame-1,
+rem     anchor_vp=ad7ce9d672a0bf6b, cam_age=0. Divisor a frame old, camera current. 48 of 48.
+rem   * Magnitude: the gun sits 0.73 m from the eye, the camera turns up to 8.86 deg/frame,
+rem     0.73 * 8.86 deg = 0.113 m against a measured max |d cpost| of 0.1248 m.
+rem
+rem The in-tree justification for the prev branch says "never worse than the old path: the
+rem elected camera's reference was always a frame old". CAMRELATCH has since falsified that -
+rem world_ref_fresh=3598650 vs world_ref_stale=97515 is 97.4% of draws on a CURRENT camera.
+rem
+rem GAUGECURDIMS=1 tries a THIS-FRAME anchor of the same (target, clip) shape before falling
+rem back to last frame's. It is the same relaxation GAUGEPREVDIMS (above, shipped ON) already
+rem makes for frame t-1, one frame fresher.
+rem
+rem *** READ THE COUNTERS BEFORE BELIEVING ANYTHING. On 'Remix live:' (remix_dump.log): ***
+rem   gauge_cur_avail  - a this-frame same-shape anchor EXISTED. Counted whether or not this
+rem                      knob is armed. IF THIS IS 0 THE ROUTE IS DEAD on this title and no
+rem                      value of GAUGECURDIMS changes anything - go to DEFERPREANCHOR=1.
+rem   gauge_cur_dims   - draws this route actually rescued. <= gauge_cur_avail always.
+rem   gauge_anchor_prev - should FALL by gauge_cur_dims.
+rem   gauge_prev_camfresh - prev-branch draws whose ELECTED camera was current: the size of
+rem                      the untried alternative route (divide by the fresh camera instead).
+rem Visible confirmation: Ctrl+click a jiggling dumpster. 'Remix picked:' read
+rem   ref=anchor_prev anchor_frame=<frame-1> in round 37; it must now read
+rem   ref=anchor anchor_frame=<this frame>.
+rem
+rem *** BLAST RADIUS *** this hands a DIFFERENT render source's this-frame anchor to a draw
+rem whose own source has not anchored yet. If static scenery lands in the wrong place, or the
+rem world shears when you turn, this knob is the first and only suspect.
+rem REVERT (no rebuild): set "RPCS3_REMIX_GAUGECURDIMS=0" - reproduces round 37 byte for byte.
+set "RPCS3_REMIX_GAUGECURDIMS=1"
+rem ======================================================================================
 rem Frames for which a flip with NO anchor keeps the last anchor-derived camera
 rem split instead of dropping back to the elected half-res gauge. Round 2 rebuilt
 rem the camera on only 43% of flips; the other 57% had the scene and the camera in
@@ -2672,7 +2759,32 @@ rem world-space axes, and - the field to actually read - eye_pre/eye_post,
 rem the object origin resolved onto right/up/forward in metres. The sign
 rem pattern that changes between those two triples names the wrong axes
 rem directly, so round 20 does not have to guess again. Needs DIAGLINES=1.
-set "RPCS3_REMIX_VMBASISMAX=24"
+set "RPCS3_REMIX_VMBASISMAX=4000"
+rem
+rem === ROUND 37: VMBASISEVERY / VMBASISVTX - THE CENSUS COULD NOT SEE TIME ===
+rem THIS IS THE MOST IMPORTANT CHANGE OF THE ROUND even though it renders
+rem nothing. The vmbasis census deduplicates on (vp, albedo) into a set that
+rem lives for the whole session, so each object emits exactly ONE line per
+rem session, ever. Round 36 ran 19,200 frames and produced NINE lines across
+rem SIX frames. The complaint is that the weapon "does not follow the camera
+rem turning smoothly" - a statement about TIME - and an instrument that samples
+rem once per object per session structurally CANNOT observe it. Not did not.
+rem Cannot. Every round that asked the log about jitter was asking a question
+rem the instrument could not answer, and no play-test would have changed that.
+rem
+rem VMBASISEVERY=1 drops the dedup and emits every frame; VMBASISVTX pins it to
+rem one mesh so the budget buys FRAMES instead of objects. 3649 is the gun body
+rem (albedo 86885A0E60751491 - the hash VMPAIRALBEDO has held since round 20,
+rem and the same one the gun-screen Ctrl+Click returned). 4000 lines is ~4000
+rem consecutive frames, about two minutes at 30 fps.
+rem IF THE LOG HAS NO "Remix vmbasis:" LINES AT ALL after this run, that mesh
+rem was not drawn: set "RPCS3_REMIX_VMBASISVTX=0" and
+rem set "RPCS3_REMIX_VMBASISEVERY=4" and take the whole viewmodel at 1/4 rate.
+rem WHILE PLAYING: turn left and right for a few seconds so the series contains
+rem the motion the complaint is about. Standing still measures nothing.
+rem REVERT (no rebuild): set "RPCS3_REMIX_VMBASISEVERY=0"
+set "RPCS3_REMIX_VMBASISEVERY=1"
+set "RPCS3_REMIX_VMBASISVTX=3649"
 rem
 rem === ROUND 36: RPCS3_REMIX_VMROTAXIS / VMROTDEG / VMROTPIVOT ===============
 rem A REAL ROTATION - axis and angle - because no sign mask can express this.
@@ -2738,6 +2850,74 @@ rem REVERT (no rebuild): set "RPCS3_REMIX_VMROTAXIS=0"
 set "RPCS3_REMIX_VMROTAXIS=1"
 set "RPCS3_REMIX_VMROTDEG=180"
 set "RPCS3_REMIX_VMROTPIVOT=0"
+rem
+rem === ROUND 37: VMROTPIVOTFWD / VMROTPIVOTUP / VMROTPIVOTRIGHT =============
+rem THE WEAPON IS TOO CLOSE, and no knob that existed before this round could
+rem reach it. Round 36 read cdist_post == cdist_pre as a success criterion and
+rem it IS one - a rotation about the eye cannot change the distance from the
+rem eye - but that is also exactly why the round-36 operator can put the weapon
+rem in FRONT of you at the wrong distance and have no lever to correct it.
+rem
+rem THE MODEL. With the pivot at camera-space (p_r, p_u, p_f) measured from the
+rem eye, a 180 degree turn about the camera right axis sends a centroid at
+rem (r, u, f) to (r, 2*p_u - u, 2*p_f - f). So the corrected model moves TWICE
+rem the offset, and that factor of two is a prediction the census can falsify:
+rem cpost forward must change by exactly 2 * VMROTPIVOTFWD. If it moves by 1x,
+rem the offset is being applied as a translation and the composition is wrong.
+rem
+rem WHY 0.15 AND NOT A NUMBER PICKED BY EYE. MEASURED on the round-36 session:
+rem cpost forward reads 0.09 .. 0.55 across the nine census lines, cdist_post
+rem 0.38 .. 1.04. World scale is ~1 unit = 1 metre, measured from the camera
+rem itself - between census frames 10013 and 10014 it moved 0.11 units in one
+rem frame, and 0.26 over the four frames 9656..9660, i.e. 2.0 .. 3.3 units per
+rem second at 30 fps, which is human walk-to-jog speed and nothing else. At that
+rem scale the gun origin sits 9 to 55 CENTIMETRES in front of the eye, which is
+rem why the gun own screen cannot be read without free-camming backwards.
+rem 0.15 pushes it +0.30 m, to roughly 0.4 .. 0.85 m - arm length.
+rem
+rem THE LADDER, if 0.15 is wrong. One edit each, no rebuild, and each moves the
+rem weapon by TWICE the change:
+rem   still too close -> 0.25 (+0.50 m), then 0.35 (+0.70 m)
+rem   now too far     -> 0.08 (+0.16 m)
+rem   weapon too LOW  -> set "RPCS3_REMIX_VMROTPIVOTUP=0.15" (raises +0.30 m).
+rem     Left at 0 deliberately: arming both at once confounds them, which is
+rem     the doctrine round 36 used for VMBASIS and it held.
+rem READ IT ON "Remix vmbasis:": cpost=[right up fwd], and rotpivot= must NO
+rem LONGER equal cam= (it did, bit for bit, on all nine round-36 lines).
+rem knobs= must read vmrotpivotf=0.15. A comma decimal separator parses to 0.
+rem REVERT (no rebuild): set "RPCS3_REMIX_VMROTPIVOTFWD=0"
+set "RPCS3_REMIX_VMROTPIVOTFWD=0.15"
+set "RPCS3_REMIX_VMROTPIVOTUP=0"
+set "RPCS3_REMIX_VMROTPIVOTRIGHT=0"
+rem
+rem === ROUND 37: RPCS3_REMIX_VMROTLOCK - the residual A/B, SHIPPED OFF =======
+rem THE BRIEF ASKED WHY relpost IS NOT 180-relpre. It is an identity of the
+rem operator, MEASURED on the nine round-36 census lines to better than 4e-6:
+rem     cos(relpre) + cos(relpost) = dotpre[0] - 1
+rem A turn about the camera RIGHT axis cannot change any component along RIGHT,
+rem so the object own X-vs-right misalignment survives untouched and IS the
+rem whole residual - relpost equals acos(dotpre[0]) to within 1.5 degrees on
+rem every line. 180-relpre only holds when dotpre[0] is 1, and it DID hold on
+rem SIX of the nine (1.70 vs 1.68, 62.18 vs 61.51 three times, 24.65 vs 23.55,
+rem 1.79 vs ~0). The three that missed all read dotpre[0] < 0.92.
+rem
+rem THE STALE-PIVOT HYPOTHESIS IS REFUTED TWICE. rotpivot= equals cam= bit for
+rem bit on all nine lines (pivot 0 is m_active_camera.position, NOT the
+rem anchor-frame eye - that is pivot 3), and camage=0 on every one of the six
+rem census frames, including the 79-degree one. Nothing was stale.
+rem
+rem SO THE RESIDUAL IS EITHER THE MESH GENUINE POSE OR A SECOND DEFECT, and
+rem this is the one-play-test test that separates them:
+rem   1 = replace the object 3x3 with the camera basis (scale preserved)
+rem   2 = align only the object X axis to the camera right axis
+rem relpost reading ~0 afterwards proves only that it composed. THE EVIDENCE IS
+rem WHAT YOU SEE: arms look right and stop swimming -> it was a defect, keep it.
+rem Arms freeze rigid, lose their aim pitch, hands detach -> it was the genuine
+rem pose, put it back to 0 and the residual is not a bug.
+rem ONLY TRY THIS IF THE WEAPON STILL DOES NOT FOLLOW THE CAMERA SMOOTHLY after
+rem the distance fix above. Two orientation knobs at once confounds them.
+rem REVERT (no rebuild): set "RPCS3_REMIX_VMROTLOCK=0"
+set "RPCS3_REMIX_VMROTLOCK=0"
 rem
 rem --- THE VIEWMODEL SELECTOR (armed only if VMBASIS cannot fix it) --------
 rem MEASURED, and it refutes a comment that has stood since round 5
@@ -3343,6 +3523,68 @@ rem of flattening, read those three counters - not ui_forced_pair.
 rem REVERT (no rebuild): set "RPCS3_REMIX_UIFORCEPAIRVP="
 set "RPCS3_REMIX_UIFORCEPAIRVP=830D7D1B9681C475"
 set "RPCS3_REMIX_UIFORCEPAIRFP=479890FF55F1D96E"
+rem
+rem === ROUND 37: UIFORCEPAIRVP2 / UIFORCEPAIRFP2 - THE OTHER TWO COPIES =====
+rem THE ROUTE ABOVE WORKS. MEASURED on the round-36 log, not inferred:
+rem ui_forced_pair=14664 rising at EXACTLY one per frame over four consecutive
+rem "Remix stats:" intervals (101/101, 99/99, 105/105, 104/104 frames against
+rem increments), 138 "Remix uiwrap: ... route=2d" lines carrying the helmet
+rem albedo C61753D31FB96507, and ZERO compositor refusals - ui_skipped froze at
+rem 5077 at frame 9678 and did not move for the next 13,800 frames.
+rem
+rem SO WHY DOES IT STILL CLIP: that albedo is submitted by THREE (vp, fp) pairs
+rem and the round-36 key held ONE. The other two reached DrawInstance as world
+rem geometry, which is the clipping, and one of them is dedicated to the helmet
+rem - all 33 of its census lines carry that albedo and no other:
+rem   830d7d1b9681c475 / 479890ff55f1d96e  138 lines  UI    (round 36 pair)
+rem   f39f504649b6f442 / 4afa02b3dbbe9b7e   33 lines  WORLD, all the helmet
+rem   830d7d1b9681c475 / 609a4216b89e296a    2 lines  WORLD
+rem Both extra pairs read depth_write=0, so the existing guard admits them.
+rem Matched POSITIONALLY, slot against slot, never crossed - crossing two lists
+rem would force nine combinations of which six are other geometry, which is
+rem round 20 failure mode exactly.
+rem
+rem READ IT: ui_forced_pair should roughly DOUBLE, to ~2 per frame; check it
+rem against the frame delta on two consecutive "Remix stats:" lines. The knobs
+rem line must read uiforcepairs=2 - a 0 or 1 there means a list did not parse.
+rem IF THE HELMET VANISHES the compositor refused the new pairs: read ui_skipped,
+rem frozen at 5077 since frame 9678, which would have to MOVE for that to be it.
+rem EXPECT IT TO LOOK LIKE THE COMPOSITED COPY, NOT THE WORLD ONE: the existing
+rem pair uiwrap lines read u=[2676..30089] v=[3417..28455] on a 512x512 texture,
+rem three orders of magnitude outside [0,1], so the atlas region being painted
+rem is already not a sane one. That is a separate defect - named, not fixed.
+rem REVERT (no rebuild): set "RPCS3_REMIX_UIFORCEPAIRVP2="
+rem --- ROUND 38: A FOURTH PAIR DRAWS THE HELMET, and round 37 could not have seen it -------
+rem Round 37 asked "either a fourth pair draws it, or the UI route does not prevent clipping".
+rem MEASURED, last 200 MB of bin\remix_dump.log, every line carrying albedo C61753D31FB96507:
+rem   Remix fpcandidate  vp=830d7d1b9681c475 fp=479890ff55f1d96e   n=424   uiwrap route=2d 331
+rem   Remix fpcandidate  vp=9f591b6a6b825612 fp=cbede4eb45f0fd25   n=416   uiwrap            0
+rem   Remix fpcandidate  vp=f39f504649b6f442 fp=4afa02b3dbbe9b7e   n=246   uiwrap route=2d  65
+rem   Remix fpcandidate  vp=830d7d1b9681c475 fp=609a4216b89e296a   n=6     uiwrap            0
+rem The SECOND row is the fourth pair, it is the second-busiest of the four, and it is the only
+rem busy one with ZERO uiwrap lines - it never reaches the 2D route, so its copy is submitted
+rem as world geometry and clips. Same vtx=59 as the other three, i.e. the same mesh. It also
+rem shows up under 'Remix alphastate:' and 'Remix kil:' with the same albedo and vtx.
+rem Confirming that the extra-pair route itself works: (f39f..., 4afa...) is UIFORCEPAIRVP2
+rem slot 0 and it produced 65 'route=2d' lines, so positional pairing parses and routes.
+rem Slot 1 (830d..., 609a...) has only 6 draws in 200 MB - too rare to judge, left armed.
+rem The array behind these lists is std::array<u64, 8> (RemixTransforms.cpp, the extra-pair
+rem struct), so three of eight slots are used and there is room.
+rem
+rem PRE-REGISTERED: uiforcepairs= must read 3. THAT SPECIFIER IS ON 'Remix stats:', WHICH GOES
+rem ONLY TO bin\log\RPCS3.log - NOT to remix_dump.log. 0 of 13,495 'Remix live:' lines in the
+rem last 200 MB carry ui_forced_pair. Round 37 read it correctly in RPCS3.log
+rem (ui_forced_pair=27708 -> 27780, uiforcepairs=2) but wrote it up as "the knobs line", which
+rem is the 'Remix live:' line in remix_dump.log and does not carry it. Read RPCS3.log AFTER
+rem the emulator exits - the file is exclusively locked while it runs.
+rem WATCH: 'Remix uiwrap:' gaining route=2d lines for vp=9f591b6a6b825612.
+rem If the helmet VANISHES instead: ui_skipped, which is live again (0 -> 7163 in the last run,
+rem so round 37's "frozen since frame 9678" no longer holds and it can be read as evidence).
+rem NOTE 9F591B6A6B825612 is also armed on RPCS3_REMIX_UVAFFINEVP above - different mechanism,
+rem left alone.
+rem REVERT (no rebuild): drop the third entry from both lists below.
+set "RPCS3_REMIX_UIFORCEPAIRVP2=F39F504649B6F442,830D7D1B9681C475,9F591B6A6B825612"
+set "RPCS3_REMIX_UIFORCEPAIRFP2=4AFA02B3DBBE9B7E,609A4216B89E296A,CBEDE4EB45F0FD25"
 rem
 rem --- 3. THE VIEWMODEL PAIR: IT IS AIMED AT REFUSED DRAWS --------------------
 rem MEASURED, round-22 run: vm_tagged_pair=0 over the whole run. The reason is

@@ -2162,6 +2162,48 @@ namespace remix_rsx
 	// exact-key-only lookup.
 	bool gauge_prev_dims_enabled();
 
+	// RPCS3_REMIX_GAUGECURDIMS=1 (default): when the CURRENT frame's exact-key anchor lookup misses,
+	// retry on (target, clip width, clip height) alone against THIS frame's anchors, before falling
+	// back to the previous frame's. This is the same relaxation GAUGEPREVDIMS already ships for
+	// frame t-1, applied one frame fresher, and it exists because of what round 38 measured.
+	//
+	// WHY (MEASURED, round 38, and this is the round's root cause). A draw that reaches the
+	// gauge_prev branch is divided by fused_donor(t-1) while Remix renders it with camera(t). The
+	// residual is exactly D = V(t) * V(t-1)^-1, which for a point p is p -> eye + (p - eye) * dR:
+	// a rotation about the eye by one frame of camera turn. The displacement is therefore
+	// (distance from the eye) x (turn per frame), so the SAME defect is a millimetre wobble on the
+	// weapon, a hand-width jiggle on a dumpster, and metres on a light fixture across the room.
+	//   * 4000 consecutive 'Remix vmbasis:' frames: the recovered viewmodel 3x3 is best aligned to
+	//     the camera basis of frame t-1. Expressing it in the basis at t+s and measuring the
+	//     frame-to-frame change gives s=-1 a STRICT minimum in median (0.2287 deg), mean (0.3750)
+	//     and p95 (1.2348) over s in {-3,-2,-1,0,+1,+2,+3}; s=0 reads 0.2984/0.4655/1.5531.
+	//     s=-2 and s=+1 are both worse than s=-1, so this is one frame and not "any decorrelation".
+	//   * All 48 'Remix picked:'/'pick-deep:' lines for the family the user reports as jiggling
+	//     (vp=830d7d1b9681c475 fp=c61b0b9586dd67fb) read ref=anchor_prev with anchor_frame ==
+	//     frame-1 and cam_age=0 - the divisor is a frame old while the camera is current.
+	//   * Magnitude check: the gun sits 0.73 m from the eye and the camera turns up to 8.86 deg in
+	//     one frame; 0.73 * 8.86 deg = 0.113 m against a measured max |d cpost| of 0.1248 m.
+	//
+	// The in-tree justification for the prev branch (RemixGSRender.cpp, above the dispatch) is
+	// "never worse than the old path: the elected camera's reference was always a frame old". That
+	// premise has since been falsified by CAMRELATCH: world_ref_fresh=3598650 against
+	// world_ref_stale=97515 is 97.4% of draws carrying a current-frame elected camera.
+	//
+	// COUNTERS, and read these before believing anything: gauge_cur_dims counts draws this route
+	// actually rescued; gauge_cur_avail counts draws where a this-frame same-shape anchor EXISTED
+	// at that moment, and is incremented whether or not the knob is armed. gauge_prev_camfresh
+	// counts prev-branch draws whose elected camera was current, i.e. the size of the alternative
+	// route nobody has tried. If gauge_cur_avail stays at 0 the route cannot fire at all for this
+	// title - the props are drawn before ANY identity donor of that shape - and the answer is the
+	// deferral that already exists (DEFERPREANCHOR) rather than a fresher lookup.
+	//
+	// BLAST RADIUS: this hands a different render source's this-frame anchor to a draw whose own
+	// source has not anchored yet. That is the same guess find_gauge_anchor_shape already makes for
+	// the tail rescue and GAUGEPREVDIMS already makes for frame t-1; the affinity gate at the end
+	// of per_draw_transform still re-runs on the result. If static scenery lands in the wrong
+	// place, this knob is the first suspect. 0 restores round 37 byte for byte.
+	bool gauge_cur_dims_enabled();
+
 	// RPCS3_REMIX_GAUGECAMHOLD=<frames> (default 30, 0 disables): when a flip has neither a
 	// current-frame nor a previous-frame anchor to rebuild the submitted camera from, keep the last
 	// anchor-derived split for up to this many frames instead of falling back to the elected
@@ -2791,6 +2833,33 @@ namespace remix_rsx
 	u64 ui_force_pair_vp_hash();
 	u64 ui_force_pair_fp_hash();
 
+	// --- round 37 ---------------------------------------------------------------------------------
+	// RPCS3_REMIX_UIFORCEPAIRVP2 / UIFORCEPAIRFP2: comma-separated lists of ADDITIONAL (vp, fp)
+	// pairs for the same route, matched POSITIONALLY - slot i against slot i, never crossed. Up to
+	// eight pairs. Empty (the default) means this is exactly round 36's single-pair behaviour.
+	//
+	// Why it was needed, MEASURED on the round-36 play-test log and not inferred: the route WORKS -
+	// ui_forced_pair=14664 at exactly one per frame over four consecutive stats intervals, 138
+	// 'Remix uiwrap: ... route=2d' lines for the helmet's albedo, zero compositor refusals since
+	// frame 9678 - but the helmet albedo C61753D31FB96507 is submitted by THREE (vp, fp) pairs and a
+	// one-slot key held one of them. The other two, f39f504649b6f442/4afa02b3dbbe9b7e (33 lines, all
+	// of them that albedo) and 830d7d1b9681c475/609a4216b89e296a (2 lines), reached DrawInstance as
+	// world geometry. That is the clipping.
+	//
+	// PRE-REGISTERED, and each of these can read otherwise:
+	//   ui_forced_pair on 'Remix stats:' must rise from ~1/frame to ~2/frame. It is per sub-draw, so
+	//   the arithmetic is checkable against the frame delta on two consecutive stats lines - if it
+	//   stays at 1/frame the extra list did not parse, and uiforcepairs= on the knobs line says so.
+	//   The helmet must stop clipping AND must stay visible. If it VANISHES, the compositor refused
+	//   the new pairs - read ui_skipped, which has been frozen at 5077 since frame 9678 and would
+	//   have to move for that to be the explanation.
+	//   The caveat worth stating before it is seen: the existing forced pair's uiwrap lines read
+	//   u=[2676..30089] v=[3417..28455] on a 512x512 texture, three orders of magnitude outside
+	//   [0,1]. Whatever the compositor paints for the helmet today is not a sane atlas region, so
+	//   expect the newly-routed copies to look like the composited one, not like the world one.
+	bool ui_force_pair_any_matches(u64 vp_hash, u64 fp_hash);
+	u32 ui_force_pair_extra_count();
+
 	// ---------------------------------------------------------------------------------------
 	// round 10
 	// ---------------------------------------------------------------------------------------
@@ -3400,6 +3469,94 @@ namespace remix_rsx
 	u32 viewmodel_rotate_axis();
 	u32 viewmodel_rotate_degrees();
 	u32 viewmodel_rotate_pivot();
+
+	// --- round 37 ---------------------------------------------------------------------------------
+	// RPCS3_REMIX_VMROTPIVOTRIGHT / VMROTPIVOTUP / VMROTPIVOTFWD, signed world units, default 0.
+	//
+	// WHY A PIVOT OFFSET AND NOT A TRANSLATION, and why the value is derived rather than eyeballed.
+	//
+	// Write the pivot in camera coordinates as (p_r, p_u, p_f) measured from the eye. A 180 degree
+	// rotation about the camera's RIGHT axis through that point sends a centroid at camera-space
+	// (r, u, f) to (r, 2*p_u - u, 2*p_f - f). At p = 0 that is the round-36 operator exactly, so
+	// arming these at 0 is bit-for-bit today's behaviour and the default is genuinely inert.
+	//
+	// The consequence that makes this the right lever: the operator PRESERVES |centroid - eye| when
+	// and only when the pivot is the eye. Round 36 read cdist_post == cdist_pre as a success
+	// criterion, and it is - for the pivot - but it also means the round-36 operator cannot change
+	// the weapon's distance from the eye at all, whatever the true distance should be. The user
+	// reports the weapon is too close and reports having to free-cam BACKWARDS to read the gun's own
+	// screen. If the real defect is a flip about a point ahead of the eye rather than about the eye,
+	// then the corrected forward distance is short by exactly 2*p_f and no other knob in the backend
+	// can reach it.
+	//
+	// So this is a falsifiable prediction, not a taste setting: cpost's forward component must move
+	// by EXACTLY 2 * VMROTPIVOTFWD and cdist_post must stop tracking cdist_pre. If cpost moves by
+	// 1x, the offset is being applied as a translation somewhere and the composition is wrong.
+	//
+	// env_float_signed and never env_float: 0 is the OFF value for all three, env_float rejects 0
+	// outright (round 32's SKYANCHOR=0 defect), and negative is a real value here - it pulls the
+	// model back towards the eye - so a reader that clamps at zero would delete half the range.
+	// No clamp: a first-person offset of order one unit is the intended range, and a wrong value is
+	// visible immediately and revertible from the launcher without a rebuild.
+	f32 viewmodel_rotate_pivot_right();
+	f32 viewmodel_rotate_pivot_up();
+	f32 viewmodel_rotate_pivot_fwd();
+
+	// RPCS3_REMIX_VMROTLOCK=<0|1|2>, default 0 = OFF.
+	//
+	// ROUND 37. The residual after the round-36 operator is NOT a pivot error and NOT a stale
+	// camera - both were refuted by measurement, see the round-37 block in docs/remix/KNOBS.md. It
+	// is an algebraic identity of the operator: for a rotation about the camera's RIGHT axis,
+	//
+	//     cos(relpre) + cos(relpost) = dotpre[0] - 1
+	//
+	// which was verified to better than 4e-6 on 8 of the 9 census lines the play-test produced. A
+	// rotation about `right` cannot change any component along `right`, so whatever misalignment the
+	// object's own X axis has from the camera's right axis survives the operator untouched, and
+	// relpost is (to within 1.5 degrees on all 9 lines) exactly acos(dotpre[0]).
+	//
+	// That residual is either the mesh's GENUINE pose - an aim pitch, a hand, a swinging arm - or it
+	// is a second defect. Nothing already in the log can tell those apart, so this knob is the test
+	// that separates them in one play-test, and it is designed to be able to fail visibly:
+	//
+	//   1 = replace the object's 3x3 with the camera's basis, column lengths preserved so scale
+	//       survives. relpost then reads ~0 BY CONSTRUCTION - that reading proves only that the
+	//       operator composed, it is not evidence about the world. The evidence is what the user
+	//       sees: if the arms and weapon look right and stop swimming, the residual was a defect;
+	//       if they freeze rigid, lose their aim pitch or the hands detach, the residual was the
+	//       genuine pose and this knob must go back to 0.
+	//   2 = align only the object's X column to the camera's right axis, by the minimal rotation
+	//       that does it, leaving the remaining roll about right alone. This is the half of mode 1
+	//       that the identity above says is responsible for the whole residual.
+	//
+	// Applied after the rotation and about the SAME pivot, so it cannot move the model - only turn
+	// it. A position change here would mean the pivot did not survive, which is itself a bug.
+	u32 viewmodel_rotate_lock();
+
+	// RPCS3_REMIX_VMBASISEVERY=<N>, default 0 = OFF = the round-19..36 dedup.
+	//
+	// ROUND 37, and this is the round's most important change even though it fixes no rendering.
+	//
+	// The 'Remix vmbasis:' census deduplicates on (vp ^ albedo * golden) and inserts into a set that
+	// lives for the whole session (RemixGSRender.cpp, the m_viewmodel_basis_census_seen guard). So
+	// every (vp, albedo) pair emits exactly ONE line per session, ever. The round-36 play-test
+	// produced NINE lines across six frames from a session of 19,200 frames.
+	//
+	// The user's complaint is that the weapon "doesn't follow the camera turning smoothly". That is
+	// a statement about time. A census that emits one sample per object per session structurally
+	// CANNOT observe it - not "did not", cannot - and three rounds of asking the log about jitter
+	// were therefore unanswerable before they were asked. That is the failure this knob fixes.
+	//
+	// N >= 1 drops the dedup entirely and emits on every frame where (frame % N) == 0, so N=1 is a
+	// contiguous per-frame time series. Bound it with VMBASISMAX (whose ceiling this round raises
+	// from 96 to 65536) and narrow it with VMBASISVTX so the volume stays readable.
+	u32 viewmodel_basis_census_every();
+
+	// RPCS3_REMIX_VMBASISVTX=<N>, default 0 = any. Restricts the census to draws of exactly N
+	// vertices, which is what makes VMBASISEVERY=1 affordable: the round-36 census found ~10 near-eye
+	// viewmodel groups live at once, so an unfiltered per-frame census burns its budget in ~400
+	// frames, while one pinned mesh gives ~4000 consecutive frames from the same budget.
+	u32 viewmodel_basis_census_vtx();
 
 	// RPCS3_REMIX_VMTAGONLY=<0|1>, default 0 = OFF = today's behaviour bit for bit.
 	//
