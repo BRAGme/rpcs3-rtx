@@ -48,8 +48,21 @@ set "RPCS3_REMIX_SKIPUNTEXTUREDFPPAIRFP=E5D8F51451B96165"
 set "RPCS3_REMIX_SKIPUNBOUNDBLENDVP=33AE0895AE9FEF72"
 set "RPCS3_REMIX_SKIPRTVP=7F02E76D7369D09E,B01BFCE3FC580E3B"
 set "RPCS3_REMIX_UVAFFINEVP=9F591B6A6B825612"
-set "RPCS3_REMIX_TRACEALBEDO=2C6485F7F04591F1"
-set "RPCS3_REMIX_TRACEALBEDOVP=C1D482DCD1B03ED0"
+rem ROUND 44, DIAGNOSTIC ONLY - no pixel changes, one "Remix albedo-trace:" line per
+rem frame. Re-pointed from 2C6485F7F04591F1 at the teleporting light fixture, on the
+rem program that draws the copy no other census can see: worldid-draw only fires for
+rem WORLDIDENTITYVP programs and C2003391127734F6 is on no list at all, so this hash
+rem has never had a per-frame raw-box + matrix trace taken of it.
+rem WHY IT MATTERS: albedo-trace prints raw=[..]..[..] AND matrix=[..] AND cam=[..] on
+rem one line. raw moving = the guest moved it and it is not our bug; raw static while
+rem matrix moves = ours. pick-follow cannot answer this - it never prints the raw box.
+rem PLAY IT WITH THE CAMERA MOVING. The one round ever aimed at this object fired its
+rem 181-frame instrument during a window where the camera was frozen for all 191
+rem frames, read d_origin=0, and that zero was mistaken for stability.
+rem REVERT: set "RPCS3_REMIX_TRACEALBEDO=2C6485F7F04591F1" and TRACEALBEDOVP back to
+rem C1D482DCD1B03ED0.
+set "RPCS3_REMIX_TRACEALBEDO=E40BF80AF519848A"
+set "RPCS3_REMIX_TRACEALBEDOVP=C2003391127734F6"
 rem A/B 2026-08-14 RESTORED 2026-08-15. Blanking this did NOT bring the Selva tree
 rem tops back (the streak-gate probe cleared that suspect too), and with it blank a
 rem ship drew at extent 9211 - vp 57A1... is the same program that draws the giant
@@ -142,6 +155,52 @@ rem and try WORLDIDMAXB=100 instead, which targets the 1.98 basis rotation
 rem rather than the translation.
 set "RPCS3_REMIX_WORLDIDMAXT=32"
 set "RPCS3_REMIX_WORLDIDMAXB=0"
+rem ====================================================================================
+rem ROUND 44 - THE ONE KNOB THAT CHANGES PIXELS THIS ROUND.
+rem GAUGEDONORMAXT (whole world units, 0 = OFF = round 43 byte for byte).
+rem
+rem This is round 30's specified-but-never-shipped fix. WORLDIDENTITYVP drives TWO
+rem gates and only WORLDIDMAXT (right above) ever learned about the threshold:
+rem   * at SUBMIT time, keep_resolved sees a draw 900 units from the origin and
+rem     correctly says "this is not a world-identity draw, keep its real transform";
+rem   * at CAPTURE time, capture_gauge_anchor() has ALREADY installed that same
+rem     draw's matrix as the WHOLE FRAME'S world gauge, qualified on the vp list
+rem     alone. It never looked at the translation at all.
+rem So the backend called one draw "carrier-local" and "this is the world" in the
+rem same frame for the same reason. This knob applies the submit verdict at capture.
+rem
+rem MEASURED (round 44, from the session that ended 2026-08-27 10:27):
+rem   * 12,779 "Remix worldid-draw:" lines. Of the 759 frames carrying two or more
+rem     rows, 559 have EVERY row reporting ONE identical pre-translation, bit for
+rem     bit across unrelated meshes (f=53640: vtx=160, vtx=224 and vtx=518 all read
+rem     t=[1.579 -132.9 -2.179]). Guest motion cannot produce that. A wrong divide
+rem     gauge is the only thing that can.
+rem   * "Remix gauge: translation=" over 17,386 frames: mean 41.99, max 1718.67,
+rem     above 128 units on 7.36% of frames.
+rem   * E40BF80AF519848A (the teleporting light fixture) has a RAW VERTEX BOX that
+rem     never moves - 30 of its 36 multi-sample mesh identities report exactly
+rem     0.0000 displacement over spans up to 14,500 frames - while the transform
+rem     applied to it swings 0 -> 21.75 -> 966.5 units.
+rem
+rem CANNOT STARVE THE GAUGE SLOT, and the census says so: AD7CE9D672A0BF6B draws
+rem 3,316,291 times, of which 2,486,813 (75.0%%) sit at |t| <= 1 and only 242,939
+rem (7.3%%) exceed 32. At 32 there are still 2.49M eligible donors.
+rem
+rem WATCH ON "Remix live:":
+rem   gauge_donor_offside  - candidates over the threshold. Counted WHETHER OR NOT
+rem                          this knob is armed. If this is 0 the mechanism is not
+rem                          present in the level you played and nothing can change.
+rem   gauge_donor_refused  - the subset actually turned away. offside > 0 with
+rem                          refused == 0 means the knob is OFF.
+rem   gauge_absent         - MUST NOT RISE much above 295,391. If it doubles, the
+rem                          gate starved the slot: revert.
+rem   gauge_prev           - may rise from 1,634,288. That is the acceptable cost:
+rem                          last frame's CORRECT gauge beats this frame's wrong one.
+rem REFUTED IF: props still teleport by the same amount while gauge_donor_refused
+rem reads in the hundreds of thousands. Then the donor election is not the mover.
+rem REVERT: set "RPCS3_REMIX_GAUGEDONORMAXT=0"   <- one line, round 43 bit-exactly.
+set "RPCS3_REMIX_GAUGEDONORMAXT=0"
+rem ====================================================================================
 rem ====================================================================================
 rem DEAD LINES - neutralised 2026-08-25 (round 40). Both of these are re-assigned
 rem further down (~:708/:709) and in a .cmd the LAST assignment wins, so editing them
@@ -1241,7 +1300,7 @@ rem signal and this is wrong. guest_lights= and guest_light_capped= size it dire
 rem MODE 1 = the old whole-census population (fixtures AND cards) - that is what put lights
 rem on doors in August. Do not use 1 as a fallback; use 0.
 rem REVERT: set "RPCS3_REMIX_GUESTLIGHTAUTO=0"
-set "RPCS3_REMIX_GUESTLIGHTAUTO=2"
+set "RPCS3_REMIX_GUESTLIGHTAUTO=0"
 rem
 rem === DEFERPREANCHOR is deliberately LEFT OFF (set to 0 above) ================
 rem Round 6's verdict: off stays the baseline. 47% of buffered draws (367,629 of
@@ -1558,6 +1617,121 @@ rem WATCH: mesh_created= on the live line. Vertex colour is hashed into the mesh
 rem   ANIMATED vertex colour mints a mesh per step. It was 582,659 with this off.
 rem REVERT: set "RPCS3_REMIX_VCOLMOD=0"
 set "RPCS3_REMIX_VCOLMOD=1"
+rem ============ ROUND 42 - THE WHITE WALLS, FOUND IN THE UCODE ======================
+rem RPCS3_REMIX_FPVCOLDEEP=1. Round 41's hop was the right idea aimed one instruction too
+rem late. Haze's fragment programs DO modulate the albedo by the vertex colour - the
+rem modulate is just THIRTY INSTRUCTIONS upstream of the export, behind the whole per-pixel
+rem lighting composite, and a classifier that only reads the terminal instruction cannot
+rem see it. MEASURED by disassembling the four Haze fragment programs whose raw ucode is on
+rem disk in bin\remix_ucode (two of them - aa0fe222771ff5c0 and 65a91390aaf6bef3 - are
+rem programs YOUR OWN Ctrl+Clicks landed on walls). Every one reads:
+rem     MOV  H1,     ATTR1                ; COL0
+rem     MUL  R1.xyz, H1, {2,0,0,0}.xxxx   ; the 0..2 lighting expansion
+rem     MOV  R1.w,   H1                   ; alpha copied UNSCALED
+rem     TEX  R0,     ATTR5, tex0          ; the albedo
+rem     MUL  R1,     R0, R1               ; *** albedo x (COL0 x 2) ***
+rem     ... 30 more instructions of normal map, specular, lighting composite ...
+rem     MUL  R0.xyz, R0, {0.999,...}.xxxx  END   <- all the old classifier ever saw
+rem That last near-identity scale is why 39 of the 64 "Remix fpother:" rows in the round-41
+rem run share one terminal shape. Round 11 independently transcribed the same thing into a
+rem source comment: "rgb = texRGB * (2 * COL0.rgb) * 0.944243".
+rem WHY IT IS SAFE: the search is four terms, all required - an unconditional MUL writing
+rem rgb, one operand a temp whose writer SAMPLED a texture, the other a clean COL0 read or a
+rem temp reached from one through nothing but BROADCAST constant scales, and the product
+rem provably live into COL0.rgb. COL1/ATTR2 is EXCLUDED by measurement, not caution: these
+rem same programs carry the packed tangent-space NORMAL there.
+rem PRE-REGISTERED, offline, before this build ever ran: the rule was reimplemented in
+rem Python and run over all 338 stored .fp files - 22 match, 316 do not, and of the 8
+rem programs on this run's own fpother census that have ucode on disk, 7 match and the
+rem 8th is a 1-instruction program that samples nothing. Every match reports scale 2.0.
+rem THE READING on "Remix live:":
+rem   fpdeep=P/D    P = programs the deep search named, D = draws they account for.
+rem                 EXPECT P around 20-40 and D in the MILLIONS. P>0 D=0 means the
+rem                 programs classify but never reach a textured draw.
+rem   fpclass=a/b/c b (the modulate program count) must jump; it was 2/1/0 last run.
+rem   vcol_mod=     was 10,280 of 5,392,256 submitted (0.19%%). This is the number that
+rem                 has to move by orders of magnitude.
+rem   mesh_created= was 402,758. Vertex colour is in the mesh key, so expect ONE bounded
+rem                 re-creation of every world mesh. If it climbs without limit, an
+rem                 ANIMATED vertex colour is minting a mesh per step - report it.
+rem PRE-REGISTERED REFUTATION: if surfaces come out visibly WRONG-COLOURED rather than
+rem   merely darker, this is round 8's RETRYUNSUP repeating and the knob goes back to 0.
+rem   "Darker" is expected and is the fix; "wrong hue" is the failure.
+rem REVERT: set "RPCS3_REMIX_FPVCOLDEEP=0" - one line, restores round 41 bit-exactly.
+set "RPCS3_REMIX_FPVCOLDEEP=1"
+rem The brightness lever, and the ONE thing most likely to need a second pass.
+rem Remix's Modulate factor is an 8-bit unorm, so the ucode's x2 cannot be represented
+rem above 0.5 and the fold saturates there. Folding it is still the faithful reading: under
+rem the x2 convention 0.5 is the UNLIT-NEUTRAL value, so replaying COL0 raw would land every
+rem surface at half the guest's shading.
+rem   MIND THE DIRECTION: 1 is the BRIGHTER setting and 0 is the DARKER one. The submitted
+rem     factor is min(1, COL0 x 2) at 1 and plain COL0 at 0, and COL0 is at most 1, so BOTH
+rem     settings can only darken relative to today's no-modulate factor of 1.0.
+rem   STILL WHITE / washed out, or flat white patches where the x2 clips -> set
+rem     "RPCS3_REMIX_FPVCOLDEEPSCALE=0" to replay COL0 raw, which halves the factor.
+rem   TOO DARK everywhere -> you are already at the brightest this knob offers. The ceiling is
+rem     the 8-bit unorm Modulate factor, not this knob; report it and revert FPVCOLDEEP.
+rem Only ever applied to RGB: the ucode copies the alpha lane across UNSCALED ("MOV R1.w,
+rem H1"), so folding it into alpha would invent an opacity the guest never computes.
+set "RPCS3_REMIX_FPVCOLDEEPSCALE=1"
+rem
+rem === ROUND 43b: THE WHITE WALLS ARE A HEIGHT MAP BOUND AS THE ALBEDO ========
+rem Round 42's vertex-colour work was correct AND could never have fixed these walls.
+rem MEASURED on the round-42 build: every draw of all five hashes reports
+rem class=vcol_modulate replay=1 with vcol0=FEFEFE - the replayed factor is NEUTRAL
+rem WHITE, because the guest's COL0 byte is 0x7F, the unlit-neutral value in the 0..2
+rem convention. Multiplying by 1.0 cannot darken anything.
+rem
+rem The fault is one texture unit up. From that run's stats line:
+rem   tex_albedo_ucode = 0        tex_albedo_guess = 7,383,877
+rem The ucode albedo discriminator did not resolve ONE draw in 41,802 flips. It
+rem declines whenever colour_mask == referenced and the backend then takes the LOWEST
+rem referenced unit. On fp=65a91390aaf6bef3 - the program on the picked white wall
+rem 9AAA430414B3D49D - that is tex0, a PARALLAX HEIGHT MAP sampled into ONE channel
+rem and used only to perturb a UV. The real diffuse is tex1, sampled into all four:
+rem
+rem    9: TEX R2.x   TEX2, tex0     one channel   - elected today
+rem   18: ADD R4.xy  TEX2, R2                     - used as a UV perturbation
+rem   24: TEX R2     R4,   tex1     four channels - the real diffuse
+rem
+rem A near-white greyscale height map bound as albedo IS a white wall.
+rem
+rem ARMED: drop units that CANNOT carry RGB - every sample of them writes fewer than
+rem three destination channels. Structural, not a heuristic: the channels are not there.
+rem
+rem *** THIS REPLACES RPCS3_REMIX_FPALBEDOKILL, WHICH IS GONE FROM THE BUILD. *** That
+rem knob reached the same answer on this wall but re-elected 36 programs, 16 of them onto
+rem a unit 8 or higher, and the play-test came back as full-screen coloured static at 32
+rem fps. It also set unit_from_ucode, which silently unblocked a retry walk that had never
+rem once been able to run on this title - two large changes at once. This rule does neither.
+rem
+rem PRE-REGISTERED OFFLINE over all 338 .fp files in bin\remix_ucode\ BEFORE the build:
+rem   323 sampled programs; 202 saturate today; this rule narrows 178 of them, but
+rem   changes the ELECTED UNIT of only THREE - and all three go unit 0 to unit 1.
+rem   NONE elects a unit above 1.   (the kill: 36 changed, 16 of them to unit 8+)
+rem   fp=65a91390aaf6bef3: mask 0x1f to 0x16, unit 0 to 1 - identical to the kill's
+rem   answer on the one case that was actually verified.
+rem
+rem CONTAINED TWICE in albedo_unit_mask(): the narrowed mask must name a unit the backend
+rem can BIND, and it must elect a DIFFERENT unit from the one taken anyway - otherwise
+rem 'referenced' is returned untouched. So the 175 programs that narrow without moving
+rem their election are bit-exact, and the retry walk is never confined for them.
+rem
+rem READ ON 'Remix live:' / 'Remix stats:'
+rem   tex_albedo_narrow above 0        - it moved that many draws. It is a subset of
+rem                                      tex_albedo_GUESS, not of tex_albedo_ucode:
+rem                                      unit_from_ucode is deliberately NOT set.
+rem   tex_albedo_narrow = 0            - it moved nothing. Check fpalbedonarrow=1 on the
+rem                                      banner before assuming it is broken.
+rem   tex_none / notex_mat_applied climbing hard - surfaces losing texture. Revert.
+rem   Ctrl+Click a wall: 'Remix picked:' albedo_unit= should read 1, not 0.
+rem
+rem PRE-REGISTERED REFUTATION: full-screen noise like last time, or an obviously wrong
+rem image (a normal map's blue, a lightmap), means the re-election is still wrong even at
+rem three programs. Report which surface and revert.
+rem
+rem REVERT: set "RPCS3_REMIX_FPALBEDONARROW=0" - one line, round 42 bit-exactly.
+set "RPCS3_REMIX_FPALBEDONARROW=1"
 rem
 rem === THE SELVA CANOPY ========================================================
 rem A third matcher pass, tried LAST, for a fused group whose row scalars read

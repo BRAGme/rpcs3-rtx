@@ -7943,6 +7943,23 @@ namespace remix_rsx
 		return value;
 	}
 
+	// --- ROUND 42 ------------------------------------------------------------------------------
+	// Default 0. See the doc block on the declaration for the four ucode listings this is designed
+	// from and for the pre-registered refutation.
+	bool fp_vcol_deep_enabled()
+	{
+		static const bool value = env_u32(L"RPCS3_REMIX_FPVCOLDEEP", 0) != 0;
+		return value;
+	}
+
+	// Default 1, and only reachable at all when the knob above is on - out_vcol_scale stays 1.0
+	// unless the deep search set it, so this cannot alter a program the terminal classifier named.
+	bool fp_vcol_deep_scale_enabled()
+	{
+		static const bool value = env_u32(L"RPCS3_REMIX_FPVCOLDEEPSCALE", 1) != 0;
+		return value;
+	}
+
 	fp_fingerprint scan_fragment_program(const void* ucode, u32 ucode_length, bool fp32_outputs)
 	{
 		fp_fingerprint result{};
@@ -8214,6 +8231,33 @@ namespace remix_rsx
 		{
 			result.colour_mask = static_cast<u16>(walk(0xf) & result.sampled_mask);
 			result.alpha_only = result.colour_mask != 0;
+		}
+
+		// --- ROUND 43b: units too NARROW to be a colour ------------------------------------------
+		// See fp_fingerprint::narrow_sample_mask for the measurement. A texture unit every sample
+		// of which writes fewer than THREE destination channels cannot be carrying RGB - it is a
+		// height, gloss, mask or lookup map. Structural, not heuristic: the channels simply are
+		// not there.
+		//
+		// Conservative in the safe direction: a unit is kept the moment ANY sample of it writes
+		// three or more channels, so a program that reads one unit both ways keeps it.
+		{
+			u16 wide = 0;
+
+			for (const fp_instr& in : code)
+			{
+				if (!in.sample || !in.writes)
+				{
+					continue;
+				}
+
+				if (std::popcount(static_cast<u32>(in.write_mask & 0xf)) >= 3)
+				{
+					wide |= static_cast<u16>(1u << in.tex_num);
+				}
+			}
+
+			result.narrow_sample_mask = static_cast<u16>(result.sampled_mask & ~wide);
 		}
 
 		if (result.colour_mask == 0)
@@ -8615,6 +8659,248 @@ namespace remix_rsx
 			// instructions wrote the two halves, which is exactly the asymmetric case the two
 			// fields exist to keep visible.
 			result.out_vcol_attr = rgb_attr ? rgb_attr : alpha_attr;
+
+			// --- ROUND 42: the modulate is upstream, not terminal --------------------------------
+			// Runs only on the failing arm, only with RPCS3_REMIX_FPVCOLDEEP=1, and only after the
+			// terminal fields above are populated - so a deep-classified program still carries the
+			// 'Remix fpother:' shape that defeated the round-41 walk, and a program the terminal
+			// classifier named is never reconsidered. The design, the four ucode listings it is
+			// built from and the pre-registered refutation are on the declaration in the header.
+			if (rgb_class == fp_out_source::other && fp_vcol_deep_enabled())
+			{
+				// NOTE, from review: this block calls hop_copies, which writes through to
+				// 'hops_used'. It does NOT try to restore it. An earlier draft snapshotted
+				// hops_used here and wrote it back at the end, which restored nothing - the
+				// round-41 srckind census above ALSO calls hop_copies, so the snapshot was already
+				// post-census. 'result.out_rgb_hops' is assigned once, above, from the terminal
+				// walk's own value and is never touched again; 'hops_used' is dead from that point
+				// on, so nothing here can corrupt the census.
+
+				// A source operand that is an unmodified read of COL0 (ATTR1). ATTR2/COL1 is
+				// EXCLUDED by measurement: these very programs carry the packed tangent-space
+				// normal there ('MAD H7.xyz, H7, {2,-1}' then NRM), so accepting it would replay a
+				// normal map as a colour.
+				const auto is_col0_operand = [&](const fp_instr& in, u32 s) -> bool
+				{
+					return in.src_type[s] == RSX_FP_REGISTER_TYPE_INPUT
+						&& in.attr_reg == 1
+						&& in.src_swizzle[s] == identity_swizzle
+						&& !(in.src_neg & (1u << s))
+						&& !(in.src_abs & (1u << s));
+				};
+
+				// Follows a temp backwards to a clean COL0 read through nothing but BROADCAST
+				// constant scales, returning their product. -1 when the chain is anything else.
+				// Broadcast (all three rgb swizzle lanes equal) is required so a per-channel
+				// constant - a tint, of which these programs contain several - cannot be collapsed
+				// into one scalar. Three steps is the measured depth plus one.
+				const auto col0_chain_scale = [&](u8 reg, u32 before) -> f32
+				{
+					f32 scale = 1.f;
+					u8 target = reg;
+					u32 cursor = before;
+
+					for (u32 step = 0; step < 3; ++step)
+					{
+						const s32 w = hop_copies(last_writer(target, 0x7, cursor), 0x7);
+
+						if (w < 0)
+						{
+							return -1.f;
+						}
+
+						const fp_instr& in = code[w];
+
+						if (!in.writes || !(in.exec_lt && in.exec_eq && in.exec_gr))
+						{
+							return -1.f;
+						}
+
+						// The chain's root: 'MOV rX, COL0'.
+						if (in.opcode == RSX_FP_OPCODE_MOV && is_col0_operand(in, 0))
+						{
+							return scale;
+						}
+
+						// The only step this walks through: 'MUL rX, <src>, <inline constant>'.
+						if (in.opcode != RSX_FP_OPCODE_MUL || !in.has_constant)
+						{
+							return -1.f;
+						}
+
+						u32 kslot = 2;
+
+						for (u32 s = 0; s < 2; ++s)
+						{
+							if (in.src_type[s] == RSX_FP_REGISTER_TYPE_CONSTANT)
+							{
+								kslot = s;
+								break;
+							}
+						}
+
+						if (kslot > 1)
+						{
+							return -1.f;
+						}
+
+						const u8 ksw = in.src_swizzle[kslot];
+						const u32 lane_x = u32{ksw} & 3u;
+
+						if (lane_x != ((u32{ksw} >> 2) & 3u) || lane_x != ((u32{ksw} >> 4) & 3u))
+						{
+							return -1.f;
+						}
+
+						const f32 k = in.constant[lane_x];
+
+						if (!std::isfinite(k) || k <= 0.f)
+						{
+							return -1.f;
+						}
+
+						scale *= k;
+
+						const u32 other = 1u - kslot;
+
+						if (in.src_swizzle[other] != identity_swizzle
+							|| (in.src_neg & (1u << other))
+							|| (in.src_abs & (1u << other)))
+						{
+							return -1.f;
+						}
+
+						if (is_col0_operand(in, other))
+						{
+							return scale;
+						}
+
+						if (in.src_type[other] != RSX_FP_REGISTER_TYPE_TEMP)
+						{
+							return -1.f;
+						}
+
+						target = in.src_reg[other];
+						cursor = static_cast<u32>(w);
+					}
+
+					return -1.f;
+				};
+
+				// The same backward reachability 'walk' above uses for colour_mask, restricted to
+				// the instructions AFTER 'from' - i.e. "does the value written at 'from' still
+				// reach COL0.rgb". No kill, so it is an over-approximation in the safe direction:
+				// it can only ever say a register reaches the output when it might not, never the
+				// reverse, and the alternative - refusing a real modulate because a later
+				// conditional write was mistaken for a redefinition - is the failure mode that
+				// costs pixels.
+				const auto reaches_output = [&](u32 from, u32 reg, u8 mask) -> bool
+				{
+					std::array<u8, s_fp_reg_count> live{};
+					live[out_reg] = 0x7;
+
+					for (u32 round = 0; round < 8; ++round)
+					{
+						bool changed = false;
+
+						for (u32 i = static_cast<u32>(code.size()); i-- > from + 1;)
+						{
+							const fp_instr& in = code[i];
+
+							if (!in.writes || !(live[in.dest] & in.write_mask))
+							{
+								continue;
+							}
+
+							for (u32 s = 0; s < in.source_count; ++s)
+							{
+								if (!(in.source_valid & (1u << s)))
+								{
+									continue;
+								}
+
+								if (live[in.source[s]] != 0xf)
+								{
+									live[in.source[s]] = 0xf;
+									changed = true;
+								}
+							}
+						}
+
+						if (!changed)
+						{
+							break;
+						}
+					}
+
+					return (live[reg] & mask & 0x7) != 0;
+				};
+
+				// Latest match wins: a program that modulates twice (a base layer and a detail
+				// layer) has its final colour built by the later one, and the earlier is already
+				// folded into it.
+				for (u32 i = static_cast<u32>(code.size()); i-- > 0;)
+				{
+					const fp_instr& in = code[i];
+
+					if (in.opcode != RSX_FP_OPCODE_MUL || !in.writes || !(in.write_mask & 0x7))
+					{
+						continue;
+					}
+
+					if (!(in.exec_lt && in.exec_eq && in.exec_gr) || in.source_count < 2)
+					{
+						continue;
+					}
+
+					f32 scale = -1.f;
+
+					for (u32 s = 0; s < 2 && scale < 0.f; ++s)
+					{
+						const u32 other = 1u - s;
+
+						// One operand must be the sampled albedo.
+						if (in.src_type[s] != RSX_FP_REGISTER_TYPE_TEMP
+							|| in.src_swizzle[s] != identity_swizzle
+							|| (in.src_neg & (1u << s))
+							|| (in.src_abs & (1u << s)))
+						{
+							continue;
+						}
+
+						const s32 tex_writer = hop_copies(
+							last_writer(in.src_reg[s], 0x7, i), 0x7);
+
+						if (tex_writer < 0 || !code[tex_writer].sample)
+						{
+							continue;
+						}
+
+						// The other must be COL0, directly or through broadcast constant scales.
+						if (is_col0_operand(in, other))
+						{
+							scale = 1.f;
+						}
+						else if (in.src_type[other] == RSX_FP_REGISTER_TYPE_TEMP
+							&& in.src_swizzle[other] == identity_swizzle
+							&& !(in.src_neg & (1u << other))
+							&& !(in.src_abs & (1u << other)))
+						{
+							scale = col0_chain_scale(in.src_reg[other], i);
+						}
+					}
+
+					if (scale > 0.f && reaches_output(i, in.dest, in.write_mask))
+					{
+						result.out_rgb_source = fp_out_source::vcol_modulate;
+						result.out_vcol_attr = 1;
+						result.out_rgb_deep = true;
+						result.out_vcol_scale = scale;
+						break;
+					}
+				}
+
+			}
 		}
 
 		return result;
@@ -9490,6 +9776,18 @@ namespace remix_rsx
 		// env_u32 rather than env_flag, same reason texcoord_from_ucode gives: the useful setting is
 		// the off one.
 		static const u32 value = env_u32(L"RPCS3_REMIX_FPALBEDO", 1);
+		return value != 0;
+	}
+
+	bool fp_albedo_narrow_enabled()
+	{
+		// ROUND 43b. Let albedo_unit_mask() drop units that cannot carry RGB
+		// (fp_fingerprint::narrow_sample_mask) when colour_mask saturates and therefore resolves
+		// nothing. Only ever consulted on the path that already declined, AND only when dropping
+		// them actually changes which unit is elected - so =0 restores round 42 bit-exactly, and
+		// so does =1 for every draw whose elected unit is unaffected.
+		// env_u32, not env_flag: the useful setting is the off one.
+		static const u32 value = env_u32(L"RPCS3_REMIX_FPALBEDONARROW", 1);
 		return value != 0;
 	}
 
@@ -12517,6 +12815,18 @@ namespace remix_rsx
 		// relaunch that has to bring the symptom back for the attribution to mean anything.
 		static const u32 value = env_u32(L"RPCS3_REMIX_ANCHORSTICKY", 1);
 		return value != 0;
+	}
+
+	u32 gauge_donor_max_translation()
+	{
+		// ROUND 44. Whole world units, 0 = OFF and OFF is byte-for-byte round 43. Same idiom and
+		// same units as RPCS3_REMIX_WORLDIDMAXT, deliberately: this is the SAME verdict that knob
+		// already applies at the submit site, applied at the capture site as well.
+		//
+		// env_u32, not env_float: 0 has to mean OFF and be reachable, and env_float treats any
+		// non-positive value as unset.
+		static const u32 value = env_u32(L"RPCS3_REMIX_GAUGEDONORMAXT", 0);
+		return value;
 	}
 
 	bool vertex_colour_bgra_enabled()

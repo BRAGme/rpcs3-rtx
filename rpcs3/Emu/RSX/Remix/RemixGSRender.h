@@ -88,6 +88,15 @@ private:
 		std::unordered_map<u32, u32> vertex_lookup;
 		std::unordered_set<static_triangle, static_triangle_hash> triangles;
 		std::unordered_set<usz> submitted_signatures;
+		// ROUND 44, diagnostic. The mesh hash the LAST submission under this entry actually
+		// carried. submitted_signatures keys on the instance transform, the category flags,
+		// doubleSided and the blend state and on NOTHING about which geometry the draw covers -
+		// so on a title that bakes world geometry in world space, where every tile shares the
+		// identity transform, all of a frame's tiles collide on one signature and only the first
+		// submits. That is correct if and only if the union mesh the first one carried already
+		// held every tile. This field is what lets the suppression be split into "same mesh,
+		// genuinely redundant" and "DIFFERENT mesh, geometry silently discarded".
+		u64 last_submitted_mesh_hash = 0;
 		u64 mesh_hash = 0;
 		u64 submit_frame = umax;
 		bool dirty = false;
@@ -420,8 +429,33 @@ private:
 		// referenced enabled 2D unit. The two sum to the draws that had any unit at all. A high
 		// guess count on a title with two-unit materials means the walk in scan_fragment_program
 		// is not following that title's shaders, not that the units are unambiguous.
+		// ROUND 43. Sign of the submitted instance transform's 3x3 determinant, over every
+		// instance that reached DrawInstance. xform_mirrored counts REFLECTIONS - the geometry is
+		// handed to the tracer inside-out, so its texture reads mirrored and its shading comes
+		// from the wrong side. xform_degenerate counts det == 0 or NaN, a collapsed frame, which
+		// is a different fault. READING THEM: xform_mirrored == 0 kills the reflection hypothesis
+		// for the black voids outright and the next round looks elsewhere; anything else, and the
+		// det= field on 'Remix picked:' names the surfaces.
+		u64 xform_measured = 0;
+		u64 xform_mirrored = 0;
+		u64 xform_degenerate = 0;
 		u64 tex_albedo_ucode = 0;
 		u64 tex_albedo_guess = 0;
+		// ROUND 43b. Draws whose elected albedo unit changed because units that cannot carry RGB
+		// were dropped (fp_fingerprint::narrow_sample_mask). A subset of tex_albedo_GUESS, not of
+		// tex_albedo_ucode: this rule leaves unit_from_ucode false on purpose, so the retry policy
+		// is unchanged and these draws are still counted as guesses.
+		//
+		// It counts only draws the rule actually MOVED. Every draw where dropping the narrow units
+		// would have elected the same unit returns 'referenced' untouched and is not counted, so
+		// this number is the exact size of the behavioural delta - expect it small and bounded:
+		// offline, only 3 of 323 programs re-elect, all of them unit 0 -> unit 1.
+		//
+		// READING IT: 0 means the rule never moved a draw. That is a real possibility and NOT the
+		// same as "it is broken" - check fpalbedonarrow=1 on the banner first, then whether the
+		// containment tests in albedo_unit_mask (no bindable unit, or the same unit either way)
+		// are what declined.
+		u64 tex_albedo_narrow = 0;
 		// Retries the ucode refused to sanction: the first unit yielded no material and the program
 		// named no *other* colour source to walk to. Before this refusal existed the loop walked to
 		// the next referenced unit regardless, which on Resistance 2 (NPEA00431) is unit 1 - 566
@@ -1178,6 +1212,17 @@ private:
 		// the submitted vertex - named rather than silently replayed from the wrong data.
 		u64 fp_vcol_col1 = 0;
 
+		// --- ROUND 42 ---------------------------------------------------------------------------
+		// fp_vcol_deep: PROGRAMS the deep modulate search classified that the terminal instruction
+		// could not - a strict subset of fp_vcol_mod. vcol_deep_applied: the DRAWS those programs
+		// account for, counted where vcol_mod_applied is. The pair is what says whether the
+		// widening reached, and how much of the screen it reached: fp_vcol_deep counts shapes,
+		// vcol_deep_applied counts pixels' worth of them. Both 0 with fpvcoldeep=1 on the banner
+		// means the search ran and matched nothing, which is a different failure from not running.
+		// RPCS3_REMIX_FPVCOLDEEP=0 drives both to 0.
+		u64 fp_vcol_deep = 0;
+		u64 vcol_deep_applied = 0;
+
 		// Vertex programs whose raw ucode was written to bin\remix_ucode\ because their position
 		// decode was refused. Once per program per run. RPCS3_REMIX_UCODESTORE=0 drives it to 0.
 		u64 ucode_stored = 0;
@@ -1221,6 +1266,32 @@ private:
 		u64 gauge_anchor_parked = 0;
 		u64 gauge_anchor_recaptured = 0;
 		u64 gauge_anchor_promoted = 0;
+
+		// ROUND 44, RPCS3_REMIX_GAUGEDONORMAXT. Two counters, deliberately not one.
+		// offside: a WORLDIDENTITYVP candidate whose own placement against the gauge the slot
+		//          already holds exceeds the threshold. Counted WHETHER OR NOT the knob is armed,
+		//          so a run with GAUGEDONORMAXT=0 still reports how large the population is. Three
+		//          previous rounds each shipped a counter that could only ever read one way; this
+		//          is the guard against a fourth.
+		// refused: the subset actually turned away, i.e. offside AND the knob armed AND not on
+		//          RPCS3_REMIX_WORLDIDMAXTEXEMPTVP AND the slot had a gauge to judge against.
+		// offside > 0 with refused == 0 means the knob is off, NOT that the mechanism is absent.
+		u64 gauge_donor_offside = 0;
+		u64 gauge_donor_refused = 0;
+
+		// ROUND 44, diagnostic only, no knob and no pixel effect.
+		// dedup:    draws suppressed by the static-index submit-signature gate. It has never had
+		//           a counter, and it sits between ++xform_measured and ++draws_submitted as the
+		//           only exit besides the poisoned-mesh one - so on the round-43 build its size
+		//           was already implied: xform_measured 8,569,414 - draws_submitted 7,944,541
+		//           - poisoned 0 = 624,873 draws, 7.29% of everything that resolved a mesh.
+		// meshdiff: the subset where the mesh this draw had selected is NOT the mesh already
+		//           submitted under that signature. Those are the ones where a strictly larger
+		//           union was built and thrown away. THIS is the number round 45 needs: near 0
+		//           means the collapse is benign and the checkerboard is elsewhere; large means
+		//           the floor is being drawn from a partial union every frame.
+		u64 static_submit_dedup = 0;
+		u64 static_submit_meshdiff = 0;
 
 		// Draws whose ALPHA halves of the FPVCOL replay were withheld because the guest consumes
 		// no fragment alpha (blend and alpha test both off). Round 9 replayed alpha there
@@ -1749,7 +1820,12 @@ private:
 	// a colour source *and* excluded at least one other referenced unit - i.e. it discriminated.
 	// A program that reaches COL0 from every unit it samples has told the caller nothing, so it is
 	// reported as a guess and the retry loop stays shut.
-	u32 albedo_unit_mask(bool* from_ucode = nullptr) const;
+	//
+	// ROUND 43b: 'from_narrow' reports that colour_mask saturated and the answer came from
+	// dropping units that cannot carry RGB (fp_fingerprint::narrow_sample_mask). It does NOT
+	// imply from_ucode and must not be made to - see the note at the return site for why the
+	// retry policy is deliberately left alone.
+	u32 albedo_unit_mask(bool* from_ucode = nullptr, bool* from_narrow = nullptr) const;
 
 	// Lowest enabled 2D fragment texture unit in 'mask' at or above 'skip_below', or -1.
 	int albedo_texture_unit_in(u32 mask, u32 skip_below) const;
@@ -2768,6 +2844,10 @@ private:
 		f32 extent = 0.f;
 		f32 origin[3]{};
 		f32 basis[3]{};
+		// ROUND 43. The 3x3 determinant of the same transform. basis[] above is three row NORMS
+		// and therefore cannot distinguish an identity from a reflection; this can. Negative means
+		// the instance was submitted mirrored.
+		f32 det = 0.f;
 		f32 camera_position[3]{};
 		// ROUND 30. The eye in origin='s OWN frame - the gauge anchor's - captured at the same submit
 		// as camera_position so one pick line carries both and 'Remix picked:' stops being the field
@@ -2936,6 +3016,15 @@ private:
 		// a half-written pair can never be followed.
 		std::atomic<u64> follow_vp{0};
 		std::atomic<u64> follow_albedo{0};
+		// ROUND 44. The clicked record's vertex count, published alongside the pair because
+		// (vp, albedo) DOES NOT IDENTIFY AN OBJECT. Haze draws a tiled prefab as many separate
+		// instances of one mesh sharing one texture, so the old two-term match followed
+		// "whichever tile was submitted first this frame" and its d_origin was the distance
+		// between two DIFFERENT tiles, not one tile's motion. Measured: E40BF80AF519848A alone
+		// carries 42 distinct raw vertex boxes across 41 distinct vertex counts on one program,
+		// and the "jumps" it reported were lattice steps between neighbouring tiles.
+		// Stored before generation, like the pair, so a half-written set can never be read.
+		std::atomic<u32> follow_vertex_count{0};
 		std::atomic<u64> follow_generation{0};
 
 		// Clicks that produced at least one identified object. Lives here rather than in the stat
@@ -2985,6 +3074,7 @@ private:
 	u64 m_pick_follow_generation = 0;
 	u64 m_pick_follow_vp = 0;
 	u64 m_pick_follow_albedo = 0;
+	u32 m_pick_follow_vertex_count = 0;
 	u64 m_pick_follow_until_frame = 0;
 	u64 m_pick_follow_last_frame = umax;
 	u32 m_pick_follow_lines = 0;

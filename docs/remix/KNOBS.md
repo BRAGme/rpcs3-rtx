@@ -67,6 +67,7 @@ an `Emu/system_config.h` entry, the config default is what is listed.
 | `RPCS3_REMIX_CAMCLIPGATE` | `1` (on) | **The far-away "portal" frames, closed structurally (round 10).** With a camera lock configured, a candidate whose surface clip is neither the same as, nor exactly double, nor exactly half the session main-clip reference is refused before the vote. Haze's **lock program itself draws the 2048x2048 shadow pass**, so the shadow variant was a legitimate *primary* candidate: `Remix cam-elect: vp=7f3d3abcefc8b057 surf=0x0 clip=2048x2048 src=resolved candidates=17 cam=[-35.4 31.95 -32.05] frame=23022` -- it won at frame 23022 with the camera 30 units above a player whose gameplay frames read y=1.6-2.5 and held for ~1400 frames, and one cutscene run's tally of elected identities reads 10x `7f3d @512x288`, 8x `ad7c @1024x576`, **2x `7f3d @surf=0x0 2048x2048`**. The rule is the same same/double/half `compatible_surface` test the world-draw path already trusts at the `skip_camera_surface` site, lifted one level up so it decides which candidate may be *elected* rather than only which draws may follow one: against a 1024x576 reference, 2048x2048 fails (2048 = 2x1024 but 2048 != 2x576) while 512x288 and 1024x576 pass. The reference is the **session** main clip (textured draws only, so a material-less shadow map can never define it), falling back to the per-frame latched main clip and then to the active camera's own clip; with none of the three available every candidate is admitted, because a boot frame must not be camera-less. Placed at the head of `consider_camera_candidate`, so the split-failure recovery path inherits it rather than routing around it. Counter `cam_clipgate_refused`; census `Remix cam-clipgate:` names every (vp, clip) it refuses, bounded 16 per window. `0` restores today's admission bit-exactly. | |
 | `RPCS3_REMIX_CAMFBRELATCH` | `1` (on) | **The dev-menu camera-type flicker (round 10).** When the active camera is the lock program's and the frame's winner is a *fallback*-program candidate that is pose-continuous with it, the elected **identity stays the lock** and only the **matrices** are taken from the candidate that actually drew. Haze's lock `7F3D3ABCEFC8B057` stops producing candidates for stretches (its matrices become unsplittable near the vertical view, and the split-failure recovery additionally requires the surface to match the *active* camera's, so once the election has flipped away the recovery is locked out); `AD7CE9D672A0BF6B` then wins, and because the two express the same pose on different surfaces (positions within 0.2 units), `camera_source_changed` treated every handover as a full identity change needing 12 confirm frames. Measured: 11 `cam-elect` lines in one run alternating exactly those two identities, flips >=40 frames apart, `candidates=1` throughout -- which the lock filter *guarantees* in either outcome and therefore does **not** mean only one pass drew. Implemented by rewriting `m_frame_candidate` rather than short-circuiting the machinery, so the ordinary latch installs it, the source-change test sees no change and the age resets. Guarded exactly as the mid-frame relatch is (`archetype`, `has_reference`, `group_count`, view within the discontinuity tolerance, projection within 1e-2), so a genuinely different lens falls through to today's confirm-and-switch. Counter `cam_fb_relatch`; the visible test is `cam-elect` going quiet. `0` restores the flicker. | |
 | `RPCS3_REMIX_ANCHORSTICKY` | `1` (on) | **Selva's "geometry follows the camera" and the carrier/cargo split (round 10).** Elects the per-key gauge anchor by **continuity with its own previous frame** instead of by draw order. `capture_gauge_anchor` is first-draw-wins per (surface, target, clip); `gauge_contested` read 462,080 mid-session and 550,394 at close-out (vs ~0 in prior runs) and **all 61 `Remix gauge-contested:` lines in the Selva run are one pair on the main key**: holder `BD1C10DF5703E559` -- a genuine identity-world donor (absolute world-span strips, x from -1373 to +1113; a `worldvp` probe shows its divided world = identity to 1e-15) -- against contender `AD7CE9D672A0BF6B`, which is also on `WORLDIDENTITYVP` but submits **non-identity** draws here (deltas 1.7-7.4 drifting over time: a moving object). While BD1C draws first the tripwire correctly refuses AD7C; on frames where BD1C is culled, first-draw-wins hands AD7C the slot and `world = fused x wrong_ref^-1` leaves a camera-correlated residue on every draw -- geometry tracks the viewpoint while the sun (a Remix light, world-anchored by the runtime) stays put -- while draws issued before the frame's first identity draw divide by the *previous* frame's anchor, putting two references in one frame. With the knob on, a frame's first same-key donor that disagrees beyond the discontinuity tolerance is **parked**, a later continuous donor installs and displaces it, and any key that saw no continuous donor all frame **promotes** its parked candidate at flip -- so a real cut converges in exactly one frame and cannot be held. In the gap the divide's existing previous-frame anchor path and `GAUGECAMHOLD` cover lookups, which is today's behaviour for anchor-less frames. The contested tripwire is untouched. Counters `anchor_parked` / `anchor_recap` / `anchor_promoted`; census `Remix anchor-elect:` fires whenever a key changes holder, and `Remix gauge-contested:` now also carries `vpscale=`/`vpoffset=`/`cont=`. `0` restores first-draw-wins bit-exactly. | |
+| `RPCS3_REMIX_GAUGEDONORMAXT` | `0` (off) | **Round 44 -- round 30's specified-but-never-shipped fix, and the one knob of that round that changes pixels.** Whole world units. `WORLDIDENTITYVP` drives **two** gates and only `WORLDIDMAXT` ever learned about a threshold: at submit, `keep_resolved` sees a draw 900 units from the origin and correctly keeps its real transform; at capture, `capture_gauge_anchor()` (`RemixGSRender.cpp:1810`) has already installed that same fused matrix as the **whole frame's world gauge**, qualified on the vp-hash list alone -- it never looks at the translation. When non-zero, a candidate whose own placement (probed as `fused * slot->inverse`, translation read from row 3 after dividing out `m[3][3]` -- character for character `report_gauge_trace()`'s own measurement, so this and `Remix gauge: translation=` are the same number) exceeds this may keep its transform at submit but may **not** donate the gauge. **MEASURED, round 44:** of 759 `Remix worldid-draw:` frames carrying two or more rows, **559 have every row reporting one identical pre-translation, bit for bit across unrelated meshes** (`f=53640`: `vtx=160`, `vtx=224`, `vtx=518` all read `t=[1.579 -132.9 -2.179]`) -- guest motion cannot do that. `Remix gauge: translation=` over 17,386 frames has mean **41.99**, max **1718.67**, and exceeds 128 units on **7.36%** of frames. `E40BF80AF519848A`'s raw vertex box never moves (30 of 36 mesh identities exactly `0.0000` over spans up to 14,500 frames) while its transform swings 0 -> 21.75 -> 966.5. **`ANCHORSTICKY` does not already cover this**: its test is `matrix_relative_delta <= 0.8`, a *relative* whole-matrix measure, and a donor 21.75 units off the origin scores nowhere near 0.8. Sticky asks *did the gauge change*; this asks *is the gauge wrong*, and a stably-wrong gauge is perfectly continuous. **Cannot starve the slot:** `AD7CE9D672A0BF6B` puts 2,486,813 of 3,316,291 draws (75.0%) at `|t| <= 1` and only 242,939 (7.3%) above 32. Programs on `WORLDIDMAXTEXEMPTVP` are exempt for the same reason they are there. An offside donor is **parked**, not dropped, so `promote_parked_anchors()` still converges a scene cut in one frame -- a bare `return` would lock the slot out permanently, and `anchor_parked` therefore rises. Counters `gauge_donor_offside` (counted **whether or not the knob is armed**, so an unarmed run still sizes the population) and `gauge_donor_refused`. Watch `gauge_absent` -- if it rises much above 295,391 the gate starved the slot. `0` restores round 43 byte for byte. |  |
 
 ## Geometry and world placement
 
@@ -123,7 +124,7 @@ an `Emu/system_config.h` entry, the config default is what is listed.
 | name | default | effect | in GUI |
 | --- | --- | --- | --- |
 | `RPCS3_REMIX_NOTEX` | off | Disable the whole texture workstream. | yes |
-| `RPCS3_REMIX_NOTEXMAT` | `1` (on) | **The untextured-population mitigation (round 6).** Attach a shared, lazily-created mid-grey material -- one 2x2 CPU texture through the synthetic `0x<hash>` path, albedo **0.5 linear** (byte 128 under UNORM, 188 under sRGB) -- to every draw that reaches submission with no albedo material, instead of submitting material-less. A material-less surface renders **white**: 41% of Haze's submitted draws are in that state (`tex_none=2,008,830` vs `tex_bound=2,879,211`), the warm guest lights turn that white beige/cream, and unlit beside a lit neighbour it reads black. One defect, three looks, and the worst thing on screen. Grey is the honest constant for an unknown colour -- it invents no texture. Only `surface.material` is redirected: the local `material` stays null through every heuristic (A2C/KIL replays, blend extension, sky and skip rules), so this changes exactly one thing. **Caveat:** an untextured draw that resolved the title's own ATTR3 colour (`vcol_applied`; Haze's sky dome) has that colour modulated by the material, so it comes out about half as bright -- if a vertex-coloured surface looks too dark, this knob is the sever. Counter: `notex_mat_applied`. `0` restores the material-less submit bit-exactly. | |
+| `RPCS3_REMIX_NOTEXMAT` | `1` (on) | **The untextured-population mitigation (round 6).** Attach a shared, lazily-created mid-grey material -- one 2x2 CPU texture through the synthetic `0x<hash>` path, albedo **0.5 linear** (byte 128 under UNORM, 188 under sRGB) -- to every draw that reaches submission with no albedo material, instead of submitting material-less. A material-less surface renders **white**. **CORRECTED, round 42:** the "41% of Haze's submitted draws are in that state (`tex_none=2,008,830` vs `tex_bound=2,879,211`)" claim this row used to carry is WRONG and was inherited for six rounds — that ratio is the albedo *walk's* failure rate, and 97.6% of `tex_none` is refused by a skip gate before submission. MEASURED on a 41,802-flip run: `notex_mat_applied=2,674` of `submitted=5,392,256`, i.e. **0.0496%**, and `tex_none` partitions exactly into skip + world + this. The knob still does what it says; it is just not covering a third of the screen. See "Round 42" TASK 0. One defect, three looks, and the worst thing on screen. Grey is the honest constant for an unknown colour -- it invents no texture. Only `surface.material` is redirected: the local `material` stays null through every heuristic (A2C/KIL replays, blend extension, sky and skip rules), so this changes exactly one thing. **Caveat:** an untextured draw that resolved the title's own ATTR3 colour (`vcol_applied`; Haze's sky dome) has that colour modulated by the material, so it comes out about half as bright -- if a vertex-coloured surface looks too dark, this knob is the sever. Counter: `notex_mat_applied`. `0` restores the material-less submit bit-exactly. | |
 | `RPCS3_REMIX_SKIPSHADOWONLY` | `1` (on) | **`SKIPAUXUNTEX`'s successor, with the term that actually discriminates.** Refuse as world geometry any draw that resolved no material, whose **every** eligible texture unit carries a `CELL_GCM_TEXTURE_DEPTH*` format, and whose render clip is *strictly smaller* than the main pass's. The measured shape: `Remix notex:` on disk reads `class=retry-refused reason=format unit=0 fmt=0xb2 dims=2048x2048 clip=512x288` on the half-res lighting passes (`33ae0895...`, `a41a18e1...`, `56cc5a96...`, `6004dce6...`) -- a 2048x2048 DEPTH16 shadow map as the only eligible unit. A draw whose entire sampler set is depth buffers has no albedo anywhere; it is a shadow projection or a lighting composite, and submitting it to a path tracer as a white surface *is* the flat-white wash. Its predecessor keyed on the absence of any eligible unit, which could never be true of that population. Main-clip shadow-only draws are **censused and left alone** this round. Counter: `skip_shadowonly`; census `Remix shadowonly:` names every (vp, fp) it touches with the sampled mask and both clips, so a widening cannot happen quietly. `0` restores submission. | |
 | `RPCS3_REMIX_MAINCLIPMAX` | `1` (on) | **Why `SKIPSHADOWONLY` reached only 4.7% of what it classifies (round 7).** Every "strictly smaller than the main pass" rule compares against `m_main_clip_area`, which is the **previous frame's** largest *textured* clip. On Haze that value oscillates -- `1024x576` on frames whose main world pass drew something textured, `512x288` on the many frames it did not -- and the half-res shadow/lighting passes are themselves `512x288`, so the test was `147456 < 147456`, false, on most frames. Measured over a 13,400-frame session: `tex_shadowonly=437,810` against `skip_shadowonly=20,656`; the 4.7% that got through are exactly the frames where the previous one happened to contain a textured `1024x576` draw. With this on, the comparison runs against the **largest textured clip seen this session** -- a property of the title rather than of the previous frame. The reference can only ever grow, so this can only widen such a rule, never narrow it. Both values are echoed as `mainclip=` and `maxclip=` on `Remix live:`; the reject partition is `so_nomain` / `so_notsmaller`. `0` restores the per-frame value exactly. | |
 | `RPCS3_REMIX_WALKSAMPLED` | `1` (on) | When the albedo walk is about to refuse to substitute a higher unit (the `tex_retry_refused` exit), step past the refused unit anyway -- but **only** to a unit named in the fragment program's own `sampled_mask` whose bound texture carries a **colour** format. That sampled-mask term is exactly what the old `RETRYUNSUP` widening lacked when it stepped onto units nothing sampled and painted character faces onto tree trunks; a unit the program provably samples, and which is not a depth buffer, is a colour source the program itself named. Counter: `tex_walk_sampled`; the population it draws from is `tex_colorunit`. `0` restores the refusal exactly. | |
@@ -1150,6 +1151,1037 @@ refutation has two independent derivations, not one.
   measured that the fragment program does not separate the weapon from the arms, and that finding was
   carried forward as "the fp does not partition the rig" — but it partitions the body from the rig
   perfectly. Re-test a rejected key against the new question.
+
+## Round 44 (2026-08-27) — the wobble is the DIVIDE GAUGE, and it is a per-frame global
+
+Deployed: `bin\rpcs3.exe` = `bin\rpcs3-next.exe` = **`14DD8282D86D298D`**. `bin\remix\d3d9.dll` **UNCHANGED at
+`16A0B512F33EBB66`** — nothing deployed into `bin\remix\`. `bin\rtx.conf` READ ONLY: never written.
+MSBuild `Release|x64` exit **0**, **0 errors, 1 warning** — the pre-existing C4723 "potential divide by
+0", now at `RemixGSRender.cpp:11562` (round 43 recorded 11456; this round's edits above that line moved
+it). **Zero new warnings.** HEAD `f091ff5a4` at both ends of the round; the tree did not move.
+
+**One knob changes pixels this round: `RPCS3_REMIX_GAUGEDONORMAXT=32`.** Everything else added is a
+counter or a print.
+
+---
+
+### THE HEADLINE: a wrong world gauge moves every instance in the frame TOGETHER
+
+**MEASURED**, from the session that ended 2026-08-27 10:27 (build `Aug 26 2026 10:50:47`, `flips=56381`),
+over all **12,779** `Remix worldid-draw:` lines:
+
+```
+frames carrying two or more rows ......................... 759
+  every row reports ONE identical pre-translation ........ 559   (73.6%)
+  rows disagree ...........................................200
+frames whose max |pre.t| > 1.0 ........................... 293
+```
+
+At `f=53640` three unrelated meshes — `vtx=160`, `vtx=224`, `vtx=518` — all carry
+`t=[1.579 -132.9 -2.179]`, identical to the last printed digit. At `f=5044`, `vtx=36` and `vtx=340` both
+carry `t=[2646 -539.5 -782.5]`. **No per-object guest motion can produce bit-identical translations on
+three different meshes in one frame.** In the 200 disagreeing frames the outlier is typically one
+genuinely moving prop while everything else shares one value.
+
+`Remix gauge:` corroborates it frame for frame — the same quantity, measured by
+`report_gauge_trace()` at `RemixGSRender.cpp:2560` as `anchor->fused * m_active_camera.reference_inverse`:
+
+| frame | `Remix gauge: translation=` | `worldid-draw` max `pre.t` component |
+| --- | --- | --- |
+| 48840 | 197.741 | 197.0 |
+| 52560 | 21.3542 | 21.67 |
+| 53640 | 132.275 | −132.9 |
+| 50764 | 916.247 | −937.5 |
+
+Run-wide over 17,386 `Remix gauge:` lines: **mean 41.99, max 1718.67, above 128 units on 7.36% of
+frames.** For a program the title declares submits absolute world vertices, every one of those numbers
+should be zero.
+
+And the object is not moving. `E40BF80AF519848A` — the teleporting light fixture, open for over a week —
+has a **raw vertex box that never moves**: of its 36 multi-sample mesh identities, **30 report exactly
+0.0000 displacement** over spans up to 14,500 frames, while `pre.t` on a bit-identical raw box
+(`vp=ad7ce9d672a0bf6b vtx=320 idx=480`, `rawcentre=[1702.385 -59.536 1037.805]` on all 19 samples) swings
+
+```
+f=50764  |t| = 966.5     basisdev = 0.5419
+f=50880  |t| = 3.7e-09   basisdev = 4.5e-13
+f=52560  |t| = 21.75     basisdev = 0.0181
+```
+
+**Raw box static + transform swinging 0 → 21.75 → 966.5 = ours, unambiguously.**
+
+### The cause: ONE declaration drives TWO gates and only one of them ever learned the threshold
+
+`WORLDIDENTITYVP` names the programs whose vertices are already in world space. It is read in two places:
+
+* **at submit**, `keep_resolved` (`RemixGSRender.cpp:20647`) measures the draw's discarded translation
+  against `RPCS3_REMIX_WORLDIDMAXT=32` and correctly says "900 units — this is not a world-identity
+  draw, keep its real transform". That is round 24's carrier fix and it is armed.
+* **at capture**, `capture_gauge_anchor()` (`RemixGSRender.cpp:1810`) has already run for that same draw,
+  earlier in the same submit, and installed that same fused matrix as **the whole frame's world gauge**.
+  Its only qualification, verified against current bytes at `:1811-1818`, is
+  `world_identity_vp_matches(m_current_vp_hash)`. **It never looks at the translation at all.**
+
+So the backend calls one draw "carrier-local" and "this is the world" in one frame for one reason.
+The launcher has recorded this diagnosis since round 30 and the fix was specified there and never shipped.
+
+**Why `ANCHORSTICKY` does not already cover it**, stated because it looks like it should: its test is
+`matrix_relative_delta(fused, slot->fused) <= s_camera_discontinuity_tolerance`, and that tolerance is
+**0.8** (`RemixGSRender.cpp:132`) on a *relative, whole-matrix* measure. A donor sitting 21.75 units off
+the world origin scores nowhere near 0.8 and installs silently. Sticky asks *did the gauge change*; this
+asks *is the gauge wrong*. **A stably-wrong gauge is perfectly continuous and passes sticky every frame.**
+The tripwire that does fire confirms the shape of the problem rather than fixing it — every
+`Remix gauge-contested:` line reads `holder_vp = contender_vp = ad7ce9d672a0bf6b`, **the same program
+contesting itself**, `delta=0.988881 tol=0.8`.
+
+### What shipped: `RPCS3_REMIX_GAUGEDONORMAXT` (whole world units, 0 = OFF = round 43 byte for byte)
+
+Round 30's specification, applied at the capture site. A `WORLDIDENTITYVP` candidate whose own placement
+— probed as `fused * slot->inverse`, translation read from row 3 after dividing out `m[3][3]`, character
+for character the measurement `report_gauge_trace()` makes, so the gate and `Remix gauge: translation=`
+are the same number — exceeds the threshold may keep its own transform at submit time but may **not**
+donate the frame's gauge.
+
+Four deliberate properties:
+
+* **It is placed below the contested tripwire's own return**, so a donor arriving after the frame's gauge
+  has landed still reaches that tripwire and `gauge_anchor_contested` is not silently deflated.
+* **An offside donor is PARKED, not dropped.** This is a correctness requirement, not tidiness: the probe
+  measures against the gauge the slot already holds, so on the frame after a scene cut *every* candidate
+  is legitimately far from the stale gauge. A bare `return` would refuse them all, leave nothing parked,
+  give `promote_parked_anchors()` nothing to install, and the slot would never recover — a permanent
+  lockout on the first hard cut. Parking reuses round 10's existing recovery verbatim.
+  **`gauge_anchor_parked` therefore rises; that is expected, and the round-43 baselines are 4,338 parked
+  and 18 promoted over 56,381 flips.**
+* **`WORLDIDMAXTEXEMPTVP` is honoured**, for exactly the reason it exists at the submit site.
+  `BD1C10DF5703E559` submits genuine absolute world spans and its census reads
+  `t=1412/4859/9/831` — 80% of its draws above 1 unit — so gating it would starve the slot.
+* **`gauge_donor_offside` is counted before the knob is consulted.** An unarmed run still reports the
+  population it would have refused. The last three rounds each shipped a counter that could only ever
+  read one way; this is the guard against a fourth.
+
+**It cannot starve the slot, and the census says so.** From the final `Remix worldid-census:` line
+(buckets are `|t|<=1 / 1..32 / 32..128 / >128`):
+
+```
+vp=ad7ce9d672a0bf6b draws=3316291 kept=242939 t=2486813/586539/2986/239953  tmax=2646.13 bmax=2.00231
+```
+
+**2,486,813 of 3,316,291 draws (75.0%) sit at |t| <= 1** and only 242,939 (7.3%) exceed 32, so at a
+threshold of 32 there are still 2.49M eligible donors on that program alone. (Round 25 measured 67% on a
+different level; this run measures 75.0%.) `kept = 242,939` equals buckets 2+3 (`2,986 + 239,953`)
+exactly, which is the arithmetic check that the buckets and the submit-site gate agree.
+
+---
+
+### THE INSTRUMENT THAT WAS LYING: `Remix pick-follow:` cannot see one object
+
+`trace_pick_follow()` matched on `(vp_hash, albedo_hash)` and printed the **first** matching draw of each
+frame (`RemixGSRender.cpp:1741`, `if (m_frame_counter == m_pick_follow_last_frame) return;`). On this
+title that is not an object. `E40BF80AF519848A` alone carries **42 distinct raw vertex boxes across 41
+distinct vertex counts** on one program — a tiled prefab drawn as many instances of one mesh under one
+texture. `d_origin` was therefore the distance between two **different tiles**, and it is an **L1** norm
+(`RemixGSRender.cpp:1756`, `+= std::abs(...)` per component), not Euclidean.
+
+**This retracts round 43's evidence.** Round 43 wrote *"per-frame instance-origin jumps of up to 8.16
+units, quantised at multiples of ~2.04"* and read the quantisation as jitter. Measured this round on
+`F312BA4706AA7162`, the "jumps" land on exactly three positions —
+`[3.1949 −1.1123 −4.0354]`, `[0.7553 −1.0691 −5.5999]`, `[5.6292 −1.1555 −2.4742]` — **evenly spaced on
+one line, step 2.899 units Euclidean, 4.047 in L1, and 8.10 for a double step.** That is the **tile
+pitch**, not a jitter. Round 43's other pick-follow claim, *"exactly 0.0000 on every identity-bypass
+one"*, also fails on this run: the identity-bypass objects read `d_origin` maxima of 8.12, 8.11 and 6.36.
+
+Worse, the one round ever pointed at `E40BF80AF519848A` fired its 181-frame follow during a window in
+which the camera was frozen for **all 191 frames** (`cam=[1786.56 −31.2314 1226.39]`, 191/191 identical),
+and `Remix gauge:` was a constant `translation=6.02944` throughout. `d_origin=0` for 181 consecutive
+frames is **what a parked camera looks like**, and it was read as proof of stability. That is why this
+object has stayed open for a week.
+
+**Fixed, diagnostic only, no pixels:** the follow now also matches the clicked record's `vertex_count`
+(published through `pick_state::follow_vertex_count`), and the line prints `vtx=`, `ext=` and `det=` so a
+reader can confirm the trace stayed on one mesh shape and can tell a size change from real motion.
+
+**Also re-pointed, launcher only:** `RPCS3_REMIX_TRACEALBEDO=E40BF80AF519848A` with
+`RPCS3_REMIX_TRACEALBEDOVP=C2003391127734F6`. `Remix albedo-trace:` emits one line per frame carrying
+`raw=[..]..[..]` **and** `matrix=[..]` **and** `cam=[..]` together — the only instrument that can answer
+"did the guest move it or did we" in one line — and `C2003391127734F6` is on **no launcher list at all**,
+so `worldid-draw` (which fires only for `WORLDIDENTITYVP` programs) has never covered that copy.
+**Play it with the camera moving.**
+
+---
+
+### PRIORITY 1 FOR ROUND 45: an uncounted `return` discards 624,873 draws, 7.29% of everything
+
+`RemixGSRender.cpp:23263`:
+
+```cpp
+if (static_entry->submitted_signatures.contains(static_submit_signature))
+{
+    return;                       // no counter, no census, until this round
+}
+```
+
+The signature (`:23214-23261`) is built from **only** the 3x4 instance transform, `categoryFlags`,
+`doubleSided` and the blend state. **It contains nothing about which geometry the draw covers.** On a
+title that bakes world geometry in world space — and Haze does; every plant-floor `worldid-draw` line
+carries `pre=[1 0 0 0; 0 1 0 0; 0 0 1 0]` — every static-index tile in a frame produces an identical
+signature and only the first submits. That is correct if and only if the union mesh the first one carried
+already held every tile, and the union is built **incrementally**, is wiped mid-frame by the
+`source_changed` reset at `:21004` (also uncounted), and sits at **0 resident of 16,601 entries**.
+
+**MEASURED exactly, by subtraction on the round-43 build.** `:23263` is the *only* return between
+`++m_stats.xform_measured` (`:22771`) and `++m_stats.draws_submitted`, other than the poisoned-mesh
+return — and `Remix stats:` reads `poisoned=0`. So:
+
+```
+xform_measured   8,569,414
+draws_submitted  7,944,541
+poisoned                 0
+------------------------------
+this exit          624,873      = 7.29% of every draw that resolved a transform and a mesh
+```
+
+**Shipped this round, diagnostic only:** `static_submit_dedup` (must reconcile to that subtraction) and
+`static_submit_meshdiff` — the subset where the mesh this draw had selected is **not** the mesh already
+submitted under that signature, i.e. where a strictly larger union was built and thrown away.
+**`meshdiff` is the number round 45 needs**: near 0 means the collapse is benign and the half-present
+floor is elsewhere; large means the floor is drawn from a partial union every frame.
+
+Supporting measurements for the same area, all this round:
+
+* **Mesh-key collision is REFUTED.** The ordinary mesh key hashes **every raw byte of every vertex**
+  (`RemixGSRender.cpp:20898-20905`, position/normal/texcoord/colour) plus all indices, the vp hash and
+  the albedo. Two distinct tiles cannot collide. The union path's `union_hash` (`:21130-21161`) does the
+  same. `tex_key_dup=33333` is a texture-descriptor counter and is unrelated.
+* **The static-index union key really is pointer-keyed.** `static_key` at `RemixGSRender.cpp:20986` and
+  the union hash at `:21159` both fold in `reinterpret_cast<usz>(material)` — a runtime heap address —
+  alongside the guest vertex-buffer address `block->real_offset_address` (`:20957`), and **no vertex data
+  at all**. A recreated material entry silently forks a new entry with `mesh_hash = 0`. Correlation over
+  671 windows cannot pin the 46 → 16,601 entry growth on material recreation, though
+  (`corr(d_entries, d_tex_destroyed) = +0.370`, `d_tex_created = −0.003`).
+* **The residency is the pathology.** Final line:
+  `entries=16601 triangles=2982810 rebuilds=21243 deferred=68 stale=0 dropped=68 peak=128 budget=128
+  resident=0 evicted=16601 nomesh=0`. `resident/entries` runs 1.000 → median 0.143 → **0.000**, with 408
+  of 671 windows under 20%. The reaper erases from `m_meshes` but never clears
+  `static_entry->mesh_hash`, which is exactly what `evicted` counts.
+* **Parity/ping-pong is REFUTED.** No frame-parity gate, draw-index parity, ping-pong buffer or
+  double-buffered slot array exists on the world submission or mesh path. Every `% 2` / `& 1` hit in
+  `RemixGSRender.cpp` and `RemixTransforms.cpp` is a texture-unit bitmask, a rate-limited log, or
+  triangle-strip winding in the **UI** compositor (`:14217`).
+* **The floor, named.** Tile pitch measured at **~8 world units** (7.75, 8.01, 7.90, 8.42, 8.11 across
+  independent tiles) — that is the checkerboard grain. Most-drawn large-extent opaque surfaces on the
+  plant floor plane: `E40BF80AF519848A`, `CB1677B87EDD72F5`, `71D189E9B559A7F9`, `6DEBE6C7CC0FEEDB`,
+  `CDC167D57B21D8E2`, `39D5CDABDAAE3ABB`, `E0D568A78FDD03F6`, `514AD452138A2803`. **11 of them are drawn
+  through BOTH a `STATICINDEXVP` program (`AD7CE9D672A0BF6B`) and an ordinary one
+  (`C1D482DCD1B03ED0`)**, 296 census shapes to 259 — one path hashing real vertex data and always
+  submitting, the other unioning by metadata and a heap pointer. (Caveat: `worldid-draw` is deduped, so
+  those are distinct observed *shapes*, not draw counts.)
+
+---
+
+### `world_refused` — round 43's "only two distinct keys" is REFUTED, and the census is blind anyway
+
+`world_refused = 452,669`. The 1,087 `Remix world-refused:` lines name **18 distinct albedos** and
+**14 distinct vps**, 20 distinct `(vp, albedo, vtx)` tuples and 17 distinct `(vp, fail)` pairs. Under
+every reading the answer is not 2.
+
+But the number is unusable either way. `world_refused_census_slot()` (`RemixGSRender.cpp:10157-10173`)
+dedups on `m_current_vp_hash ^ (0x9e3779b97f4a7c15 * (m_world_fail_index + 1))` — **(program, reason)
+only**; albedo, vtx, clip and surf are printed but not keyed. Window is
+`s_stats_interval_flips = 120` (`:122`), cap is `s_max_world_refused_lines = 128`
+(`RemixGSRender.h:3688`), reason space is 14 names. **Ceiling 14 x 14 = 196 possible lines per window,
+capped at 128, against 452,669 refusals — at most ~0.03% of the population, and exactly one albedo per
+(vp, reason).** Any statement of the form "material X is/is not being refused" is unanswerable from this
+instrument.
+
+Refusals **by draw**, from the final `Remix world-fail:` line, which is the right shape:
+
+| reason | draws | % of world_refused |
+| --- | --- | --- |
+| `tail` | 402,198 | 88.85% |
+| `nocam` | 46,317 | 10.23% |
+| `lay_other` | 42,781 | 9.45% |
+
+`46,317 + 42,781 + 402,198 = 491,296`, minus `world_refused` `452,669` = **38,627**, which is exactly the
+`particle=38627/416887` field — GATE 2's particle arm, which calls `note_world_fail` but is deliberately
+not counted as refused because those draws *are* submitted. The books balance to the unit.
+`Remix layother:` is 256/256 `areason=no-chain`, all `blend=1 depth_write=0` — **transparent
+non-depth-writing draws, not floor tiles.**
+
+---
+
+### Instrument notes worth keeping
+
+* **A census that dedups by key cannot enumerate a population.** Round 43 read "two distinct keys in the
+  whole run" off an instrument whose key is `(vp, reason)` and whose cap is 128 lines per 120 flips.
+  Before quoting a census as a fact about the world, read its admission gate and compute its ceiling.
+* **`d_origin` between two draws of one (program, texture) pair is not motion.** Where a title instances
+  one mesh many times, the "jitter" is the instance pitch. The tell is that it is **quantised**: real
+  numerical error is not.
+* **Zero from an instrument that cannot move is not evidence.** 181 frames of `d_origin=0` were read as a
+  stable object; the camera had not moved for any of them. Before believing a null result, check that the
+  driving variable varied.
+* **Check the format auditor before trusting it.** `scratchpad\r43\audit.py` reported "298 formatted
+  calls, 0 mismatches" on a file into which a 1-extra-specifier mismatch had been deliberately injected
+  at the `Remix pick-follow:` site. It gives a **false pass**. `scratchpad\r44\fmtaudit44.py` catches that
+  same injection and reports 108 `fmt::format` calls (matching `grep -c "fmt::format("` exactly), 0
+  mismatches on the shipped file. Self-test the tool on a broken copy every time.
+* **A gate that judges against a stale reference must not be a bare `return`.** The scene-cut lockout in
+  the first draft of `GAUGEDONORMAXT` was found by asking what the probe measures on the frame *after* a
+  cut, not by testing.
+* **Both banners, both arg lists.** `gaugedonormaxt=%u` had to be added to the run-start banner and the
+  `Remix live:` knobs section, with the matching argument in both lists. The `Remix live:` format is one
+  360-specifier call; a positional slip there misroutes every later field.
+
+## Round 43b (2026-08-26) — the kill was too wide; the rule is CHANNEL WIDTH
+
+**`RPCS3_REMIX_FPALBEDOKILL` was play-tested and reverted.** It produced a full-screen coloured-static
+overlay at 32 fps. It is **removed from the build**, not merely defaulted off — the exe contains neither
+the wide string `RPCS3_REMIX_FPALBEDOKILL` nor `tex_albedo_kill=%llu` nor `fpalbedokill=%d` (all three
+verified absent at offset -1).
+
+Deployed: `bin\rpcs3.exe` = `bin\rpcs3-next.exe` = **`ADA8AD6CDCDB53B1`**. `bin\remix\d3d9.dll`
+unchanged at `16A0B512F33EBB66`; `bin\rtx.conf` unchanged at `215975B8697DE21B` (read only all round).
+MSBuild `Release|x64` exit 0, **0 errors, 1 warning** — the same pre-existing C4723, now at
+`RemixGSRender.cpp:11456`.
+
+### What the kill got right, and what it got wrong
+
+It fired exactly as designed: `tex_albedo_ucode` went **0 → 81,091**, all 81,091 from the kill. The
+diagnosis of the white walls stands unchanged. The defect was **scope**, in two independent ways — and
+only one of them was the one anticipated.
+
+### The re-election was NOT what painted the screen
+
+The theory was that one of the 36 re-elected programs draws full-screen. **That is not supported.**
+Mapping all 36 back through `raw ^ 0x9e3779b97f4a7c15` and searching the 32,888-frame log:
+
+```
+of the 36 kill-changed programs:
+  appear in 'Remix uiwrap:' / 'Remix ui-biggest:' (screen-space) ....  0
+  appear anywhere in the run, as world geometry ....................  1   (65a91390aaf6bef3)
+  never drew at all in that session ................................ 35
+```
+
+**Caveat, stated because it matters:** that log is the round-42 session, *before* the noise. "Never drew"
+transfers only weakly — a different area draws different programs. The **zero screen-space hits** is the
+stronger half: across a session covering menus, loading screens and gameplay, not one of the 36 ever
+reached the UI census.
+
+### The likelier mechanism is the one shipped alongside it
+
+`albedo_unit_mask()` also set `from_ucode = true` on the kill path. That is not cosmetic: it unblocks the
+retry guard at `RemixGSRender.cpp:19445`, whose own comment says it "can never not fire" on this title.
+Unblocked, those draws take the **unrestricted** `albedo_texture_unit_in(unit_mask, unit + 1)` walk — the
+one the source documents as having "painted character faces onto tree trunks" on Resistance 2 (NPEA00431).
+81,091 draws with an unrestricted substitution walk fits world-wide static far better than 36 programs of
+which one drew.
+
+**Both mechanisms are closed by the new design**, not just the smaller one.
+
+### The rule that shipped instead: channel width
+
+A texture unit **every sample of which writes fewer than three destination channels** cannot be carrying
+RGB. Structural, not heuristic — the channels are not there. From the confirmed-good program
+`fp=65a91390aaf6bef3`:
+
+```
+  4: TEX R1     TEX2.zwzz, tex2    4 channels
+  9: TEX R2.x   TEX2,      tex0    ONE channel   <- parallax height map, elected today
+ 18: ADD R4.xy  TEX2, R2                         <- used only to perturb a UV
+ 21: TEX R2.yw  R4,        tex3    2 channels
+ 24: TEX R2     R4,        tex1    4 channels    <- the real diffuse
+```
+
+Scored offline over all 338 `.fp` files (`scratchpad\r43\chanrule.py`) **before the build**:
+
+| | KILL (reverted) | CHANNEL (shipped) |
+| --- | --- | --- |
+| saturated programs narrowed | 110 | 178 |
+| **elected unit CHANGES** | **36** | **3** |
+| of those, electing unit >= 8 | **16** | **0** |
+| units re-elected to | 1, 8, 10, 11, 13, 14, 15 | **all three are 0 -> 1** |
+| `fp=65a91390aaf6bef3` | `0x1f` -> `0x16`, unit 0 -> 1 | **identical** |
+
+Same answer on the one case ever verified, one twelfth of the blast radius, and every high-unit
+re-election gone.
+
+### Two containments, both required
+
+`albedo_unit_mask()` returns `referenced` untouched unless the narrowed mask (a) names a unit the backend
+can **bind**, and (b) elects a **different** unit from the one that would have been taken anyway. (b) is
+what makes it surgical: the rule narrows 178 programs but only 3 change election, so the other 175 are
+bit-exact and their retry walk is never confined to a smaller mask.
+
+And `from_ucode` is **deliberately left false**. `tex_albedo_narrow` is therefore a subset of
+`tex_albedo_guess`, not of `tex_albedo_ucode`, and the retry policy is byte-for-byte round 42's. One
+change at a time.
+
+### The one program that will actually move
+
+`65a91390aaf6bef3` is the only one of the three that drew in the logged session. It appears **0 times** in
+`Remix uiwrap:` and `Remix ui-biggest:`, and 2,545 times in `Remix watch:` plus `Remix effect:`,
+`Remix suncard:` and `Remix fpcandidate:` — all world-geometry censuses. **It is world geometry and never
+screen-space.** The other two (`f26a8613a74b6178`, `1ab7ae13810b04f2`) never drew at all.
+
+### The mirroring hypothesis is REFUTED — by the instrument shipped the same round
+
+`xform_mirrored = 0`, and three fresh picks read `det = 1.00104`, `det = 1`, `det = 1`. **No reflected
+instances exist.** The black voids are not a facing problem, and the reversed wall text in the capture has
+some other cause — graffiti authored mirrored in the game, or read through a transparent surface. The
+hypothesis was wrong; the `det=` field made it cost one run instead of a round.
+
+Hypotheses (a) never submitted, (b) hidden, (c) degenerate transform and (d) reflected are now **all
+refuted**. Round 44 starts from picks taken on the black surfaces themselves — they now carry `det=`, and
+`xform_measured`/`xform_degenerate` say whether those draws reach the transform path at all.
+
+### Instrument note
+
+**Two changes shipped under one knob cannot be told apart by a play-test.** The kill changed *which unit
+is elected* **and** *whether the retry walk may run*. The visible failure was attributed to the first; the
+evidence fits the second better; and one knob could not separate them. One mechanism per knob.
+
+## Round 43 (2026-08-26)
+
+Deployed: `bin\rpcs3.exe` = `bin\rpcs3-next.exe` = **`DD82C9B9A8FDAB7F`**. Runtime `bin\remix\d3d9.dll`
+**UNCHANGED at `16A0B512F33EBB66`** — nothing deployed into `bin\remix\`. `bin\rtx.conf` READ ONLY:
+not written this round.
+
+Tree at both ends: HEAD `f091ff5a4`, working tree carries rounds 37–42 plus this round's four source
+edits and the launcher. **The tree did not move.** Both exes read `DCCF0459B83778AE` at the start,
+exactly what round 42's inbox recorded. MSBuild `Release|x64` exit **0**, **0 errors, 1 warning** —
+the pre-existing C4723 "potential divide by 0", now at `RemixGSRender.cpp:11440` (round 42 recorded
+11389; this round's edits above that line moved it). **Zero new warnings.**
+
+---
+
+### THE WHITE WALLS ARE A PARALLAX HEIGHT MAP BOUND AS THE ALBEDO
+
+Round 42's deep vertex-colour search **worked**, and **could never have fixed these walls**. Both halves
+are measured on the round-42 build the user play-tested (`build=Aug 25 2026 18:50:12`, 32,888 flips):
+
+| counter | round 41 | round 42 build | verdict |
+| --- | --- | --- | --- |
+| `vcol_mod` | 10,280 / 5,392,256 = **0.19%** | **3,242,137** / 5,013,889 = **64.7%** | the fix fired |
+| `fpclass=a/b/c` | b = 1 | b = **122** | the fix fired |
+| `fpdeep` | — | **121 / 3,233,387** | the fix fired |
+| `created` (meshes) | 402,758 | 435,050, `live` 2,296 | bounded, no per-step minting |
+
+And yet the walls are still white, because **the replayed factor is neutral**. Every draw of all five
+hashes the user listed reports `class=vcol_modulate replay=1 route=scaled rgb-varies=0` with
+`vcol0=FEFEFE` (76 draws for `A26189276C5819BC`; 207 / 22 / 12 / 18 for the others). `vcol0` is read
+from the *submitted* vertices, after the fold and after `clamp(v,0,1)*255` at `RemixGSRender.cpp:11116`.
+Working back through the `fold *= 2.0` at `:11093-11095`, `0xFE` post-fold means the guest's COL0 byte
+is exactly **`0x7F`** — the unlit-neutral value in the 0..2 convention the code documents at
+`:11062-11064`. **Multiplying by 1.0 cannot darken anything.**
+
+**The fault is one unit further up, and the run says so exactly.** From the last `Remix stats:` line:
+
+```
+tex_albedo_ucode = 0            tex_albedo_guess = 7,383,877
+```
+
+The ucode albedo discriminator did not resolve **one** draw in the whole session.
+`albedo_unit_mask()` (`RemixGSRender.cpp:6061`) declines whenever `colour == referenced`
+(`:6087`) and the caller then takes the **lowest referenced unit** (`albedo_texture_unit_in`, `:6105`).
+
+On `fp=65a91390aaf6bef3` — the program on the picked white wall `9AAA430414B3D49D` — the lowest unit
+is **not** the diffuse:
+
+```
+  9: TEX      R2.x   TEX2, tex0      <- .x only: a single-channel PARALLAX HEIGHT MAP
+ 11: MUL      R2.x   R2, {0.334754}
+ 13: MAD      R2.x   -R1.wwww, {0.5}, R2
+ 17: MUL      R2.xy  R2.xxxx, R2.zwzz
+ 18: ADD      R4.xy  TEX2, R2        <- R4 is a TEXTURE COORDINATE
+ 24: TEX      R2     R4, tex1        <- the real diffuse
+ 31: MUL      R2     R2, R5          <- the modulate round 42 replays
+ 46: TEX      R4     ...,  tex4      <- writes R4 AGAIN
+```
+
+**Why `colour_mask` saturates.** The backward walk at `RemixTransforms.cpp:8170-8218` has **no kill** —
+its own comment at `:8168-8171` says so and calls the over-approximation safe. So `R4`, live from
+instruction 46's result, stays live all the way back past instruction 18; the walk follows `R2` into
+the height-map chain and credits **tex0** as a colour. `colour_mask == sampled_mask == 0x1f`, the
+discriminator declines, the lowest unit wins, and a **near-white greyscale height map is bound as the
+albedo**. A near-white albedo is a white wall.
+
+This is a known-but-unclosed defect in the file itself: `RemixGSRender.cpp:19435` already reads *"Haze
+reports `tex_albedo_ucode=0`, so `unit_from_ucode` is always false here and the guard can never not
+fire"*.
+
+It also explains why tagging those five hashes in `rtx.conf` never did anything: **they are the content
+hashes of height/mask maps, not of wall diffuse maps** (`albedo_hash = entry->content_hash` for the
+*selected* unit). Two of them were in `rtx.decalTextures` and were untagged before this round; that
+change is orthogonal and is not the reason anything does or does not improve.
+
+#### What shipped: `RPCS3_REMIX_FPALBEDOKILL`
+
+`fp_fingerprint::colour_mask_kill` (`RemixTransforms.h`, filled at `RemixTransforms.cpp` right after
+`colour_mask`) — the same reachability, one reverse pass, with an ordinary backward kill: an
+**unpredicated** write retires the destination bits it defines before its own sources are added.
+Predicated writes retire nothing, which is the same guard the deep-modulate search uses and the reason
+the existing walk refused a kill at all.
+
+Single pass, not a fixpoint, deliberately: the kill makes `live` non-monotonic, so the existing loop's
+termination argument ("bounded because live only grows") stops holding. A single pass is also what makes
+the answer a guaranteed **subset**: single-pass-with-kill ⊆ single-pass-no-kill ⊆ fixpoint-no-kill.
+
+`albedo_unit_mask()` consults it **only on the branch that already declined**, behind three guards, all
+required: non-empty; a **strict** subset of `referenced`; and it must name a unit
+`albedo_texture_unit_in()` can actually bind. Without the third, a program whose only killed unit is
+disabled would go from *wrong texture* to *no texture*. It is also AND-ed with `colour`, so a future
+divergence between the two walks can only ever remove units.
+
+**PRE-REGISTERED OFFLINE, before the build existed**, by reimplementing both walks in Python over all
+338 `.fp` files in `bin\remix_ucode\` (`scratchpad\r43\killwalk.py`, decode mirrored field-for-field
+from `RemixTransforms.cpp:8000-8095`):
+
+```
+325 programs with a sample (313 multi-unit)
+  saturated today, untouched by this change ........ 123
+  saturated today, kill NARROWS it ................. 110
+      of those, same elected unit .................. 74   (no visible change; from_ucode flips true)
+      of those, elected unit CHANGES ............... 36   <- the whole blast radius
+  kill yields empty / no narrowing ................. 92   (falls back, bit-exact)
+  kill WIDENED a mask (must be 0) .................. 0
+fp=65a91390aaf6bef3 : mask 0x1f -> 0x16, elected unit 0 -> 1
+```
+
+Saturation over the corpus drops **202/325 (62.2%) → 76/325 (23.4%)**; programs that discriminate go
+**121 → 227**.
+
+**Second-order effect, named rather than hidden.** `unit_from_ucode` turning true also unblocks the
+retry guard at `RemixGSRender.cpp:19445`, which on this title has never once been able to not fire. The
+`tex_retry_refused = 1,917,177` population (identical to `tex_none_shadowonly`) may now walk past its
+2048×2048 DEPTH16 shadow map to a higher unit. That is the intended direction, and it is also the
+largest thing that could go wrong.
+
+---
+
+### PRIORITY 1, THE BLACK VOID: three hypotheses refuted, a fourth found, and the instrument that could never see it
+
+`Remix pick-follow:`, `Remix world-refused:` and the category counters separate the three hypotheses the
+brief listed. **All three are refuted for walls and floors:**
+
+- **(a) never submitted.** `world_refused = 248,109`, but the `Remix world-refused:` census names only
+  **two distinct keys in the entire run** — `line=1/128` and `line=2/128` of a 128-line-per-window
+  budget — and both are `vtx=4` full-screen quads (`albedo=EA4E4CF3B4BF0C7C`,
+  `albedo=FCB2B58AF77F60A0`). No wall or floor is being refused for want of a world transform.
+- **(b) submitted and hidden.** `cat_hidden = 134,023` comes **entirely** from
+  `RPCS3_REMIX_CAT_HIDE=B6AE753B64E6F693,597C5F48E671924F`, two hashes deliberately set at launcher
+  line 1163 (`hash_in_category`, `RemixGSRender.cpp:5705-5709`). `cat_decal = 0`, `cat_particle = 0`,
+  `cat_sky = 0`. Nothing else is hidden, and `rtx.conf`'s own lists never reach this path — the backend
+  reads `RPCS3_REMIX_CAT_*` (`RemixTransforms.cpp:6309-6320`), not the conf file.
+- **(c) degenerate transform.** Real but **not proof of a visible defect**: `Remix pick-follow:` shows
+  per-frame instance-origin jumps of up to **8.16 units**, quantised at multiples of ~2.04, on every
+  surface whose reference is `anchor`/`anchor_prev`, and **exactly 0.0000** on every `identity-bypass`
+  one. But the `arch=fused` path divides the vertices by that same reference, so the product is
+  unchanged — origin jitter alone cannot move a surface on screen. It matters for motion vectors and
+  mesh identity, not for a missing wall.
+
+**The fourth hypothesis, from the user's own capture** (`rpcs3__2026-08-26__09-24-20_trim.mp4`):
+
+- `f_030.jpg` / `f_031.jpg` — painted wall text reads **backwards** ("PAZ", "FUERA", "NUESTRO"), and it
+  is on precisely the surface that is rendering **solid black**. The rpcs3 HUD in the same frame reads
+  correctly, so the final image is not mirrored.
+- `f_200.jpg` — in a different area of the *same run*, world text reads **correctly** ("SECTION D" on a
+  sign, "R107" stamped on a dozen steel beams, "003-KVZ MANTEL GLOBAL INDUSTRIES"), and the scene is
+  properly textured and lit.
+
+So the reflection is **per instance**, not a global handedness error in the camera, and it is not
+back-face culling either: `instance.doubleSided` is 1 on every instance unless `cull_from_rsx()`
+(`RemixGSRender.cpp:22611`), and `RPCS3_REMIX_CULL` is absent.
+
+**A negative 3×3 determinant is the one transform property that produces both symptoms at once**: the
+geometry is reflected, so its texture reads mirrored, and the winding is reversed, so the surface is
+shaded from behind and renders unlit — a black polygon that light leaks past.
+
+**And it has never been observable.** `pick_record::basis[i]` is `sqrt(x²+y²+z²)` of row *i* — a norm,
+sign-blind by construction, so `basis=[1 1 1]` reads identically for an identity and for a reflection.
+The only `det3()` in the backend (`RemixGSRender.cpp:7633`) is a lambda local to the **viewmodel** basis
+census and is never applied to a world instance. Four rounds of hypotheses about the black voids were
+argued with no instrument that could see a reflection.
+
+**Shipped this round, diagnostic only, no pixel depends on it:** `xform_measured` / `xform_mirrored` /
+`xform_degenerate` over every instance that reaches `DrawInstance`, on both `Remix stats:` and
+`Remix live:` (as `xform_mirrored=M/D/T`), and **`det=` on `Remix picked:`**, computed from the same
+transform at the same point so the counter and the pick line can never disagree.
+
+---
+
+### PRIORITY 2, THE ADS COLLAPSE: root-caused, and it is NOT the compositor's blend
+
+Round 42 named `compositor::blend()`'s missing additive path and its `alpha == 0xFF` `memcpy`
+(`RemixCompositor.cpp:631-633`) as the mechanism. That code is exactly as described — straight alpha
+only, no additive path anywhere in the file, `blend()` the sole compositing operator (3 call sites,
+`:782`, `:891`, `:952`) — **but it is not what costs the frame.** Three of round 42's supporting numbers
+do not survive re-measurement:
+
+- **`ui_px = 4,480,204` is from a different run.** It came from a scratchpad `timing.txt` written
+  2026-08-25 18:14, not from `bin\log\RPCS3.log`. This run's worst in-world window is **1,383,961**
+  px/frame, and its global maximum over all 400 windows is 2,142,748 (a loading screen).
+- **"a fixed, deterministic 24-draw overlay set" is backwards.** `ui_pixel` is cumulative
+  (`m_stats` is never reset; only `m_timing` and `m_compositor.reset_pixels()` are, at
+  `RemixGSRender.cpp:25294-25295`). Per-window deltas make `ui_pixel/frame` bimodal at 1 and 22–25, and
+  **the 22–25 population is the cheap one**. In the expensive windows `ui_pixel/frame` is exactly 0.
+- **`present` falling is not the tracer being starved of geometry.** `submitted/frame` goes 56 → 48 and
+  `draws/frame` 227 → 234 across the boundary — essentially unchanged. The world is still being
+  submitted; the CPU is simply spending 25 ms elsewhere in the same frame.
+
+**What actually happens, MEASURED across the boundary** (windows 105–107 control vs 109–115 ADS, camera
+parked at the same `scene=[1786 -31.31 1227]`):
+
+| per frame | control | ADS | |
+| --- | --- | --- | --- |
+| `ui_ndc` | 20.0 | **94.0** | the branch that flipped |
+| `ui_forced` | 22.0 | **0.0** | |
+| `ui_pixel` | 22.2 | **0.0** | |
+| `ui_px` | 24,811 | **1,383,930** | **55.8×** |
+| `ui` ms | 0.29 | **25.2** | **87×** |
+| `present` ms | 11.07 | **0.41** | |
+| `frame_ms` | 21.5–22.3 (45.7 fps) | 33.0–35.0 (**29.7 fps**) | |
+
+Vertex program **`2f64c2f8ffd6add1`** is not statically fingerprinted as screen-space, so
+`is_screen_space_draw()` re-decides per draw. In the control regime the classifier **refuses** it and
+`RPCS3_REMIX_UIFORCEVP` drags it in through the **clip-pixel** branch (`RemixGSRender.cpp:12870`), where
+coordinates are already pixels — 22 cheap draws/frame. In ADS the same program **passes the classifier
+on its own**, so `ui_forced` goes to 0 and it takes the **NDC** branch (`:12859`), which multiplies every
+vertex up to full compositor scale at `:12864-12865`. Its 1280×720 sheet **`FF724C765485B42B`** is then
+rasterised at exact full-screen NDC `[-1,-1]..[1,1]`; `Remix ui-biggest:` reports `area=861440px`, which
+is the **entire** compositor buffer (`RPCS3_REMIX_UIWIDTH=1280`, launcher line 59 → 1280×673 = 861,440).
+That one quad is **63.3%** of the 1,359,880 textured px/frame.
+
+Pixel reconciliation, exact: `ui_uv` counts `address_coordinate` calls, two per sampled texel
+(`RemixCompositor.cpp:368-369`), so textured samples = Σ`ui_uv`/2 = 1,359,880; plus a constant
+~24,050 px/frame of untextured rpcs3-overlay work → **1,383,934 = `ui_px`, residual 0.0**.
+Refitting on textured pixels only: `ui_ms = 16.84 ns × px + 0.295 ms`, **R² = 0.98151**.
+
+`ui_px` is counted at `RemixCompositor.cpp:613`, the **first** statement of `blend()`, before both the
+`alpha == 0` early-out and the clip reject — which is why the linear fit is so tight, and which means
+the cost is paid in `sample_bgra` and the raster loop, **not** in the blend arithmetic.
+
+**No existing knob can skip this draw.** `SKIPVP` takes a single hash and would delete the whole HUD;
+`UIFORCEVP` is measured at 0.00/frame in ADS and cannot help; `UIRECTSHRINKPCT` reaches only the 298
+font triangles/frame. The only lever is `RPCS3_REMIX_UIWIDTH`, and the cost is **quadratic** in it:
+
+| `UIWIDTH` | full-screen layer | ADS `ui` | ADS frame | |
+| --- | --- | --- | --- | --- |
+| 1280 (now) | 861,440 px | 25.2 ms | ~33.5 ms (29.9 fps) | |
+| 960 | 484,560 px | ~14.2 ms | ~22.5 ms (44 fps) | HUD upscaled 4× to a 3840 client |
+| 640 | 215,360 px | ~6.3 ms | ~14.6 ms (68 fps) | HUD noticeably soft |
+
+That is a **trade, not a fix**, and it is offered as one. The fix is either to stop that program taking
+the NDC branch when its post-matrix extent already covers the screen, or to make the raster loop not
+scalar. Neither is a one-liner and neither shipped this round.
+
+---
+
+### Also settled
+
+- **`6575ACE3A42A78E6` is not a rect-sizing problem.** `f_200.jpg` shows two **solid filled** yellow
+  quads and a solid white bar where nectar HUD text should be — the atlas is not being sampled at all.
+  `RPCS3_REMIX_UIRECTSHRINK` addresses UV rect geometry and cannot fix an unsampled texture. It is on
+  the shrink list at 50% and carries a veto in `rtx.uiTextures`; neither is the cause.
+- **`RPCS3_REMIX_EMISSIVEINT` is still not a real variable** — the parser reads
+  `RPCS3_REMIX_EMISSIVEINTENSITY` (`RemixTransforms.cpp`). Unchanged from round 42's note.
+- **`glauto=%d` still prints a boolean, not the mode.** Unchanged from round 42's note; the launcher
+  has `GUESTLIGHTAUTO=0` so it reads 0 either way this round.
+- **The static-index cache is thrashing and nobody has explained it.** `entries=3296 rebuilds=11183
+  dropped=69 peak=128 budget=128 resident=62 evicted=3234`. Round 42 refuted round 31's budget theory
+  using `dropped`, which is the right counter for "draws that got no index" — but `evicted` is a
+  different counter and 3,234 of 3,296 entries have been evicted from a 128-slot cache. Not claimed as
+  a defect; claimed as an unexplained number.
+
+### Instrument notes worth keeping
+
+- **A norm cannot see a sign.** `basis=[1 1 1]` was read as "no transform anomaly" for four rounds. Ask
+  what a diagnostic is mathematically incapable of representing before concluding from it.
+- **Check which run a number came from.** Round 42's headline `ui_px` and its "24 draws" both came from
+  a scratchpad file belonging to an earlier session, and neither reproduces in the log the same brief
+  pointed at.
+- **A cumulative counter divided by frames is not a rate.** `ui_pixel` reads 22–25/frame only if you
+  take per-window deltas; taken raw it is nonsense, and the population it names is the cheap one.
+- **The offline corpus is the cheapest possible A/B.** Reimplementing a classifier in Python over
+  `bin\remix_ucode\` scored this round's change to a blast radius of 36 programs before a compiler ran.
+
+## Round 42 (2026-08-25)
+
+Deployed: `bin\rpcs3.exe` = `bin\rpcs3-next.exe` = **`DCCF0459B83778AE`**. Runtime `bin\remix\d3d9.dll`
+**UNCHANGED at `16A0B512F33EBB66`** — nothing deployed into `bin\remix\`.
+
+Tree at both ends: HEAD `f091ff5a4`, working tree carries this round's four source edits plus the
+launcher. **The tree did not move.** Both exes read `49D31EEA1D767004` at the start, exactly what
+round 41 recorded. MSBuild `Release|x64` exit 0, **0 errors, 1 warning** — the pre-existing C4723
+"potential divide by 0", now at `RemixGSRender.cpp:11389` (it was 11339; this round's edits moved it).
+**Zero new warnings.** The exe carries no `expected<enum rsx::primitive_type` marker, so the build is
+not the poisoned `primitive_mode()` shape.
+
+---
+
+### TASK 0 — THE BRIEF'S PREMISE IS REFUTED, AND THAT IS THIS ROUND'S FIRST RESULT
+
+The brief opened: *"37.6% of textured-draw attempts resolve to NO ALBEDO ... Over a third of the world
+is submitted with no albedo and renders with the backend's neutral material. This dwarfs everything
+else."* The ratio is arithmetically correct and the conclusion drawn from it is not.
+
+**MEASURED**, the final `Remix stats:` and `Remix live:` lines of the round-41 play-test
+(`bin\log\RPCS3.log`, 41,802 flips, 5,392,256 submitted draws):
+
+```
+tex_none = 3,693,131
+  notex_skip        3,605,397   97.62%   refused by a named skip gate
+  notex_world          85,060    2.30%   refused by the world/affinity gate
+  notex_mat_applied     2,674    0.07%   reached Remix, took the neutral grey
+                    ---------
+                    3,693,131            EXACT
+```
+
+**The three sum to `tex_none` exactly.** And the refusals really are refusals: all thirteen
+`report_skip_census(...)` call sites in `RemixGSRender.cpp` — `wext`, `viewmodelrefused`, `skipvp`,
+`skippair`, `skipalbedo`, `skipuntexturedvp`, `untexturedfppair`, `characterdepth`, `unboundblend`,
+`auxuntex`, `shadowonly`, `r2streak-late`, `skipextent` — are each immediately followed by a
+`return`, verified line by line against current bytes.
+
+**So the number of draws that reach Remix with no albedo is 2,674 out of 5,392,256 — 0.0496%, not
+37.6%.** `tex_none / (tex_none + tex_bound)` is the *walk's* failure rate over every draw that ever
+looked at a texture unit, including 2.2M binds of a depth buffer. It is not a submitted-population
+share, and it never was.
+
+A second exact partition says the same thing from the other side:
+
+```
+tex_none = 3,693,131
+  tex_no_unit          1,527,047   41.35%   no eligible 2D unit at all
+  tex_retry_refused    2,166,084   58.65%   the walk gave up
+                       ---------
+                       3,693,131            EXACT
+tex_shadowonly (= tex_none_shadowonly) = 2,166,084   <- identical to tex_retry_refused
+tex_colorunit  (= tex_none_colorunit)  = 0
+```
+
+**`tex_none_colorunit = 0`.** Not one draw in a 41,802-flip run had a colour-format texture on a
+sampled unit the walk failed to reach. The `WALKSAMPLED` widening is armed (`walksampled=1` on the
+banner) and did its work: `tex_walk_sampled = 77,883`. The albedo walk is not failing on this title —
+**for 58.65% of the population every eligible unit is the 2048x2048 DEPTH16 shadow map and there is no
+colour texture anywhere, and for the other 41.35% the fragment program references no 2D unit at all.**
+
+The `Remix notex:` census on disk names them: **919 unique rows read
+`class=retry-refused reason=format unit=0 fmt=0xb2 shadowonly=1 colorunit=0 sampled=0x1`** — the
+program samples exactly one unit, that unit is the shadow map, and there is nothing else to elect.
+541 rows read `class=no-unit sampled=0x0`.
+
+**Therefore the brief's stated round-42 task — "why does the fragment program's sampler analysis fail
+to name the albedo unit"** — has no failing population to work on. `tex_albedo_ucode=0` is real, but
+it is not costing pixels: with `colour == referenced` the mask falls back to the lowest referenced
+unit, which is the same answer, and `tex_colorunit=0` proves no better answer existed.
+
+**The user's `524D584E4F544558` ("RMXNOTEX") Ctrl+Click is consistent with this, not against it.**
+Of nineteen `Remix picked:` lines recovered from the run, **eighteen read `material=1
+albedo_unit=0`** — a resolved texture. The single exception is
+
+```
+vp=fc0fac8afccec49a fp=938cfb957fcb7db7 albedo=0000000000000000 vtx=32 extent=99.71
+material=0 albedo_unit=-1 sampled=0x0 fpcol=vcol_pass fpalpha=vcol_pass fpvcol=1
+```
+
+`sampled=0x0` — the fragment program samples **nothing**. That draw is vertex-coloured by design; the
+grey placeholder is what an untextured draw is supposed to get, and the pick landed on one of the
+2,674. One pick is not one third of the world.
+
+---
+
+### TASK 1 — THE WHITE WALLS, FOUND IN THE UCODE
+
+The brief's *instinct* was right and its target was wrong. It predicted the answer would be *"a bit or
+a shape in the ucode encoding the matcher fails to replay"*. It is exactly that — in the **fragment
+vertex-colour classifier**, not the albedo-unit matcher.
+
+#### 1a. What the classifier was looking at, and what the programs actually do
+
+`scan_fragment_program` classifies the **last instruction** that writes `col0.rgb`, accepting only
+`MOV out, COL0` or `MUL out, tex, COL0`. Round 41 added a hop through identity `MOV` copies and moved
+`fpclass` from `1/1/0` to **`2/1/0`** — one more program in the whole title.
+
+The round-41 `Remix fpother:` census is what settles it. **MEASURED, all 64 rows:**
+
+| terminal shape | rows |
+| --- | --- |
+| `op=2(MUL) srcs=2 t0=0(TEMP) t1=2(CONST) k0=0x04 k1=0x08` | **39** |
+| `op=2 srcs=2 t0=0 t1=0 k0=0x04 k1=0x0c` | 6 |
+| `op=1(MOV) srcs=1 t0=2(CONST)` | 3 |
+| `op=4(MAD)` variants | 4 |
+| everything else | 12 |
+
+**39 of 64 end on `MUL col0.rgb, <temp>, <inline constant>.<swizzle>`** — a multiply by a literal.
+(`k1=0x08` says non-identity swizzle; the census cannot say *broadcast*, but all four programs
+disassembled below read theirs as `.xxxx`.)
+
+Four of these programs have their raw ucode on disk in `bin\remix_ucode\` from earlier runs, stored
+by `store_refused_fp_ucode`. Disassembled this round (the file name is `fp_hash ^
+0x9e3779b97f4a7c15` when `fp32_outputs`, `RemixGSRender.cpp:9031`). Two of them are programs the
+**user's own Ctrl+Clicks landed on walls** — `aa0fe222771ff5c0` and `65a91390aaf6bef3`.
+
+`34389B9B085589D5.fp` (= fp `aa0fe222771ff5c0`, 58 slots), slot numbers verbatim:
+
+```
+ 14: MOV  H1,     ATTR1                    ; COL0
+ 15: MUL  R1.xyz, H1, {2,0,0,0}.xxxx       ; the 0..2 lighting expansion
+ 17: MOV  R1.w,   H1                       ; alpha copied UNSCALED
+ 26: TEX  R0,     ATTR5, tex0              ; the albedo
+ 27: MUL  R1,     R0, R1                   ; *** albedo x (COL0 x 2) ***
+ ... 30 instructions of normal map, specular, lighting composite ...
+ 57: MUL  R0.xyz, R0, {0.999001,1.001,0,0}.xxxx  END
+```
+
+`FB9E6A29D5BCC2E6.fp` (= fp `65a91390aaf6bef3`, 64 slots) is the same program with the modulate at
+slot 41 and the terminal at 63 (`{0.999002,...}`). `3FF09E976DF177B5.fp` and `7BD30EA79A75DB92.fp`
+likewise, at slots 5 and 6.
+
+**The modulate is real, unambiguous and thirty to forty-five instructions upstream of the export.**
+A classifier that reads only the terminal instruction cannot reach it, and no number of identity hops
+will: the instructions in between are `MAD`s doing real lighting arithmetic. That is round 41's own
+pre-registered failure mode firing exactly as written — *"a program that does real arithmetic between
+the modulate and the export ... is not reached and stays other."*
+
+**Independently corroborated inside this repository.** Round 11 transcribed the haze card's fragment
+program into a source comment and wrote its line 9-10 as
+`rgb = texRGB * (2 * COL0.rgb) * 0.944243` (`RemixGSRender.cpp`, the `apply_haze_fade` doc block).
+The same shape, decoded a different round by a different route, sat in a comment for thirty rounds
+without being connected to the classifier.
+
+#### 1b. The fix: `RPCS3_REMIX_FPVCOLDEEP` (default 0, armed 1)
+
+Search the whole program for the modulate instead of only its last line. Four terms, **all** required:
+
+1. an unconditional `MUL` writing rgb;
+2. one operand a temp whose writer **sampled a texture** (`is_sampled_temp`'s own predicate,
+   reached through the existing identity hop);
+3. the other operand a clean `COL0` read, or a temp reached from one through nothing but
+   **broadcast** constant scales — never a swizzle, negate or abs, and never a per-channel constant
+   (the three rgb swizzle lanes must be equal, so a *tint* cannot be collapsed to one scalar);
+4. the product **provably live into `col0.rgb`**, by the same no-kill backward walk `colour_mask`
+   already uses, restricted to the instructions after the candidate.
+
+**COL1 / ATTR2 is excluded by measurement, not by caution.** These same programs carry the packed
+tangent-space **normal** in ATTR2 — `MAD H7.xyz, H7, {2,-1}` then `NRM` — so a rule that accepted
+ATTR2 would replay a normal map as a colour. The existing terminal `is_vcol` accepts `attr_reg == 1
+|| attr_reg == 2` and is saved only by `vcol_replayable()` requiring attr 1 downstream; the deep rule
+requires attr 1 at the match site.
+
+Latest match wins: a program that modulates twice has its final colour built by the later one.
+
+#### 1c. PRE-REGISTERED OFFLINE, BEFORE THIS BUILD EVER RAN
+
+The rule was reimplemented in Python from the same bit layout (`RSXFragmentProgram.h:29-140`,
+`FPOpcodes.h:10-80`) and run over the stored ucode corpus. **MEASURED:**
+
+| corpus | match | no match |
+| --- | --- | --- |
+| all 338 `.fp` files in `bin\remix_ucode\` | **22** | 316 |
+| the 8 programs on this run's own `Remix fpother:` census that have ucode on disk | **7** | 1 |
+
+Every one of the 22 reports a scale of **2.0** (19) or **1.0** (3) — no other value appears. The one
+fpother program that does not match is `0DBB822C00810202` (fp `938cfb957fcb7e17`), a
+**one-instruction program with `sampled=0x00`**: it samples nothing, so it correctly cannot have a
+modulate. The corpus is heavily biased *against* the shape — `store_refused_fp_ucode` only stores
+programs drawn with **no material**, and a material-less draw usually samples no albedo — so 22/338 is
+a floor, not a prediction.
+
+The four programs above were also hand-simulated instruction by instruction against the rule,
+including every other `MUL` in each program, and in all four the match is **unique**: on
+`34389B9B085589D5` twelve `MUL`s are examined and only slot 27 satisfies all four terms.
+
+#### 1d. `RPCS3_REMIX_FPVCOLDEEPSCALE` (default 1) — the x2, and why it is folded
+
+`apply_vertex_colour`'s `fold[]` already carries the constants the **vertex** ucode multiplies ATTR3
+by (`c[18]` on every Haze world program — MEASURED, 44 `Remix vcolroute:` rows). It has never carried
+the constant the **fragment** ucode multiplies COL0 by, because until this round no such program was
+ever classified. That constant is **2.0 on every Haze program read**.
+
+Remix's Modulate factor is an 8-bit unorm, so a factor above 1 cannot be represented and the fold
+saturates above 0.5. Folding it is still the faithful reading: under the x2 convention **0.5 is the
+unlit-neutral value**, so replaying COL0 raw would land every surface at half the guest's shading.
+
+**MIND THE DIRECTION — this was written backwards once and caught before shipping.** The submitted
+factor is `min(1, COL0 x 2)` at `FPVCOLDEEPSCALE=1` and plain `COL0` at `=0`, and `COL0 <= 1`, so
+**1 is the BRIGHTER setting and 0 is the DARKER one** — and *both* can only darken relative to
+today's no-modulate factor of 1.0. `=0` is therefore the lever for surfaces that come out **still
+white / washed out**, or that show flat white patches where the x2 clips. There is no brighter
+setting: at `=1` the ceiling is the 8-bit unorm factor itself.
+
+**RGB only, and that is read from the bytes rather than assumed:** the same programs copy the alpha
+lane across **unscaled** (`MOV R1.w, H1`), so folding it into `fold[3]` would invent an opacity the
+guest never computes — the exact failure the alpha-route gate exists for.
+
+#### 1e. The latent bug that would have eaten part of the fix
+
+`apply_vertex_alpha` wrote `m_scratch_vertices[i].color = 0x00FFFFFFu | (alpha << 24)` — **forcing RGB
+to white** — and it runs *after* `apply_vertex_colour` as an independent `if`, not an `else`
+(the two statements at `RemixGSRender.cpp:19842` and `:19872`; the comment at the first of them says
+so in as many words). Round 41's inbox flagged this as priority 4. On any textured draw that is both
+fp-classified and blended with a constant-alpha albedo, it overwrote a freshly replayed vertex colour
+with white.
+
+Now `(color & 0x00FFFFFFu) | (alpha << 24)` — **under `FPVCOLDEEP`, and the gate matters.**
+
+An earlier draft shipped it ungated on the argument that the mask is *"a strict identity on every
+draw the old line could reach before this round"*. **That argument is false and review caught it.**
+It is an identity only where `apply_vertex_colour` did not write — and `apply_vertex_colour` writes
+on any draw the **terminal** classifier already named, i.e. the two `vcol_pass`/`vcol_modulate`
+programs that predate this round. Ungated, `FPVCOLDEEP=0` would therefore *not* have been a bit-exact
+round-41 control, and since the mesh content hash covers these bytes those meshes would re-create for
+no reason. **A revert knob that does not revert is worse than the bug it hides**, so the knob owns
+this line too: with `FPVCOLDEEP=0` it writes the literal `0x00FFFFFF` exactly as before.
+
+Everywhere else the mask genuinely is an identity: every vertex leaves the decode loop at
+`0xFFFFFFFF` (`RemixGSRender.cpp:3904` and `:18704`) and `apply_vertex_colour` is the only writer
+between there and here.
+
+#### 1f. THE FULL BOOLEAN CHAIN, GREPPED AND VERIFIED ARMED
+
+Round 41's own instrument note: *"a knob that ANDs into the gate you are widening will silently
+swallow the widening."* Every term checked against current bytes and against the last run's banner:
+
+| term | site | state |
+| --- | --- | --- |
+| `vertex_colour_modulate_enabled()` | `fp_wants_vcol`, `RemixGSRender.cpp:19832` | `VCOLMOD=1`, launcher:1560 |
+| `fp_vertex_colour_replay_enabled()` | same | `FPVCOL=1`, launcher:1503 |
+| `vcol_replayable()` | same | **the gate this round widens** |
+| `vertex_colour_disabled()` (`NOVCOL`) | `apply_vertex_colour:10927` | false — proven by `vcol_mod=10280 > 0` last run |
+| `vcol_route_replayable()` | `:10937` and the blend ext | **`route=scaled` on every Haze world VP**, MEASURED |
+| all three ANDed | blend ext, `:22605` | armed |
+
+The `Remix vcolroute:` census, all 44 rows: `830d7d1b9681c475`, `f39f504649b6f442`,
+`ad7ce9d672a0bf6b`, `c1d482dcd1b03ed0`, `d0b6a471bb2d463b`, `af06f6d32ec048ee`, `57a12323f22f4988`,
+`c2003391127734f6`, `0214281b9a7a412d`, `bd1c10df5703e559`, `4d5a87bffbce0717` and eleven more all
+read `route=scaled alpha_from_attr=1 slots=[c[18].x;c[18].y;c[18].z;c[18].w]`. **The vertex side is
+ready for the entire world. The fragment classifier was the only thing in the way.**
+
+`fpvcol_skygate` is NOT in this chain — it gates the self-lit/emissive verdict
+(`RemixGSRender.cpp:20006`), not the colour replay.
+
+#### 1g. THE READINGS, AND THE PRE-REGISTERED REFUTATION
+
+| reading on `Remix live:` | meaning |
+| --- | --- |
+| `fpdeep=P/D` with P ~20-40 and D in the millions | **PASS** — the search named P programs and they account for D draws |
+| `fpdeep=0/0` with `fpvcoldeep=1` on the banner | the search ran and matched nothing — a different failure from not running |
+| `fpdeep=P/0`, P > 0 | the programs classify but never reach a **textured** draw; check `vcol_route_blocked` |
+| `fpclass=a/b/c` — b must jump from 1 | b is the modulate program count |
+| `vcol_mod=` — was **10,280** of 5,392,256 submitted (0.19%) | the number that has to move by orders of magnitude |
+| `mesh_created=` — was **402,758** | expect ONE bounded re-creation of every world mesh (vertex colour is in the mesh key). Unbounded climb = an animated vertex colour minting a mesh per step |
+
+**PRE-REGISTERED REFUTATION.** *Darker is the fix; wrong hue is the failure.* If surfaces come out
+visibly wrong-**coloured** rather than merely darker, this is round 8's `RETRYUNSUP` repeating and
+`RPCS3_REMIX_FPVCOLDEEP=0` reverts it in one line. If they come out **still white or washed out**,
+`RPCS3_REMIX_FPVCOLDEEPSCALE=0` is the second, independent line — see the direction note in 1d: 0 is
+the DARKER setting, not the brighter one.
+
+#### 1h. Clamp audit
+
+| knob | armed | clamp | note |
+| --- | --- | --- | --- |
+| `FPVCOLDEEP` | **1** | `env_u32(..., 0) != 0` | boolean, no ceiling to hit |
+| `FPVCOLDEEPSCALE` | **1** | `env_u32(..., 1) != 0` | boolean; armed at its shipped default, kept as a documented one-line revert |
+| `FPVCOLHOP` | 4 | `min(env, 8)` | unchanged; the deep search reuses the same hop |
+| `VCOLMOD`, `FPVCOL`, `FPVCOLROUTE`, `VCOLFOLD`, `VCOLBGRA`, `VCOLCONSTBLACK` | 1 | boolean | all verified armed above |
+
+Neither new knob is an `env_float`, so **neither can hit the `env_float` rejects-zero trap** that cost
+round 41 the `GUESTLIGHTRADIUSSCALE=0` finding. The fragment fold is deliberately **not** inside the
+`vcol_fold_enabled()` block, so `VCOLFOLD=0` does not silently disable it — and for the same reason
+it does **not** set `folded`, so `vcol_fold_applied` keeps meaning "the *vertex* program's fold
+fired". The consequence, stated rather than left to be derived: with `FPVCOLDEEP=1` the pack loop's
+invariant *"fold[] is all-ones whenever `VCOLFOLD=0`"* no longer holds; `FPVCOLDEEPSCALE=0` is what
+makes `fold[]` all-ones on that branch.
+
+**Two further review findings, both now fixed in the shipped build.** (1) An earlier draft
+snapshotted `hops_used` before the deep search and wrote it back afterwards, on the theory that it
+was restoring the terminal walk's value — it was not, because the round-41 `srckind` census *also*
+calls `hop_copies`, so the snapshot was already post-census. Both lines are deleted;
+`result.out_rgb_hops` is assigned once from the terminal walk and never touched again. (2) **KNOWN
+GAP, measured inert on this title:** the constant-vertex-colour-route branch returns before the fold,
+so a program that is constant-route on the vertex side *and* deep-classified on the fragment side
+does not get the x2. Both of Haze's constant routes are degenerate for it — `cval=[1 1 1 0]` is
+already at the unorm ceiling and `cval=[0 0 0 1]` is refused outright on textured draws by
+`VCOLCONSTBLACK`.
+
+`RPCS3_REMIX_GUESTLIGHTAUTO=0` was left untouched at launcher:1244, as instructed.
+
+---
+
+### TASK 2 — THE ADS WHITE BLOOM AND THE 5x FRAMERATE COLLAPSE, MEASURED
+
+Not fixed this round — the brief gates it behind task 1 — but **root-caused with numbers**, which is
+what round 43 needs. All MEASURED from 468 `Remix timing:` windows in `bin\log\RPCS3.log`
+(the timing line goes to `rsx_log.notice` only, `RemixGSRender.cpp:24622`, so it is **not** in
+`remix_dump.log`; 380 of the windows are in-level).
+
+| per frame | normal (n=353) | the episode (n=22) | ratio |
+| --- | --- | --- | --- |
+| frame_ms | 21.42 (46.7 fps) | **81.83 (12.2 fps)** | 3.8x |
+| draw | 11.73 | 88.89 | 7.6x |
+| **ui** | **2.26** | **64.88** | **28.7x** |
+| **present** | **6.39** | **0.65** | **0.10x** |
+| ui_px | 138,477 | **4,480,204** | 32.4x |
+
+**`present` FALLS.** The path tracer was *starved*, not overloaded — the cost is 100% CPU-side in the
+backend's own software UI compositor. Correlation with frame time: `ui r=+0.896`, `ui_px r=+0.894`,
+everything else <= +0.52, `present r=-0.424`. Regression over 380 windows:
+**`ui_ms = 14.57 ns x ui_px + 0.207 ms, R2 = 0.99825`** — 4.48M px/frame is **2.16 full-screen
+CPU-rasterized layers per frame**. Of the +77.16 ms over a normal draw, **62.86 ms (81.5%) is `ui`**.
+
+The worst window: `frame_ms=88.26 draw=88.89 (ui=65.12) present=0.63 scene=[1770 -31.65 1134]`.
+All 22 slow windows are one continuous encounter with the camera frozen at that position for 21 s.
+`Remix live:` deltas: `ui_pixel` (the pixel-space UI route) goes **1.0 -> 24.0 draws per frame** and `ui_uv` is stable to +/-30 across every slow window — a fixed, deterministic
+24-draw overlay set.
+
+**The visual half, MEASURED:** `compositor::blend()` in `RemixCompositor.cpp` implements **straight
+alpha only** (`++m_pixels` at `:613` is what `ui_px` counts) — there is no additive path anywhere in the file, and `alpha == 0xFF` takes a
+`std::memcpy` (`:633`), a hard overwrite. **INFERRED, and it is the obvious reading:** an additive
+lens-flare / glare sprite with opaque white texels is composited as a solid opaque white disc rather
+than as a glow. That makes the white bloom and the framerate one defect, not two.
+
+**Ruled out by measurement — none of these moved during the episode (per-window delta 0.0):**
+`mat_emissive` (485), `guest_lights` (128 = exactly `glmax`, pool saturated), `sunsprite`
+(`1579/0` — **every one of 1579 observations rejected offscreen, zero accepted**), `suncard_elected`
+(0), `fpvcol_emissive` (0), `fpvcol_additive` (0). The post-process surface cap did not fail open
+either: `s_max_tracked_surfaces = 256` and the warning never fired.
+
+---
+
+### Instrument defects found this round
+
+- **`glauto=%d` on both banners prints a BOOLEAN, not the mode** — the argument is
+  `guest_light_auto_enabled() ? 1 : 0` (`RemixGSRender.cpp:929` and `:25983`). Round 41 armed
+  `GUESTLIGHTAUTO=2` and every log line since has read `glauto=1`, which is indistinguishable from
+  mode 1 — the mode that *"put lights on doors in August"*. Nothing was wrong with the run; the
+  banner cannot state which mode it used. Worth one line in a later round.
+- **`RPCS3_REMIX_EMISSIVEINT` is not a real variable.** The parser reads
+  `RPCS3_REMIX_EMISSIVEINTENSITY` (`RemixTransforms.cpp:11219`); `emissiveint=` on the banner is a
+  dump field only. The launcher sets `EMISSIVEINTENSITY`, so nothing is broken — but the short name
+  appears in prose and would silently do nothing.
+- **The `Remix uiwrap:` census is already re-keyed per stats window**
+  (`RemixGSRender.cpp:13818`), so its 64-line cap is per window and not per run. Round 43 can
+  name the ADS overlay draws from the existing census by matching the window to the slow frames; no
+  new instrument is needed.
+- **`mat_untested` on the stats line is correctly wired** to `tex.materials_untested`
+  (`RemixTextures.h:176`) — it grepped as missing only because it lives in a different header.
+
+### Lessons
+
+- **A ratio is not a population.** `tex_none / (tex_none + tex_bound)` measured the walk's failure
+  rate; the thing that renders is `notex_mat_applied / submitted`, and the two differ by a factor of
+  757 on this title. Three rounds of briefs carried the first number as if it were the second. Before
+  building a round on a counter, find the counter that partitions it and check the partition sums.
+- **A matcher that reads one instruction cannot see a program.** The round-41 hop was safe, correct
+  and aimed thirty instructions too late. When a classifier recognises two shapes in a whole title,
+  the question is not "which extra shape" but "is it looking in the right place at all".
+- **The answer was already in a comment.** Round 11 wrote `rgb = texRGB * (2 * COL0.rgb) * 0.944243`
+  into `apply_haze_fade`'s doc block and moved on. Grep the repo's own transcriptions before
+  disassembling.
+- **Reimplement the rule offline and run it over the stored corpus before you build.** 22/338 and
+  7/8 with one measured constant is a pre-registration; "it should match the wall programs" is not.
 
 ## Round 41 (2026-08-25)
 

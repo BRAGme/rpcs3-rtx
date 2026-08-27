@@ -786,12 +786,18 @@ void RemixGSRender::on_init_thread()
 			// confirm; texidle has no launcher line by default and its config default (300
 			// frames) is the leading suspect for the idle degradation, so the banner states the
 			// value the run actually used rather than leaving it to be inferred.
-			"fpvcol=%d vcolmod=%d madchainmix=%d texreapsafe=%d ucodestore=%d texidle=%u "
+			"fpvcol=%d vcolmod=%d "
+			// ROUND 42, inserted immediately after vcolmod with its two arguments in the
+			// matching position: the classifier widening and whether the measured
+			// fragment-side scale is folded. A run that reads fpdeep=0/0 with fpvcoldeep=1
+			// here searched and matched nothing; with fpvcoldeep=0 it never searched.
+			"fpvcoldeep=%d fpvcoldeepscale=%d fpalbedonarrow=%d "
+			"madchainmix=%d texreapsafe=%d ucodestore=%d texidle=%u "
 			// Round 10. Every one of these is a bisect step on the play-test card, and the whole
 			// point of the banner is that the first ten lines of a run say what it was launched
 			// with. vcolbgra in particular has to be visible: the HUD turning amber is the visible
 			// test, and "amber" with vcolbgra=0 would mean the binary is stale.
-			"camclipgate=%d camfbrelatch=%d anchorsticky=%d vcolbgra=%d fpvcolalphagate=%d "
+			"camclipgate=%d camfbrelatch=%d anchorsticky=%d gaugedonormaxt=%u vcolbgra=%d fpvcolalphagate=%d "
 			"fpvcolemissive=%.4g fpvcoladditive=%d vmalbedos=%u vmanchorgeo=%d vmalbedocam=%d "
 			"madaccumwalk=%d "
 			// Round 11. hazefade is the headline visible test and the first thing the play-test
@@ -928,6 +934,9 @@ void RemixGSRender::on_init_thread()
 			remix_rsx::wdivide_walk_enabled() ? 1 : 0,
 			remix_rsx::fp_vertex_colour_replay_enabled() ? 1 : 0,
 			remix_rsx::vertex_colour_modulate_enabled() ? 1 : 0,
+			remix_rsx::fp_vcol_deep_enabled() ? 1 : 0,
+			remix_rsx::fp_vcol_deep_scale_enabled() ? 1 : 0,
+			remix_rsx::fp_albedo_narrow_enabled() ? 1 : 0,
 			remix_rsx::mad_chain_mixed_lanes_enabled() ? 1 : 0,
 			remix_rsx::texture_reap_safe() ? 1 : 0,
 			remix_rsx::ucode_store_enabled() ? 1 : 0,
@@ -935,6 +944,7 @@ void RemixGSRender::on_init_thread()
 			remix_rsx::camera_clip_gate_enabled() ? 1 : 0,
 			remix_rsx::camera_fallback_relatch_enabled() ? 1 : 0,
 			remix_rsx::gauge_anchor_sticky_enabled() ? 1 : 0,
+			remix_rsx::gauge_donor_max_translation(),
 			remix_rsx::vertex_colour_bgra_enabled() ? 1 : 0,
 			remix_rsx::fp_vcol_alpha_gate_enabled() ? 1 : 0,
 			static_cast<f64>(remix_rsx::fp_vcol_emissive()),
@@ -1326,6 +1336,7 @@ void RemixGSRender::pick_callback(const u32* values, u32 count, void* user)
 		const pick_record& first = request->snapshot[*reported.begin() - 1];
 		state->follow_vp.store(first.vp_hash, std::memory_order_release);
 		state->follow_albedo.store(first.albedo_hash, std::memory_order_release);
+		state->follow_vertex_count.store(first.vertex_count, std::memory_order_release);
 		state->resolved.fetch_add(1, std::memory_order_acq_rel);
 		state->follow_generation.fetch_add(1, std::memory_order_acq_rel);
 	}
@@ -1347,7 +1358,12 @@ void RemixGSRender::pick_callback(const u32* values, u32 count, void* user)
 			// camanchor= is the eye in origin='s own frame. So origin - camanchor is a real distance and
 			// origin - cam is the one this project has been quoting as ground truth while it was off by
 			// up to 429.96 units on X. camanchor==cam means the two frames agreed on that flip.
-			"basis=[%.6g %.6g %.6g] camvp=%016llx cam=[%.6g %.6g %.6g] camanchor=[%.6g %.6g %.6g] cam_age=%u frame=%llu "
+			// ROUND 43. det= is the 3x3 determinant of the SAME transform basis= summarises, and it
+			// is here because basis= cannot answer the question it looks like it answers: each of
+			// its three numbers is a row NORM, sqrt(x^2+y^2+z^2), so basis=[1 1 1] reads identical
+			// for an identity and for a reflection. NEGATIVE det = this instance was handed to the
+			// tracer reflected: mirrored texture, inverted shading.
+			"basis=[%.6g %.6g %.6g] det=%.6g camvp=%016llx cam=[%.6g %.6g %.6g] camanchor=[%.6g %.6g %.6g] cam_age=%u frame=%llu "
 			"uv_attr=%d uv_ucode=%d uv_scale=%s(%.6g) u=[%.4g..%.4g] v=[%.4g..%.4g] "
 			// Which reference divided this draw, and the identity of that reference. Round 2's fix
 			// fired and the wobble stayed, and nothing in that run said whether the object under the
@@ -1381,6 +1397,7 @@ void RemixGSRender::pick_callback(const u32* values, u32 count, void* user)
 			u32{r.clip_width}, u32{r.clip_height},
 			static_cast<f64>(r.origin[0]), static_cast<f64>(r.origin[1]), static_cast<f64>(r.origin[2]),
 			static_cast<f64>(r.basis[0]), static_cast<f64>(r.basis[1]), static_cast<f64>(r.basis[2]),
+			static_cast<f64>(r.det),
 			r.camera_vp_hash,
 			static_cast<f64>(r.camera_position[0]), static_cast<f64>(r.camera_position[1]), static_cast<f64>(r.camera_position[2]),
 			static_cast<f64>(r.camera_anchor_position[0]), static_cast<f64>(r.camera_anchor_position[1]),
@@ -1694,6 +1711,7 @@ void RemixGSRender::trace_pick_follow(const pick_record& record)
 		m_pick_follow_generation = generation;
 		m_pick_follow_vp = m_pick_state->follow_vp.load(std::memory_order_acquire);
 		m_pick_follow_albedo = m_pick_state->follow_albedo.load(std::memory_order_acquire);
+		m_pick_follow_vertex_count = m_pick_state->follow_vertex_count.load(std::memory_order_acquire);
 		m_pick_follow_until_frame = m_frame_counter + s_pick_follow_frames;
 		m_pick_follow_last_frame = umax;
 		m_pick_follow_lines = 0;
@@ -1704,7 +1722,16 @@ void RemixGSRender::trace_pick_follow(const pick_record& record)
 		|| m_frame_counter > m_pick_follow_until_frame
 		|| m_pick_follow_lines >= s_max_pick_follow_lines
 		|| record.vp_hash != m_pick_follow_vp
-		|| record.albedo_hash != m_pick_follow_albedo)
+		|| record.albedo_hash != m_pick_follow_albedo
+		// ROUND 44. The third term, and it is the whole point of this edit. (vp, albedo) is not
+		// an object on this title - a tiled floor or a repeated fixture draws N instances of one
+		// mesh under one texture - so the old match followed the frame's FIRST such draw and
+		// reported the gap between two different tiles as d_origin. That is why round 43 read
+		// "per-frame origin jumps up to 8.16 units, quantised at multiples of ~2.04": the
+		// quantisation was the tile PITCH, not a jitter. Matching the clicked record's vertex
+		// count confines the trace to one mesh shape, which is the coarsest identity available
+		// here without plumbing a per-instance id through the pick table.
+		|| record.vertex_count != m_pick_follow_vertex_count)
 	{
 		return;
 	}
@@ -1732,7 +1759,8 @@ void RemixGSRender::trace_pick_follow(const pick_record& record)
 	}
 
 	const std::string line = fmt::format(
-		"Remix pick-follow: frame=%llu vp=%016llx albedo=%016llX origin=[%.6g %.6g %.6g] "
+		"Remix pick-follow: frame=%llu vp=%016llx albedo=%016llX vtx=%u ext=%.4g det=%.6g "
+		"origin=[%.6g %.6g %.6g] "
 		"basis=[%.6g %.6g %.6g] d_origin=%.6g d_basis=%.6g first=%d relatch=%d "
 		// The reference that placed this frame's copy of the followed object. A d_basis that
 		// oscillates while 'ref' flips between anchor and camera IS the reference-selection
@@ -1742,6 +1770,13 @@ void RemixGSRender::trace_pick_follow(const pick_record& record)
 		m_frame_counter,
 		record.vp_hash,
 		record.albedo_hash,
+		// ROUND 44. vtx is the match term added above, printed so a reader can confirm the trace
+		// stayed on one mesh shape; ext and det are free from the same record and are what say
+		// whether a d_origin came with a size change (a different instance) or without one (real
+		// motion of the followed instance).
+		record.vertex_count,
+		static_cast<f64>(record.extent),
+		static_cast<f64>(record.det),
 		static_cast<f64>(record.origin[0]), static_cast<f64>(record.origin[1]), static_cast<f64>(record.origin[2]),
 		static_cast<f64>(record.basis[0]), static_cast<f64>(record.basis[1]), static_cast<f64>(record.basis[2]),
 		static_cast<f64>(origin_delta),
@@ -1887,6 +1922,83 @@ void RemixGSRender::capture_gauge_anchor(const remix_rsx::mat4& fused)
 		return;
 	}
 
+	// --- ROUND 44: the placement gate (RPCS3_REMIX_GAUGEDONORMAXT) -------------------------------
+	//
+	// Round 30 specified this and never shipped it. WORLDIDENTITYVP drives two gates and only one
+	// of them ever learned about WORLDIDMAXT: submit_subdraw's `keep_resolved` reads this draw's
+	// discarded translation, sees hundreds of units and correctly refuses to call it a
+	// world-identity draw - while this function has already installed that same draw's fused matrix
+	// as the whole frame's world gauge on the strength of the vp-hash list alone.
+	//
+	// MEASURED, this round, over the newest session's 12,779 'Remix worldid-draw:' lines: of the
+	// 759 frames carrying two or more rows, 559 have EVERY row reporting one identical
+	// pre-translation, bit-for-bit across unrelated meshes. Guest motion cannot do that. And the
+	// magnitudes are not small - 'Remix gauge:' translation has mean 41.99 and max 1718.67 over
+	// 17,386 frames, exceeding 128 units on 7.36% of them.
+	//
+	// WHY ANCHORSTICKY DOES NOT ALREADY DO THIS, stated because it looks like it should:
+	// slot_continuous above is matrix_relative_delta <= 0.8, a RELATIVE whole-matrix measure. A
+	// donor sitting 21.75 units off the world origin scores nowhere near 0.8 and installs silently.
+	// Sticky asks "did the gauge CHANGE"; this asks "is the gauge WRONG". A stably-wrong gauge is
+	// perfectly continuous and passes sticky on every frame.
+	//
+	// The probe is `fused * slot->inverse` and its translation is read from row 3 after dividing
+	// out m[3][3] - character for character the measurement report_gauge_trace() makes at :2454,
+	// so 'Remix gauge: translation=' and this gate are the same number and can be read against each
+	// other without a conversion.
+	//
+	// PLACED HERE ON PURPOSE, below the contested tripwire's own return rather than above it. A
+	// donor arriving after the frame's gauge has already landed still reaches that tripwire and is
+	// still counted by gauge_anchor_contested, so arming this knob cannot silently deflate the one
+	// counter that measures the disagreement this gate exists to act on.
+	//
+	// ONE existing counter DOES move, and it is named rather than left to be discovered:
+	// gauge_anchor_parked rises, because an offside donor is parked rather than dropped (see the
+	// scene-cut note at the park site below). gauge_anchor_promoted may rise with it. Read the
+	// round-43 baselines - parked 4,338 and promoted 18 over 56,381 flips - as the before.
+	//
+	// Three deliberate properties:
+	//   - it needs a gauge to judge against, so the first donor after a scene cut is never refused
+	//     (slot_has_gauge); the bootstrap is stated rather than hidden;
+	//   - WORLDIDMAXTEXEMPTVP is honoured for exactly the reason it exists at the submit site -
+	//     those programs submit absolute world spans and their large translations are real;
+	//   - gauge_donor_offside is incremented before the knob is consulted, so GAUGEDONORMAXT=0
+	//     still measures the population it would have refused.
+	bool donor_offside = false;
+
+	if (slot_has_gauge && !remix_rsx::world_identity_keep_exempt_matches(m_current_vp_hash))
+	{
+		const remix_rsx::mat4 probe = remix_rsx::mat4_multiply(fused, slot->inverse);
+		const f32 w = probe.m[3][3];
+		const f32 inv = (std::isfinite(w) && std::abs(w) > 1e-6f) ? (1.f / w) : 1.f;
+
+		f32 donor_translation = 0.f;
+		for (u32 row = 0; row < 3; ++row)
+		{
+			donor_translation = std::max(donor_translation, std::abs(probe.m[3][row] * inv));
+		}
+
+		const u32 donor_max = remix_rsx::gauge_donor_max_translation();
+
+		// The threshold the counter measures against when the knob is off is the same 32 units the
+		// submit site already uses, so an unarmed run's gauge_donor_offside is directly comparable
+		// to the armed run's gauge_donor_refused.
+		const f32 measure_against = static_cast<f32>(donor_max != 0 ? donor_max
+			: remix_rsx::world_identity_keep_translation());
+
+		if (std::isfinite(donor_translation) && measure_against > 0.f
+			&& donor_translation > measure_against)
+		{
+			++m_stats.gauge_donor_offside;
+
+			if (donor_max != 0)
+			{
+				++m_stats.gauge_donor_refused;
+				donor_offside = true;
+			}
+		}
+	}
+
 	// --- round 10: park a discontinuous first donor instead of installing it --------------------
 	// This is Selva's "geometry follows the camera / the carrier and its cargo move in different
 	// frames", and the mechanism is named rather than guessed. The main-key holder BD1C10DF5703E559
@@ -1914,7 +2026,16 @@ void RemixGSRender::capture_gauge_anchor(const remix_rsx::mat4& fused)
 	//
 	// The contested tripwire is untouched and keeps counting: it is measuring AD7C's bad donations,
 	// which this leaves refused. RPCS3_REMIX_ANCHORSTICKY=0 restores first-draw-wins bit-exactly.
-	if (remix_rsx::gauge_anchor_sticky_enabled() && slot_has_gauge && !slot_continuous)
+	// ROUND 44. donor_offside joins the sticky condition rather than returning on its own,
+	// and that is a correctness requirement, not tidiness. The probe above measures this
+	// candidate against the gauge the slot already holds, so on the frame after a scene cut
+	// EVERY candidate is legitimately far from the stale gauge. A bare return would refuse
+	// them all, leave nothing parked, give promote_parked_anchors() nothing to install, and
+	// the slot would never recover - a permanent lockout on the first hard cut. Parking
+	// instead reuses round 10's existing recovery verbatim: if nothing in-threshold turns up
+	// all frame the parked candidate is promoted at flip and the cut converges in one frame.
+	if (slot_has_gauge
+		&& ((remix_rsx::gauge_anchor_sticky_enabled() && !slot_continuous) || donor_offside))
 	{
 		// Keep the FIRST parked candidate of the frame rather than the last: if no continuous donor
 		// arrives, the promoted gauge should be the one draw order would have chosen anyway, so the
@@ -6050,7 +6171,7 @@ bool RemixGSRender::is_screen_space_draw() const
 	return remix_rsx::is_orthographic(outer) && !rsx::method_registers.depth_write_enabled();
 }
 
-u32 RemixGSRender::albedo_unit_mask(bool* from_ucode) const
+u32 RemixGSRender::albedo_unit_mask(bool* from_ucode, bool* from_narrow) const
 {
 	// referenced_textures_mask comes from the fragment ucode disassembly that
 	// analyse_current_rsx_pipeline() already ran, so it costs nothing here. GL and VK iterate
@@ -6060,6 +6181,15 @@ u32 RemixGSRender::albedo_unit_mask(bool* from_ucode) const
 	if (from_ucode)
 	{
 		*from_ucode = false;
+	}
+
+	// ROUND 43. Separate from from_ucode on purpose: a kill-resolved draw sets BOTH, because it
+	// is a ucode answer, and the retry guard downstream must treat it as one. This one exists so
+	// the counter can say how many of those answers only came from the kill. Cleared here rather
+	// than at the call site so every caller reads false when the branch is not taken.
+	if (from_narrow)
+	{
+		*from_narrow = false;
 	}
 
 	if (!remix_rsx::fp_albedo_enabled() || !m_current_fp_fingerprint)
@@ -6078,7 +6208,58 @@ u32 RemixGSRender::albedo_unit_mask(bool* from_ucode) const
 	// where reading the program changed what the caller may do.
 	if (colour == 0 || colour == referenced)
 	{
-		return referenced;
+		// --- ROUND 43b ------------------------------------------------------------------------
+		// This is the declining branch, and on this title it is where 100% of draws land:
+		// tex_albedo_ucode = 0 against tex_albedo_guess = 7,383,877 over a whole 41,802-flip run.
+		// colour_mask saturates, the answer becomes "the lowest referenced unit", and on the wall
+		// programs that unit is a single-channel parallax HEIGHT MAP - which is the white wall.
+		// See fp_fingerprint::narrow_sample_mask for the ucode and the measurement.
+		//
+		// Only the saturating case. colour == 0 means "no sample reaches COL0 at all", which is
+		// not a mask to narrow - there is no evidence there to refine.
+		if (!remix_rsx::fp_albedo_narrow_enabled() || colour == 0 || !m_current_fp_fingerprint)
+		{
+			return referenced;
+		}
+
+		// Drop the units that cannot be carrying RGB. See fp_fingerprint::narrow_sample_mask.
+		const u32 wide = referenced & ~u32{m_current_fp_fingerprint->narrow_sample_mask};
+
+		if (wide == 0 || wide == referenced)
+		{
+			return referenced;
+		}
+
+		// THE CONTAINMENT, and the whole lesson of round 43's first attempt. Ask both questions
+		// and change nothing unless the answer actually differs:
+		//
+		//   - the narrowed mask must name a unit this backend can bind, or a program whose only
+		//     wide unit is disabled would go from wrong texture to NO texture;
+		//   - and it must elect a DIFFERENT unit from the one the caller would have taken anyway.
+		//
+		// The second test is what makes this surgical. Over bin\remix_ucode\ the rule narrows 178
+		// of the 202 saturated programs but changes the election of only THREE; without this test
+		// the other 175 would still have had their retry walk confined to the narrowed mask, and
+		// "the retry can no longer reach the unit that was working" is precisely the shape of
+		// failure that took the first attempt off the table.
+		const int narrowed_unit = albedo_texture_unit_in(wide, 0);
+
+		if (narrowed_unit < 0 || narrowed_unit == albedo_texture_unit_in(referenced, 0))
+		{
+			return referenced;
+		}
+
+		// NOTE what is deliberately NOT set: from_ucode stays false, so the retry guard at
+		// :19445 keeps refusing to substitute exactly as it does today. Round 43's first attempt
+		// set it, which silently unblocked a walk that had never once been able to run on this
+		// title and put a second, much larger population in play at the same time as the
+		// re-election. One change at a time.
+		if (from_narrow)
+		{
+			*from_narrow = true;
+		}
+
+		return wide;
 	}
 
 	if (from_ucode)
@@ -11045,6 +11226,48 @@ void RemixGSRender::apply_vertex_colour(u32 first_vertex, u32 vertex_count, bool
 		}
 	}
 
+	// --- ROUND 42: the FRAGMENT program's own scale, folded beside the vertex program's ----------
+	// fold[] above carries the constants the VERTEX ucode multiplies ATTR3 by on the way to COL0
+	// (c[18] on every Haze world program). It has never carried the constant the FRAGMENT ucode
+	// multiplies COL0 by on the way to the modulate, because until this round no program whose
+	// fragment stage did that was ever classified. MEASURED as exactly 2.0 on all four Haze
+	// programs whose ucode is on disk - 'MUL R1.xyz, H1, {2,0,0,0}.xxxx' immediately after
+	// 'MOV H1, ATTR1' - which is the standard "vertex colour is a 0..2 lighting multiplier packed
+	// into 0..1" convention, so 0.5 is unlit-neutral and dropping the x2 would land every surface
+	// at half the guest's shading.
+	//
+	// RGB ONLY, and that is read from the bytes rather than assumed: the same programs copy the
+	// alpha lane across UNSCALED ('MOV R1.w, H1'), so folding this into fold[3] would invent an
+	// opacity the guest never computes - the exact failure the alpha-route gate below exists for.
+	//
+	// out_vcol_scale is 1.0 unless the deep search set it, so this cannot alter a program the
+	// terminal classifier named. RPCS3_REMIX_FPVCOLDEEPSCALE=0 replays COL0 raw.
+	//
+	// Deliberately NOT gated on RPCS3_REMIX_VCOLFOLD and deliberately NOT setting 'folded'.
+	// VCOLFOLD is the VERTEX program's fold and vcol_fold_applied is its counter; ANDing this into
+	// that knob would let VCOLFOLD=0 silently swallow half of round 42, and setting 'folded' would
+	// make one counter report two different mechanisms. The consequence, stated so the next reader
+	// does not have to derive it: with FPVCOLDEEP=1 the pack loop's invariant "fold[] is all-ones
+	// whenever VCOLFOLD=0" no longer holds - the fragment-side scale is the other contributor, and
+	// FPVCOLDEEPSCALE=0 is what makes fold[] all-ones on this branch.
+	//
+	// KNOWN GAP, measured inert on this title: the constant-route branch above RETURNS before this
+	// point, so a program that is constant-route on the vertex side AND deep-classified on the
+	// fragment side does not get the scale. Both constant routes Haze has are degenerate for it -
+	// 'Remix vcolroute:' reports cval=[1 1 1 0] (already at the unorm ceiling, so x2 clamps to the
+	// same value) and cval=[0 0 0 1] (refused outright on textured draws by VCOLCONSTBLACK).
+	if (m_current_fp_fingerprint && m_current_fp_fingerprint->out_rgb_deep
+		&& remix_rsx::fp_vcol_deep_scale_enabled()
+		&& m_current_fp_fingerprint->out_vcol_scale > 0.f
+		&& m_current_fp_fingerprint->out_vcol_scale != 1.f)
+	{
+		const f32 fp_scale = m_current_fp_fingerprint->out_vcol_scale;
+
+		fold[0] *= fp_scale;
+		fold[1] *= fp_scale;
+		fold[2] *= fp_scale;
+	}
+
 	// The alpha lane is a separate question from the colour lanes, and it is the one that can
 	// delete geometry: an alpha the guest never computes, replayed into a Modulate stage, resolves
 	// to opacity 0. Where the route cannot prove ATTR3.w reaches COL0.w the submitted alpha stays
@@ -12298,9 +12521,31 @@ bool RemixGSRender::apply_vertex_alpha(u32 first_vertex, u32 vertex_count)
 
 	for (u32 i = 0; i < vertex_count; ++i)
 	{
-		// RGB left at white: the tint question the sibling declines to answer stays unanswered.
-		// 0x00FFFFFF is the same value under either pack order, so VCOLBGRA does not reach here.
-		m_scratch_vertices[i].color = 0x00FFFFFFu | (u32{m_scratch_alpha[i]} << 24);
+		// --- ROUND 42: preserve whatever RGB is already there --------------------------------
+		// This used to write a literal 0x00FFFFFF, and the comment for it - "RGB left at white:
+		// the tint question the sibling declines to answer stays unanswered" - was true only while
+		// the sibling declined. It no longer does: apply_vertex_colour runs BEFORE this on the same
+		// draw (they are two independent statements at :19842 and :19872, not two arms of one
+		// chain, and the comment there says so in as many words), so on any textured draw that is
+		// both fp-classified and blended with a constant-alpha albedo, this line was overwriting a
+		// freshly replayed vertex colour with white.
+		//
+		// GATED, and the reason is worth stating because an earlier draft shipped it ungated on
+		// the argument that it was "a strict identity on every draw the old line could reach".
+		// THAT ARGUMENT IS FALSE, caught in review. It is an identity only where
+		// apply_vertex_colour did not write, and apply_vertex_colour writes on any draw the
+		// TERMINAL classifier already named - the two vcol_pass/vcol_modulate programs that
+		// predate round 42. So ungated, FPVCOLDEEP=0 would not have been a bit-exact round-41
+		// control, and the mesh content hash covers these bytes, so those meshes would re-create.
+		// A revert knob that does not revert is worse than the bug it hides, so the knob owns
+		// this line too: with FPVCOLDEEP=0 it writes the literal 0x00FFFFFF exactly as before.
+		//
+		// Everywhere else the mask IS an identity: every vertex leaves the decode loop at
+		// 0xFFFFFFFF (:3904, :18704) and apply_vertex_colour is the only writer between there and
+		// here, so with no vertex colour applied 'color & 0x00FFFFFF' is 0x00FFFFFF.
+		m_scratch_vertices[i].color = remix_rsx::fp_vcol_deep_enabled()
+			? ((m_scratch_vertices[i].color & 0x00FFFFFFu) | (u32{m_scratch_alpha[i]} << 24))
+			: (0x00FFFFFFu | (u32{m_scratch_alpha[i]} << 24));
 	}
 
 	return true;
@@ -19185,7 +19430,11 @@ void RemixGSRender::submit_subdraw()
 		// Walk the eligible 2D units in order and keep the first that yields a material.
 		// A refusal on the lowest unit is not a refusal for the draw: see albedo_texture_unit_in.
 		bool unit_from_ucode = false;
-		const u32 unit_mask = albedo_unit_mask(&unit_from_ucode);
+		// ROUND 43. Counted at the same place the ucode/guess pair is counted, so all three
+		// partition one population and tex_albedo_narrow reads as a share of tex_albedo_ucode
+		// rather than of the draw count.
+		bool unit_from_narrow = false;
+		const u32 unit_mask = albedo_unit_mask(&unit_from_ucode, &unit_from_narrow);
 
 		int unit = albedo_texture_unit_in(unit_mask, 0);
 		const int first_unit = unit;
@@ -19216,6 +19465,17 @@ void RemixGSRender::submit_subdraw()
 			else
 			{
 				++m_stats.tex_albedo_guess;
+			}
+
+			// ROUND 43b: counted OUTSIDE the pair above, and that is the point. The narrow-unit
+			// rule deliberately does not set unit_from_ucode - it changes which unit is elected
+			// and nothing else, leaving the retry policy exactly as it was - so these draws are
+			// still counted as guesses. tex_albedo_narrow is therefore a subset of
+			// tex_albedo_guess, not of tex_albedo_ucode. If it ever needs to be read as a share,
+			// read it against tex_albedo_guess.
+			if (unit_from_narrow)
+			{
+				++m_stats.tex_albedo_narrow;
 			}
 		}
 
@@ -19796,6 +20056,14 @@ void RemixGSRender::submit_subdraw()
 		if (m_stats.vcol_applied != before)
 		{
 			++m_stats.vcol_mod_applied;
+
+			// ROUND 42: the same draw, attributed to the widening that admitted it. Counted here
+			// rather than at the scan because the scan counts PROGRAMS, and "39 of 64 programs"
+			// says nothing about how much of the screen they draw.
+			if (m_current_fp_fingerprint->out_rgb_deep)
+			{
+				++m_stats.vcol_deep_applied;
+			}
 		}
 	}
 
@@ -20751,6 +21019,7 @@ void RemixGSRender::submit_subdraw()
 			static_entry->vertex_lookup.clear();
 			static_entry->triangles.clear();
 			static_entry->submitted_signatures.clear();
+			static_entry->last_submitted_mesh_hash = 0;
 			static_entry->mesh_hash = 0;
 			static_entry->submit_frame = umax;
 			static_entry->dirty = false;
@@ -22470,6 +22739,49 @@ void RemixGSRender::submit_subdraw()
 	instance.transform = transform;
 	instance.doubleSided = (remix_rsx::cull_from_rsx() && rsx::method_registers.cull_face_enabled()) ? 0u : 1u;
 
+	// --- ROUND 43: the determinant, because nothing here could ever see a mirror -----------------
+	//
+	// The user's capture shows painted wall text rendering BACKWARDS ("PAZ", "FUERA", "NUESTRO")
+	// on exactly the surfaces that come out solid black - while in another scene of the same run
+	// world text reads correctly ("SECTION D" on a sign, "R107" stamped on steel beams). So the
+	// reflection is PER INSTANCE, not a global handedness error in the camera, and it is not
+	// back-face culling either: doubleSided is 1 on every instance above unless RPCS3_REMIX_CULL
+	// is set, and it is not set.
+	//
+	// A negative determinant is the one transform property that produces both symptoms at once:
+	// the geometry is reflected, so its texture reads mirrored, and the winding is reversed, so
+	// the surface is shaded from behind and renders unlit - a black polygon that light leaks
+	// past. That is the whole description of "the black void floor".
+	//
+	// WHY THIS IS NEW. It has never been measurable. pick_record::basis is sqrt(x^2+y^2+z^2) per
+	// row - sign-blind by construction - and the only det3() in this file (:7633) is a local
+	// lambda inside the VIEWMODEL basis census and is never applied to a world instance. Four
+	// rounds of hypotheses about the black voids were argued without an instrument that could
+	// observe a reflection at all.
+	//
+	// Diagnostic only. Nothing below reads xform_det; no pixel changes.
+	const f64 xform_det = [&]
+	{
+		const auto e = [&](u32 r, u32 c) { return static_cast<f64>(transform.matrix[r][c]); };
+		return e(0, 0) * (e(1, 1) * e(2, 2) - e(1, 2) * e(2, 1))
+			- e(0, 1) * (e(1, 0) * e(2, 2) - e(1, 2) * e(2, 0))
+			+ e(0, 2) * (e(1, 0) * e(2, 1) - e(1, 1) * e(2, 0));
+	}();
+
+	++m_stats.xform_measured;
+
+	if (xform_det < 0.0)
+	{
+		++m_stats.xform_mirrored;
+	}
+	else if (!(xform_det > 0.0))
+	{
+		// NaN or exactly zero. A degenerate frame collapses the instance onto a plane or a point,
+		// which is a different failure from a reflection and has a different fix. Counted apart so
+		// the two can never be read as one number.
+		++m_stats.xform_degenerate;
+	}
+
 	if (skinned)
 	{
 		// Read per draw, not per clause: a title that uploads a new palette between draw calls
@@ -22908,6 +23220,7 @@ void RemixGSRender::submit_subdraw()
 		{
 			static_entry->submit_frame = m_frame_counter;
 			static_entry->submitted_signatures.clear();
+			static_entry->last_submitted_mesh_hash = 0;
 		}
 
 		static_submit_signature = rpcs3::fnv_seed;
@@ -22949,6 +23262,20 @@ void RemixGSRender::submit_subdraw()
 
 		if (static_entry->submitted_signatures.contains(static_submit_signature))
 		{
+			// ROUND 44. This exit has existed without a counter or a census line. Measured on the
+			// round-43 build by subtraction - it is the only return between ++xform_measured and
+			// ++draws_submitted, and poisoned read 0 - it discards 624,873 draws, 7.29% of every
+			// draw that resolved a transform and a mesh. Counting it directly, and splitting off
+			// the half that matters: the signature carries the transform and the render state and
+			// nothing about WHICH GEOMETRY the draw covers, so when the union grew between two
+			// draws of one frame the larger mesh is built and then dropped here.
+			++m_stats.static_submit_dedup;
+
+			if (static_entry->last_submitted_mesh_hash != hash)
+			{
+				++m_stats.static_submit_meshdiff;
+			}
+
 			return;
 		}
 
@@ -23021,6 +23348,11 @@ void RemixGSRender::submit_subdraw()
 			? static_cast<u8>(m_current_fp_fingerprint->out_alpha_source) : 0u;
 		record.fp_vcol_replayed = remix_rsx::fp_vertex_colour_replay_enabled()
 			&& m_current_fp_fingerprint && m_current_fp_fingerprint->vcol_replayable();
+
+		// ROUND 43: from the same transform the loop below summarises, computed once above at the
+		// point it is handed to the runtime, so the pick line and the xform_mirrored counter can
+		// never disagree about a draw.
+		record.det = static_cast<f32>(xform_det);
 
 		for (u32 i = 0; i < 3; ++i)
 		{
@@ -23366,6 +23698,7 @@ void RemixGSRender::submit_subdraw()
 	if (static_entry && has_static_submit_signature)
 	{
 		static_entry->submitted_signatures.insert(static_submit_signature);
+		static_entry->last_submitted_mesh_hash = hash;
 	}
 
 	if (static_entry && static_union_selected)
@@ -23529,6 +23862,14 @@ const remix_rsx::fp_fingerprint& RemixGSRender::fp_fingerprint_for(u64 fp_hash)
 			else if (fp.out_rgb_source == remix_rsx::fp_out_source::vcol_modulate)
 			{
 				++m_stats.fp_vcol_mod;
+
+				// ROUND 42: a strict subset, so the pair reads "of N modulate programs, D were
+				// only reachable by the deep search". D == N would mean the terminal classifier
+				// found nothing at all this run, which is a different statement from D == 0.
+				if (fp.out_rgb_deep)
+				{
+					++m_stats.fp_vcol_deep;
+				}
 			}
 
 			if (classified && fp.out_vcol_attr == 2)
@@ -23540,6 +23881,14 @@ const remix_rsx::fp_fingerprint& RemixGSRender::fp_fingerprint_for(u64 fp_hash)
 			{
 				dump_line(fmt::format(
 					"Remix fpvcol: fp=%016llx class=%s alpha=%s attr=COL%u replay=%d sampled=0x%02x "
+					// ROUND 42. deep=1 says the terminal instruction did NOT name this shape and
+					// the whole-program search did; fpscale is the fragment-side constant it
+					// measured between COL0 and the modulate (2 on every Haze program read, 1 on a
+					// plain copy). termop is the terminal opcode that defeated the round-41 walk,
+					// kept on the line so a deep-classified program still reports the shape the
+					// 'Remix fpother:' census would have shown for it. Inserted immediately before
+					// instrs=, with its three arguments in the matching position below.
+					"deep=%u fpscale=%.4g termop=%u "
 					"instrs=%u fp32=%u hops=%u frame=%llu",
 					fp_hash,
 					remix_rsx::fp_out_source_name(fp.out_rgb_source),
@@ -23547,6 +23896,9 @@ const remix_rsx::fp_fingerprint& RemixGSRender::fp_fingerprint_for(u64 fp_hash)
 					u32{fp.out_vcol_attr} ? u32{fp.out_vcol_attr} - 1u : 9u,
 					fp.vcol_replayable() ? 1 : 0,
 					u32{fp.sampled_mask},
+					fp.out_rgb_deep ? 1u : 0u,
+					static_cast<f64>(fp.out_vcol_scale),
+					u32{fp.out_rgb_opcode},
 					fp.instructions,
 					fp32_outputs ? 1 : 0,
 					u32{fp.out_rgb_hops},
@@ -24625,7 +24977,7 @@ void RemixGSRender::log_stats()
 		"cat_hidden=%llu cat_hidepair=%llu cat_particle=%llu cat_decal=%llu cat_smoothnormals=%llu | "
 		"blend_chained=%llu blend_translucent=%llu blend_unmapped=%llu blend_rtopaque=%llu "
 		"blend_arescued=%llu blend_astranded=%llu blend_pairs={%s} | "
-		"tex_bound=%llu tex_none=%llu tex_no_unit=%llu tex_unit_retry=%llu tex_albedo_ucode=%llu tex_albedo_guess=%llu tex_retry_refused=%llu tex_unit_substituted=%llu uv_applied=%llu uv_none=%llu uv_absent=%llu uv_layout=%llu uv_memory=%llu uv_fallback=%llu uv_ucode=%llu uv_heuristic=%llu uv_nonfinite=%llu vcol_applied=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_tombstone=%llu tex_rehashed=%llu tex_refreshed=%llu mat_created=%llu tex_retry_unsupported=%llu mat_untested=%llu tex_tomb_transient=%llu tex_key_dup=%llu uv_scale_ucode=%llu uv_scale_fixed=%llu uv_scale_refuse=%llu/%llu/%llu/%llu/%llu uv_affine_general=%llu uv_affine_lanes=%llu uv_tiled=%llu | "
+		"tex_bound=%llu tex_none=%llu tex_no_unit=%llu tex_unit_retry=%llu xform_measured=%llu xform_mirrored=%llu xform_degenerate=%llu tex_albedo_ucode=%llu tex_albedo_guess=%llu tex_albedo_narrow=%llu tex_retry_refused=%llu tex_unit_substituted=%llu uv_applied=%llu uv_none=%llu uv_absent=%llu uv_layout=%llu uv_memory=%llu uv_fallback=%llu uv_ucode=%llu uv_heuristic=%llu uv_nonfinite=%llu vcol_applied=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_tombstone=%llu tex_rehashed=%llu tex_refreshed=%llu mat_created=%llu tex_retry_unsupported=%llu mat_untested=%llu tex_tomb_transient=%llu tex_key_dup=%llu uv_scale_ucode=%llu uv_scale_fixed=%llu uv_scale_refuse=%llu/%llu/%llu/%llu/%llu uv_affine_general=%llu uv_affine_lanes=%llu uv_tiled=%llu | "
 		"ui_draws=%llu ui_skipped=%llu ui_no_colour=%llu ui_rt=%llu ui_prims=%llu ui_frames=%llu ui_ndc=%llu ui_unit=%llu ui_pixel=%llu ui_nospace=%llu ui_ortho2d=%llu "
 		"ui_vpydown=%llu ui_vpyup=%llu ui_vpfallback=%llu ui_vflip_ndc=%llu/%llu ui_vflip_pixel=%llu/%llu ui_vflip_abstain=%llu | "
 		"ui_forced=%llu uiforce_vps=%u "
@@ -24844,8 +25196,12 @@ void RemixGSRender::log_stats()
 		m_stats.tex_none,
 		m_stats.tex_no_unit,
 		m_stats.tex_unit_retry,
+		m_stats.xform_measured,
+		m_stats.xform_mirrored,
+		m_stats.xform_degenerate,
 		m_stats.tex_albedo_ucode,
 		m_stats.tex_albedo_guess,
+		m_stats.tex_albedo_narrow,
 		m_stats.tex_retry_refused,
 		m_stats.tex_unit_substituted,
 		m_stats.uv_applied,
@@ -25216,7 +25572,11 @@ void RemixGSRender::log_stats()
 			// the ones UVSCALELANES newly resolves. uv_tiled: draws whose submitted UVs leave the
 			// unit square at all, which is the size of the population the uvrange census names.
 			"uv_affine_lanes=%llu uv_tiled=%llu | "
-			"tex_bound=%llu tex_none=%llu | "
+			// ROUND 43: the albedo-election split, on the LIVE line as well as the stats line.
+			// It is the readout for the killed colour walk and the stats line only reaches
+			// RPCS3.log, which is exclusively locked while the emulator runs.
+			"tex_bound=%llu tex_none=%llu tex_albedo_ucode=%llu tex_albedo_guess=%llu tex_albedo_narrow=%llu "
+			"xform_mirrored=%llu/%llu/%llu | "
 			// Round 9: the texture cache's own residency, mirrored where it can be read while the
 			// thing it describes is on screen. These printed only into RPCS3.log, which is held
 			// exclusively locked for the whole run - which is why two full runs of the
@@ -25233,7 +25593,12 @@ void RemixGSRender::log_stats()
 			"reap_kept=%llu reap_freed=%llu | "
 			// Round 9: the effects family. fpvcol_applied climbing while an effect is on screen is
 			// the fix firing on it; fp_vcol_pass/mod are the PROGRAM counts behind it.
-			"fpvcol_applied=%llu vcol_mod=%llu vcol_const_black=%llu fpclass=%llu/%llu/%llu ucode_stored=%llu/%llu "
+			"fpvcol_applied=%llu vcol_mod=%llu vcol_const_black=%llu fpclass=%llu/%llu/%llu "
+			// ROUND 42 inserts fpdeep IMMEDIATELY AFTER fpclass, and its two arguments go in the
+			// matching position below - adjacent, one specifier group, one argument group, which is
+			// the only shape of edit to this line that cannot shift an unrelated pair. programs/draws.
+			"fpdeep=%llu/%llu "
+			"ucode_stored=%llu/%llu "
 			"madmix=%llu/%llu "
 			// Round 17: the Selva tree tops. programs/draws. Zero with madlanemap=1 on the banner
 			// means the arm is armed but the canopy programs never reached the matcher this run.
@@ -25402,6 +25767,17 @@ void RemixGSRender::log_stats()
 			//   vm_anchor_unmeasured must stay 0: non-zero says VMANCHORGEO is partly inert.
 			"cam_clipgate_refused=%llu cam_fb_relatch=%llu "
 			"anchor_parked=%llu anchor_recap=%llu anchor_promoted=%llu "
+			// ROUND 44, RPCS3_REMIX_GAUGEDONORMAXT. offside is counted whether or not the knob is
+			// armed, so an unarmed run still sizes the population; refused is the subset actually
+			// turned away. offside > 0 with refused == 0 means the knob is OFF, not that the
+			// mechanism is absent.
+			"gauge_donor_offside=%llu gauge_donor_refused=%llu "
+			// ROUND 44, diagnostic only. static_submit_dedup is the static-index submit-signature
+			// gate, which until now had no counter at all; it must reconcile with
+			// xform_measured - submitted - poisoned. meshdiff is its subset where a LARGER union
+			// mesh had been built and was discarded, and is the number that says whether the
+			// half-present floor is this gate or something else.
+			"static_submit_dedup=%llu static_submit_meshdiff=%llu "
 			"fpvcol_alpha_skip=%llu fpvcol_emissive=%llu fpvcol_additive=%llu "
 			"vm_tagged_albedo=%llu vmcam_twin=%llu vm_anchor_unmeasured=%llu "
 			// Round 20. vm_tagged_pair is the (vp, albedo) pair route. It partitions with
@@ -25509,11 +25885,17 @@ void RemixGSRender::log_stats()
 			// instrument. texidle is echoed because it has no launcher line by default and its
 			// config default (300 frames) is the prime suspect for the idle degradation - a run
 			// has to be able to state what it was actually launched with.
-			"fpvcol=%d vcolmod=%d madchainmix=%d texreapsafe=%d ucodestore=%d texidle=%u "
+			"fpvcol=%d vcolmod=%d "
+			// ROUND 42, inserted immediately after vcolmod with its two arguments in the
+			// matching position: the classifier widening and whether the measured
+			// fragment-side scale is folded. A run that reads fpdeep=0/0 with fpvcoldeep=1
+			// here searched and matched nothing; with fpvcoldeep=0 it never searched.
+			"fpvcoldeep=%d fpvcoldeepscale=%d fpalbedonarrow=%d "
+			"madchainmix=%d texreapsafe=%d ucodestore=%d texidle=%u "
 			// Round 10. Every one of these is a bisect step on the play-test card, so a run has to
 			// be able to state what it was launched with without anyone reading the launcher -
 			// which is the rule that caught round 6's silently-inert AFFINETOL run.
-			"camclipgate=%d camfbrelatch=%d anchorsticky=%d "
+			"camclipgate=%d camfbrelatch=%d anchorsticky=%d gaugedonormaxt=%u "
 			"vcolbgra=%d fpvcolalphagate=%d fpvcolemissive=%.4g fpvcoladditive=%d "
 			"vmalbedos=%u vmanchorgeo=%d vmalbedocam=%d madaccumwalk=%d "
 			// Round 11, same rule: every one of these is a bisect step on the play-test card.
@@ -25657,6 +26039,14 @@ void RemixGSRender::log_stats()
 			m_stats.uv_tiled,
 			m_stats.tex_bound,
 			m_stats.tex_none,
+			m_stats.tex_albedo_ucode,
+			m_stats.tex_albedo_guess,
+			m_stats.tex_albedo_narrow,
+			// mirrored/degenerate/measured, in that order: the two faults first so a healthy run
+			// reads "0/0/<big>" at a glance.
+			m_stats.xform_mirrored,
+			m_stats.xform_degenerate,
+			m_stats.xform_measured,
 			static_cast<u64>(m_textures.live()),
 			m_textures.stats().created,
 			m_textures.stats().destroyed,
@@ -25670,6 +26060,9 @@ void RemixGSRender::log_stats()
 			m_stats.fp_vcol_pass,
 			m_stats.fp_vcol_mod,
 			m_stats.fp_vcol_col1,
+			// ROUND 42, the pair for the 'fpdeep=%llu/%llu' inserted immediately after fpclass.
+			m_stats.fp_vcol_deep,
+			m_stats.vcol_deep_applied,
 			m_stats.ucode_stored,
 			m_stats.ucode_store_failed,
 			m_stats.madmix_resolved,
@@ -25786,6 +26179,10 @@ void RemixGSRender::log_stats()
 			m_stats.gauge_anchor_parked,
 			m_stats.gauge_anchor_recaptured,
 			m_stats.gauge_anchor_promoted,
+			m_stats.gauge_donor_offside,
+			m_stats.gauge_donor_refused,
+			m_stats.static_submit_dedup,
+			m_stats.static_submit_meshdiff,
 			m_stats.fpvcol_alpha_skipped,
 			m_stats.fpvcol_emissive,
 			m_stats.fpvcol_additive,
@@ -25888,6 +26285,9 @@ void RemixGSRender::log_stats()
 			remix_rsx::texture_verify_frames(),
 			remix_rsx::fp_vertex_colour_replay_enabled() ? 1 : 0,
 			remix_rsx::vertex_colour_modulate_enabled() ? 1 : 0,
+			remix_rsx::fp_vcol_deep_enabled() ? 1 : 0,
+			remix_rsx::fp_vcol_deep_scale_enabled() ? 1 : 0,
+			remix_rsx::fp_albedo_narrow_enabled() ? 1 : 0,
 			remix_rsx::mad_chain_mixed_lanes_enabled() ? 1 : 0,
 			remix_rsx::texture_reap_safe() ? 1 : 0,
 			remix_rsx::ucode_store_enabled() ? 1 : 0,
@@ -25895,6 +26295,7 @@ void RemixGSRender::log_stats()
 			remix_rsx::camera_clip_gate_enabled() ? 1 : 0,
 			remix_rsx::camera_fallback_relatch_enabled() ? 1 : 0,
 			remix_rsx::gauge_anchor_sticky_enabled() ? 1 : 0,
+			remix_rsx::gauge_donor_max_translation(),
 			remix_rsx::vertex_colour_bgra_enabled() ? 1 : 0,
 			remix_rsx::fp_vcol_alpha_gate_enabled() ? 1 : 0,
 			static_cast<f64>(remix_rsx::fp_vcol_emissive()),

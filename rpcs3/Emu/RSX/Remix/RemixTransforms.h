@@ -703,6 +703,36 @@ namespace remix_rsx
 		// product disqualifies a path.
 		u16 colour_mask = 0;
 
+		// ROUND 43b. Bit N: unit N is sampled, and EVERY sample of it writes fewer than three
+		// destination channels. Such a unit cannot be carrying RGB - it is a height, gloss, mask
+		// or lookup map. This is structural, not a heuristic: the channels are not there.
+		//
+		// WHY IT EXISTS. colour_mask above is documented as an over-approximation that "can only
+		// ever add units". On Haze it SATURATES: over the 323 sampled programs in
+		// bin\remix_ucode\, 202 come back with colour_mask == sampled_mask, which
+		// albedo_unit_mask() reads as "the ucode declines" and answers with the LOWEST referenced
+		// unit. The run's counters agreed exactly - tex_albedo_ucode = 0 against
+		// tex_albedo_guess = 7,383,877, i.e. the discriminator resolved nothing all session.
+		//
+		// From fp=65a91390aaf6bef3, the program on the picked white wall 9AAA430414B3D49D:
+		//
+		//    4: TEX R1     TEX2.zwzz, tex2    4 channels
+		//    9: TEX R2.x   TEX2,      tex0    ONE channel  <- a parallax height map
+		//   18: ADD R4.xy  TEX2, R2                        <- ...used as a UV perturbation
+		//   21: TEX R2.yw  R4,        tex3    2 channels
+		//   24: TEX R2     R4,        tex1    4 channels   <- the real diffuse
+		//
+		// tex0 is the lowest referenced unit, so it wins the decline, and a near-white greyscale
+		// height map bound as the albedo IS a white wall.
+		//
+		// WHY NOT A LIVENESS KILL. Round 43 first shipped exactly that - the same backward walk
+		// with an ordinary kill on unpredicated writes. It reached the right answer here (mask
+		// 0x1f -> 0x16, unit 0 -> 1, identical to this rule) but re-elected the albedo of 36
+		// programs, 16 of which moved to a unit >= 8, and the play-test came back as full-screen
+		// coloured static. This rule re-elects THREE, all of them unit 0 -> unit 1, none above
+		// unit 1. Same answer where it was verified, one twelfth of the blast radius.
+		u16 narrow_sample_mask = 0;
+
 		// Four-bit TEX input index per texture unit (0 = TEX0, 1 = TEX1, ...; 0xf =
 		// unresolved). Texture unit and coordinate input are independent in RSX fragment
 		// programs. Keeping them separate prevents a unit-0 sample sourced from TEX1 from
@@ -811,6 +841,17 @@ namespace remix_rsx
 		// Bit per source slot: 0x1 clean COL0/COL1 read, 0x2 temp whose writer sampled a texture,
 		// 0x4 temp (any), 0x8 non-identity swizzle, 0x10 negated, 0x20 abs.
 		u8 out_rgb_srckind[3] = {};
+
+		// --- ROUND 42: the modulate is not the terminal instruction on this title -----------------
+		// True when out_rgb_source was decided by the DEEP search rather than by the terminal
+		// instruction. The terminal fields above stay populated in that case, so a deep-classified
+		// program still reports the shape that defeated the round-41 walk.
+		bool out_rgb_deep = false;
+		// The product of the fragment-side constant scales sitting between COL0 and the modulate.
+		// MEASURED as exactly 2.0 on all four Haze programs whose ucode is on disk - the classic
+		// "vertex colour is a 0..2 lighting multiplier packed into 0..1" convention. 1.0 means the
+		// chain was a plain copy. Only ever applied to rgb: the ucode scales .xyz and copies .w.
+		f32 out_vcol_scale = 1.f;
 	};
 
 	// Reads the fragment ucode and reports which sampled units feed the final colour. 'ucode' is
@@ -827,6 +868,58 @@ namespace remix_rsx
 	// program that does real arithmetic (fog, specular, a lerp) between the modulate and the export
 	// will not be reached and must stay 'other'. Clamped to 8.
 	u32 fp_vcol_hop_budget();
+
+	// RPCS3_REMIX_FPVCOLDEEP=1 (default 0 = OFF, round-41 behaviour bit-exactly).
+	//
+	// ROUND 42. The round-41 hop was the right idea aimed one instruction too late. MEASURED from
+	// the four Haze fragment programs whose ucode is on disk in bin\remix_ucode - two of them
+	// (34389B9B085589D5 = fp aa0fe222771ff5c0, FB9E6A29D5BCC2E6 = fp 65a91390aaf6bef3) are
+	// programs the user's own Ctrl+Clicks landed on walls - every one of them has this shape:
+	//
+	//     14: MOV  H1,      ATTR1                  ; COL0
+	//     15: MUL  R1.xyz,  H1, {2,0,0,0}.xxxx     ; the 0..2 lighting expansion
+	//     17: MOV  R1.w,    H1                     ; alpha copied UNSCALED
+	//     26: TEX  R0,      ATTR5, tex0            ; the albedo
+	//     27: MUL  R1,      R0, R1                 ; *** albedo x (COL0 x 2) ***
+	//     ... 30 more instructions of normal map, specular and lighting composite ...
+	//     57: MUL  R0.xyz,  R0, {0.999001,...}.xxxx  END
+	//
+	// The modulate is real, it is unambiguous, and it is THIRTY INSTRUCTIONS upstream of the
+	// export. A classifier that only ever looks at the terminal instruction cannot see it, which is
+	// why 39 of the 64 'Remix fpother:' rows in the round-41 run read the same terminal shape
+	// (op=MUL t0=TEMP t1=CONSTANT) - the near-identity output scale, not the modulate.
+	// Independently corroborated: round 11 transcribed the haze card's fragment program into a
+	// comment in RemixGSRender.cpp and wrote 'rgb = texRGB * (2 * COL0.rgb) * 0.944243'.
+	//
+	// So this searches the whole program for the modulate instead of only its last line, and the
+	// search is deliberately NARROW - four terms, all of which must hold:
+	//   1. an unconditional MUL writing rgb,
+	//   2. one operand a temp whose writer sampled a texture (the same is_sampled_temp predicate
+	//      the terminal classifier already uses),
+	//   3. the other operand a clean COL0 read, or a temp reached from one through nothing but
+	//      BROADCAST constant scales - never COL1, never a per-channel constant, never a swizzle,
+	//      negate or abs,
+	//   4. the product provably live into COL0.rgb, by the same backward walk colour_mask uses.
+	// COL1 is excluded by measurement, not by caution: these same programs carry the packed
+	// tangent-space NORMAL in ATTR2 ('MAD H7.xyz, H7, 2, -1' then NRM), so a rule that accepted
+	// ATTR2 would replay a normal map as a colour.
+	//
+	// PRE-REGISTERED REFUTATION: if surfaces go visibly wrong-coloured rather than merely darker,
+	// this is round 8's RETRYUNSUP repeating and the knob defaults off - one line.
+	bool fp_vcol_deep_enabled();
+
+	// RPCS3_REMIX_FPVCOLDEEPSCALE=1 (default 1). Folds fp_fingerprint::out_vcol_scale - the
+	// measured fragment-side constant, 2.0 on every Haze program read - into the replayed vertex
+	// colour's rgb. Remix's Modulate factor is an 8-bit unorm, so a factor above 1 cannot be
+	// represented and the fold saturates above 0.5; that is still the faithful reading, because the
+	// x2 convention means 0.5 is the unlit-neutral value.
+	//
+	// MIND THE DIRECTION. The submitted factor is min(1, COL0 x 2) at 1 and plain COL0 at 0, and
+	// COL0 <= 1, so 1 is the BRIGHTER setting and 0 is the DARKER one - and BOTH can only darken
+	// relative to the no-modulate factor of 1.0 a program gets today. Set to 0 for surfaces that
+	// come out still white / washed out, or that show flat white patches where the x2 clips. There
+	// is no brighter setting: at 1 the ceiling is the 8-bit unorm Modulate factor itself.
+	bool fp_vcol_deep_scale_enabled();
 
 	fp_fingerprint scan_fragment_program(const void* ucode, u32 ucode_length, bool fp32_outputs);
 
@@ -1113,6 +1206,11 @@ namespace remix_rsx
 	// which is exactly the flat blue the dev-menu texture grid shows bound as albedo today. On by
 	// default; the bisect knob for reading the colour source out of the fragment program.
 	bool fp_albedo_enabled();
+
+	// RPCS3_REMIX_FPALBEDONARROW=0: never consult fp_fingerprint::narrow_sample_mask, restoring
+	// the round-42 albedo election bit-exactly. Only read where colour_mask already saturated,
+	// and only where dropping the narrow units changes which unit is elected.
+	bool fp_albedo_narrow_enabled();
 
 	// RPCS3_REMIX_SKYLEARN: admit the narrower latitude bands of a dome whose vertex program has
 	// already produced a sky-tagged draw. A tessellated dome is a stack of bands and only the
@@ -3139,6 +3237,46 @@ namespace remix_rsx
 	// 0 restores first-draw-wins bit-exactly. Counters: gauge_anchor_parked / _recaptured /
 	// _promoted. Census: 'Remix anchor-elect:'.
 	bool gauge_anchor_sticky_enabled();
+
+	// RPCS3_REMIX_GAUGEDONORMAXT (whole world units, 0 = OFF = round 43 byte for byte).
+	//
+	// ROUND 44, and this is round 30's specified-but-never-shipped fix. ONE declaration
+	// (WORLDIDENTITYVP) drives TWO gates and only one of them ever learned about WORLDIDMAXT:
+	//   * submit_subdraw's `keep_resolved` reads the draw's discarded translation, sees hundreds of
+	//     units, and correctly says "this is NOT a world-identity draw, keep its real transform";
+	//   * capture_gauge_anchor() has already run for that same draw and installed its fused matrix
+	//     as the WHOLE FRAME'S world gauge, qualified on the vp-hash list alone. It never looks at
+	//     the translation at all.
+	// So the backend says "carrier-local" and "this is the world" about one draw, in one frame, for
+	// one reason.
+	//
+	// MEASURED, round 44, over 12,779 'Remix worldid-draw:' lines of the newest session: of 759
+	// frames carrying two or more rows, 559 have EVERY row reporting one identical pre-translation,
+	// bit-for-bit across unrelated meshes (f=53640: vtx=160, vtx=224 and vtx=518 all read
+	// t=[1.579 -132.9 -2.179]). A per-object guest motion cannot do that; a wrong divide gauge is
+	// the only thing that can. The same frames' 'Remix gauge:' translation tracks it - 197.741 vs
+	// 197.0, 21.3542 vs 21.67, 132.275 vs -132.9, 916.247 vs -937.5 - and run-wide that number has
+	// mean 41.99, max 1718.67, and exceeds 128 units on 7.36% of frames.
+	//
+	// ANCHORSTICKY does NOT already cover this. Its test is matrix_relative_delta against the held
+	// gauge with a tolerance of 0.8 - a RELATIVE, whole-matrix measure. A donor sitting 21.75 units
+	// off the world origin scores nowhere near 0.8 and installs silently. Sticky asks "did the gauge
+	// CHANGE"; this asks "is the gauge WRONG", and a stably-wrong gauge passes sticky every time.
+	//
+	// The gate: a WORLDIDENTITYVP candidate whose own placement, measured against the gauge the slot
+	// already holds, exceeds this many world units may keep its own transform at submit time but may
+	// NOT donate the frame's gauge. Programs on RPCS3_REMIX_WORLDIDMAXTEXEMPTVP are exempt for the
+	// same reason they are exempt there - they submit genuinely absolute world spans and their large
+	// translations are real. A slot with no gauge yet donates unconditionally: there is nothing to
+	// judge the first donor of a scene against, and that bootstrap is stated rather than hidden.
+	//
+	// Cannot starve the slot, and the run says so: of AD7CE9D672A0BF6B's 3,316,291 draws,
+	// 2,486,813 (75.0%) sit at |t| <= 1 and only 242,939 (7.3%) exceed 32, so 2.49M donors still
+	// qualify at 32. Counters on 'Remix live:': gauge_donor_offside counts candidates over the
+	// threshold WHETHER OR NOT the knob is armed, so an unarmed run still reports the population;
+	// gauge_donor_refused counts the ones actually turned away. offside > 0 with refused == 0 means
+	// the knob is off, not that the mechanism is absent.
+	u32 gauge_donor_max_translation();
 
 	// RPCS3_REMIX_VCOLBGRA=1 (default): pack the replayed vertex colour in D3DCOLOR byte order
 	// (B, G, R, A) to match the format the runtime actually binds it with.
