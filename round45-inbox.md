@@ -1,212 +1,199 @@
 # Round 45 inbox — RPCS3 RTX Remix backend, Haze (BLUS30094)
 
-Written at the close of round 44, 2026-08-27. Branch `remix-backend`, HEAD **`f091ff5a4`**, working tree
-carries rounds 37–44 (39–41 committed; 42's, 43's and 44's source edits and the launcher are not).
+Written at the close of round 44b, 2026-08-27. Branch `remix-backend`, HEAD **`398f3f1ed`**.
+
+**THE TREE MOVED DURING THIS ROUND — not by me.** It started at `f091ff5a4` and someone committed
+`398f3f1ed` *"Remix: parallax height map bound as albedo; the world gauge is a per-frame global"* at
+**2026-08-27 12:02:05**, mid-round, while round 44b was being built. That commit snapshots the **round 44**
+state: the round-44 source, the round-44 KNOBS section, `round43/44/45-inbox.md`, and the launcher with
+`RPCS3_REMIX_GAUGEDONORMAXT=0` (the coordinator's revert) at its line 202. **Round 44b is NOT in it.**
+
+Everything this round produced is uncommitted working-tree state on top of `398f3f1ed`: seven modified
+files (RemixGSRender.cpp/.h, RemixTransforms.cpp/.h, the KNOBS doc, the launcher, this file).
+I committed nothing.
 
 | artefact | SHA256 (first 16) | note |
 | --- | --- | --- |
-| `bin\rpcs3.exe` | `14DD8282D86D298D` | built this round, MSBuild `Release\|x64` exit 0, **0 errors, 1 warning** |
-| `bin\rpcs3-next.exe` | `14DD8282D86D298D` | **identical — the copy was made** |
+| `bin\rpcs3.exe` | `260E9986847110F8` | built this round, MSBuild `Release\|x64` exit 0, **0 errors, 1 warning** |
+| `bin\rpcs3-next.exe` | `260E9986847110F8` | **identical — the copy was made** |
 | `bin\remix\d3d9.dll` | `16A0B512F33EBB66` | **UNCHANGED.** Nothing deployed into `bin\remix\`. |
 | `bin\rtx.conf` | `215975B8697DE21B` | **UNCHANGED.** Read only, never written. |
-| `bin\user.conf` | `77A65DFE391BA7D5` | **UNCHANGED.** Read only. |
 
-Round 43 deployed `ADA8AD6CDCDB53B1`; both exes read exactly that at the start of this round, which is
-what its inbox recorded. The one warning is the pre-existing C4723 "potential divide by 0", now at
-`RemixGSRender.cpp:11562` (round 43 recorded 11456; this round's edits above that line moved it).
-**Zero new warnings.** HEAD `f091ff5a4` at both ends and the same modified-file set — the tree did not move.
+Round 44 deployed `14DD8282D86D298D` and it was play-tested and **reverted**. The one warning is the
+pre-existing C4723, now at `RemixGSRender.cpp:11636`. **Zero new warnings.** Full derivations in
+`docs\remix\KNOBS.md` — read **"Round 44b"** first, then "Round 44".
 
-Full derivations in `docs\remix\KNOBS.md` — read **"Round 44"** first.
+**Launcher line numbers shifted again.** `WORLDIDMAXT` `:156`, `GAUGEDONORBEST` `:203`, `TRACEALBEDO`
+`:64`, `DEFERPREANCHOR` `:1027`, `GUESTLIGHTAUTO` `:1305`. Re-grep, never trust a quoted line number.
 
-**Launcher line numbers shifted.** `launch-haze-remix.cmd` gained 177 lines around `:158`–`:203`, so every
-line reference in round 42/43 notes past that point is off by ~+50. `WORLDIDMAXT` is now `:156`,
-`GAUGEDONORMAXT` `:202`, `TRACEALBEDO` `:64`.
+---
+
+## READ THIS FIRST — it invalidates a whole class of measurement, including several of mine
+
+**The user pauses the game before every Ctrl+Click.** Their words: *"I did pause the game to ctrl click the
+light fixture (and others that teleport really quickly) so that way i don't mis click another texture that
+is actually stable."*
+
+That is sound method on their side. It also means **every pick in every log this project has ever taken was
+captured with a frozen camera.** So round 43's `E40BF80AF519848A` follow reading `d_origin = 0` for 181
+consecutive frames was not bad luck — it is **structural**, and it would have read 0 no matter how bad the
+defect was.
+
+**Any diagnostic that samples at pick time, is armed by a pick, or keys off `pick_record` can never observe
+a motion defect.** `Remix pick-follow:` is disqualified for motion work whatever else is fixed about it.
+Instruments for motion must run **continuously** and key on the albedo or the program.
+`Remix albedo-trace:` (`RPCS3_REMIX_TRACEALBEDO` + `TRACEALBEDOVP`) is the one that qualifies today. Re-read
+any earlier conclusion that rests on pick-adjacent sampling of a moving object.
 
 ---
 
 ## PLAY-TEST CARD — one knob changes pixels
 
-### `RPCS3_REMIX_GAUGEDONORMAXT=32` (launcher `:202`)
+### `RPCS3_REMIX_GAUGEDONORBEST=32` (launcher `:203`)
 
-**What it does.** A `WORLDIDENTITYVP` draw sitting more than 32 world units from the origin may keep its
-own transform (that is `WORLDIDMAXT`, unchanged) but may no longer become **the whole frame's world
-gauge**. One declaration drove two gates and only one of them ever learned the threshold.
+Round 44's `GAUGEDONORMAXT` **refused** an off-origin gauge donor. That handed it to the `ANCHORSTICKY`
+park, and `promote_parked_anchors()` runs at **flip** — so the refused donor was installed anyway, **one
+frame late**. Per flip, round 43 → round 44: `anchor_promoted` 0.00032 → 0.1360 (**+42,512%**),
+`anchor_recap` 0.0766 → 0.0181, park outcomes 99.6%/0.4% recaptured/promoted → **11.8%/88.2%**, and the
+share of placements on last frame's anchor 19.22% → **37.09%**. A one-frame-old gauge under camera rotation
+displaces the whole scene by (distance from eye) x (turn per frame) — which is exactly *"the whole scene
+warps aggressively when turning camera"*. **It is removed from the build**, not defaulted off.
 
-**What to look at.** Props, light fixtures and beams that teleport or bounce — `E40BF80AF519848A` above
-all, and the eight deeper in the plant. The prediction is that the *jump* class goes away or shrinks
-sharply. It is **not** aimed at continuous fine wobble.
+`GAUGEDONORBEST` does the opposite. The frame's **first donor installs immediately and unconditionally**, so
+the gauge is never late and never absent. A **later** donor of the same frame may **replace** it, but only
+when at least **twice as close** to the world origin and only when the installed one is beyond the
+threshold. First-draw-wins becomes best-draw-wins. Nothing is parked, promoted or refused.
 
 | reading on `Remix live:` | meaning |
 | --- | --- |
-| `gauge_donor_offside` > 0, `gauge_donor_refused` > 0 | the gate fired. This is the run to judge. |
-| `gauge_donor_offside` > 0, `gauge_donor_refused` = 0 | the knob is **off**, not the mechanism absent |
-| `gauge_donor_offside` = 0 | the mechanism is **not present in the level you played**. Nothing can change; play the plant. |
-| `gauge_absent` climbing well past **295,391** | **FAIL** — the gate starved the gauge slot. Revert. |
-| `anchor_parked` up from **4,338** | expected. Offside donors are parked, not dropped, so a scene cut still recovers. |
-| `gauge_prev` up from **1,634,288** | acceptable cost. Last frame's *correct* gauge beats this frame's wrong one. |
+| `gauge_donor_upgrade_avail` > 0, `gauge_donor_upgraded` > 0 | the route fired. This is the run to judge. |
+| `avail` > 0, `upgraded` = 0 | the knob is **off**, not the route dead |
+| `avail` = 0 | a better donor never existed in the level you played. Nothing can change; play the plant. |
+| `anchor_promoted` | **MUST stay near round 43's 0.00032/flip.** This knob cannot touch it. If it moves, something else did. |
+| `gauge_prev` **as a share** of `gauge_used + gauge_prev + gauge_absent` | **MUST NOT rise** above round 43's 19.22%. Round 44 (bad) hit 37.09%. |
 
-**PRE-REGISTERED REFUTATION:** props teleport by the same amounts while `gauge_donor_refused` reads in the
-hundreds of thousands. Then the donor election is not what moves them, and the next suspect is the
-`ref=anchor_prev` population (`gauge_prev_camfresh = 1,582,140`, 18.6% of all placed draws, divided by
-last frame's anchor while the elected camera is current).
+**Divide by `flips` before comparing anything.** Round 43 ran 56,381 flips, round 44 ran 17,583. Raw totals
+across sessions are meaningless — see the post-mortem below.
 
-**REVERT:** `set "RPCS3_REMIX_GAUGEDONORMAXT=0"` — one line, round 43 bit-exactly.
+**PRE-REGISTERED REFUTATION:** the gauge now changes mid-frame, so draws submitted before an upgrade used
+the old one. **If the scene tears within a frame — part of the world offset from the rest, props separating
+from the floor they stand on — that is this knob.**
 
-### Also changed, both DIAGNOSTIC ONLY — no pixels
+**REVERT:** `set "RPCS3_REMIX_GAUGEDONORBEST=0"` — one line, round 43 bit-exactly.
 
-* `RPCS3_REMIX_TRACEALBEDO=E40BF80AF519848A` + `RPCS3_REMIX_TRACEALBEDOVP=C2003391127734F6`
-  (launcher `:64`–`:65`, was `2C6485F7F04591F1` / `C1D482DCD1B03ED0`).
-  **PLAY THIS ONE WITH THE CAMERA MOVING.** `Remix albedo-trace:` prints one line per frame carrying
-  `raw=[..]..[..]` **and** `matrix=[..]` **and** `cam=[..]` together — the only instrument that can say in
-  one line whether the guest moved the object or we did. `C2003391127734F6` is on no launcher list, so
-  `worldid-draw` has never covered that copy.
-* `Remix pick-follow:` now also matches the clicked record's **vertex count**, and prints `vtx= ext= det=`.
-* `Remix live:` gains `gauge_donor_offside`, `gauge_donor_refused`, `static_submit_dedup`,
-  `static_submit_meshdiff`. Both banners gain `gaugedonormaxt=`.
+### My guard failed twice, and both errors are reusable
 
----
+1. **I put a threshold on an absolute cumulative counter and compared across sessions of different length.**
+   The guard was "`gauge_absent` must not rise much above 295,391". It read 57,424 and I would have called
+   that a pass. Per flip: 3.27 vs 5.24. The round-43 notes already say *"a cumulative counter divided by
+   frames is not a rate"*; this is the mirror-image error.
+2. **Even normalised it was the wrong counter.** The failure route was park → promote, so the gauge was
+   never *absent*, only *late*. `anchor_promoted` moved 425-fold, and my own shipped comment named it as a
+   counter that "may rise with it" **without putting a threshold on it**. Put the guard on the counter the
+   failure mode moves.
 
-## PRIORITY 1 — the checkerboard floor. An uncounted `return` discards 7.29% of all draws
-
-`RemixGSRender.cpp:23263`:
-
-```cpp
-if (static_entry->submitted_signatures.contains(static_submit_signature))
-{
-    return;
-}
-```
-
-The signature (`:23214-23261`) is built from **only** the 3x4 instance transform, `categoryFlags`,
-`doubleSided` and the blend state. **Nothing about which geometry the draw covers.** Haze bakes world
-geometry in world space — every plant-floor `worldid-draw` line reads `pre=[1 0 0 0; 0 1 0 0; 0 0 1 0]` —
-so **every static-index floor tile in a frame produces an identical signature and only the first
-submits.** That is correct if and only if the union mesh the first one carried already held every tile,
-and the union is built incrementally, is wiped mid-frame by the `source_changed` reset at `:21004` (also
-uncounted), and sits at **`resident=0` of `entries=16601`**.
-
-**Its size, MEASURED by subtraction on the round-43 build.** `:23263` is the only return between
-`++m_stats.xform_measured` (`:22771`) and `++m_stats.draws_submitted`, other than the poisoned-mesh
-return, and `Remix stats:` reads `poisoned=0`:
-
-```
-xform_measured   8,569,414
-draws_submitted  7,944,541
-poisoned                 0
---------------------------
-this exit          624,873      = 7.29% of every draw that resolved a transform and a mesh
-```
-
-**Round 45 starts by reading two numbers this build now prints.** `static_submit_dedup` must reconcile to
-that subtraction. `static_submit_meshdiff` is the half that matters — suppressions where the mesh **this**
-draw had selected is not the mesh already submitted under that signature, i.e. where a strictly larger
-union was built and thrown away.
-
-* `meshdiff` near 0 → the collapse is benign; the half-present floor is somewhere else and this lead is
-  closed with a number instead of an argument.
-* `meshdiff` large → **the fix is to fold the selected mesh `hash` into `static_submit_signature`.** That
-  is provably a superset of today's submissions (identical union ⇒ identical hash ⇒ identical signature ⇒
-  suppressed exactly as now). **The risk to think about before shipping it is double-draw:** the partial
-  union already submitted is a strict subset of the completed one, so both would be drawn coincident. One
-  mechanism, one knob, and the counters above are the A/B.
-
-**Refuted this round, do not re-run:**
-
-* **Mesh-key collision.** The ordinary mesh key hashes **every raw byte of every vertex**
-  (`RemixGSRender.cpp:20898-20905`) plus all indices, the vp hash and the albedo; `union_hash`
-  (`:21130-21161`) does the same. Two distinct tiles cannot collide. `tex_key_dup=33333` is a
-  texture-descriptor counter, unrelated.
-* **Parity / ping-pong.** No frame-parity gate, draw-index parity, ping-pong buffer or double-buffered
-  slot array exists on the world submission or mesh path. Every `% 2` / `& 1` in `RemixGSRender.cpp` and
-  `RemixTransforms.cpp` is a texture-unit bitmask, a rate-limited log, or triangle-strip winding in the
-  **UI** compositor (`:14217`).
-* **`world_refused` by material is UNANSWERABLE from the census.** `world_refused_census_slot()`
-  (`:10157-10173`) dedups on **(program, reason)** only — albedo, vtx, clip and surf are printed but not
-  keyed — window 120 flips, cap 128 lines, 14 reasons. Ceiling 14x14 = 196 lines per window against
-  452,669 refusals: **at most ~0.03% of the population, one albedo per (vp, reason).**
-  **Round 43's "only two distinct keys in the whole run" is wrong twice over** — the 1,087 lines name 18
-  distinct albedos and 14 vps — and the instrument could not have answered it either way. By draw:
-  `tail` 402,198 (88.85%), `nocam` 46,317 (10.23%), `lay_other` 42,781 (9.45%); the 38,627 remainder is
-  exactly the `particle=38627/416887` arm, which is submitted and correctly not counted as refused.
-
-**Still true and still unexplained:** `entries=16601 rebuilds=21243 dropped=68 peak=128 budget=128
-resident=0 evicted=16601`. `static_key` (`:20986`) and `union_hash` (`:21159`) both fold in
-`reinterpret_cast<usz>(material)` — a runtime heap address — plus the guest vertex-buffer address
-(`:20957`), and **no vertex data**. The reaper erases from `m_meshes` but never clears
-`static_entry->mesh_hash`, which is what `evicted` counts. Correlation over 671 windows does **not** pin
-the 46 → 16,601 growth on material recreation (`corr(d_entries, d_tex_destroyed) = +0.370`,
-`d_tex_created = -0.003`).
-
-**The floor, named** — tile pitch measured at **~8 world units** (7.75, 8.01, 7.90, 8.42, 8.11), which is
-the checkerboard grain: `E40BF80AF519848A`, `CB1677B87EDD72F5`, `71D189E9B559A7F9`, `6DEBE6C7CC0FEEDB`,
-`CDC167D57B21D8E2`, `39D5CDABDAAE3ABB`, `E0D568A78FDD03F6`, `514AD452138A2803`. **11 floor albedos are
-drawn through BOTH `AD7CE9D672A0BF6B` (on `STATICINDEXVP`) and `C1D482DCD1B03ED0` (not).**
+**THE RULE:** *a gauge remedy must never make the gauge later or absent.* Wrong-but-current beats
+correct-but-late.
 
 ---
 
-## PRIORITY 2 — the wobble. Judge `GAUGEDONORMAXT`, then attack `anchor_prev`
+## The defect is not in doubt — and it finally has a continuous, camera-free measurement
 
-The root cause of the **jump** class is established: the divide gauge, moving as a per-frame global.
-559 of 759 multi-row `worldid-draw` frames have every row on one bit-identical pre-translation;
-`Remix gauge: translation=` mean 41.99, max 1718.67, above 128 on 7.36% of frames; and
-`E40BF80AF519848A`'s raw box never moves while its transform swings 0 → 21.75 → 966.5.
-
-If `GAUGEDONORMAXT` does not close it, the next population is already sized:
+`TRACEALBEDO` was re-pointed at `E40BF80AF519848A` (`TRACEALBEDOVP=C2003391127734F6`) and produced **2,331
+per-frame samples with the camera free**:
 
 ```
-gauge_used=6571673  gauge_prev=1634288  gauge_absent=295391      -> anchor_prev = 19.22% of placements
-gauge_prev_camfresh=1582140                                       -> 96.8% of those had a CURRENT camera
-gauge_cur_dims=431701 = gauge_cur_avail=431701                    -> round 38's rescue always fires when it can
+distinct raw vertex boxes over 2,331 frames ..........  2   (two sub-parts; neither ever moves)
+frames placing it more than   1 unit off ............. 46.63%
+                              8 units ................ 25.61%
+                             32 units ................ 16.60%
+                            128 units .................. 0.77%
+max |t| = 194.6 units      max basis deviation = 0.1141 (~6.5 deg of spurious rotation)
+bad frames form 53 runs, median 6 frames, longest 225
 ```
 
-**1,582,140 draws are divided by last frame's anchor while being rendered with this frame's camera.**
-`Remix pick-follow:` breaks down as: `anchor_prev` 44.01% of frames moved (max jump 40.94),
-`anchor` 27.19% (max 8.13), `identity-bypass` 17.92% (max 8.12), `camera` 0.00%. **The four largest
-single-frame transform jumps in the whole run are all `anchor_prev`.** The election condition
-(`RemixGSRender.cpp:17483-17537`): no anchor exists for the draw's own pass shape yet this frame, and the
-GAUGECURDIMS fallback also missed — the source comment says why, *"Haze's camera program draws late in
-the frame"*. `RPCS3_REMIX_DEFERPREANCHOR=1` is the shipped-but-off mechanism for exactly that population
-(launcher `:1025`; round 6 measured 47% of buffered draws never seeing their frame's anchor and left it
-off). That is a whole round on its own — **do not bundle it with anything.**
+The raw box is bit-identical across every sample. **The guest never moves it; we do, on 47% of frames, by
+up to 194 units.** Episodes of 6 to 225 frames is "it teleports and comes back". This is independent of any
+pick and independent of the `worldid-draw` evidence, and it agrees with both.
 
-### Do not reuse round 43's origin-jitter numbers. They measured tile pitch.
+The cause remains `capture_gauge_anchor()` (`RemixGSRender.cpp:1810`) installing a `WORLDIDENTITYVP` draw as
+the frame's world gauge on the vp-hash list alone (`:1815`), while the submit site's `keep_resolved`
+independently judges the same draw against `WORLDIDMAXT` and refuses to call it world-space.
 
-`trace_pick_follow()` matched on `(vp, albedo)` only and printed the **first** matching draw per frame.
-On this title that is not an object: `E40BF80AF519848A` alone carries **42 distinct raw vertex boxes
-across 41 distinct vertex counts** on one program. `d_origin` was the L1 distance between two **different
-tiles**. Round 43's *"jumps up to 8.16 units, quantised at multiples of ~2.04"* is the instance pitch —
-measured on `F312BA4706AA7162`, the positions land on exactly three points evenly spaced on a line, step
-**2.899 Euclidean / 4.047 L1**, with 8.10 for a double step. Round 43's companion claim *"exactly 0.0000
-on every identity-bypass one"* also fails here: those read maxima of 8.12, 8.11 and 6.36.
-
-And the one round ever aimed at `E40BF80AF519848A` fired its 181-frame follow while the camera was frozen
-for **all 191 frames of the window** (`cam=[1786.56 -31.2314 1226.39]`, 191/191 identical; `Remix gauge:`
-a constant `translation=6.02944`). `d_origin=0` was read as a stable object. It is what a parked camera
-looks like. **That is why this hash stayed open for a week.** The follow now carries the vertex count in
-its match and prints `vtx= ext= det=`.
+**Keep the trace pointed here until it is closed.** If `GAUGEDONORBEST` works, these percentages fall. That
+is the measurement, not a screenshot.
 
 ---
 
-## PRIORITY 3 — lights are still entirely absent, and it is still deliberate
+## PRIORITY 1 — the underfloor. It is a TWO-LAYER problem, not alternating dropout
 
-`GUESTLIGHTAUTO=0`, unchanged. Round 44 did **not** fix either of the two known faults, and says so:
-a world-geometry gate so character suit panels cannot qualify, and light position from the emitter rather
-than the billboard centroid. Radius already derives from mesh extent. Do not re-enable it without both.
-Current run: `guest_lights=28 guest_light_match=29614 guest_light_toobig=4029 mat_emissive=347`.
+New from the user: ***"The wooden plank floor is supposed to be under the checkerboard tiles."*** The tiles
+render **correctly**. The black is the **missing underfloor**, seen through the gaps between them. The
+"alternating dropout" framing that the checkerboard appearance suggested is wrong and should be dropped.
 
-## PRIORITY 4 — carried, untouched this round
+Counters from the round-44 build: `static_submit_dedup = 115,567`, `static_submit_meshdiff = 1,309` —
+meshdiff is **1.13%** of dedups. And `xform_measured 1,777,810 − submitted 1,662,243 = 115,567` **exactly**,
+which confirms round 44's subtraction attribution of that exit to the unit.
 
-* Helmet still clips: `1BF8325ADEF3C986`. Weapon/arms picks: `0721D150DF278E7D`, `CC6008D0E9E98972`.
-* `524D584E4F544558` is ASCII **"RMXNOTEX"** — the backend's own untextured sentinel. That draw resolves
-  no albedo at all; the grey ripple is that, not a material bug.
-* `6575ACE3A42A78E6` nectar UI renders as a solid yellow quad — an **unsampled** texture. Round 43's lead
-  stands: check whether the UI compositor resolves an albedo `entry` at `RemixGSRender.cpp:13733`
-  (`have_uv ? entry : nullptr`); a null `entry` rasterises the flat tint, which is a solid coloured quad.
-* `90DAF653752E0DD2` low-resolution. Smoke and the nectar gas grenade do not render though fire does.
-  UI has residual noise and does not update smoothly with the camera.
-* ADS collapse: root-caused in round 43, not fixed. `UIWIDTH` is a trade, not a defect fix, and is
-  **still 1280** because the user has not chosen a value. Do not change it unilaterally.
-* The chapter list is untouched again. Nothing under `bin\patches\` was changed.
+**THE DEDUP IS REFUTED AS THE CAUSE — settled from source this round, do not spend a round on it.**
+`static_key` (`RemixGSRender.cpp:21027`-`21061`) folds in `block->real_offset_address`, `base_offset`,
+`memory_location`, `attribute_stride`, the per-attribute layout, **`m_current_vp_hash`, `albedo_hash` AND
+the material pointer**. The submit-signature dedup at `:23337` tests `static_entry->submitted_signatures`,
+i.e. it is scoped to **one** `static_entry`. Two floor layers with different textures therefore land on
+**different entries and can never collide.** `static_submit_meshdiff` at 1.13% of dedups is consistent
+with that: the collapse is doing its job. **Do not fold the mesh hash into the signature to fix the
+underfloor** — it would not touch it. (Folding it in may still be worth doing for its own sake later; that
+is now an unrelated, low-priority item.)
+
+So the planks are lost somewhere else, and the search is open.
+
+Then find where the planks actually go. Candidate silent exits, all of which drop a draw without a refusal
+census line: `static_index_deferred_dropped` (`:21299` — *"no live handle at all, so the draw is never
+submitted, invisible WITHOUT a trace"*), the `source_changed` union wipe (`:21078`, uncounted), and the
+static-index residency pathology (`resident=0` of `entries=16601` on the round-43 run, `evicted=16601`).
+
+Refuted, do not re-run: **mesh-key collision** (the key hashes every raw vertex byte at `:20972-20979`),
+**parity/ping-pong** (none exists on the world submit path), and **`world_refused` by material** (its census
+keys on `(program, reason)` with a 128-line cap per 120 flips against 452,669 refusals — at most ~0.03% of
+the population, one albedo per pair; round 43's "only two distinct keys" was both wrong and unanswerable).
+
+---
+
+## PRIORITY 2 — point lights on props. NEW, never investigated, and `GUESTLIGHTAUTO` is 0
+
+User: *"some of the props like dumpsters and sheet metal have point lights on them, which have been there
+for a while."* The automatic glow-card light path is **off**, so **something else creates these**. Round-44
+counters: `guest_lights = 114`, `guest_light_match = 6,141`, `mat_emissive = 260`.
+
+Enumerate every path that can create a Remix light (`CreateLight`, `light_info`,
+`maybe_inject_guest_light`, the sun path, `suncard`, `lightpass`) and the knob gating each, then check which
+are live with `GUESTLIGHTAUTO=0`. The dumpsters are `vp=830d7d1b9681c475` with fps `c61b0b9586dd67fb` /
+`bd80201c29b6b01e`; dumpster/locker albedos include `CA4E206BDCF6143E`, `7EF0E9C703B50054`,
+`B0624AD7BA785B13`, `955BCB4DA1EB7DD9`. `Remix light-candidate:` and `Remix lightpass:` censuses exist.
+This is a long-standing visible artefact with a cheap likely fix (one knob to 0) — worth doing early.
+
+## PRIORITY 3 — carried
+
+* **Still teleporting:** the big metal pipes near the windows that used to carry the green lights. Same
+  family as the fixture; judge them on the same run.
+* **Lights are still entirely absent** and that is still deliberate. `GUESTLIGHTAUTO=0`. Round 44b did not
+  fix either known fault — a world-geometry gate so character suit panels cannot qualify, and light
+  position from the emitter rather than the billboard centroid. Do not re-enable without both.
+  Note this is *separate* from Priority 2: that one is unwanted lights from another path.
+* `gauge_prev_camfresh` — **611,546 draws divided by last frame's anchor while the elected camera is
+  current**, 34.78/flip. If `GAUGEDONORBEST` does not close the wobble, this is the next population.
+  `RPCS3_REMIX_DEFERPREANCHOR=1` (launcher `:1027`) is the shipped-but-off mechanism for exactly it.
+  A whole round on its own — **do not bundle it with anything**, and remember the rule: it must not make
+  the gauge later.
+* Helmet clips: `1BF8325ADEF3C986`. Weapon/arms: `0721D150DF278E7D`, `CC6008D0E9E98972`.
+* `524D584E4F544558` is ASCII **"RMXNOTEX"**, the backend's own untextured sentinel — that draw resolves no
+  albedo at all.
+* `6575ACE3A42A78E6` nectar UI renders as a solid yellow quad (unsampled texture). Check whether the UI
+  compositor resolves an albedo `entry` at `RemixGSRender.cpp:13807` (`have_uv ? entry : nullptr`).
+* `90DAF653752E0DD2` low-resolution. Smoke and the nectar gas grenade do not render though fire does. UI has
+  residual noise and does not update smoothly with the camera.
+* ADS collapse root-caused in round 43, not fixed. `UIWIDTH` is a trade, still 1280, user has not chosen.
+* Chapter list untouched. Nothing under `bin\patches\` was changed.
 
 ---
 
@@ -214,40 +201,31 @@ Current run: `guest_lights=28 guest_light_match=29614 guest_light_toobig=4029 ma
 
 In `...\scratchpad\r44\`:
 
-* **`lastrun.log`** — the 49 MB slice of the newest session (from byte 1,104,125,772 of
-  `bin\remix_dump.log`, build `Aug 26 2026 10:50:47`, `flips=56381`). Every number in this inbox comes
-  from it.
+* **`run44b.log`** — the 17 MB slice of the round-44 play-test (build `Aug 27 2026 11:01:23`,
+  `flips=17583`). Contains the 2,331 `Remix albedo-trace:` samples on `E40BF80AF519848A`.
+* **`lastrun.log`** — the 49 MB round-43 slice (`flips=56381`). The two together are the per-flip A/B.
 * **`fmtaudit44.py`** — a format-string auditor for `RemixGSRender.cpp` that **actually works**.
-  Usage: `python fmtaudit44.py <file> [substring]`. It finds all 108 `fmt::format(` calls (matching
-  `grep -c "fmt::format("` exactly), balances specifiers against top-level arguments, and reports 0
-  mismatches on the shipped file.
-* `selftest.cpp` — a copy of `RemixGSRender.cpp` with a deliberate 1-extra-specifier mismatch injected at
-  the `Remix pick-follow:` site. `fmtaudit44.py` catches it. **`scratchpad\r43\audit.py` does not** — it
-  reports "298 formatted calls, 0 mismatches" on that same broken file. **Do not trust `r43\audit.py`.**
-* `hash_all.txt`, `wid_all.txt`, `pf_all.txt` and the parsers `parse_wid.py`, `rawmove.py`, `bigpre.py`,
-  `movers.py`, `perframe.py` — the `E40BF80AF519848A` and per-frame-global analysis.
-
-`scratchpad\r43\` still holds `chanrule.py`, `killwalk.py` and `fpdis.py` (the albedo-election work).
-Those are unaffected.
+  `python fmtaudit44.py <file> [substring]`. 108 `fmt::format` calls, matching
+  `grep -c "fmt::format("` exactly, 0 mismatches on the shipped file.
+* `selftest.cpp` — a copy with a deliberate 1-extra-specifier mismatch injected at the `Remix pick-follow:`
+  site. `fmtaudit44.py` catches it; **`scratchpad\r43\audit.py` does not** — it reports "298 formatted
+  calls, 0 mismatches" on that same broken file. **Do not trust `r43\audit.py`.**
 
 ## Instrument notes worth keeping
 
+* **Every pick was taken with the game paused.** Motion instruments must run continuously and key on the
+  albedo or program, never on a pick. See the top of this file.
+* **A gauge remedy must never make the gauge later or absent.** Wrong-but-current beats correct-but-late.
+* **Normalise by `flips` before comparing two sessions,** and put the guard on the counter the failure mode
+  actually moves — not the one that sounds related.
 * **A census that dedups by key cannot enumerate a population.** Read the admission gate and compute the
-  ceiling before quoting a census as a fact about the world. Round 43 quoted `Remix world-refused:` for a
-  question its key structurally cannot answer, and miscounted it as well.
-* **`d_origin` between two draws of one (program, texture) pair is not motion** where a title instances
-  one mesh many times. The tell is that it is **quantised**: numerical error is not.
-* **Zero from an instrument that cannot move is not evidence.** Before believing a null result, check that
-  the driving variable actually varied during the window.
-* **Self-test the format auditor on a broken copy every single time.** One of the two in the scratchpad
-  gives a false pass on exactly the site this round edited.
-* **A gate that judges against a stale reference must not be a bare `return`.** `GAUGEDONORMAXT`'s first
-  draft would have locked the gauge slot out permanently on the first hard scene cut, because on the frame
-  after a cut every candidate is legitimately far from the stale gauge. Found by asking what the probe
-  measures then, not by testing.
-* **`bin\remix_dump.log` is ~1.15 GB and append-mode.** Find run boundaries with `grep -abo "Remix
+  ceiling before quoting one as a fact about the world.
+* **`d_origin` between two draws of one (program, texture) pair is not motion** where a title instances one
+  mesh many times. The tell is that it is quantised: numerical error is not.
+* **Self-test the format auditor on a deliberately broken copy every time.** One of the two in the
+  scratchpad gives a false pass on exactly the site round 44 edited.
+* **`bin\remix_dump.log` is ~1.17 GB and append-mode.** Find run boundaries with `grep -abo "Remix
   run-start:"` over a `dd`-skipped tail, slice once with `tail -c +N` into the scratchpad, then grep that.
-* **`Remix timing:` and `Remix stats:` go to `bin\log\RPCS3.log` only.** `Remix live:` goes to both.
-  `poisoned=` is on `Remix stats:`, and it is what makes the `:23263` subtraction exact.
+* **`Remix stats:` carries `poisoned=`**, and it is what makes the `:23337` subtraction exact.
 * **Do not build a launcher dry-run by `head -N` past the `cd /d "%~dp0bin"` line** — the next line starts
   the game.

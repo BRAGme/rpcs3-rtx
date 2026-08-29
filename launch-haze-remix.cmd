@@ -156,50 +156,52 @@ rem rather than the translation.
 set "RPCS3_REMIX_WORLDIDMAXT=32"
 set "RPCS3_REMIX_WORLDIDMAXB=0"
 rem ====================================================================================
-rem ROUND 44 - THE ONE KNOB THAT CHANGES PIXELS THIS ROUND.
-rem GAUGEDONORMAXT (whole world units, 0 = OFF = round 43 byte for byte).
+rem ROUND 44b - THE ONE KNOB THAT CHANGES PIXELS. Replaces round 44's GAUGEDONORMAXT,
+rem which was PLAY-TESTED, REVERTED, and is now REMOVED FROM THE BUILD (the exe contains
+rem neither the wide string RPCS3_REMIX_GAUGEDONORMAXT nor gaugedonormaxt=%%u nor the
+rem counter gauge_donor_refused). Do not re-add it.
 rem
-rem This is round 30's specified-but-never-shipped fix. WORLDIDENTITYVP drives TWO
-rem gates and only WORLDIDMAXT (right above) ever learned about the threshold:
-rem   * at SUBMIT time, keep_resolved sees a draw 900 units from the origin and
-rem     correctly says "this is not a world-identity draw, keep its real transform";
-rem   * at CAPTURE time, capture_gauge_anchor() has ALREADY installed that same
-rem     draw's matrix as the WHOLE FRAME'S world gauge, qualified on the vp list
-rem     alone. It never looked at the translation at all.
-rem So the backend called one draw "carrier-local" and "this is the world" in the
-rem same frame for the same reason. This knob applies the submit verdict at capture.
+rem WHY ROUND 44 FAILED, measured per flip, round 43 (56,381 flips) vs round 44 (17,583):
+rem     anchor_parked    0.0769 -> 0.1542      anchor_recap   0.0766 -> 0.0181
+rem     anchor_promoted  0.00032 -> 0.1360     (+42,512%%)
+rem     park outcomes    99.6%% recaptured / 0.4%% promoted  ->  11.8%% / 88.2%%
+rem     placements on last frame's anchor      19.22%% -> 37.09%%
+rem Refusing the off-origin donor parked it; promotion runs at FLIP, so the very donor that
+rem was refused got installed ONE FRAME LATE anyway. The gate did not remove the bad gauge,
+rem it DELAYED it - which is why the scene warped under camera turn: a one-frame-old gauge
+rem displaces everything by distance-from-eye x turn-per-frame.
+rem A GAUGE REMEDY MUST NEVER MAKE THE GAUGE LATER OR ABSENT.
 rem
-rem MEASURED (round 44, from the session that ended 2026-08-27 10:27):
-rem   * 12,779 "Remix worldid-draw:" lines. Of the 759 frames carrying two or more
-rem     rows, 559 have EVERY row reporting ONE identical pre-translation, bit for
-rem     bit across unrelated meshes (f=53640: vtx=160, vtx=224 and vtx=518 all read
-rem     t=[1.579 -132.9 -2.179]). Guest motion cannot produce that. A wrong divide
-rem     gauge is the only thing that can.
-rem   * "Remix gauge: translation=" over 17,386 frames: mean 41.99, max 1718.67,
-rem     above 128 units on 7.36% of frames.
-rem   * E40BF80AF519848A (the teleporting light fixture) has a RAW VERTEX BOX that
-rem     never moves - 30 of its 36 multi-sample mesh identities report exactly
-rem     0.0000 displacement over spans up to 14,500 frames - while the transform
-rem     applied to it swings 0 -> 21.75 -> 966.5 units.
+rem (My guard was also mis-specified twice, recorded so it is not repeated: I put a threshold
+rem on an ABSOLUTE cumulative counter and compared it across sessions of different length
+rem - gauge_absent 57,424 vs 295,391 is 3.27/flip vs 5.24/flip, it went DOWN - and even
+rem normalised it was the WRONG counter, because park->promote means the gauge was never
+rem absent, only late. anchor_promoted moved 425x and I had put no threshold on it.)
 rem
-rem CANNOT STARVE THE GAUGE SLOT, and the census says so: AD7CE9D672A0BF6B draws
-rem 3,316,291 times, of which 2,486,813 (75.0%%) sit at |t| <= 1 and only 242,939
-rem (7.3%%) exceed 32. At 32 there are still 2.49M eligible donors.
+rem WHAT GAUGEDONORBEST DOES INSTEAD (whole world units, 0 = OFF = round 43 byte for byte):
+rem the frame's FIRST donor installs immediately and unconditionally, exactly as today, so
+rem the gauge is never late and never absent. A LATER donor of the same frame may REPLACE it,
+rem but only when it is at least TWICE as close to the world origin (measured against the
+rem gauge held when the first donor arrived) and only when the installed one is beyond this
+rem threshold. First-draw-wins becomes best-draw-wins. Nothing is parked, promoted or refused,
+rem so anchor_promoted structurally CANNOT move - and that is the counter that caught round 44.
+rem 75.0%% of AD7CE9D672A0BF6B's 3,316,291 draws sit at |t| <= 1, so a good donor is usually
+rem in the frame; only the ORDER was wrong.
 rem
 rem WATCH ON "Remix live:":
-rem   gauge_donor_offside  - candidates over the threshold. Counted WHETHER OR NOT
-rem                          this knob is armed. If this is 0 the mechanism is not
-rem                          present in the level you played and nothing can change.
-rem   gauge_donor_refused  - the subset actually turned away. offside > 0 with
-rem                          refused == 0 means the knob is OFF.
-rem   gauge_absent         - MUST NOT RISE much above 295,391. If it doubles, the
-rem                          gate starved the slot: revert.
-rem   gauge_prev           - may rise from 1,634,288. That is the acceptable cost:
-rem                          last frame's CORRECT gauge beats this frame's wrong one.
-rem REFUTED IF: props still teleport by the same amount while gauge_donor_refused
-rem reads in the hundreds of thousands. Then the donor election is not the mover.
-rem REVERT: set "RPCS3_REMIX_GAUGEDONORMAXT=0"   <- one line, round 43 bit-exactly.
-set "RPCS3_REMIX_GAUGEDONORMAXT=0"
+rem   gauge_donor_upgrade_avail - a better donor existed. Counted WHETHER OR NOT this knob is
+rem                               armed. If 0, the route is dead in the level you played.
+rem   gauge_donor_upgraded      - replacements that happened. avail>0 & upgraded=0 = knob off.
+rem   anchor_promoted           - MUST STAY NEAR ROUND 43's RATE (0.00032/flip). This knob
+rem                               cannot touch it; if it moves, something else did.
+rem   gauge_prev                - MUST NOT rise as a SHARE of gauge_used+gauge_prev+gauge_absent.
+rem                               Round 43 19.22%%, round 44 (bad) 37.09%%. Divide, do not compare
+rem                               raw totals: the sessions are different lengths.
+rem REFUTED IF: the scene TEARS within a frame - part of the world offset from the rest, props
+rem separating from the floor they stand on. That is the gauge changing mid-frame.
+rem REVERT: set "RPCS3_REMIX_GAUGEDONORBEST=0"   <- one line, round 43 bit-exactly.
+set "RPCS3_REMIX_GAUGEDONORBEST=32"
+rem ====================================================================================
 rem ====================================================================================
 rem ====================================================================================
 rem DEAD LINES - neutralised 2026-08-25 (round 40). Both of these are re-assigned
@@ -254,7 +256,7 @@ rem which needs no list, carries each lamp own colour and its own radius, and is
 rem rule that can reproduce "only SOME bulbs are lit".
 rem REVERT to round 40: set "RPCS3_REMIX_GUESTLIGHTALBEDO=71D189E9B559A7F9"
 set "RPCS3_REMIX_GUESTLIGHTALBEDO="
-set "RPCS3_REMIX_GUESTLIGHTALBEDO2=C2F33F7E5105DAE7"
+set "RPCS3_REMIX_GUESTLIGHTALBEDO2="
 rem DEAD LINES - neutralised 2026-08-16. Both of these are re-assigned further
 rem down (GUESTLIGHTRADIUS at ~:240 = 0.6, GUESTLIGHTRADIANCE at ~:229 = 150) and
 rem in a .cmd the LAST assignment wins, so editing 0.2 / 30 here did nothing.
@@ -1022,7 +1024,83 @@ rem What you lose: the ship no longer slides as you turn - that fix was real and
 rem you confirmed it. What you get back: roughly 14 fps.
 rem This is a genuine trade, not a defect. Set it back to 1 if you would rather
 rem have the stable props than the frames.
-set "RPCS3_REMIX_DEFERPREANCHOR=0"
+rem
+rem ============================================================================
+rem ROUND 45, 2026-08-29: ARMED. THIS IS THE ONE PIXEL CHANGE OF THE ROUND.
+rem ============================================================================
+rem Round 44b shipped GAUGEDONORBEST=32 to close the teleporting light fixture.
+rem It is MEASURED INERT: gauge_donor_upgrade_avail=0 over 21630 flips, and that
+rem counter is incremented whether or not the knob is armed, so the route never
+rem had a candidate. gauge_contested=0 in the same run says why - within a frame
+rem every later gauge donor AGREES with the first one. There is no better donor
+rem to elect, so no within-frame election (round 44's refusal or round 44b's
+rem best-of-frame) can ever change anything. Both rounds assumed a choice exists.
+rem It does not. THE FRAME'S ONLY DONOR IS ITSELF SOMETIMES WRONG.
+rem
+rem The inbox pre-designated this as the next population if that happened, and it
+rem is the one remedy that does not touch the gauge at all:
+rem   gauge_prev_camfresh = 588035 over 21630 flips = 27.2 draws/frame divided by
+rem   LAST frame's anchor while the elected camera is CURRENT.
+rem
+rem MEASURED THIS RUN, on the teleporting fixture itself (albedo E40BF80AF519848A,
+rem 'Remix picked:' lines, 5/5 separation):
+rem   frame  7546  ref=anchor       origin=[0 3.5e-10 0]            CORRECT
+rem   frame  7646  ref=anchor       origin=[7.5e-09 2.3e-10 0]      CORRECT
+rem   frame 10443  ref=anchor_prev  origin=[2.277 0.306 2.257]      DISPLACED
+rem   frame 10460  ref=anchor_prev  origin=[-0.502 0.556 0.803]     DISPLACED
+rem   frame 10525  ref=anchor_prev  origin=[0.349 0.498 -0.377]     DISPLACED
+rem Round 4 read the same object 9/9 ref=anchor_prev. Eight of eight displaced
+rem placements of this object, across two rounds, are the anchor_prev branch.
+rem
+rem WHY IT MATCHES "the camera bounces as I walk so props follow the bounce":
+rem a one-frame-stale ANCHOR under a pure camera TRANSLATION gives a pure
+rem translation error with no rotation - which is exactly a walk-bob, and is a
+rem motion round 38's distance x turn-per-frame model cannot produce.
+rem
+rem WHY THIS IS SAFE UNDER ROUND 44b'S RULE ("a gauge remedy must never make the
+rem gauge later or absent"): this is not a gauge remedy. It does not refuse,
+rem park, promote or reorder a single donor. It holds the DRAW until this
+rem frame's anchor for its own render source lands, then re-divides. Anything
+rem still held at flip goes out with the transform it already has, so the worst
+rem case is byte-identical to today, one flush later, and no draw is ever lost.
+rem anchor_promoted / anchor_parked / anchor_recap structurally cannot move.
+rem
+rem WHY NOW, when this was switched off on 2026-08-16 for ~14 fps:
+rem   1. The two conditions the launcher itself named as making deferral
+rem      expensive are measurably gone. gauge_contested 550394 -> 0. world_ref
+rem      stale is 76799 against fresh 3495737 = 2.1%.
+rem   2. DEFERPREVONLY=1 (below, staged in round 32 for exactly this re-test)
+rem      removes the gauge_absent third of the population up front. This run:
+rem      defer_absent_declined=114477 against gauge_prev=598158, i.e. 16% of the
+rem      old population is gone before a single draw is buffered.
+rem   3. THE 14 FPS WAS NEVER INSTRUMENTED. m_timing.deferred_instance did not
+rem      exist when that measurement was taken - round 32 added it precisely so
+rem      this re-test would not have to guess, and it reads deferred_instance=0.00
+rem      on 'Remix timing:' today because the path is dead. The population is
+rem      27.2 draws per frame; buffering 27 structs cannot cost 14 fps, so the
+rem      old attribution is now checkable rather than believable.
+rem
+rem READ THESE, IN THIS ORDER, ON 'Remix timing:' AND 'Remix live:':
+rem   1. deferred_instance=  on 'Remix timing:' (bin\log\RPCS3.log). It is 0.00
+rem      today. THIS IS THE COST, in ms/frame, measured rather than inferred.
+rem      Compare it against frame_ms= on the same line.
+rem   2. defer_fresh >> defer_flip = the deferral is doing work. PRE-REGISTERED
+rem      (round 32's own threshold): defer_flip/defer_buffered must come in
+rem      BELOW 72%. If it is still ~half, the absent branch was not the waste,
+rem      the narrowing is refuted, and this goes back to 0.
+rem   3. anchor_parked / anchor_recap / anchor_promoted MUST NOT MOVE from
+rem      8 / 0 / 8 per 21630 flips. This knob cannot touch them. If they move,
+rem      something else did.
+rem   4. The fixture and the big window pipes: do they stop teleporting.
+rem
+rem PRE-REGISTERED REFUTATION: a deferred draw is submitted LATER IN THE FRAME
+rem than the geometry around it. If anything now renders in front of or behind
+rem something it should not - decals sinking into surfaces, blended props
+rem sorting wrongly against opaque ones - that is this knob's submit-order
+rem change and nothing else in this build can cause it.
+rem
+rem REVERT: set "RPCS3_REMIX_DEFERPREANCHOR=0"  <- one line, round 44b exactly.
+set "RPCS3_REMIX_DEFERPREANCHOR=1"
 rem Hard cap on how many draws one frame may hold back; the excess goes out the
 rem old way and counts defer_spilled.
 set "RPCS3_REMIX_DEFERPREANCHORMAX=4096"
@@ -1127,7 +1205,22 @@ rem closed one is refused before it can be picked at all, so this watch is the o
 rem instrument that can name the program refusing it. Face the closed door and copy
 rem every "Remix watch:" line with verdict=world_refused out of the dump.
 rem Blank it once the door is bound - the watch costs a log line per frame.
-set "RPCS3_REMIX_WATCHALBEDO=EF4700267F08C7F3"
+rem ROUND 45: EF4700267F08C7F3 MATCHED ZERO LINES IN THE ENTIRE 21630-FLIP RUN.
+rem It is retired here rather than kept as a decoration. Retargeted at the two
+rem albedos the round-45 audit named as worth watching:
+rem   4094F22DB2A8278A - the checkerboard tile, vp c1d482dcd1b03ed0, vtx 2088.
+rem     It is the SUBMITTED NEIGHBOUR of the black-void underfloor and it picks
+rem     cleanly (ref=identity-bypass, origin exactly [0 0 0]). Its verdict lines
+rem     carry the render-source key and the eye distance of the surface the
+rem     missing planks sit under, which is what the next attempt on the floor
+rem     needs and what a pick on an unclickable pixel can never give.
+rem   2722B18EB6EEDDF6 - the ONLY albedo any skip gate eats on the MAIN pass
+rem     (skippair, with vp 57A12323F22F4988). Measured by subtraction this run:
+rem     skip_albedo 1660629 - notex_refused_skip 1661448 + skip_shadowonly 14422
+rem     = 13603 draws. It is the giant-NPC-weapon suppressor, not a floor, and
+rem     this watch is what will say so continuously instead of by arithmetic.
+rem WALK OVER THE BLACK FLOOR WITH THIS ARMED and copy every 'Remix watch:' line.
+set "RPCS3_REMIX_WATCHALBEDO=4094F22DB2A8278A,2722B18EB6EEDDF6"
 rem SKIPAUXUNTEX is RETIRED this round: the code default flipped 1 -> 0 on the
 rem evidence (99,695 refusals in round 4 with the wash still reported, and still
 rem no doors with the gate off). The line above already reads 0, so nothing here
@@ -1302,12 +1395,14 @@ rem on doors in August. Do not use 1 as a fallback; use 0.
 rem REVERT: set "RPCS3_REMIX_GUESTLIGHTAUTO=0"
 set "RPCS3_REMIX_GUESTLIGHTAUTO=0"
 rem
-rem === DEFERPREANCHOR is deliberately LEFT OFF (set to 0 above) ================
-rem Round 6's verdict: off stays the baseline. 47% of buffered draws (367,629 of
-rem 774,606) never saw their frame's anchor at all, which is architectural, and
-rem the FPS attribution is unproven. The play-test card has the one A/B that
-rem settles it. The tail rescue above shares NO code path with the deferral, so
-rem this verdict blocks nothing.
+rem === DEFERPREANCHOR - SUPERSEDED BY ROUND 45. IT IS NOW SET TO 1 ABOVE. ======
+rem This block used to read "deliberately LEFT OFF". It is kept because its last
+rem sentence is still the operative one: "the FPS attribution is unproven". Round
+rem 32 added m_timing.deferred_instance so that it no longer has to be. There is
+rem NO 'set' in this block - cmd is last-wins and the only assignment is above.
+rem Round 6's numbers, kept for the A/B: 47% of buffered draws (367,629 of
+rem 774,606) never saw their frame's anchor. The tail rescue above shares NO code
+rem path with the deferral, so nothing here blocks anything.
 
 set "RPCS3_CODEX_INPUT_FILE=%TEMP%\rpcs3-codex-input.txt"
 

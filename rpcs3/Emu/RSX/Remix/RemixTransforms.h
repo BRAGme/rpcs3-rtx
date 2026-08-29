@@ -3238,45 +3238,50 @@ namespace remix_rsx
 	// _promoted. Census: 'Remix anchor-elect:'.
 	bool gauge_anchor_sticky_enabled();
 
-	// RPCS3_REMIX_GAUGEDONORMAXT (whole world units, 0 = OFF = round 43 byte for byte).
+	// RPCS3_REMIX_GAUGEDONORBEST (whole world units, 0 = OFF = round 43 byte for byte).
 	//
-	// ROUND 44, and this is round 30's specified-but-never-shipped fix. ONE declaration
-	// (WORLDIDENTITYVP) drives TWO gates and only one of them ever learned about WORLDIDMAXT:
-	//   * submit_subdraw's `keep_resolved` reads the draw's discarded translation, sees hundreds of
-	//     units, and correctly says "this is NOT a world-identity draw, keep its real transform";
-	//   * capture_gauge_anchor() has already run for that same draw and installed its fused matrix
-	//     as the WHOLE FRAME'S world gauge, qualified on the vp-hash list alone. It never looks at
-	//     the translation at all.
-	// So the backend says "carrier-local" and "this is the world" about one draw, in one frame, for
-	// one reason.
+	// ROUND 44b, and it replaces RPCS3_REMIX_GAUGEDONORMAXT, which is REMOVED FROM THE BUILD.
 	//
-	// MEASURED, round 44, over 12,779 'Remix worldid-draw:' lines of the newest session: of 759
-	// frames carrying two or more rows, 559 have EVERY row reporting one identical pre-translation,
-	// bit-for-bit across unrelated meshes (f=53640: vtx=160, vtx=224 and vtx=518 all read
-	// t=[1.579 -132.9 -2.179]). A per-object guest motion cannot do that; a wrong divide gauge is
-	// the only thing that can. The same frames' 'Remix gauge:' translation tracks it - 197.741 vs
-	// 197.0, 21.3542 vs 21.67, 132.275 vs -132.9, 916.247 vs -937.5 - and run-wide that number has
-	// mean 41.99, max 1718.67, and exceeds 128 units on 7.36% of frames.
+	// THE DEFECT IS REAL AND IS NOT IN DOUBT. capture_gauge_anchor() installs a WORLDIDENTITYVP
+	// draw as the whole frame's world gauge qualified on the vp-hash list alone - it never looks
+	// at the draw's own placement, while the submit site's keep_resolved does exactly that against
+	// WORLDIDMAXT. MEASURED: of 759 "Remix worldid-draw:" frames carrying two or more rows, 559
+	// have EVERY row on one bit-identical pre-translation across unrelated meshes; "Remix gauge:
+	// translation=" has mean 41.99 and max 1718.67 over 17,386 frames; and E40BF80AF519848A's raw
+	// vertex box never moves while its transform swings 0 -> 21.75 -> 966.5 units.
 	//
-	// ANCHORSTICKY does NOT already cover this. Its test is matrix_relative_delta against the held
-	// gauge with a tolerance of 0.8 - a RELATIVE, whole-matrix measure. A donor sitting 21.75 units
-	// off the world origin scores nowhere near 0.8 and installs silently. Sticky asks "did the gauge
-	// CHANGE"; this asks "is the gauge WRONG", and a stably-wrong gauge passes sticky every time.
+	// WHAT ROUND 44 GOT WRONG, and the rule that falls out of it. GAUGEDONORMAXT REFUSED an
+	// off-origin candidate and handed it to the ANCHORSTICKY park, expecting promote_parked_anchors()
+	// to recover. It does recover - AT FLIP, one frame late. MEASURED per flip, round 43 -> round 44:
+	//   anchor_parked    0.0769 -> 0.1542    anchor_recap  0.0766 -> 0.0181
+	//   anchor_promoted  0.00032 -> 0.1360   (+42,512%)   park outcomes 99.6%/0.4% -> 11.8%/88.2%
+	//   share of placements on last frame's anchor: 19.22% -> 37.09%
+	// The refused donor was installed anyway, one frame later, and the population placed by a stale
+	// gauge nearly doubled. The user saw "the whole scene warps aggressively when turning camera",
+	// which is a one-frame-old gauge under rotation: distance-from-eye x turn-per-frame, everywhere.
+	// A GAUGE REMEDY MUST NEVER MAKE THE GAUGE LATER OR ABSENT. That constrains every future attempt.
 	//
-	// The gate: a WORLDIDENTITYVP candidate whose own placement, measured against the gauge the slot
-	// already holds, exceeds this many world units may keep its own transform at submit time but may
-	// NOT donate the frame's gauge. Programs on RPCS3_REMIX_WORLDIDMAXTEXEMPTVP are exempt for the
-	// same reason they are exempt there - they submit genuinely absolute world spans and their large
-	// translations are real. A slot with no gauge yet donates unconditionally: there is nothing to
-	// judge the first donor of a scene against, and that bootstrap is stated rather than hidden.
+	// (Two further errors in that round's guard, recorded because they are the reusable part: the
+	// threshold was set on an ABSOLUTE cumulative counter and compared across sessions of different
+	// length - gauge_absent 57,424 vs 295,391 is 3.27/flip vs 5.24/flip - and even normalised it was
+	// the WRONG COUNTER, because the failure route was park -> promote, so the gauge was never
+	// absent, only late. anchor_promoted moved 425x and had no threshold on it.)
 	//
-	// Cannot starve the slot, and the run says so: of AD7CE9D672A0BF6B's 3,316,291 draws,
-	// 2,486,813 (75.0%) sit at |t| <= 1 and only 242,939 (7.3%) exceed 32, so 2.49M donors still
-	// qualify at 32. Counters on 'Remix live:': gauge_donor_offside counts candidates over the
-	// threshold WHETHER OR NOT the knob is armed, so an unarmed run still reports the population;
-	// gauge_donor_refused counts the ones actually turned away. offside > 0 with refused == 0 means
-	// the knob is off, not that the mechanism is absent.
-	u32 gauge_donor_max_translation();
+	// WHAT THIS DOES INSTEAD. The frame's first donor installs IMMEDIATELY and unconditionally, as
+	// today, so the gauge is never late and never absent. A LATER donor of the same frame may then
+	// REPLACE it, but only when its own placement - measured against the FRAME REFERENCE, the gauge
+	// held when the first donor arrived - is at least twice as close to the origin, and only when
+	// the installed donor is itself beyond this threshold. First-draw-wins becomes best-draw-wins.
+	// Nothing is parked, promoted or refused, so anchor_promoted structurally cannot move.
+	// 75.0% of AD7CE9D672A0BF6B's 3,316,291 draws sit at |t| <= 1, so a good donor is usually
+	// present in the frame; only the ORDER was wrong.
+	//
+	// Counters: gauge_donor_upgrade_avail (counted WHETHER OR NOT armed, so an unarmed run sizes the
+	// route) and gauge_donor_upgraded. avail > 0 with upgraded == 0 means the knob is off.
+	// PRE-REGISTERED REFUTATION: the gauge changes mid-frame, so draws submitted before the upgrade
+	// used the old one. If the scene TEARS within a frame - part of the world offset from the rest,
+	// props separating from the floor they stand on - that is this. 0 reverts it exactly.
+	u32 gauge_donor_best();
 
 	// RPCS3_REMIX_VCOLBGRA=1 (default): pack the replayed vertex colour in D3DCOLOR byte order
 	// (B, G, R, A) to match the format the runtime actually binds it with.

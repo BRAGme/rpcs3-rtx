@@ -12817,15 +12817,18 @@ namespace remix_rsx
 		return value != 0;
 	}
 
-	u32 gauge_donor_max_translation()
+	u32 gauge_donor_best()
 	{
-		// ROUND 44. Whole world units, 0 = OFF and OFF is byte-for-byte round 43. Same idiom and
-		// same units as RPCS3_REMIX_WORLDIDMAXT, deliberately: this is the SAME verdict that knob
-		// already applies at the submit site, applied at the capture site as well.
+		// ROUND 44b. Whole world units, 0 = OFF = round 43 byte for byte. Replaces round 44's
+		// RPCS3_REMIX_GAUGEDONORMAXT, which is REMOVED FROM THE BUILD after its play-test: refusing
+		// an off-origin donor parked it, promotion then installed it one frame LATE, and a late
+		// gauge warps the whole scene under camera rotation. This never refuses and never parks -
+		// the frame's first donor installs immediately as always, and a later donor of the same
+		// frame may replace it only when at least twice as close to the world origin.
 		//
 		// env_u32, not env_float: 0 has to mean OFF and be reachable, and env_float treats any
 		// non-positive value as unset.
-		static const u32 value = env_u32(L"RPCS3_REMIX_GAUGEDONORMAXT", 0);
+		static const u32 value = env_u32(L"RPCS3_REMIX_GAUGEDONORBEST", 0);
 		return value;
 	}
 

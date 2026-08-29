@@ -581,6 +581,32 @@ private:
 
 		u64 skip_vp = 0;
 		u64 skip_albedo = 0;
+
+		// ROUND 45. skip_albedo is the SUM of six independent gates, and for eleven rounds it was
+		// the only number any of them produced. It is printed on 'Remix stats:', which goes only to
+		// bin\log\RPCS3.log - so "how much does gate X eat" was answerable from neither log without
+		// blanking a knob and relaunching. These six partition it exactly
+		// (skip_gate_pair + skip_gate_albedo + skip_gate_untexvp + skip_gate_untexfppair
+		//  + skip_gate_chardepth + skip_gate_unbound == skip_albedo, an invariant a run can check),
+		// and they are printed on 'Remix live:', which DOES reach remix_dump.log.
+		//
+		// Note what this replaces rather than adds: 'Remix skip-census:' already names each gate the
+		// first time it eats a given (gate, vp, fp, albedo), and its 256-line cap has never been
+		// reached on this title (6 of 256 in the round-44b play-test), so a gate with no census line
+		// fired ZERO times run-wide. What the census cannot say is HOW MUCH, because it dedups. That
+		// is the hole these close.
+		u64 skip_gate_pair = 0;
+		u64 skip_gate_albedo = 0;
+		u64 skip_gate_untexvp = 0;
+		u64 skip_gate_untexfppair = 0;
+		u64 skip_gate_chardepth = 0;
+		u64 skip_gate_unbound = 0;
+
+		// skip_vp has the same defect and one of its two gates is armed on main-pass geometry:
+		// SKIPEXTENTVP=57A12323F22F4988 with SKIPEXTENTMIN=128. skip_gate_vp + skip_gate_extent
+		// == skip_vp.
+		u64 skip_gate_vp = 0;
+		u64 skip_gate_extent = 0;
 		// Unique vertex programs, not draws: how the HPOS writer collection went
 		// (vp_fingerprint::hpos_indirect). 'recovered' is programs whose matrix chain was only
 		// found by following a writer through a register, 'refused' is programs where a MOV was
@@ -1267,17 +1293,18 @@ private:
 		u64 gauge_anchor_recaptured = 0;
 		u64 gauge_anchor_promoted = 0;
 
-		// ROUND 44, RPCS3_REMIX_GAUGEDONORMAXT. Two counters, deliberately not one.
-		// offside: a WORLDIDENTITYVP candidate whose own placement against the gauge the slot
-		//          already holds exceeds the threshold. Counted WHETHER OR NOT the knob is armed,
-		//          so a run with GAUGEDONORMAXT=0 still reports how large the population is. Three
-		//          previous rounds each shipped a counter that could only ever read one way; this
-		//          is the guard against a fourth.
-		// refused: the subset actually turned away, i.e. offside AND the knob armed AND not on
-		//          RPCS3_REMIX_WORLDIDMAXTEXEMPTVP AND the slot had a gauge to judge against.
-		// offside > 0 with refused == 0 means the knob is off, NOT that the mechanism is absent.
+		// ROUND 44b. offside survives round 44 as PURE MEASUREMENT: candidates whose own placement
+		// against the held gauge exceeds RPCS3_REMIX_WORLDIDMAXT. Nothing reads it. It measured
+		// 160,740 over 17,583 flips (9.14/flip), which is why the defect is not in doubt even though
+		// round 44's remedy for it was wrong. gauge_donor_refused is GONE with that remedy.
 		u64 gauge_donor_offside = 0;
-		u64 gauge_donor_refused = 0;
+
+		// ROUND 44b, RPCS3_REMIX_GAUGEDONORBEST. upgrade_avail counts frames where a later donor was
+		// at least twice as close to the origin as the installed one, WHETHER OR NOT the knob is
+		// armed - so an unarmed run sizes the route before anyone plays it. upgraded counts the
+		// replacements that actually happened. avail > 0 with upgraded == 0 means the knob is off.
+		u64 gauge_donor_upgrade_avail = 0;
+		u64 gauge_donor_upgraded = 0;
 
 		// ROUND 44, diagnostic only, no knob and no pixel effect.
 		// dedup:    draws suppressed by the static-index submit-signature gate. It has never had
@@ -1744,6 +1771,19 @@ private:
 		// flip only if no continuous donor turned up all frame. That is what makes a real cut
 		// converge in one frame while a single stray non-identity draw cannot redefine the whole
 		// frame's divide gauge. Cleared the moment it is promoted or displaced.
+		// --- ROUND 44b: the frame reference (RPCS3_REMIX_GAUGEDONORBEST) ---------------------
+		// The gauge this slot carried when the frame's FIRST donor arrived - last frame's - kept
+		// for the duration of the frame so that two candidates of one frame are comparable.
+		// slot.inverse cannot serve: it is overwritten by whichever donor installed first, so
+		// measuring a later candidate against it says only that the two disagree, never which is
+		// closer to the world origin. installed_translation is the installed donor's own |t|
+		// against this reference, so "is the candidate better" is one comparison.
+		// Negative installed_translation = no usable reference this frame; no upgrade can fire.
+		remix_rsx::mat4 frame_ref_inverse{};
+		bool frame_ref_valid = false;
+		u64 frame_ref_frame = umax;
+		f32 installed_translation = -1.f;
+
 		bool parked_valid = false;
 		u64 parked_frame = umax;
 		u64 parked_vp_hash = 0;

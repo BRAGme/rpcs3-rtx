@@ -67,7 +67,7 @@ an `Emu/system_config.h` entry, the config default is what is listed.
 | `RPCS3_REMIX_CAMCLIPGATE` | `1` (on) | **The far-away "portal" frames, closed structurally (round 10).** With a camera lock configured, a candidate whose surface clip is neither the same as, nor exactly double, nor exactly half the session main-clip reference is refused before the vote. Haze's **lock program itself draws the 2048x2048 shadow pass**, so the shadow variant was a legitimate *primary* candidate: `Remix cam-elect: vp=7f3d3abcefc8b057 surf=0x0 clip=2048x2048 src=resolved candidates=17 cam=[-35.4 31.95 -32.05] frame=23022` -- it won at frame 23022 with the camera 30 units above a player whose gameplay frames read y=1.6-2.5 and held for ~1400 frames, and one cutscene run's tally of elected identities reads 10x `7f3d @512x288`, 8x `ad7c @1024x576`, **2x `7f3d @surf=0x0 2048x2048`**. The rule is the same same/double/half `compatible_surface` test the world-draw path already trusts at the `skip_camera_surface` site, lifted one level up so it decides which candidate may be *elected* rather than only which draws may follow one: against a 1024x576 reference, 2048x2048 fails (2048 = 2x1024 but 2048 != 2x576) while 512x288 and 1024x576 pass. The reference is the **session** main clip (textured draws only, so a material-less shadow map can never define it), falling back to the per-frame latched main clip and then to the active camera's own clip; with none of the three available every candidate is admitted, because a boot frame must not be camera-less. Placed at the head of `consider_camera_candidate`, so the split-failure recovery path inherits it rather than routing around it. Counter `cam_clipgate_refused`; census `Remix cam-clipgate:` names every (vp, clip) it refuses, bounded 16 per window. `0` restores today's admission bit-exactly. | |
 | `RPCS3_REMIX_CAMFBRELATCH` | `1` (on) | **The dev-menu camera-type flicker (round 10).** When the active camera is the lock program's and the frame's winner is a *fallback*-program candidate that is pose-continuous with it, the elected **identity stays the lock** and only the **matrices** are taken from the candidate that actually drew. Haze's lock `7F3D3ABCEFC8B057` stops producing candidates for stretches (its matrices become unsplittable near the vertical view, and the split-failure recovery additionally requires the surface to match the *active* camera's, so once the election has flipped away the recovery is locked out); `AD7CE9D672A0BF6B` then wins, and because the two express the same pose on different surfaces (positions within 0.2 units), `camera_source_changed` treated every handover as a full identity change needing 12 confirm frames. Measured: 11 `cam-elect` lines in one run alternating exactly those two identities, flips >=40 frames apart, `candidates=1` throughout -- which the lock filter *guarantees* in either outcome and therefore does **not** mean only one pass drew. Implemented by rewriting `m_frame_candidate` rather than short-circuiting the machinery, so the ordinary latch installs it, the source-change test sees no change and the age resets. Guarded exactly as the mid-frame relatch is (`archetype`, `has_reference`, `group_count`, view within the discontinuity tolerance, projection within 1e-2), so a genuinely different lens falls through to today's confirm-and-switch. Counter `cam_fb_relatch`; the visible test is `cam-elect` going quiet. `0` restores the flicker. | |
 | `RPCS3_REMIX_ANCHORSTICKY` | `1` (on) | **Selva's "geometry follows the camera" and the carrier/cargo split (round 10).** Elects the per-key gauge anchor by **continuity with its own previous frame** instead of by draw order. `capture_gauge_anchor` is first-draw-wins per (surface, target, clip); `gauge_contested` read 462,080 mid-session and 550,394 at close-out (vs ~0 in prior runs) and **all 61 `Remix gauge-contested:` lines in the Selva run are one pair on the main key**: holder `BD1C10DF5703E559` -- a genuine identity-world donor (absolute world-span strips, x from -1373 to +1113; a `worldvp` probe shows its divided world = identity to 1e-15) -- against contender `AD7CE9D672A0BF6B`, which is also on `WORLDIDENTITYVP` but submits **non-identity** draws here (deltas 1.7-7.4 drifting over time: a moving object). While BD1C draws first the tripwire correctly refuses AD7C; on frames where BD1C is culled, first-draw-wins hands AD7C the slot and `world = fused x wrong_ref^-1` leaves a camera-correlated residue on every draw -- geometry tracks the viewpoint while the sun (a Remix light, world-anchored by the runtime) stays put -- while draws issued before the frame's first identity draw divide by the *previous* frame's anchor, putting two references in one frame. With the knob on, a frame's first same-key donor that disagrees beyond the discontinuity tolerance is **parked**, a later continuous donor installs and displaces it, and any key that saw no continuous donor all frame **promotes** its parked candidate at flip -- so a real cut converges in exactly one frame and cannot be held. In the gap the divide's existing previous-frame anchor path and `GAUGECAMHOLD` cover lookups, which is today's behaviour for anchor-less frames. The contested tripwire is untouched. Counters `anchor_parked` / `anchor_recap` / `anchor_promoted`; census `Remix anchor-elect:` fires whenever a key changes holder, and `Remix gauge-contested:` now also carries `vpscale=`/`vpoffset=`/`cont=`. `0` restores first-draw-wins bit-exactly. | |
-| `RPCS3_REMIX_GAUGEDONORMAXT` | `0` (off) | **Round 44 -- round 30's specified-but-never-shipped fix, and the one knob of that round that changes pixels.** Whole world units. `WORLDIDENTITYVP` drives **two** gates and only `WORLDIDMAXT` ever learned about a threshold: at submit, `keep_resolved` sees a draw 900 units from the origin and correctly keeps its real transform; at capture, `capture_gauge_anchor()` (`RemixGSRender.cpp:1810`) has already installed that same fused matrix as the **whole frame's world gauge**, qualified on the vp-hash list alone -- it never looks at the translation. When non-zero, a candidate whose own placement (probed as `fused * slot->inverse`, translation read from row 3 after dividing out `m[3][3]` -- character for character `report_gauge_trace()`'s own measurement, so this and `Remix gauge: translation=` are the same number) exceeds this may keep its transform at submit but may **not** donate the gauge. **MEASURED, round 44:** of 759 `Remix worldid-draw:` frames carrying two or more rows, **559 have every row reporting one identical pre-translation, bit for bit across unrelated meshes** (`f=53640`: `vtx=160`, `vtx=224`, `vtx=518` all read `t=[1.579 -132.9 -2.179]`) -- guest motion cannot do that. `Remix gauge: translation=` over 17,386 frames has mean **41.99**, max **1718.67**, and exceeds 128 units on **7.36%** of frames. `E40BF80AF519848A`'s raw vertex box never moves (30 of 36 mesh identities exactly `0.0000` over spans up to 14,500 frames) while its transform swings 0 -> 21.75 -> 966.5. **`ANCHORSTICKY` does not already cover this**: its test is `matrix_relative_delta <= 0.8`, a *relative* whole-matrix measure, and a donor 21.75 units off the origin scores nowhere near 0.8. Sticky asks *did the gauge change*; this asks *is the gauge wrong*, and a stably-wrong gauge is perfectly continuous. **Cannot starve the slot:** `AD7CE9D672A0BF6B` puts 2,486,813 of 3,316,291 draws (75.0%) at `|t| <= 1` and only 242,939 (7.3%) above 32. Programs on `WORLDIDMAXTEXEMPTVP` are exempt for the same reason they are there. An offside donor is **parked**, not dropped, so `promote_parked_anchors()` still converges a scene cut in one frame -- a bare `return` would lock the slot out permanently, and `anchor_parked` therefore rises. Counters `gauge_donor_offside` (counted **whether or not the knob is armed**, so an unarmed run still sizes the population) and `gauge_donor_refused`. Watch `gauge_absent` -- if it rises much above 295,391 the gate starved the slot. `0` restores round 43 byte for byte. |  |
+| `RPCS3_REMIX_GAUGEDONORBEST` | `0` (off) | **Round 44b -- best-draw-wins for the world gauge, and the replacement for round 44's `GAUGEDONORMAXT`, which was play-tested, reverted and REMOVED FROM THE BUILD.** Whole world units. **The defect:** `capture_gauge_anchor()` (`RemixGSRender.cpp:1810`) installs a `WORLDIDENTITYVP` draw as the whole frame's world gauge qualified on the vp-hash list alone (`:1815`) -- it never looks at the draw's own placement, while the submit site's `keep_resolved` does exactly that against `WORLDIDMAXT`. **MEASURED continuously and camera-free**, 2,331 per-frame `Remix albedo-trace:` samples of `E40BF80AF519848A`: only **2 distinct raw vertex boxes** and neither ever moves, while the instance transform places it >1 unit off on **46.63%** of frames, >8 units on 25.61%, >32 on 16.60%, max **194.6 units**, max basis deviation 0.114; the bad frames form 53 runs, median 6 frames, longest 225. **WHAT ROUND 44 GOT WRONG:** refusing an off-origin donor handed it to the `ANCHORSTICKY` park, and `promote_parked_anchors()` runs at **flip** -- so the refused donor was installed anyway, ONE FRAME LATE. Per flip, r43 -> r44: `anchor_promoted` 0.00032 -> 0.1360 (**+42,512%**), `anchor_recap` 0.0766 -> 0.0181, park outcomes 99.6%/0.4% recaptured/promoted -> 11.8%/88.2%, and the share of placements on last frame's anchor 19.22% -> **37.09%**. The user saw *"the whole scene warps aggressively when turning camera"*, which is a one-frame-old gauge under rotation: distance-from-eye x turn-per-frame, everywhere. **A GAUGE REMEDY MUST NEVER MAKE THE GAUGE LATER OR ABSENT.** **WHAT THIS DOES:** the frame's first donor installs immediately and unconditionally as always, so the gauge is never late; a LATER donor of the same frame may replace it only when at least **twice as close** to the origin (measured against the *frame reference* -- the gauge held when the first donor arrived, since `slot.inverse` has already been overwritten) and only when the installed one is beyond this threshold. Nothing is parked, promoted or refused, so `anchor_promoted` structurally cannot move. 75.0% of `AD7CE9D672A0BF6B`'s 3,316,291 draws sit at `|t| <= 1`, so a good donor is usually present -- only the ORDER was wrong. Ranks by translation only; basis error is `WORLDIDMAXB`'s job. Counters `gauge_donor_upgrade_avail` (counted **whether or not armed**) and `gauge_donor_upgraded`; `gauge_donor_offside` survives as pure measurement (9.14/flip). **PRE-REGISTERED REFUTATION:** the gauge changes mid-frame, so if the scene TEARS within a frame -- part of the world offset from the rest, props separating from the floor they stand on -- that is this. `0` restores round 43 byte for byte. **ROUND 45 VERDICT: MEASURED INERT.** Play-tested at 32 over 21,630 flips: `gauge_donor_upgrade_avail=0` and `gauge_donor_upgraded=0`, and `avail` is counted whether or not the knob is armed, so the route never had a candidate. `gauge_contested=0` in the same branch says why: ~63 later donors per frame and every one AGREES with the first. **There is no better donor inside a frame to elect, so the whole donor-selection family - refusal, election, ranking, hysteresis, consensus - is retired.** The guards passed (`anchor_promoted` 0.00037/flip against r43's 0.00032; `gauge_prev` share 17.31% against 19.22%) and the pre-registered within-frame tear could not have occurred. Left at 32 because it costs nothing and its counters size the route for free; nothing depends on it. |  |
 
 ## Geometry and world placement
 
@@ -139,7 +139,7 @@ an `Emu/system_config.h` entry, the config default is what is listed.
 | `RPCS3_REMIX_UVAFFINEALL` | `1` (on) | Replay the same 2x2-plus-two-biases form for every program and unit where the walk resolves it out of that program's own ucode -- attribute, scale slot **and component**, row slots, bias slots. This is what carries the constant scale through instead of falling back to `UVINTSCALE`: 267,355 draws took the fixed 4096 divisor in the last Haze run while the ucode named 1/32768, which is the 8x tiling. `0` restores per-hash-only. Counter: `uv_affine_general`; every refused program is named with its reason by the `Remix uvscale-fixed:` census. | |
 | `RPCS3_REMIX_UVSCALELANES` | `1` (on) | Let the resolved affine form carry one divisor **component per lane** (or per 2x2 row) instead of one scalar for both. Read out of Haze's ucode, not inferred: `c151` is a *vector* of per-attribute divisors -- `f7f12d5d15bb9c37` multiplies ATTR8 by `c151.x`, ATTR9 by `c151.y` and ATTR10 by `c151.z` in one TEX0 slice, and `24d1ba819f701e47`'s live `c151` reads `[0.00024426 3.05176e-05 0.00024426 3.05176e-05]`, two divisors 8x apart inside one uploaded vector. A program may therefore divide u and v differently in a single instruction, and `bab9af462da74331` does (`MUL o7.xy = ATTR8.xyxx * c68.xyxx`); the single-scalar form refused it (`affine:mul-two-components`) and the draw fell back to the fixed 1/4096 on **both** lanes. Provably inert on every program that already resolves -- those name the same component twice, so both readings compute the same number -- so it can only change draws that are refused today. Counter: `uv_affine_lanes` (0 means no program in the scene divides u and v differently and the knob changed nothing). `0` restores the refusal. | |
 | `RPCS3_REMIX_UVRANGECENSUS` | `1` (on) | Name every (program, texcoord output, albedo) whose **submitted** UVs leave the unit square by more than a texel's slack: one `Remix uvrange:` line, capped at 256, carrying the u/v range, the repeat count, the resolved form, and the live value of the scale slot, both 2x2 rows and both biases. Pure logging. The pick line answers this for a clicked draw, and 116 clicks in the round-2 Haze run produced exactly one tiling draw -- not enough to separate "this mesh genuinely tiles 4x in v" from "the replay is out on a population the cursor never landed on". Printing the divisor beside the range settles it without a rebuild: a divisor the ucode names and the register file holds is the game's own. Counter: `uv_tiled`. `0` removes both. | |
-| `RPCS3_REMIX_DEFERPREANCHOR` | `1` (on) | **Pre-anchor deferral.** A draw whose render source has no *current-frame* gauge anchor is otherwise placed by last frame's (`gauge_prev`, 25% of divides) or by the cross-pass camera (`gauge_absent`, 20%) -- one frame of camera motion stale, which is the residual wobble round 4 attributed: the ceiling fixture `vp=c2003391127734f6` picked `ref=anchor_prev` 9/9 with its origin drifting ~0.5 units between frames while its basis stayed within 3e-5 of 1 (the arithmetic was already clean; the *pose* was late). Such an instance is now buffered by value -- info, blend/picking extension structs, the fused matrix, the object-space prepend and the source key -- and submitted the moment `capture_gauge_anchor` lands that source's anchor, re-divided in f64 against it. The object-space matrix is captured by running the live prepend lambda on an identity, so there is no second copy of that composition to drift. Anything still buffered at flip is flushed with the placement it already carried, so no draw is ever lost. Skinned draws keep the immediate path (their bone extension points at per-draw scratch). Counters: `defer_buffered`, `defer_fresh`, `defer_flip`, `defer_spilled`, `defer_skinned` -- **`fresh` >> `flip` is the success reading**; `flip` dominant says the anchor arrives too late in the title's frame and full flip-deferral is the next step. `0` restores the immediate submit bit-exactly. | |
+| `RPCS3_REMIX_DEFERPREANCHOR` | `1` (on) | **Pre-anchor deferral.** A draw whose render source has no *current-frame* gauge anchor is otherwise placed by last frame's (`gauge_prev`, 25% of divides) or by the cross-pass camera (`gauge_absent`, 20%) -- one frame of camera motion stale, which is the residual wobble round 4 attributed: the ceiling fixture `vp=c2003391127734f6` picked `ref=anchor_prev` 9/9 with its origin drifting ~0.5 units between frames while its basis stayed within 3e-5 of 1 (the arithmetic was already clean; the *pose* was late). Such an instance is now buffered by value -- info, blend/picking extension structs, the fused matrix, the object-space prepend and the source key -- and submitted the moment `capture_gauge_anchor` lands that source's anchor, re-divided in f64 against it. The object-space matrix is captured by running the live prepend lambda on an identity, so there is no second copy of that composition to drift. Anything still buffered at flip is flushed with the placement it already carried, so no draw is ever lost. Skinned draws keep the immediate path (their bone extension points at per-draw scratch). Counters: `defer_buffered`, `defer_fresh`, `defer_flip`, `defer_spilled`, `defer_skinned` -- **`fresh` >> `flip` is the success reading**; `flip` dominant says the anchor arrives too late in the title's frame and full flip-deferral is the next step. `0` restores the immediate submit bit-exactly. **ROUND 45: ARMED IN THE LAUNCHER** (was 0 since 2026-08-16). It is the remedy for the population round 44 and 44b could not touch: 8 of 8 displaced placements of the teleporting fixture, across rounds 4 and 45, are `ref=anchor_prev`. It is NOT a gauge remedy - it refuses, parks, promotes and reorders nothing, and a draw still held at flip goes out with the placement it already had - so round 44b's LATE/ABSENT rule does not apply to it. The ~14 fps that switched it off predates `m_timing.deferred_instance=`, which round 32 added for this re-test and which reads 0.00 today; the population is 27.6 draws/frame. Judge on `deferred_instance=` (`Remix timing:`, `bin\log\RPCS3.log`), then `defer_flip/defer_buffered` below round 32's pre-registered 72%. | |
 | `RPCS3_REMIX_DEFERPREANCHORMAX` | `4096` | Hard cap on the per-frame deferral buffer. A frame past it spills the remainder through the immediate path and counts `defer_spilled`. | |
 | `RPCS3_REMIX_NECTARMODE` | `1` | `1` publishes the fork game value `haze.nectar_disruption="1"` on every frame the `(A41A18E14C782613, E5D8F51451B96165)` pass is submitted -- the previous behaviour. `0` never publishes, which kills the fork-side greyscale outright. That pair turns out to be one of the generic half-resolution blended shadow-sampling passes (`Remix notex:` has it at `sampled=0x3 blend=1 depth_write=0`), i.e. drawn whenever its volume is on screen -- so mode 1 fires whenever the player merely *looks toward* the room rather than when the effect is active. The pass is still detected in either mode; only the publish is gated. Mode `2` (publish on a discriminator) is reserved until `LIGHTPASSCENSUS` names one. Counter: `nectar_published`. | |
 | `RPCS3_REMIX_LIGHTPASSCENSUS` | `1` (on) | One `Remix lightpass:` line per (vp, fp) per stats window, capped at 64, for draws on a *strictly smaller than main* clip with blend on and depth-write off -- the population `Remix notex:` names on Haze (`a41a18e14c782613/e5d8f51451b96165`, `504d2b3a.../9e16b7f2...`, `8ded5c7d.../8ab4259c...`, `33ae0895.../1e27bc07...`, all sampling the 2048x2048 DEPTH16 shadow map, i.e. the shape of a per-light shadow/lighting composite). Dumps vertex count, sampled mask, live blend function/equation/factors and blend colour, and the fragment program's first eight inline literal vec4s. Pure measurement, zero behaviour change: RSX has no fixed-function light registers, so the only place a title's light parameters exist in a form the RSX consumes is the constants of the passes that apply them -- and nothing has ever dumped Haze's fragment literals. If per-light positions or colours are in there, real light interception becomes designable on data; if not, the option is dead and the fixture-albedo channel is the whole answer. `0` removes the lines. | |
@@ -446,7 +446,12 @@ programs draws. That ordering is deliberate and documented at the call site.
 
 ### The wobble fix already exists, was user-confirmed, and is deliberately OFF for ~14 fps.
 
-`launch-haze-remix.cmd` sets `RPCS3_REMIX_DEFERPREANCHOR=0`, with a 2026-08-16 comment recording the
+**ROUND 45 UPDATE: it is now ON.** `launch-haze-remix.cmd` sets `RPCS3_REMIX_DEFERPREANCHOR=1` as of
+2026-08-29 — the run this section, the round-32 staging of `DEFERPREVONLY`, and the launcher's own
+"IF YOU WANT THE STABLE PROPS BACK, this is the run to try" note all asked for. See "Round 45" below.
+The paragraph that follows is the historical record of why it was off.
+
+`launch-haze-remix.cmd` previously set `RPCS3_REMIX_DEFERPREANCHOR=0`, with a 2026-08-16 comment recording the
 whole trade in the launcher's own words: *"What you lose: the ship no longer slides as you turn --
 that fix was real and you confirmed it. What you get back: roughly 14 fps. This is a genuine trade,
 not a defect."* Its own pre-registered tripwire tripped: MEASURED `defer_buffered=543244
@@ -1152,13 +1157,399 @@ refutation has two independent derivations, not one.
   carried forward as "the fp does not partition the rig" — but it partitions the body from the rig
   perfectly. Re-test a rejected key against the new question.
 
+## Round 45 (2026-08-29) — GAUGEDONORBEST was INERT, the skip gates are cleared, and the deferral is back on
+
+Deployed: `bin\rpcs3.exe` = `bin\rpcs3-next.exe` = **`7BA23387091418C2`**. `bin\remix\d3d9.dll` unchanged at
+`16A0B512F33EBB66`; `bin\rtx.conf` never opened. MSBuild `Release|x64` exit 0. The only warning from
+anything under `Emu\RSX\Remix\` is the pre-existing C4723 at `RemixGSRender.cpp:11636` — **zero new
+warnings.** HEAD `398f3f1ed` at start and at end; nothing committed, nothing stashed, nothing checked out.
+
+Everything below is measured from the **user's own round-44b play-test**: `remix_dump.log` bytes
+1,181,271,419.. (`build=Aug 27 2026 12:12:05`, `flips=21630`, `gaugedonorbest=32`, `fpalbedonarrow=1`,
+`glalbedos=0`) and the matching `bin\log\RPCS3.log`, which carries the 267 `Remix stats:` and
+`Remix timing:` lines that never reach the dump.
+
+### 1. `GAUGEDONORBEST=32` NEVER FIRED. MEASURED, and it is not a close call
+
+```
+gauge_donor_upgrade_avail = 0      over 21,630 flips
+gauge_donor_upgraded      = 0
+gauge_contested           = 0
+```
+
+`gauge_donor_upgrade_avail` is incremented **whether or not the knob is armed** — that was round 44b's own
+design, precisely so an inert run could be told from a dead route. It read **0**. By round 44b's own
+pre-registered table that means *"a better donor never existed"*. The fixture still teleports because the
+knob was never in the loop.
+
+**The guards both passed, and they are worth recording because round 44's did not:**
+
+| counter | r43 /flip | r44 (bad) /flip | **r45 /flip** | verdict |
+| --- | --- | --- | --- | --- |
+| `anchor_promoted` | 0.00032 | 0.1360 | **0.00037** (8/21630) | flat. The structural guard held. |
+| `anchor_parked` | 0.0769 | 0.1542 | 0.00037 (8) | fell 200x |
+| `anchor_recap` | 0.0766 | 0.0181 | 0 | — |
+| `gauge_prev` as share of placements | 19.22% | 37.09% | **17.31%** | did not rise |
+| `gauge_prev_camfresh` | 28.06 | 34.78 | 27.19 | flat |
+
+The **pre-registered refutation (within-frame tearing) cannot have occurred**: `gauge_donor_upgraded=0`
+means the gauge never changed mid-frame in this run. Anything the user saw tear is something else.
+
+### 2. WHY it was inert, and why this retires a whole family of remedies
+
+`gauge_contested = 0` over 21,630 flips. That counter lives in the *same branch* the upgrade lives in —
+`if (slot && slot->frame == m_frame_counter)`, i.e. the second-and-later gauge donor of a frame — and that
+branch is entered constantly: `worldid-census` shows `ad7ce9d672a0bf6b` alone submitting **1,377,732 draws
+over 21,630 flips = 64 per frame**, and every one of them past the first re-enters it.
+
+**So there are ~63 later donors per frame and every single one AGREES with the first to within tolerance.**
+
+Round 44 refused a donor. Round 44b elected between donors. **Both assumed a choice exists inside the
+frame. MEASURED: it does not.** The frame's only donor is itself sometimes wrong, and no within-frame
+election, ranking, refusal, hysteresis or consensus rule can change that. This retires the entire
+donor-selection family. What remains is (a) correcting the single donor after the fact, which is what
+round 44 tried and what the LATE/ABSENT rule forbids, or (b) not dividing pre-anchor draws by a stale
+gauge at all — which is `DEFERPREANCHOR`, and is what shipped.
+
+### 3. The defect itself, re-measured continuously and camera-free
+
+`Remix albedo-trace:` on `E40BF80AF519848A` / `C2003391127734F6`, **3,989 per-frame samples**:
+
+```
+                                  round 44b (2331)   round 45 (3989)
+frames placing it > 1  unit off ....... 46.63%          49.84%
+                     > 8  units ....... 25.61%          15.47%
+                     > 32 units ....... 16.60%           7.85%
+                     > 128 units ....... 0.77%           0.23%
+max |t| ............................... 194.6           501.688
+max basis deviation ................... 0.1141          0.2331
+distinct raw vertex boxes ............. 2               6 (LOD/sub-part; none ever moves)
+```
+
+The differences are session variation, **not** the knob — `gauge_donor_upgraded=0` proves the knob touched
+nothing. The bimodality is new and useful: **24.39% of samples are exact** (|t| < 0.01, basis = I), then a
+mode at 0.5–1.0 (20.31%) and a second at 2–4 (16.57%), then a tail to 501.
+
+**501.688 is not the fixture's private number.** `Remix worldid-census:` reads `tmax=501.688` for
+`c1d482dcd1b03ed0` — a different program — and `tmax=3201.11` shared by `ad7ce9d672a0bf6b`,
+`d0b6a471bb2d463b` and `0214281b9a7a412d`. **Unrelated programs sharing one displacement magnitude is the
+per-frame global gauge**, which is round 44's finding, now confirmed a second way.
+
+Scene-wide error rates from the same census (translation-residue buckets, cumulative over the run):
+
+| program | draws | off-identity | tmax |
+| --- | --- | --- | --- |
+| `ad7ce9d672a0bf6b` (main world) | 1,377,732 | 391 = **0.03%** | 3201.11 |
+| `c1d482dcd1b03ed0` (props/tiles) | 66,447 | 7,069 = **10.6%** | 501.688 |
+| `7f02e76d7369d09e` | 162,655 | 77 = 0.05% | 865.155 |
+| `bd1c10df5703e559`, `a7505f7ad3a86838`, `1f9342de47afb400` | 7,421 | 0 | 2.2e-08 |
+
+The world itself is placed correctly 99.97% of the time. **The props are the population that moves**, at
+10.6%, which is the same order as `gauge_prev`'s 17.31% share of placements.
+
+### 4. `ref=anchor_prev` is the displacement, on the object itself. 8/8 across two rounds
+
+`Remix picked:`, this run, on `E40BF80AF519848A`:
+
+| frame | ref | origin | |
+| --- | --- | --- | --- |
+| 7546 | `anchor` | `[0 3.5e-10 0]` | correct |
+| 7646 | `anchor` | `[7.5e-09 2.3e-10 0]` | correct |
+| 10443 | **`anchor_prev`** | `[2.277 0.306 2.257]` | displaced |
+| 10460 | **`anchor_prev`** | `[-0.502 0.556 0.803]` | displaced |
+| 10525 | **`anchor_prev`** | `[0.349 0.498 -0.377]` | displaced |
+
+Round 4 read the same object `ref=anchor_prev` **9/9**. That is 8 displaced placements of this object
+across two rounds and **every one of them is the stale-anchor branch**, with perfect separation from the
+correct ones.
+
+**This is the mechanism behind the user's "the camera bounces as I walk so props follow the bounce".** A
+one-frame-stale *anchor* under a pure camera *translation* produces a pure translation error with no
+rotation — exactly a walk-bob — and that is a motion round 38's `distance x turn-per-frame` model
+explicitly cannot produce. The det-varies-per-frame finding fits the same picture: the anchor is a
+view x projection, so a stale one perturbs scale as well as position.
+
+### 5. WHAT SHIPPED: `RPCS3_REMIX_DEFERPREANCHOR=1` — one launcher line, no new mechanism
+
+Not a gauge remedy: it does not refuse, park, promote, reorder or re-rank a single donor, so round 44b's
+rule (*a gauge remedy must never make the gauge later or absent*) is not merely satisfied, it does not
+apply. It holds the **draw** until this frame's anchor for its own render source lands, then re-divides in
+f64 against it. Anything still held at flip goes out with the placement it already carried, so the worst
+case is byte-identical to today, one flush later, and **no draw is ever lost**. `anchor_parked` /
+`anchor_recap` / `anchor_promoted` structurally cannot move.
+
+**This is not a new idea. It was root-caused, shipped, and CONFIRMED BY THE USER to stop the props sliding**
+in round 31, then switched off on 2026-08-16 for ~14 fps. Three things changed since, all measured:
+
+1. **The conditions the launcher itself blamed are gone.** `gauge_contested` 550,394 -> **0**;
+   `world_ref_stale` 76,799 against `world_ref_fresh` 3,495,737 = **2.1%**.
+2. **`DEFERPREVONLY=1` (round 32, staged for exactly this re-test) removes the `gauge_absent` third up
+   front** — this run `defer_absent_declined=114477` against `gauge_prev=598158`.
+3. **The 14 fps was never instrumented.** `m_timing.deferred_instance` did not exist when that number was
+   taken; round 32 added it so this re-test would not have to guess, and it reads `deferred_instance=0.00`
+   today because the path is dead. The population is `gauge_prev` = **598,158 / 21,630 flips = 27.6 draws
+   per frame**. Buffering 27 POD structs per frame cannot cost 14 fps. The claim is now checkable.
+
+**Judge it on, in order:** `deferred_instance=` on `Remix timing:` (ms/frame, against `frame_ms=`);
+`defer_flip/defer_buffered` **below 72%** (round 32's own pre-registered threshold); `anchor_parked` /
+`anchor_recap` / `anchor_promoted` unchanged at 8/0/8 per 21,630 flips; then the fixture and the pipes.
+
+**PRE-REGISTERED REFUTATION:** a deferred draw is submitted *later in the frame* than the geometry around
+it. If anything now sorts wrongly — decals sinking into surfaces, blended props against opaque ones —
+that is this knob's submit-order change and nothing else in this build can cause it.
+**REVERT:** `set "RPCS3_REMIX_DEFERPREANCHOR=0"` — one line, round 44b exactly.
+
+### 6. THE BLACK FLOOR: no skip gate eats it. Settled from the existing log, no rebuild needed
+
+The round-45 brief asked which of the six shared-counter gates eats the floor. **The answer is none, and
+it did not need the counter split** — it needed reading `Remix skip-census:` correctly.
+
+`report_skip_census` dedups by `(gate, vp, fp, albedo)` and caps at 256 lines, and
+**`m_skip_census_seen` / `m_skip_census_lines` are never reset — there is no window.** The whole run emitted
+**6 lines of 256**, so the cap was never approached and **a gate with no census line fired zero times,
+run-wide.** The six that fired:
+
+```
+gate=skipuntexturedvp  vp=7f3d3abcefc8b057 albedo=0  clip=2048x2048   (shadow map, untextured)
+gate=unboundblend      vp=33ae0895aef9ef72 albedo=0  clip=512x288     (aux pass, untextured)
+gate=characterdepth    vp=56cc5a962ead7ecd albedo=0  clip=512x288     (aux pass, untextured)
+gate=shadowonly        vp=6004dce66b8b7a11 albedo=0  clip=512x288     (aux pass, untextured)
+gate=skippair          vp=57a12323f22f4988 albedo=2722B18EB6EEDDF6 clip=1024x576  x2 fp
+```
+
+`skippair` is **the only gate that touches the main pass with a real albedo**, and its size is MEASURED by
+subtraction over three counters that already exist:
+
+```
+notex_refused_skip 1,661,448  (every albedo==0 gate call)
+  - skip_shadowonly   14,422
+  = 1,647,026  = skipuntexturedvp + unboundblend + characterdepth
+skip_albedo        1,660,629  ('Remix stats:')
+  - 1,647,026
+  = 13,603     = skippair          (0.18% of 7,728,159 draws)
+```
+
+And `skip_vp = **0**` — so **`SKIPVP` and `SKIPEXTENTVP` both ate nothing at all**, despite
+`SKIPEXTENTVP=57A12323F22F4988 SKIPEXTENTMIN=128` being armed on main-pass geometry. `skip_aux_untextured
+= 0`, `so_nomain = 0`, `so_notsmaller = 0`, `skipalbedo` and `untexturedfppair` never fired.
+`2722B18EB6EEDDF6` is the giant-NPC-weapon suppressor the launcher documents, not a floor.
+
+**Every named skip gate is cleared. The floor is not eaten by a gate.**
+
+The static index is cleared too: `entries=567 deferred=0 stale=0 dropped=0 nomesh=0 peak=100 budget=128`.
+`evicted=378` of 567 sounds alarming and is not: `evicted` means the reaper freed that entry's union mesh
+and the next draw rebuilds it, and `dropped=0` says no draw ever took the no-live-handle exit. The
+round-43 pathology (`resident=0 of 16601`) did not recur.
+
+### 7. What the floor's unclickability does and does NOT prove — and the leading candidate
+
+The brief read *"the floor is a black void and is unclickable"* as *"no draw exists there, so this is a
+submission failure"*. **The first half is right and the second half is one hypothesis of two.** An empty
+pick means **no draw is AT THOSE PIXELS**. A draw that was submitted and then thrown 500 units across the
+room is also not at those pixels, and also picks as nothing. Unclickability kills the *shading* hypothesis
+outright; it does not separate *not submitted* from *submitted elsewhere*.
+
+With every skip gate cleared, the static index clean, and the world-refusal exits accounted
+(`nocam=68100 lay_other=18155 tail=107734`, summing exactly to `world_fallback=193989`), **displacement is
+now the leading candidate**, and it has direct support:
+
+* The user's own clip, frame 28: ***"a long beam/plank floating diagonally in mid-air."*** The missing
+  object is the ***wooden plank*** floor.
+* The program that draws the props/tiles in that room, `c1d482dcd1b03ed0`, misplaces **10.6%** of its
+  draws, to a maximum of **501.688** units.
+* `ad7ce9d672a0bf6b` reaches **3201.11** units on 391 draws — far enough to leave a room empty.
+
+**INFERRED, not measured** — the plank in the video has not been tied to a hash. The discriminator is
+cheap and is now armed: `WATCHALBEDO` was carrying `EF4700267F08C7F3`, which matched **zero lines all
+run**, and is retargeted to `4094F22DB2A8278A` (the checkerboard tile — the *submitted, clickable*
+neighbour of the void) and `2722B18EB6EEDDF6`. If P1's fix moves the floor, they were one bug.
+
+### 8. Instrument changes (no pixels)
+
+* **`skip_albedo` and `skip_vp` are split eight ways** and printed on `Remix live:`, which reaches
+  `remix_dump.log`. `skipg_pair` / `skipg_alb` / `skipg_untexvp` / `skipg_untexfp` / `skipg_chardepth` /
+  `skipg_unbound` sum to `skip_albedo`; `skipg_vp` + `skipg_extent` sum to `skip_vp`. Two invariants a run
+  can check against `Remix stats:` without a second instrument. This closes the blind spot the brief named
+  — but note the census had already answered the question and the counters make it *readable* rather than
+  *derivable*.
+* **`Remix albedo-trace:` gains `ref=` and `refage=`.** The one instrument that runs continuously and is
+  not gated on a pick could measure the defect but never attribute it, because `ref=` lived only on
+  `Remix picked:` — and **every pick in this project's history was taken with the game paused.** `ref=` is
+  reported the way `Remix picked:` reports it (identity-bypass overrides the divide that was thrown away);
+  `refage = m_frame_counter - m_ref_pick_frame`, so `anchor`/`0` is correct and `anchor_prev`/`1` is a
+  one-frame-stale gauge, `-1` = no reference frame. **Next round this turns the 8/8 pick correlation into
+  a 4,000-sample one, and it is how `DEFERPREANCHOR=1` gets judged: `anchor_prev` should collapse.**
+
+### Method notes earned this round
+
+- **A dedup census with an unhit cap is a proof of ABSENCE, even though it cannot count a population.**
+  Six lines of 256, no window reset, therefore every gate with no line fired zero times. The brief's own
+  warning ("a census that dedups by key cannot enumerate a population") is true and was read one step too
+  far: it cannot say *how much*, but it says *whether* with certainty.
+- **`Remix stats:` is not unreadable, it is in the other log.** Both `Remix stats:` and `Remix timing:`
+  land in `bin\log\RPCS3.log`, 267 lines each, from the same run. Three of this round's most load-bearing
+  numbers (`skip_albedo`, `skip_vp`, `deferred_instance=`) came from there. Slice both logs, not one.
+- **"Unclickable" separates *rendered black* from *not rendered here*. It does not separate *not
+  submitted* from *submitted somewhere else*.** Write the pick's negative result as the two hypotheses it
+  actually leaves.
+- **When a counter designed to size an unarmed route reads 0, believe it and go read its sibling.**
+  `gauge_donor_upgrade_avail=0` plus `gauge_contested=0` in the same branch is what retired the whole
+  donor-election family in one reading, without a play-test.
+- **A cost attributed before the timer for it existed is a guess.** `deferred_instance=` was added in
+  round 32 for exactly this; the 14 fps predates it.
+- **On this title the HUD draws through the same compositor as the world, so a screen-space UI element
+  can look like world geometry in a still frame.** The round-45 brief read *"white triangular spikes on
+  an NPC"* out of a video frame as character geometry corruption; the user identified them as the
+  **damage-direction indicators in the HUD**, rendering correctly. **RETRACTED - there is no character
+  geometry corruption from that frame and nothing to investigate.** The cheap discriminator before
+  calling anything in a frame a geometry defect: **position stability across frames while the camera
+  moves.** Screen-space holds its screen position; world geometry does not. The *other* anomaly in the
+  same frame - a long beam/plank floating diagonally in mid-air - survives and is genuine prop
+  displacement.
+
+## Round 44b (2026-08-27) — the refusal was reverted; a late gauge is worse than a wrong one
+
+**`RPCS3_REMIX_GAUGEDONORMAXT` was play-tested and reverted.** The user reported *"now the whole scene
+warps aggressively when turning camera"*, and the light fixture still teleported. It is **removed from the
+build**, not defaulted off: the exe contains neither the wide string `RPCS3_REMIX_GAUGEDONORMAXT` nor
+`gaugedonormaxt=%u` nor the counter `gauge_donor_refused`, all three verified absent.
+
+Deployed: `bin\rpcs3.exe` = `bin\rpcs3-next.exe` = **`260E9986847110F8`**. `bin\remix\d3d9.dll` unchanged at
+`16A0B512F33EBB66`; `bin\rtx.conf` unchanged at `215975B8697DE21B`. MSBuild `Release|x64` exit 0,
+**0 errors, 1 warning** — the same pre-existing C4723, now at `RemixGSRender.cpp:11636`.
+
+**The tree moved during this round and not by me.** It started at `f091ff5a4`; `398f3f1ed` was committed
+at 2026-08-27 12:02:05, mid-round, snapshotting the **round 44** state (round-44 source, the Round 44
+section below, the three inboxes, and the launcher with `GAUGEDONORMAXT=0`). Round 44b is not in it — it
+is uncommitted working-tree state on top of that commit, across seven files. Nothing was committed by me.
+
+**The diagnosis underneath it stands and is now stronger.** What was wrong was the remedy.
+
+### Why it failed: the gate did not remove the bad gauge, it DELAYED it
+
+MEASURED, normalised per flip — round 43 ran 56,381 flips, round 44 ran 17,583, so raw totals are not
+comparable and are not quoted:
+
+| counter | r43 /flip | r44 /flip | change |
+| --- | --- | --- | --- |
+| `anchor_parked` | 0.0769 | 0.1542 | +100% (expected) |
+| `anchor_recap` | 0.0766 | 0.0181 | **−76%** |
+| `anchor_promoted` | 0.00032 | 0.1360 | **+42,512%** |
+| `gauge_prev` as share of all placements | **19.22%** | **37.09%** | +93% |
+| `gauge_prev_camfresh` | 28.06 | 34.78 | +24% |
+
+Park outcomes went from **99.6% recaptured / 0.4% promoted** to **11.8% / 88.2%**. `promote_parked_anchors()`
+runs at **flip**, so a promoted candidate becomes the gauge for the *next* frame. The refused donor was
+therefore installed anyway, one frame late — and the share of placements divided by last frame's anchor
+nearly doubled. A one-frame-old gauge under camera rotation displaces the entire scene by
+(distance from eye) x (turn per frame). That is the warp, exactly.
+
+**THE RULE THIS ESTABLISHES, and it constrains every future attempt here:
+A GAUGE REMEDY MUST NEVER MAKE THE GAUGE LATER OR ABSENT.** Wrong-but-current beats correct-but-late.
+
+### Two independent specification errors in my own guard, both reusable
+
+1. **I put a threshold on an absolute cumulative counter and compared it across sessions of different
+   length.** The guard was "`gauge_absent` must not rise much above 295,391". It read 57,424 — and I would
+   have called that a pass. Per flip it is 3.27 against 5.24: it genuinely fell, but the comparison as
+   written was meaningless. The round-43 notes already record *"a cumulative counter divided by frames is
+   not a rate"*; this is the mirror-image error and it is just as fatal.
+2. **Even normalised, it was the wrong counter.** The failure route was park → promote, so the gauge was
+   never *absent* — it was *late*. The counter that moved 425-fold was `anchor_promoted`, and the shipped
+   code comment named it as one that "may rise with it" **without putting a threshold on it**. A guard
+   belongs on the counter the failure mode moves, and I had already written down which one that was.
+
+### The defect is not in doubt — and it now has a continuous, camera-free measurement
+
+`RPCS3_REMIX_TRACEALBEDO` was re-pointed at `E40BF80AF519848A` with
+`RPCS3_REMIX_TRACEALBEDOVP=C2003391127734F6`, and `Remix albedo-trace:` emits one line per frame carrying
+the raw vertex box and the instance matrix together. **2,331 continuous per-frame samples**, camera free:
+
+```
+distinct raw vertex boxes over 2,331 frames ..........  2   (two sub-parts; neither ever moves)
+frames placing it more than   1 unit off ............. 46.63%
+                              8 units ................ 25.61%
+                             32 units ................ 16.60%
+                            128 units .................. 0.77%
+max |t| = 194.6 units      max basis deviation = 0.1141 (~6.5 degrees of spurious rotation)
+bad frames form 53 runs, median 6 frames, longest 225
+```
+
+The raw box is bit-identical across every sample. **The guest never moves it; we do, on 47% of frames, by
+up to 194 units.** Episodes lasting 6 frames to 225 frames is precisely "it teleports and comes back".
+
+This is the first measurement of the defect that is not gated on a pick — see the instrument note below
+for why every earlier one was.
+
+### What shipped instead: `RPCS3_REMIX_GAUGEDONORBEST=32`
+
+First-draw-wins becomes **best-draw-wins**, with no refusal, no parking and no promotion:
+
+* The frame's **first donor installs immediately and unconditionally**, exactly as before. The gauge is
+  never late and never absent, so this cannot reproduce the warp.
+* A **later** donor of the same frame may **replace** it, but only when its own placement is at least
+  **twice as close** to the world origin, and only when the installed donor is itself beyond the
+  threshold. Two conditions, one mechanism: the second is hysteresis, so the gauge cannot churn between
+  two donors of like quality.
+* Candidates are compared against the **frame reference** — the gauge the slot held when the frame's first
+  donor arrived. `slot.inverse` cannot serve: it has already been overwritten by whichever donor installed
+  first, so measuring against it says only that two candidates disagree, never which is closer to the
+  origin. New slot fields `frame_ref_inverse` / `frame_ref_valid` / `frame_ref_frame` /
+  `installed_translation` carry it.
+* **`anchor_promoted` structurally cannot move.** That is deliberate: it is the counter that caught
+  round 44, and it is now also the guard.
+
+Why it should converge: **2,486,813 of `AD7CE9D672A0BF6B`'s 3,316,291 draws (75.0%) sit at |t| ≤ 1**
+against the held gauge. A good donor is present in the great majority of frames. Only the *order* was
+wrong. Ranking is by translation only; the basis error (max 0.114 measured above) is left to
+`WORLDIDMAXB`, which is a separate knob and stays 0.
+
+**PRE-REGISTERED REFUTATION:** the gauge now changes mid-frame, so draws submitted before an upgrade used
+the old one. **If the scene tears within a frame — part of the world offset from the rest, props separating
+from the floor they stand on — that is this.** `set "RPCS3_REMIX_GAUGEDONORBEST=0"` reverts it exactly.
+
+Counters: `gauge_donor_upgrade_avail` is counted **whether or not the knob is armed**, so an unarmed run
+sizes the route before anyone plays it; `gauge_donor_upgraded` counts the replacements that happened.
+`avail > 0` with `upgraded = 0` means the knob is off, not that the route is dead. `gauge_donor_offside`
+survives as pure measurement (nothing reads it): 160,740 over 17,583 flips, 9.14 per flip.
+
+### INSTRUMENT NOTE, and it retroactively weakens a class of earlier conclusions
+
+**The user pauses the game before every Ctrl+Click.** In their words: *"I did pause the game to ctrl click
+the light fixture (and others that teleport really quickly) so that way i don't mis click another texture
+that is actually stable."* That is sound method on their side — it is how they avoid mis-clicking — but it
+means **every pick in every log this project has ever taken was captured with a frozen camera.**
+
+So round 43's `E40BF80AF519848A` follow reading `d_origin = 0` for 181 consecutive frames was not bad luck
+and not a coincidence: it is **structural**. Any diagnostic that samples at pick time, or is armed by a
+pick, or keys off `pick_record`, **can never observe a motion defect**, because there is no motion while it
+is running.
+
+**Instruments for motion must run continuously and be keyed on the albedo or the program, never on a pick.**
+`Remix albedo-trace:` (via `TRACEALBEDO`/`TRACEALBEDOVP`) is the one that qualifies today, and it is what
+produced the 2,331-sample table above. `Remix pick-follow:` does not, whatever else is fixed about it.
+Every conclusion in this document's history that rests on pick-adjacent sampling of a moving object should
+be re-read with that in mind.
+
+### The checkerboard is a TWO-LAYER problem, not alternating dropout
+
+New from the user: *"The wooden plank floor is supposed to be under the checkerboard tiles."* The tiles
+render **correctly**. The black is the **missing underfloor**, seen through the gaps between them. That is
+a different problem from "half the tiles are dropped" and it invalidates the alternating-dropout framing
+that the checkerboard appearance suggested.
+
+Counters from the round-44 build: `static_submit_dedup = 115,567`, `static_submit_meshdiff = 1,309` —
+meshdiff is only **1.13%** of dedups. And `xform_measured 1,777,810 − submitted 1,662,243 = 115,567`
+**exactly**, which confirms the round-44 subtraction attribution of that exit to the unit.
+
 ## Round 44 (2026-08-27) — the wobble is the DIVIDE GAUGE, and it is a per-frame global
 
 Deployed: `bin\rpcs3.exe` = `bin\rpcs3-next.exe` = **`14DD8282D86D298D`**. `bin\remix\d3d9.dll` **UNCHANGED at
 `16A0B512F33EBB66`** — nothing deployed into `bin\remix\`. `bin\rtx.conf` READ ONLY: never written.
 MSBuild `Release|x64` exit **0**, **0 errors, 1 warning** — the pre-existing C4723 "potential divide by
 0", now at `RemixGSRender.cpp:11562` (round 43 recorded 11456; this round's edits above that line moved
-it). **Zero new warnings.** HEAD `f091ff5a4` at both ends of the round; the tree did not move.
+it). **Zero new warnings.** HEAD `f091ff5a4` at both ends of the round; the tree did not move. (True as written:
+`398f3f1ed` was committed later, during round 44b, and it is what froze this section.)
 
 **One knob changes pixels this round: `RPCS3_REMIX_GAUGEDONORMAXT=32`.** Everything else added is a
 counter or a print.

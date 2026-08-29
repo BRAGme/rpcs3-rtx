@@ -797,7 +797,7 @@ void RemixGSRender::on_init_thread()
 			// point of the banner is that the first ten lines of a run say what it was launched
 			// with. vcolbgra in particular has to be visible: the HUD turning amber is the visible
 			// test, and "amber" with vcolbgra=0 would mean the binary is stale.
-			"camclipgate=%d camfbrelatch=%d anchorsticky=%d gaugedonormaxt=%u vcolbgra=%d fpvcolalphagate=%d "
+			"camclipgate=%d camfbrelatch=%d anchorsticky=%d gaugedonorbest=%u vcolbgra=%d fpvcolalphagate=%d "
 			"fpvcolemissive=%.4g fpvcoladditive=%d vmalbedos=%u vmanchorgeo=%d vmalbedocam=%d "
 			"madaccumwalk=%d "
 			// Round 11. hazefade is the headline visible test and the first thing the play-test
@@ -944,7 +944,7 @@ void RemixGSRender::on_init_thread()
 			remix_rsx::camera_clip_gate_enabled() ? 1 : 0,
 			remix_rsx::camera_fallback_relatch_enabled() ? 1 : 0,
 			remix_rsx::gauge_anchor_sticky_enabled() ? 1 : 0,
-			remix_rsx::gauge_donor_max_translation(),
+			remix_rsx::gauge_donor_best(),
 			remix_rsx::vertex_colour_bgra_enabled() ? 1 : 0,
 			remix_rsx::fp_vcol_alpha_gate_enabled() ? 1 : 0,
 			static_cast<f64>(remix_rsx::fp_vcol_emissive()),
@@ -1857,6 +1857,89 @@ void RemixGSRender::capture_gauge_anchor(const remix_rsx::mat4& fused)
 	const bool slot_continuous = slot_has_gauge
 		&& matrix_relative_delta(fused, slot->fused) <= s_camera_discontinuity_tolerance;
 
+	// --- ROUND 44b: the placement PROBE. Measurement only. The gate that stood here is GONE ---
+	//
+	// ROUND 44 SHIPPED A REFUSAL HERE AND IT WAS PLAY-TESTED AND REVERTED. RPCS3_REMIX_GAUGEDONORMAXT
+	// is REMOVED FROM THE BUILD, not defaulted off. Do not re-add it. What it did: a candidate whose
+	// own placement exceeded 32 units was refused and handed to the ANCHORSTICKY park, on the
+	// reasoning that park+promote would recover a scene cut. It does recover - one frame late - and
+	// ONE FRAME LATE IS WORSE THAN WRONG-BUT-CURRENT. The user's report was 'the whole scene warps
+	// aggressively when turning camera', which is exactly a one-frame-old gauge under rotation:
+	// displacement = distance-from-eye x turn-per-frame, applied to the entire scene.
+	//
+	// MEASURED, per flip, round 43 (56,381 flips) -> round 44 armed (17,583 flips):
+	//   anchor_parked     0.0769 -> 0.1542   (+100%, expected)
+	//   anchor_recap      0.0766 -> 0.0181   (-76%)
+	//   anchor_promoted   0.00032 -> 0.1360  (+42,512%)   <- the whole story
+	//   gauge_prev share  19.22% -> 37.09%   of all placements
+	// Park outcomes went from 99.6% recaptured / 0.4% promoted to 11.8% / 88.2%. Promotion happens
+	// at FLIP, so the refused donor was installed anyway - one frame later. The gate did not remove
+	// the bad gauge, it DELAYED it, and doubled the population placed by last frame's anchor.
+	//
+	// THE RULE THAT FALLS OUT OF THAT, and it constrains every future remedy here:
+	// A GAUGE REMEDY MUST NEVER MAKE THE GAUGE LATER OR ABSENT. Install something in-frame, always.
+	//
+	// The probe itself survives as pure measurement, because the defect it measures is real: 559 of
+	// 759 multi-row worldid-draw frames carry ONE bit-identical pre-translation across unrelated
+	// meshes. gauge_donor_offside counts candidates whose own placement against the held gauge
+	// exceeds RPCS3_REMIX_WORLDIDMAXT - the same verdict the submit site applies - and it reached
+	// 160,740 over 17,583 flips (9.14 per flip). Nothing reads it.
+	f32 donor_translation = -1.f;
+
+	if (slot_has_gauge)
+	{
+		// fused * slot->inverse, translation from row 3 after dividing out m[3][3] - character for
+		// character the measurement report_gauge_trace() makes, so this and "Remix gauge:
+		// translation=" are the same number and can be read against each other directly.
+		const remix_rsx::mat4 probe = remix_rsx::mat4_multiply(fused, slot->inverse);
+		const f32 w = probe.m[3][3];
+		const f32 inv = (std::isfinite(w) && std::abs(w) > 1e-6f) ? (1.f / w) : 1.f;
+
+		f32 measured = 0.f;
+		for (u32 row = 0; row < 3; ++row)
+		{
+			measured = std::max(measured, std::abs(probe.m[3][row] * inv));
+		}
+
+		if (std::isfinite(measured))
+		{
+			donor_translation = measured;
+
+			const f32 offside = static_cast<f32>(remix_rsx::world_identity_keep_translation());
+
+			if (offside > 0.f && measured > offside
+				&& !remix_rsx::world_identity_keep_exempt_matches(m_current_vp_hash))
+			{
+				++m_stats.gauge_donor_offside;
+			}
+		}
+	}
+
+	// The same candidate measured against the FRAME REFERENCE - the gauge this slot held when the
+	// frame's first donor arrived, i.e. last frame's. That is the only origin reference available
+	// here, and it is the one that makes two candidates of one frame comparable: slot->inverse has
+	// already been overwritten by whichever donor installed first, so measuring against IT only
+	// says the two disagree, never which is closer to the world origin.
+	f32 frame_translation = -1.f;
+
+	if (slot && slot->frame_ref_valid && slot->frame_ref_frame == m_frame_counter)
+	{
+		const remix_rsx::mat4 probe = remix_rsx::mat4_multiply(fused, slot->frame_ref_inverse);
+		const f32 w = probe.m[3][3];
+		const f32 inv = (std::isfinite(w) && std::abs(w) > 1e-6f) ? (1.f / w) : 1.f;
+
+		f32 measured = 0.f;
+		for (u32 row = 0; row < 3; ++row)
+		{
+			measured = std::max(measured, std::abs(probe.m[3][row] * inv));
+		}
+
+		if (std::isfinite(measured))
+		{
+			frame_translation = measured;
+		}
+	}
+
 	if (slot && slot->frame == m_frame_counter)
 	{
 		// First identity draw of the frame wins. A later one that disagrees is the tripwire the
@@ -1919,84 +2002,69 @@ void RemixGSRender::capture_gauge_anchor(const remix_rsx::mat4& fused)
 			}
 		}
 
-		return;
-	}
+		// --- ROUND 44b: BEST-OF-FRAME (RPCS3_REMIX_GAUGEDONORBEST) ---------------------------
+		//
+		// The replacement for round 44's refusal, designed against the one rule that round's
+		// play-test established: A GAUGE REMEDY MUST NEVER MAKE THE GAUGE LATER OR ABSENT.
+		// Refusing an off-origin donor sent it to the ANCHORSTICKY park, promotion fired at flip
+		// instead of recapture (88.2% promoted against round 43's 0.4%), and the very donor that
+		// was refused got installed one frame late anyway - taking the share of placements on last
+		// frame's anchor from 19.22% to 37.09% and turning a wrong gauge into a LATE one. The
+		// scene then warps under camera rotation by distance-from-eye x turn-per-frame.
+		//
+		// This does the opposite. The frame's first donor installs IMMEDIATELY and unconditionally,
+		// exactly as it does today, so the gauge is never late and never absent and this branch can
+		// only ever run with a gauge already in place. A LATER donor of the same frame may then
+		// REPLACE it, but only when it is demonstrably closer to the world origin. First-draw-wins
+		// becomes best-draw-wins. Nothing is parked, nothing is promoted, nothing is refused -
+		// anchor_promoted structurally cannot move, and that is the counter that caught round 44.
+		//
+		// WHY IT SHOULD CONVERGE: 2,486,813 of AD7CE9D672A0BF6B's 3,316,291 draws (75.0%) sit at
+		// |t| <= 1 against the held gauge, so an origin-resident donor is available in the great
+		// majority of frames. Only the ORDER was wrong.
+		//
+		// Two conditions, one mechanism. The installed donor must itself be off-origin (else there
+		// is nothing to fix and the frame stays bit-exact), and the candidate must be at least
+		// twice as close (hysteresis, so the gauge cannot churn between two donors of like quality).
+		//
+		// gauge_donor_upgrade_avail is counted WHETHER OR NOT the knob is armed, so an unarmed run
+		// still reports how often the route could have fired. Round 44 shipped a guard on a counter
+		// the failure mode did not move; this is the guard against repeating that.
+		//
+		// PRE-REGISTERED REFUTATION: the gauge changing mid-frame means draws submitted BEFORE the
+		// upgrade used the old one. If the scene tears within a frame - part of the world offset
+		// from the rest, or props separating from the floor they stand on - that is this, and
+		// GAUGEDONORBEST=0 reverts it exactly.
+		const u32 upgrade_units = remix_rsx::gauge_donor_best();
 
-	// --- ROUND 44: the placement gate (RPCS3_REMIX_GAUGEDONORMAXT) -------------------------------
-	//
-	// Round 30 specified this and never shipped it. WORLDIDENTITYVP drives two gates and only one
-	// of them ever learned about WORLDIDMAXT: submit_subdraw's `keep_resolved` reads this draw's
-	// discarded translation, sees hundreds of units and correctly refuses to call it a
-	// world-identity draw - while this function has already installed that same draw's fused matrix
-	// as the whole frame's world gauge on the strength of the vp-hash list alone.
-	//
-	// MEASURED, this round, over the newest session's 12,779 'Remix worldid-draw:' lines: of the
-	// 759 frames carrying two or more rows, 559 have EVERY row reporting one identical
-	// pre-translation, bit-for-bit across unrelated meshes. Guest motion cannot do that. And the
-	// magnitudes are not small - 'Remix gauge:' translation has mean 41.99 and max 1718.67 over
-	// 17,386 frames, exceeding 128 units on 7.36% of them.
-	//
-	// WHY ANCHORSTICKY DOES NOT ALREADY DO THIS, stated because it looks like it should:
-	// slot_continuous above is matrix_relative_delta <= 0.8, a RELATIVE whole-matrix measure. A
-	// donor sitting 21.75 units off the world origin scores nowhere near 0.8 and installs silently.
-	// Sticky asks "did the gauge CHANGE"; this asks "is the gauge WRONG". A stably-wrong gauge is
-	// perfectly continuous and passes sticky on every frame.
-	//
-	// The probe is `fused * slot->inverse` and its translation is read from row 3 after dividing
-	// out m[3][3] - character for character the measurement report_gauge_trace() makes at :2454,
-	// so 'Remix gauge: translation=' and this gate are the same number and can be read against each
-	// other without a conversion.
-	//
-	// PLACED HERE ON PURPOSE, below the contested tripwire's own return rather than above it. A
-	// donor arriving after the frame's gauge has already landed still reaches that tripwire and is
-	// still counted by gauge_anchor_contested, so arming this knob cannot silently deflate the one
-	// counter that measures the disagreement this gate exists to act on.
-	//
-	// ONE existing counter DOES move, and it is named rather than left to be discovered:
-	// gauge_anchor_parked rises, because an offside donor is parked rather than dropped (see the
-	// scene-cut note at the park site below). gauge_anchor_promoted may rise with it. Read the
-	// round-43 baselines - parked 4,338 and promoted 18 over 56,381 flips - as the before.
-	//
-	// Three deliberate properties:
-	//   - it needs a gauge to judge against, so the first donor after a scene cut is never refused
-	//     (slot_has_gauge); the bootstrap is stated rather than hidden;
-	//   - WORLDIDMAXTEXEMPTVP is honoured for exactly the reason it exists at the submit site -
-	//     those programs submit absolute world spans and their large translations are real;
-	//   - gauge_donor_offside is incremented before the knob is consulted, so GAUGEDONORMAXT=0
-	//     still measures the population it would have refused.
-	bool donor_offside = false;
-
-	if (slot_has_gauge && !remix_rsx::world_identity_keep_exempt_matches(m_current_vp_hash))
-	{
-		const remix_rsx::mat4 probe = remix_rsx::mat4_multiply(fused, slot->inverse);
-		const f32 w = probe.m[3][3];
-		const f32 inv = (std::isfinite(w) && std::abs(w) > 1e-6f) ? (1.f / w) : 1.f;
-
-		f32 donor_translation = 0.f;
-		for (u32 row = 0; row < 3; ++row)
+		if (slot->frame_ref_valid && slot->frame_ref_frame == m_frame_counter
+			&& slot->installed_translation > 0.f && frame_translation >= 0.f
+			&& !remix_rsx::world_identity_keep_exempt_matches(m_current_vp_hash))
 		{
-			donor_translation = std::max(donor_translation, std::abs(probe.m[3][row] * inv));
-		}
+			// The threshold the availability counter measures against when the knob is off is the
+			// same WORLDIDMAXT the submit site uses, so an unarmed run's avail is directly
+			// comparable to an armed run's upgraded.
+			const f32 floor_units = static_cast<f32>(upgrade_units != 0 ? upgrade_units
+				: remix_rsx::world_identity_keep_translation());
 
-		const u32 donor_max = remix_rsx::gauge_donor_max_translation();
-
-		// The threshold the counter measures against when the knob is off is the same 32 units the
-		// submit site already uses, so an unarmed run's gauge_donor_offside is directly comparable
-		// to the armed run's gauge_donor_refused.
-		const f32 measure_against = static_cast<f32>(donor_max != 0 ? donor_max
-			: remix_rsx::world_identity_keep_translation());
-
-		if (std::isfinite(donor_translation) && measure_against > 0.f
-			&& donor_translation > measure_against)
-		{
-			++m_stats.gauge_donor_offside;
-
-			if (donor_max != 0)
+			if (floor_units > 0.f && slot->installed_translation > floor_units
+				&& (frame_translation * 2.f) < slot->installed_translation)
 			{
-				++m_stats.gauge_donor_refused;
-				donor_offside = true;
+				++m_stats.gauge_donor_upgrade_avail;
+
+				if (upgrade_units != 0
+					&& write_gauge_anchor(*slot, fused, m_current_vp_hash, surface, target, clip_w, clip_h,
+						rsx::method_registers.viewport_scale_z(), rsx::method_registers.viewport_offset_z()))
+				{
+					// write_gauge_anchor does not touch frame_ref_*, so the frame reference stays put
+					// and a third donor of the same frame is still measured against the same origin.
+					slot->installed_translation = frame_translation;
+					++m_stats.gauge_donor_upgraded;
+				}
 			}
 		}
+
+		return;
 	}
 
 	// --- round 10: park a discontinuous first donor instead of installing it --------------------
@@ -2026,16 +2094,9 @@ void RemixGSRender::capture_gauge_anchor(const remix_rsx::mat4& fused)
 	//
 	// The contested tripwire is untouched and keeps counting: it is measuring AD7C's bad donations,
 	// which this leaves refused. RPCS3_REMIX_ANCHORSTICKY=0 restores first-draw-wins bit-exactly.
-	// ROUND 44. donor_offside joins the sticky condition rather than returning on its own,
-	// and that is a correctness requirement, not tidiness. The probe above measures this
-	// candidate against the gauge the slot already holds, so on the frame after a scene cut
-	// EVERY candidate is legitimately far from the stale gauge. A bare return would refuse
-	// them all, leave nothing parked, give promote_parked_anchors() nothing to install, and
-	// the slot would never recover - a permanent lockout on the first hard cut. Parking
-	// instead reuses round 10's existing recovery verbatim: if nothing in-threshold turns up
-	// all frame the parked candidate is promoted at flip and the cut converges in one frame.
-	if (slot_has_gauge
-		&& ((remix_rsx::gauge_anchor_sticky_enabled() && !slot_continuous) || donor_offside))
+	// ROUND 44b: the donor_offside coupling that stood here was PLAY-TESTED AND REMOVED. See
+	// the note at the offside probe above. Restored to round 43 exactly.
+	if (remix_rsx::gauge_anchor_sticky_enabled() && slot_has_gauge && !slot_continuous)
 	{
 		// Keep the FIRST parked candidate of the frame rather than the last: if no continuous donor
 		// arrives, the promoted gauge should be the one draw order would have chosen anyway, so the
@@ -2085,6 +2146,19 @@ void RemixGSRender::capture_gauge_anchor(const remix_rsx::mat4& fused)
 	if (key_had_park)
 	{
 		++m_stats.gauge_anchor_recaptured;
+	}
+
+	// ROUND 44b. Snapshot the gauge this slot is carrying BEFORE it is overwritten: that is the
+	// frame reference every later donor of this frame is measured against. Taken here rather than
+	// at the top because 'slot' may have been recycled from the spare pool above, and a spare
+	// belongs to a different render source whose gauge is not this key's origin.
+	slot->frame_ref_frame = m_frame_counter;
+	slot->frame_ref_valid = slot_has_gauge && donor_translation >= 0.f;
+	slot->installed_translation = slot->frame_ref_valid ? donor_translation : -1.f;
+
+	if (slot->frame_ref_valid)
+	{
+		slot->frame_ref_inverse = slot->inverse;
 	}
 
 	if (!write_gauge_anchor(*slot, fused, m_current_vp_hash, surface, target, clip_w, clip_h,
@@ -18500,6 +18574,7 @@ void RemixGSRender::submit_subdraw()
 	if (const u64 skip_hash = remix_rsx::skip_vp_hash(); skip_hash != 0 && skip_hash == m_current_vp_hash)
 	{
 		++m_stats.skip_vp;
+		++m_stats.skip_gate_vp;
 		// No albedo has been resolved this early, so the census names the program pair only. That is
 		// still the answer for a whole-program bisector.
 		report_skip_census("skipvp", 0, -1.f, -1.f);
@@ -19801,6 +19876,7 @@ void RemixGSRender::submit_subdraw()
 		&& skip_pair_vp == m_current_vp_hash && skip_pair_albedo == albedo_hash)
 	{
 		++m_stats.skip_albedo;
+		++m_stats.skip_gate_pair;
 		report_skip_census("skippair", albedo_hash, -1.f, -1.f);
 		note_watch("skippair", albedo_hash, -1.f, -1.f);
 		return;
@@ -19809,6 +19885,7 @@ void RemixGSRender::submit_subdraw()
 	if (const u64 skip_hash = remix_rsx::skip_albedo_hash(); skip_hash != 0 && skip_hash == albedo_hash)
 	{
 		++m_stats.skip_albedo;
+		++m_stats.skip_gate_albedo;
 		report_skip_census("skipalbedo", albedo_hash, -1.f, -1.f);
 		note_watch("skipalbedo", albedo_hash, -1.f, -1.f);
 		return;
@@ -19823,6 +19900,7 @@ void RemixGSRender::submit_subdraw()
 		&& skip_untextured_vp == m_current_vp_hash)
 	{
 		++m_stats.skip_albedo;
+		++m_stats.skip_gate_untexvp;
 		report_skip_census("skipuntexturedvp", albedo_hash, -1.f, -1.f);
 		note_watch("skipuntexturedvp", albedo_hash, -1.f, -1.f);
 		return;
@@ -19869,6 +19947,7 @@ void RemixGSRender::submit_subdraw()
 		}
 
 		++m_stats.skip_albedo;
+		++m_stats.skip_gate_untexfppair;
 		report_skip_census("untexturedfppair", albedo_hash, -1.f, -1.f);
 		note_watch("untexturedfppair", albedo_hash, -1.f, -1.f);
 		return;
@@ -19888,6 +19967,7 @@ void RemixGSRender::submit_subdraw()
 	if (haze_untextured_character_depth)
 	{
 		++m_stats.skip_albedo;
+		++m_stats.skip_gate_chardepth;
 		report_skip_census("characterdepth", albedo_hash, -1.f, -1.f);
 		note_watch("characterdepth", albedo_hash, -1.f, -1.f);
 		return;
@@ -19904,6 +19984,7 @@ void RemixGSRender::submit_subdraw()
 		&& skip_unbound_blend_vp == m_current_vp_hash)
 	{
 		++m_stats.skip_albedo;
+		++m_stats.skip_gate_unbound;
 		report_skip_census("unboundblend", albedo_hash, -1.f, -1.f);
 		note_watch("unboundblend", albedo_hash, -1.f, -1.f);
 		return;
@@ -21631,6 +21712,15 @@ void RemixGSRender::submit_subdraw()
 			"Remix albedo-trace: albedo=%016llX vp=%016llx vtx=%u skinned=%d world=%d "
 			"origin=[%.6g %.6g %.6g] camvp=%016llx surf=%08X target=%u clip=%ux%u "
 			"cam=[%.6g %.6g %.6g] raw=[%.6g %.6g %.6g]..[%.6g %.6g %.6g] "
+			// ROUND 45. WHICH REFERENCE placed this draw, on the one instrument that runs
+			// continuously and is not gated on a pick. The 2,331-sample round-44b table and this
+			// round's 3,989-sample one both say the raw box never moves while |t| reaches 500 units
+			// - but neither could say WHAT divided it, because 'ref=' lived only on 'Remix picked:',
+			// and every pick in this project's history was taken with the game PAUSED. refage is
+			// m_frame_counter - m_ref_pick_frame, so anchor with refage=0 is the correct case and
+			// anchor_prev with refage=1 is a one-frame-stale gauge. -1 = no reference frame
+			// (camera / viewmodel / identity-bypass). Diagnostic only, no pixel changes.
+			"ref=%s refage=%d "
 			"matrix=[%.6g %.6g %.6g %.6g; %.6g %.6g %.6g %.6g; %.6g %.6g %.6g %.6g] frame=%llu",
 			albedo_hash, m_current_vp_hash, vertex_count, skinned ? 1 : 0, world_resolved ? 1 : 0,
 			static_cast<f64>(transform.matrix[0][3]), static_cast<f64>(transform.matrix[1][3]), static_cast<f64>(transform.matrix[2][3]),
@@ -21639,6 +21729,12 @@ void RemixGSRender::submit_subdraw()
 			static_cast<f64>(m_active_camera.position[0]), static_cast<f64>(m_active_camera.position[1]), static_cast<f64>(m_active_camera.position[2]),
 			static_cast<f64>(raw_lo[0]), static_cast<f64>(raw_lo[1]), static_cast<f64>(raw_lo[2]),
 			static_cast<f64>(raw_hi[0]), static_cast<f64>(raw_hi[1]), static_cast<f64>(raw_hi[2]),
+			// identity_bypass is reported the same way 'Remix picked:' reports it (:23475): the
+			// WORLDIDENTITYVP replacement happens after per_draw_transform has already recorded
+			// whichever reference it used, so m_ref_pick_source alone would name a divide that was
+			// then thrown away.
+			ref_source_name(world_identity_match ? ref_source::identity_bypass : m_ref_pick_source),
+			m_ref_pick_frame == umax ? -1 : static_cast<s32>(m_frame_counter - m_ref_pick_frame),
 			static_cast<f64>(transform.matrix[0][0]), static_cast<f64>(transform.matrix[0][1]), static_cast<f64>(transform.matrix[0][2]), static_cast<f64>(transform.matrix[0][3]),
 			static_cast<f64>(transform.matrix[1][0]), static_cast<f64>(transform.matrix[1][1]), static_cast<f64>(transform.matrix[1][2]), static_cast<f64>(transform.matrix[1][3]),
 			static_cast<f64>(transform.matrix[2][0]), static_cast<f64>(transform.matrix[2][1]), static_cast<f64>(transform.matrix[2][2]), static_cast<f64>(transform.matrix[2][3]),
@@ -22610,6 +22706,7 @@ void RemixGSRender::submit_subdraw()
 		&& m_streak_extent > remix_rsx::skip_extent_min())
 	{
 		++m_stats.skip_vp;
+		++m_stats.skip_gate_extent;
 		report_skip_census("skipextent", albedo_hash, m_streak_extent, skip_census_dist);
 		note_watch("skipextent", albedo_hash, m_streak_extent, skip_census_dist);
 		return;
@@ -25696,6 +25793,19 @@ void RemixGSRender::log_stats()
 			// so_nomain / so_notsmaller are the same accounting for SKIPSHADOWONLY: classified
 			// minus skipped minus these two is what an earlier exact rule refused first.
 			"| notex_world=%llu notex_skip=%llu so_nomain=%llu so_notsmaller=%llu "
+			// ROUND 45: the eight-way split of the two shared skip counters. skip_albedo and
+			// skip_vp are printed ONLY on 'Remix stats:', which goes only to bin\log\RPCS3.log and
+			// appears zero times in remix_dump.log, so "which gate ate my floor" had no answer in
+			// the dump at all. Two invariants a run can check without a second instrument:
+			//   skipg_pair+skipg_alb+skipg_untexvp+skipg_untexfp+skipg_chardepth+skipg_unbound
+			//     == skip_albedo   (on 'Remix stats:')
+			//   skipg_vp+skipg_extent == skip_vp
+			// Read against 'Remix skip-census:', which names each gate the first time it eats a
+			// given (gate, vp, fp, albedo) and whose 256-line cap has never been reached on this
+			// title - so a gate with no census line fired zero times run-wide, and these say how
+			// much the ones that did fire actually ate.
+			"skipg_pair=%llu skipg_alb=%llu skipg_untexvp=%llu skipg_untexfp=%llu "
+			"skipg_chardepth=%llu skipg_unbound=%llu skipg_vp=%llu skipg_extent=%llu "
 			// Round 8: tex_stale_detected is cache hits whose guest bytes had moved under a stable
 			// descriptor key - the "stale pool slot" arm of the bark-textured-soldier bug. Non-zero
 			// with 'Remix texstale:' lines naming the keys is the arm confirmed; zero across a
@@ -25767,11 +25877,10 @@ void RemixGSRender::log_stats()
 			//   vm_anchor_unmeasured must stay 0: non-zero says VMANCHORGEO is partly inert.
 			"cam_clipgate_refused=%llu cam_fb_relatch=%llu "
 			"anchor_parked=%llu anchor_recap=%llu anchor_promoted=%llu "
-			// ROUND 44, RPCS3_REMIX_GAUGEDONORMAXT. offside is counted whether or not the knob is
-			// armed, so an unarmed run still sizes the population; refused is the subset actually
-			// turned away. offside > 0 with refused == 0 means the knob is OFF, not that the
-			// mechanism is absent.
-			"gauge_donor_offside=%llu gauge_donor_refused=%llu "
+			// ROUND 44b. offside is pure measurement (nothing reads it). upgrade_avail is counted
+			// whether or not GAUGEDONORBEST is armed, so an unarmed run sizes the route; upgraded
+			// counts the replacements that happened. avail > 0 with upgraded == 0 = knob off.
+			"gauge_donor_offside=%llu gauge_donor_upgrade_avail=%llu gauge_donor_upgraded=%llu "
 			// ROUND 44, diagnostic only. static_submit_dedup is the static-index submit-signature
 			// gate, which until now had no counter at all; it must reconcile with
 			// xform_measured - submitted - poisoned. meshdiff is its subset where a LARGER union
@@ -25895,7 +26004,7 @@ void RemixGSRender::log_stats()
 			// Round 10. Every one of these is a bisect step on the play-test card, so a run has to
 			// be able to state what it was launched with without anyone reading the launcher -
 			// which is the rule that caught round 6's silently-inert AFFINETOL run.
-			"camclipgate=%d camfbrelatch=%d anchorsticky=%d gaugedonormaxt=%u "
+			"camclipgate=%d camfbrelatch=%d anchorsticky=%d gaugedonorbest=%u "
 			"vcolbgra=%d fpvcolalphagate=%d fpvcolemissive=%.4g fpvcoladditive=%d "
 			"vmalbedos=%u vmanchorgeo=%d vmalbedocam=%d madaccumwalk=%d "
 			// Round 11, same rule: every one of these is a bisect step on the play-test card.
@@ -26137,6 +26246,17 @@ void RemixGSRender::log_stats()
 			m_stats.notex_refused_skip,
 			m_stats.shadowonly_nomain,
 			m_stats.shadowonly_notsmaller,
+			// ROUND 45. Eight arguments in the eight positions the two new format lines occupy,
+			// inserted HERE against their own text rather than appended - rounds 18/19 both shipped
+			// an ordering bug by appending to the end of this list.
+			m_stats.skip_gate_pair,
+			m_stats.skip_gate_albedo,
+			m_stats.skip_gate_untexvp,
+			m_stats.skip_gate_untexfppair,
+			m_stats.skip_gate_chardepth,
+			m_stats.skip_gate_unbound,
+			m_stats.skip_gate_vp,
+			m_stats.skip_gate_extent,
 			m_textures.stats().wrap_forced,
 			m_textures.stats().stale_detected,
 			m_textures.stats().stale_evicted,
@@ -26180,7 +26300,8 @@ void RemixGSRender::log_stats()
 			m_stats.gauge_anchor_recaptured,
 			m_stats.gauge_anchor_promoted,
 			m_stats.gauge_donor_offside,
-			m_stats.gauge_donor_refused,
+			m_stats.gauge_donor_upgrade_avail,
+			m_stats.gauge_donor_upgraded,
 			m_stats.static_submit_dedup,
 			m_stats.static_submit_meshdiff,
 			m_stats.fpvcol_alpha_skipped,
@@ -26295,7 +26416,7 @@ void RemixGSRender::log_stats()
 			remix_rsx::camera_clip_gate_enabled() ? 1 : 0,
 			remix_rsx::camera_fallback_relatch_enabled() ? 1 : 0,
 			remix_rsx::gauge_anchor_sticky_enabled() ? 1 : 0,
-			remix_rsx::gauge_donor_max_translation(),
+			remix_rsx::gauge_donor_best(),
 			remix_rsx::vertex_colour_bgra_enabled() ? 1 : 0,
 			remix_rsx::fp_vcol_alpha_gate_enabled() ? 1 : 0,
 			static_cast<f64>(remix_rsx::fp_vcol_emissive()),
