@@ -11648,6 +11648,17 @@ namespace remix_rsx
 		return value != 0;
 	}
 
+	// --- ROUND 46 -------------------------------------------------------------------------------
+	// Admit tag-only viewmodel draws to the pre-anchor deferral. Full derivation and the four
+	// measurements behind it are on the declaration in RemixTransforms.h. env_u32, not env_flag, for
+	// the same reason DEFERPREANCHOR uses it: 0 has to restore the round-45 build bit-exactly or the
+	// A/B on "does the gun still shake" means nothing.
+	bool defer_viewmodel_enabled()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_DEFERVIEWMODEL", 0);
+		return value != 0;
+	}
+
 	u32 defer_pre_anchor_max()
 	{
 		// Hard cap on the per-frame deferral buffer. A frame that buffers more than this spills the
@@ -11938,6 +11949,35 @@ namespace remix_rsx
 	u32 guest_light_auto_mode()
 	{
 		static const u32 value = std::min(env_u32(L"RPCS3_REMIX_GUESTLIGHTAUTO", 0), 2u);
+		return value;
+	}
+
+	// --- ROUND 48: the STATIC-FIXTURE gate, and it is what makes GUESTLIGHTAUTO usable ----------
+	// Round 41 armed GUESTLIGHTAUTO=2 (glow cards only) and had to disable it again for two faults
+	// that are one fault: the trigger lit SOLDIERS as they walked, and scattered spheres at
+	// positions no fixture occupies. Both are the same thing - the AUTO population is keyed on
+	// render state (blended, no depth write, bright texture) and nothing in that key says the draw
+	// is STANDING STILL. A lamp is bolted to a wall; a suit panel on a walking NPC and a
+	// camera-adjacent billboard are not.
+	//
+	// So require the candidate to re-appear in the SAME quantised cell on N distinct frames before
+	// it may mint a light. A static fixture hits its cell every frame it is drawn and confirms in N
+	// frames; a moving emitter leaves a trail of cells and never reaches N in any of them. The cell
+	// quantisation is the one the light hash already uses (0.25 world units), so "same cell" is the
+	// same equivalence the dedup has always applied - this adds a time axis to it, nothing else.
+	//
+	// 0 = OFF, which is round-41 behaviour bit-exactly: every AUTO candidate mints a light on first
+	// sight. The knob is the whole mechanism; there is no second switch.
+	//
+	// NOTE THE INTERACTION WITH FLICKER, because it is the user's other request and it is easy to
+	// break here. A confirmed cell STAYS confirmed (see m_guest_light_cells) so that a bulb which
+	// flickers off, loses its light to GUESTLIGHTIDLE, and comes back on re-lights on the FIRST
+	// frame its card returns rather than serving the N-frame apprenticeship again. Without that,
+	// any stability window longer than the flicker period would make a flickering bulb permanently
+	// dark - the exact opposite of what was asked for.
+	u32 guest_light_stable_frames()
+	{
+		static const u32 value = std::min(env_u32(L"RPCS3_REMIX_GUESTLIGHTSTABLE", 0), 600u);
 		return value;
 	}
 

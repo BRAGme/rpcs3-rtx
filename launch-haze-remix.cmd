@@ -402,7 +402,7 @@ rem reaper, not the budget: MESHIDLE=600 (~20 s at 30 fps) is what evicts them, 
 rem untaken lever is a longer idle window scoped to static-index UNION meshes only, which is
 rem a code change and NOT this knob.
 rem REVERT: set "RPCS3_REMIX_STATICINDEXBUDGET=64"
-set "RPCS3_REMIX_STATICINDEXBUDGET=128"
+set "RPCS3_REMIX_STATICINDEXBUDGET=512"
 rem ======================================================================================
 rem 2026-08-15 IDLE-REAPER EXPERIMENT. Textures degrade to flat white after ~30s
 rem standing still, and this reproduces with TEXREHASH off, so it is a real
@@ -828,7 +828,26 @@ set "RPCS3_REMIX_GUESTLIGHTCOLOR=1"
 rem Destroy a light no draw has re-matched for this many frames. 0 = keep forever,
 rem which is what a room lit by its own ceiling fixtures wants: a lamp does not
 rem stop existing when you turn around.
-set "RPCS3_REMIX_GUESTLIGHTIDLE=0"
+rem
+rem --- ROUND 48: 0 becomes 4, AND THIS IS THE FLICKER HALF OF THE FEATURE ----------------
+rem The round-48 brief assumed a card-keyed light flickers "for free" because a bulb that
+rem flickers off stops drawing its card. IT DOES NOT, and this is the line that made the
+rem assumption false: at 0 a light is NEVER destroyed, so the card can stop being drawn for
+rem any length of time and the light stays lit. Flicker needs a non-zero idle window.
+rem
+rem 4 frames: a bulb dark for more than ~0.13s goes out; a one- or two-frame blink does not,
+rem which is right - that is sub-perceptual and would only add strobing.
+rem Re-lighting is immediate and NOT gated by GUESTLIGHTSTABLE, because the cell stays
+rem confirmed once it has graduated. That pairing is deliberate and the two knobs have to be
+rem read together: STABLE decides what may EVER light, IDLE decides when a light goes out.
+rem
+rem SIDE EFFECT, and it is wanted: every light also goes out when the player turns away (the
+rem fixture stops being drawn) and comes back on the first frame it is drawn again. That is
+rem free culling. The only visible cost is that re-entering a room with more than 4 fixtures
+rem takes a few frames to fully light, because creation is capped at 4 per frame.
+rem WATCH guest_light_reaped= - it should now be LARGE and climbing. 0 means this is inert.
+rem REVERT (round 41 exactly): set "RPCS3_REMIX_GUESTLIGHTIDLE=0"
+set "RPCS3_REMIX_GUESTLIGHTIDLE=4"
 rem Live guest-light cap (was hardcoded at 64). Raise if guest_light_capped starts
 rem climbing on the "Remix live:" line AND the extra lights are wanted.
 rem ROUND 41: 64 -> 128. GUESTLIGHTAUTO=2 lights every glow card in a level rather than one
@@ -1125,6 +1144,84 @@ rem   must stay above ~40. If defer_flip is still ~half of defer_buffered, the
 rem   absent branch was not the waste and narrowing is refuted - set both back.
 rem REVERT: set this to 0 to reproduce round 31's deferral population exactly.
 set "RPCS3_REMIX_DEFERPREVONLY=1"
+rem ============================================================================
+rem ROUND 46 - THE PLAY-TEST CARD. THE ARMS, THE GUN AND THE HELMET.
+rem ============================================================================
+rem DEFERPREANCHOR=1 above fixed the WORLD ("light fixture is now stable, props
+rem are not moving as camera turns"). The viewmodel did NOT move with it, and
+rem round 46 found why: the deferral has an explicit exclusion for viewmodel
+rem draws, and it is gated on the TAG, not on the PLACEMENT.
+rem
+rem The exclusion's own comment argues "a viewmodel draw is placed relative to
+rem the weapon camera, so no world anchor can make it more correct". That is
+rem FALSE at VMTAGONLY=1 (set below, and it is this title's shipped value):
+rem the tag is decoupled from the placement, so the arms go down the ordinary
+rem WORLD path and are divided by the WORLD gauge. Round 34 already reached this
+rem conclusion for the twin gate on the tail-rescue ladder and moved that one to
+rem viewmodel_place; this is the sibling it left behind.
+rem
+rem MEASURED, the round-45 play-test, 44,375 flips:
+rem   * all 4 viewmodel picks read  ref=anchor_prev anchor_vp=ad7ce9d672a0bf6b
+rem     - divided by the WORLD program's anchor, one frame stale - while all 15
+rem     world/prop picks read anchor or identity-bypass. 0 of 15 anchor_prev.
+rem     That split IS the user's split: props stable, arms shaking.
+rem   * 'Remix albedo-trace:', 9,544 continuous samples, camera FREE:
+rem         ref=anchor       5,622 draws   |t| < 0.01 on 5,622 of 5,622 (100%)
+rem         ref=anchor_prev  2,099 draws   |t| < 0.01 on     0 of 2,099
+rem         ref=camera       1,823 draws   |t| < 0.01 on     0 of 1,823
+rem     A fresh anchor is not merely better. It is EXACT, every single time.
+rem   * defer_fresh 867,086 / defer_buffered 874,746 = 99.1% of held draws DO
+rem     get a fresh anchor later in the same frame. A held viewmodel draw is
+rem     overwhelmingly likely to be flushed against one, not to time out.
+rem   * the tail rescue is ALREADY armed for these draws and never succeeds:
+rem     tail_rescued_cur + tail_rescued_aged = 0 of 131,774, with 99,428 failing
+rem     "same_ref". No alternative EXISTING anchor helps. Only waiting does.
+rem
+rem The operators are preserved, not dropped: the submit site now captures the
+rem composite of apply_viewmodel_basis + apply_viewmodel_rotation as
+rem Op = post * pre^-1 and the flush replays it. MEASURED what would otherwise
+rem be lost: dbasis=0 on all 3,293 census lines (VMBASIS=0, that operator is
+rem inert) but drot = 1.46..1.99 units on every one of them.
+rem
+rem JUDGE IT ON, in order. Both counters are on 'Remix live:', which reaches
+rem remix_dump.log - NOT on 'Remix stats:', which is in RPCS3.log and does not
+rem survive the next launch of rpcs3:
+rem   1. vm_op=<captured>/<declined>/<singular>/<replayed>
+rem        captured  sizes the viewmodel population per frame; counted on ANY
+rem                  run, armed or not (~2.3/frame last run - vm_tagged 100,226
+rem                  over 44,375 flips).
+rem        declined  MUST BE 0 at the shipped VMROTAXIS=1 VMROTPIVOT=0
+rem                  VMBASIS=0. Non-zero means one of those three moved and the
+rem                  operator stopped being replayable - see the warning below.
+rem        singular  a failed 3x3 inverse. Must stay ~0.
+rem        replayed  bounded above by defer_viewmodel; the gap is exactly the
+rem                  draws that reached flip.
+rem   2. defer_viewmodel= - viewmodel draws ACTUALLY BUFFERED, counted at the
+rem      buffering site rather than at the election. Structurally 0 unless
+rem      DEFERVIEWMODEL=1 AND DEFERPREANCHOR=1. Zero with both armed means the
+rem      route has no candidates and the diagnosis is wrong, not the plumbing.
+rem   3. THE EYES: does the gun still have parkinsons, does the helmet still
+rem      detach and stretch in the nectar room.
+rem   4. 'Remix cost:' in remix_dump.log (NEW - see below).
+rem
+rem PRE-REGISTERED REFUTATION: if replayed is ~0 while defer_viewmodel is large,
+rem every held viewmodel draw reached FLIP rather than an anchor
+rem (flush_deferred_at_flip does not rebuild the transform, so it has nothing to
+rem replay) and the gun will look exactly as it does today. If the gun instead
+rem TELEPORTS or doubles, the replay is composing wrongly and this knob goes
+rem straight back to 0.
+rem
+rem DO NOT MOVE VMROTAXIS, VMROTPIVOT OR VMBASISPIVOT WHILE THIS IS ON.
+rem The replay is exact only while both viewmodel operators are placement-
+rem independent world-space LEFT-multiplies. VMROTAXIS>=4 switches
+rem apply_viewmodel_rotation to a MODEL-space RIGHT-multiply (M' = M*R), and
+rem VMROTPIVOT/VMBASISPIVOT != 0 derive the pivot from the placement itself. The
+rem backend REFUSES the capture at those settings rather than replaying a wrong
+rem operator - those draws take the immediate path and land in vm_op declined -
+rem so nothing breaks, but the knob quietly stops doing anything for them.
+rem
+rem REVERT: set "RPCS3_REMIX_DEFERVIEWMODEL=0"  <- one line, round 45 exactly.
+set "RPCS3_REMIX_DEFERVIEWMODEL=1"
 rem ROUND 32 - THE GEOMETRY AUDITS, AND THE ONLY REMOVABLE PART OF THE FRAME.
 rem MEASURED in round 31's worst window that actually drew geometry (frames=38):
 rem   draw=50.88 of frame_ms=53.03, and the five named children only account for
@@ -1177,7 +1274,49 @@ rem ROUND 35: take the ~11 ms then, and either (a) arm DRAWAUDIT=0 with
 rem SKIPEXTENTVP blanked so the interaction is explicit, or (b) attack the
 rem decode child (6.35 ms) instead, by caching decoded positions per
 rem (source pointer, count) as round 33 pre-registered.
-set "RPCS3_REMIX_DRAWAUDIT=1"
+rem
+rem ================= ROUND 48: ARMED AT 0, AND THE WELD IS GONE ==============
+rem Round 34 was right to refuse this and its objection has now been removed IN
+rem CODE rather than argued away. The blocker was that DRAWAUDIT=0 also disarmed
+rem the SKIPEXTENTVP refusal, because that gate reads 'AND m_streak_measured' and
+rem m_streak_measured is written only inside audit_world_extent. Option (a) above
+rem was to blank SKIPEXTENTVP; that trades one behaviour change for another.
+rem
+rem INSTEAD: the audit now ALSO runs whenever the current vertex program IS the
+rem SKIPEXTENTVP program, whatever DRAWAUDIT says. The gate keeps its input by
+rem construction, for the one program hash it can ever fire on, and every other
+rem draw in the scene stops paying. Nothing is traded.
+rem
+rem WHY IT IS WORTH IT - MEASURED, round-47 play-test, bin\log\RPCS3.log, the two
+rem in-play 'Remix timing:' windows (the third is a paused/menu frame, ignore it):
+rem   frame_ms=69.78 / draw=67.13 (... decode=14.15 audit=24.76 hash=2.33
+rem     xform=0.48 rest=13.93)
+rem   frame_ms=59.15 / draw=54.73 (... decode=12.14 audit=20.41 hash=1.02
+rem     xform=0.48 rest=9.63)
+rem audit is 24.76 ms = 35.5% of the WHOLE FRAME and 36.9% of draw - larger than
+rem decode and larger than rest. It has grown since round 34 measured 11.35 ms.
+rem
+rem WHY IT IS SAFE - the other two consumers, MEASURED over 83,019 flips:
+rem   wext_refused=0  - the refusal inside audit_world_extent never fired at all
+rem   skipg_extent=0  - nor did SKIPEXTENTVP, though it is armed and its program
+rem                     IS drawn, so the gate is live and simply never met its
+rem                     128-unit threshold. It is preserved anyway, by the code
+rem                     change above - this counter is corroboration, not the
+rem                     argument.
+rem   extent_plausible in maybe_inject_guest_light becomes unconditionally true.
+rem                     That is a COST change, not a behaviour change: it removes
+rem                     an early-out, and small_enough - the same transformed AABB
+rem                     - still gates the trigger.
+rem
+rem ATTRIBUTION, because GUESTLIGHTAUTO=2 also ships this round. The two cannot
+rem be confused: this one moves 'audit=' on the timing line and NOTHING visual;
+rem that one moves guest_lights= and is a pixel test. The ONE confound is frame
+rem time, and it has a tell - if fps does not improve and 'rest' has climbed while
+rem 'audit' fell, that is the extent_plausible interaction above, i.e. the bbox
+rem walk in maybe_inject_guest_light (which sits in no named timer) eating the
+rem saving. In that case revert GUESTLIGHTAUTO first, not this.
+rem REVERT: set "RPCS3_REMIX_DRAWAUDIT=1"
+set "RPCS3_REMIX_DRAWAUDIT=0"
 rem ALPHA TO COVERAGE - the third cutout channel, and the last hardware mechanism
 rem that could explain foliage/fences rendering as solid cards. rpcs3's own OpenGL
 rem backend reads these two bits and this backend never did. Read a2c_ctrl /
@@ -1392,8 +1531,57 @@ rem lit fixtures, or guest_light_capped= starts climbing, the glow card is NOT t
 rem signal and this is wrong. guest_lights= and guest_light_capped= size it directly.
 rem MODE 1 = the old whole-census population (fixtures AND cards) - that is what put lights
 rem on doors in August. Do not use 1 as a fallback; use 0.
+rem
+rem ================= ROUND 48: ARMED AT 2, WITH THE TWO ROUND-41 FAULTS FIXED =================
+rem This is the user's request, both halves of it, and they are ONE mechanism: "fix all the
+rem lights being lit to only the ones that are actually lit", and "make a spherical light on
+rem that flickering light that turns off when the bulb is flickering off".
+rem
+rem Haze draws an additive glow card over a fixture that is LIT and omits it for one that is
+rem not - which is why only some bulbs glow in the raster original. Keying the light on the
+rem CARD rather than on a texture list therefore answers both at once: unlit fixtures never
+rem produce a card, so they stay dark, and a bulb that flickers off stops drawing its card on
+rem the off frames, so its light disappears those frames. No animation code exists or is
+rem needed. EMISSIVE cannot do this at all - it is MATERIAL-scoped, so every surface sharing
+rem the bulb texture glows or none does, which is exactly why EMISSIVE=71D189E9B559A7F9:30
+rem lights every fixture in the level whether it is on or not.
+rem
+rem Round 41 shipped this and it had to be turned off for two faults. BOTH are fixed in code
+rem this round, and neither fix is a list:
+rem   * it lit the player's ARMS AND WEAPON, and scattered spheres a metre in front of the
+rem     eye. One fault, not two: a viewmodel draw satisfies every term of the glow-card test,
+rem     and the position derived from it is the AABB centre of a VIEWMODEL transform.
+rem     FIXED by a world-geometry gate on the AUTO arm - see guest_light_vmref= below.
+rem   * it lit SOLDIERS AS THEY WALKED. The viewmodel gate cannot catch that (an NPC is
+rem     ordinary world geometry) and no render state separates a suit panel's glow card from
+rem     a lamp's. What separates them is that A LAMP DOES NOT MOVE.
+rem     FIXED by GUESTLIGHTSTABLE below - see guest_light_unstable=.
+rem
+rem PRE-REGISTERED REFUTATION, unchanged from round 41 and still the right one: if the plant
+rem ends up with far more lights than it has visibly lit fixtures, or guest_light_capped=
+rem starts climbing, the glow card is NOT the "is lit" signal and this is wrong.
+rem THE PIXEL TEST: does the flickering bulb's light flicker with it, and do unlit fixtures
+rem stay dark. Both are visible without any log.
+rem MODE 1 = the old whole-census population (fixtures AND cards) - that is what put lights
+rem on doors in August. Do not use 1 as a fallback; use 0.
 rem REVERT: set "RPCS3_REMIX_GUESTLIGHTAUTO=0"
-set "RPCS3_REMIX_GUESTLIGHTAUTO=0"
+set "RPCS3_REMIX_GUESTLIGHTAUTO=2"
+rem
+rem --- ROUND 48: the static-fixture gate, and the reason AUTO=2 is usable at all -------------
+rem A candidate must re-appear in the SAME quantised cell (0.25 world units, the same cell the
+rem light hash already uses) on this many DISTINCT frames before it may create a light.
+rem 30 = one second at 30 fps. The cell is 0.25 units, so an NPC walking even slowly leaves its
+rem cell within 2-4 frames and can never graduate in any of them; a bolted-down fixture hits
+rem one cell every frame it is drawn and graduates in 30.
+rem COST OF 30: a fixture takes ~1s of being on screen to light the FIRST time you ever see it.
+rem After that its cell is CONFIRMED FOR THE REST OF THE LEVEL, so re-entering the room - and,
+rem critically, a bulb flickering back on - re-lights on the first frame. Without that
+rem stickiness any window longer than the flicker period would hold a flickering bulb dark
+rem forever, which is the opposite of what was asked for.
+rem 0 = OFF = round-41 behaviour bit-exactly (light on first sight). Clamp is 600.
+rem TOO SLOW TO LIGHT: 15, then 8. STILL LIGHTS MOVING NPCs: 60, then 120.
+rem REVERT: set "RPCS3_REMIX_GUESTLIGHTSTABLE=0"
+set "RPCS3_REMIX_GUESTLIGHTSTABLE=30"
 rem
 rem === DEFERPREANCHOR - SUPERSEDED BY ROUND 45. IT IS NOW SET TO 1 ABOVE. ======
 rem This block used to read "deliberately LEFT OFF". It is kept because its last

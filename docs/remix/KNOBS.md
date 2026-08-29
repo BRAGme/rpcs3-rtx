@@ -251,6 +251,7 @@ sun direction is in the recovered world space and is normalised in code.
 | `RPCS3_REMIX_GUESTLIGHTLUM` | `0.7` | Luminance floor (Rec.709, over the albedo's own decoded mean RGB) for a submitted draw to appear on a `Remix light-candidate:` census line. Measurement input for the fixture list; nothing acts on it unless `GUESTLIGHTAUTO` is on. | |
 | `RPCS3_REMIX_GUESTLIGHTMAXEXT` | `6` | World-extent ceiling for the same census. Together with the render-state test -- opaque fixture (`depth_write=1, blend=0`) or glow card (`blend=1, depth_write=0`) -- these are the three terms of the guest-light discriminator. The lines double as `EMISSIVE` candidates. | |
 | `RPCS3_REMIX_GUESTLIGHTAUTO` | `0` (off) | Treat every census-qualifying draw above as a fixture trigger, through the existing dedup / cap / idle machinery, without its albedo being on `GUESTLIGHTALBEDO`. **Default off deliberately:** the last generalisation of fixture identity (albedo alone) put lights on doors and sheet-metal covers, because Haze shares fixture textures with ordinary props. The census de-risks the list in one ordinary session, and flipping this on is a launcher edit inside the same sitting. | |
+| `RPCS3_REMIX_GUESTLIGHTSTABLE` | `0` (off) | **Round 48.** A `GUESTLIGHTAUTO` candidate must re-appear in the SAME quantised cell (0.25 world units, the cell the light hash already uses) on this many DISTINCT frames before it may create a light. This is what makes `GUESTLIGHTAUTO=2` usable: round 41 had to disable it because it lit SOLDIERS as they walked, and no render state separates an NPC's suit glow card from a lamp's — but **a lamp does not move**. A fixture hits one cell every frame and graduates; a walking NPC leaves its cell in 2-4 frames and never graduates in any. Confirmation is **sticky for the level**, which is what lets a flickering bulb re-light instantly instead of re-serving the window — without that, any value longer than the flicker period holds a flickering bulb permanently dark. Clamped to 600. Sized by `guest_light_unstable=`; table occupancy is `guest_light_cells=` against a 4096 ceiling. **Read together with `GUESTLIGHTIDLE`:** this decides what may ever light, that decides when a light dies. | |
 | `RPCS3_REMIX_EMISSIVE` | empty | Comma-separated 16-hex albedo *content* hashes made emissive at material creation, so a fixture's own visible surface glows from exactly where the game says the light comes from. No embedding problem -- it emits from the drawn geometry. Bounded at 16. Counter: `mat_emissive`. Materials are cache-keyed by content + sampler/alpha state and the list is latched once, so cache coherence is unaffected. | |
 | `RPCS3_REMIX_EMISSIVEINTENSITY` | `1` | `emissiveIntensity` for the listed materials. The colour is the texture's own normalised mean RGB (white if it never decoded). | |
 | `RPCS3_REMIX_FPVCOL` | `1` (on) | **The vertex-coloured effects fix (round 9).** State the colour pipeline the *fragment program's own bytes* prove in the per-draw `remixapi_InstanceInfoBlendEXT`, instead of the parity default that says "colour = Texture" for every draw. Haze's yellow nectar danger pulse binds no texture, so round 6's neutral grey 2x2 material attaches -- and its fragment program, decoded from `DBB822C008101A2.fp`, is literally **one instruction: `MOV r0.xyzw, COL0.xyzw`** with the END bit. Its colour *is* the vertex colour; `apply_vertex_colour` already decodes ATTR3 into the submitted mesh, the runtime's API path already binds `color0Buffer` from `remixapi_HardcodedVertex::color`, and the blend extension was then telling the fixed-function stage to take colour from the Texture argument only. The vertex colour was not missing -- it was being dropped by explicit configuration. With the knob on, a program classified `vcol_pass` gets `textureColorArg1Source = VertexColor0` with `SelectArg1`; one classified `vcol_modulate` (`TEX r0, TEX0, tex0` then `MUL r0, r0, COL0` -- the giant flower, `D12A627700B7818A.fp`) gets `Arg1 = Texture`, `Arg2 = VertexColor0`, `Modulate`. Both also clear `isVertexColorBakedLighting`, because under that flag the runtime **normalises the vertex colour by its max channel and lerps it toward white by `rtx.vertexColorStrength` (0.6 in this fork)** -- the baked-lighting reading, which for an effect whose colour *is* the vertex colour destroys the ramp. Nothing else in the fill moves: `alphaTest*`, `tFactor`, the blend factors and the write mask are untouched. Anything deeper than the two decoded shapes -- extra instructions between the sample and the output, swizzled or negated reads, a conditional write, flow control -- classifies `other` and changes nothing. Counter `fpvcol_applied` (draws) and `fpclass=<pass>/<mod>/<col1>` (programs) on `Remix live:`; censuses `Remix fpvcol:` (once per program) and `Remix effect:` (once per vp/fp per window); `fpcol=` on every `Remix picked:` line. `0` restores today's parity fill for every draw bit-exactly -- that A/B is the whole attribution. | |
@@ -1156,6 +1157,865 @@ refutation has two independent derivations, not one.
   measured that the fragment program does not separate the weapon from the arms, and that finding was
   carried forward as "the fp does not partition the rig" — but it partitions the body from the rig
   perfectly. Re-test a rejected key against the new question.
+
+## Round 48 (2026-08-29) — the glow-card lights, and `audit` was a third of the frame
+
+Deployed: `bin\rpcs3.exe` = `bin\rpcs3-next.exe` = **`5B6B6396A7A8FE50`** (was `AC7245342F3E9627`).
+`bin\remix\d3d9.dll` unchanged at `16A0B512F33EBB66` — not opened. `bin\rtx.conf` read only; it moved on its
+own from `B24C0FA70F098F98` to `615E71138D151A96` during the user's play-test, which is the runtime saving
+its own settings and is not tampering. MSBuild `Release|x64` exit **0**, **0 errors**, and the only warning
+from anything under `Emu\RSX\Remix\` is the pre-existing C4723, moved by this round's insertions from
+`RemixGSRender.cpp:11799` to **`:11922`** — exactly the 123 lines inserted above it, so **zero new warnings**.
+HEAD `7810224be` at start and at end; nothing committed, stashed or checked out.
+
+**Verification that the deployed binary is this code, not a stale copy:** the UTF-16 env names
+`RPCS3_REMIX_GUESTLIGHTSTABLE` / `GUESTLIGHTAUTO` / `DRAWAUDIT` / `SKIPEXTENTVP` and the ASCII census fields
+`guest_light_vmref=` / `guest_light_unstable=` / `guest_light_cells=` are all present in
+`bin\rpcs3-next.exe`. Round 47's lesson — "the file the launcher runs is not necessarily the file you
+built" — is now checked by string search rather than by hash alone.
+
+---
+
+### Round 47's two shipped changes: BOTH landed mechanically, NEITHER fixed its symptom
+
+MEASURED from the round-47 play-test, `Remix run-start: build=Aug 29 2026 09:22:04`, **83,019 flips**, last
+`Remix live:` line and all 856 `Remix static-index:` lines.
+
+**A. `DEFERVIEWMODEL=1` — the pass criterion is met in full.**
+
+| reading | round 46 | round 47 | verdict |
+| --- | --- | --- | --- |
+| `defer_projsplit=<held>/<fresh>/<kept>` | — | **`189481/189466/15`** | `held > 0`: the cancellation is gone |
+| `defer_viewmodel` | **0** | **189,481** | equals `vm_tagged` exactly |
+| `vm_op=c/d/s/r` | — | **`189481/0/0/189466`** | `declined=0` ok, `replayed` non-zero for the first time |
+| `defer_spilled` | 0 | **0** | now a real 0, not an absent population, because `held > 0` |
+
+`held == vm_tagged == 189,481` — **100%** of the viewmodel population is deferred, and 189,466/189,481 =
+**99.99%** was successfully re-crossed. Every pre-registered reading passed.
+
+**And the user reports the weapon and arms still shake in the smelting plant.** So the re-cross is applied to
+the entire population and the shake survives it. That **refutes** "the shake is the proj_split re-divide".
+Three rounds have now aimed at this and the mechanism is elsewhere.
+
+**B. `STATICINDEXBUDGET=512` — the drops are GONE, and the missing floor is not the static index.**
+
+| reading | budget=128 (round 46) | budget=512 (round 47) |
+| --- | --- | --- |
+| `dropped` | 5,521 over 52,208 flips (0.106/frame) | **0 — the only value across all 856 census lines** |
+| `peak` | (pinned at 128) | **177**, and 177 < 512 |
+| `stale` | 62 | **0**, the only value |
+| `resident/entries` | 3,809/13,997 (72.8% evicted) | 3,616/8,077 (55.2% evicted) |
+
+Pre-registered threshold was "at least an 80% fall means the budget was binding". The fall is **100%**. **The
+budget WAS the binding constraint** — and `peak=177 > 128` proves the old cap was being hit.
+
+**The user still reports the floor missing and walls disappearing in the hallway.** With `dropped=0` for the
+entire session, **the static-index drop was not the mechanism**. Carry the symptom, drop the hypothesis.
+
+> **INSTRUMENT NOTE — correcting round 47's blindness #7.** Round 47 recorded `peak <= budget` as a
+> structural invariant and concluded `peak` *cannot* judge the budget. That is true only for `peak ==
+> budget`, which is indeed a tautology. **`peak < budget` STRICTLY is not** — it proves the clamp was never
+> reached, hence no drop was possible, and it is exactly what `peak=177` says. A clamped counter is blind at
+> its ceiling and informative below it. Do not retire a whole instrument for a defect that affects only one
+> of its readings.
+
+---
+
+### The `audit` block: 35% of the frame, and the weld that kept it switched on is now cut
+
+MEASURED, round-47 play-test, `bin\log\RPCS3.log`, the two in-play `Remix timing:` windows (a third window
+is a paused/menu frame — `present=49.93`, `ui=12.94` — and must be ignored):
+
+```
+frame_ms=69.78 | draw=67.13 (ui=0.15 mesh_create=0.31 tex_bind=0.47 uv=9.77 draw_instance=0.76
+  decode=14.15 audit=24.76 hash=2.33 xform=0.48 rest=13.93)
+frame_ms=59.15 | draw=54.73 (ui=2.17 ... decode=12.14 audit=20.41 hash=1.02 xform=0.48 rest=9.63)
+```
+
+`audit = 24.76 ms` is **35.5% of the whole frame** and **36.9% of `draw`** — larger than `decode`, larger
+than `rest`, and it has **more than doubled** since round 34 measured 11.35 ms. It is pure diagnostics.
+
+Round 34 armed `DRAWAUDIT=0`, then correctly refused to ship it, because `m_streak_measured` is written
+**only** inside `audit_world_extent` and the `SKIPEXTENTVP` refusal gate reads `and m_streak_measured`. Its
+proposed way out was to blank `SKIPEXTENTVP` — trading one behaviour change for another.
+
+**This round cuts the weld instead of trading.** The audit now also runs whenever the current vertex program
+**is** the `SKIPEXTENTVP` program, whatever `DRAWAUDIT` says:
+
+```cpp
+const u64 extent_gate_vp = remix_rsx::skip_extent_vp_hash();
+const bool extent_gate_armed = extent_gate_vp != 0 && extent_gate_vp == m_current_vp_hash;
+if (run_audits || r2_ca_candidate || extent_gate_armed)
+```
+
+The gate can only ever fire for one program hash, so measuring that one program preserves its behaviour **by
+construction** — not by an argument about what a run happened to measure. Every other draw stops paying.
+
+The three consumers, all MEASURED over 83,019 flips:
+
+| consumer | reading | status under `DRAWAUDIT=0` |
+| --- | --- | --- |
+| `wext_refused` (inside `audit_world_extent`) | **0** all session | never fired; lost harmlessly |
+| `skipg_extent` (`SKIPEXTENTVP`) | **0** all session, though the program **is** drawn (three glow-card census lines name `vp=57a12323f22f4988`), so the gate is live and simply never met its 128-unit threshold | **preserved anyway, in code** |
+| `extent_plausible` in `maybe_inject_guest_light` | becomes unconditionally true | **cost change, not behaviour change** — it only removes an early-out; `small_enough`, from the same transformed AABB, still gates the trigger |
+
+**Pre-registered tell if the saving does not appear:** `rest` climbing while `audit` falls. The bounding-box
+walk that `extent_plausible` used to skip lives in `maybe_inject_guest_light`, which sits inside **no named
+timer**, so it lands in `rest`. If that is what happens, revert `GUESTLIGHTAUTO` first, not `DRAWAUDIT`.
+
+---
+
+### PRIORITY 1 — the glow-card lights. Both of the user's questions have one answer
+
+> *"Can we fix all the lights being lit to only the ones that are actually lit? And how can we make a
+> spherical light on that flickering light that turns off when the bulb is flickering off?"*
+
+Haze draws an additive glow card over a fixture that is **lit** and omits it for one that is not. Keying the
+light on the **card** answers both at once: an unlit fixture never draws a card so it stays dark, and a bulb
+that flickers off stops drawing its card on the off frames so its light goes with it. **No animation code.**
+`EMISSIVE` cannot express this at all — it is **material-scoped**, so every surface sharing the bulb texture
+glows or none does, which is exactly why `EMISSIVE=...71D189E9B559A7F9:30` lights every fixture in the level.
+
+That is `GUESTLIGHTAUTO=2`, shipped in round 41 and disabled for two faults. **Both are fixed in code, and
+neither fix is a texture list.**
+
+**Fault 1 — it lit the player's arms and weapon, and scattered spheres at wrong positions. ONE fault.** A
+viewmodel draw satisfies every term of the glow-card test (blended, no depth write, bright), and the position
+derived from it is the AABB centre of a **viewmodel** transform, so the sphere lands about a metre in front
+of the eye and travels with the player. Fixed by a world-geometry gate on the AUTO arm only. Sized by
+`guest_light_vmref=`.
+
+The gate uses the caller's own `is_viewmodel` local, **deliberately not** `m_scratch_defer_is_viewmodel`:
+that member is set inside the `vm_op` capture block and reads false at `VIEWMODELCAM` 0 and 1, which would
+make the gate silently inert at two reachable knob values — the exact defect shape rounds 46 and 47 both
+shipped.
+
+**Fault 2 — it lit SOLDIERS as they walked.** The viewmodel gate cannot catch that: an NPC is ordinary world
+geometry, and no render state separates a suit panel's glow card from a lamp's. What separates them is that
+**a lamp does not move.**
+
+`RPCS3_REMIX_GUESTLIGHTSTABLE=30` requires a candidate to re-appear in the **same quantised cell** on that
+many **distinct** frames before it may mint a light. The cell is the 0.25-unit quantisation the light hash
+already uses, so "same cell" is the same equivalence the dedup has always applied — this adds a time axis to
+it and nothing else. A bolted-down fixture hits one cell every frame it is drawn and graduates in 30 frames
+(about one second); an NPC walking even slowly leaves its cell within 2 to 4 frames and can never graduate in
+any of them. Sized by `guest_light_unstable=`.
+
+**The flicker half needed a second thing, and the brief's "it falls out for free" was WRONG.**
+`GUESTLIGHTIDLE` shipped at **0 = keep every light forever**, so a card could stop being drawn indefinitely
+and the light would stay lit. Flicker is impossible at 0. Armed at **4** frames.
+
+**The two knobs have to be read together: `STABLE` decides what may ever light, `IDLE` decides when a light
+goes out.** They would deadlock if `confirmed` were not sticky — a bulb that flickers off loses its light to
+`IDLE`, and with a 30-frame apprenticeship to re-serve it could never come back inside a flicker period.
+`confirmed` is therefore **permanent for the level**, so re-lighting is immediate. Without that, any
+`GUESTLIGHTSTABLE` longer than the flicker period would hold a flickering bulb **permanently dark** — the
+exact opposite of the request.
+
+**The staging table is bounded, and it had to be.** It is keyed on a quantised world position and the
+population it exists to *reject* is the one that mints a new key every frame. Left unbounded a walking NPC
+would add a cell per 0.25 units travelled for the whole session — and sessions here are 52,208 and 83,019
+flips. `s_max_guest_light_cells = 4096` with a 900-frame quiet window; the prune drops **unconfirmed** cells
+that have gone quiet (exactly the moving-emitter trail) and never touches a confirmed one. Occupancy is on
+the live line as `guest_light_cells=`.
+
+**MEASURED population this will act on** (387 `Remix light-candidate:` lines in the round-47 slice; the
+census is line-budget capped at 96 per window, so this is a sample):
+
+* **every one of the 387 is `state=glowcard`** — not one `state=fixture` line in the whole slice
+* **14 distinct albedos**, top four `F613BD83DAF2B4E2` (132), `0F86FCEDC4226D3B` (57), `A0D0AB03F0BB1D3C`
+  (47), `577B02B123B0F15F` (36)
+* **17 distinct (vp, fp) pairs** — which is why round 41 retired the vp/fp key for this rule; no pair names
+  the population
+* **`vp=f39f504649b6f442` appears 20 times.** That is the launcher's own `hidepairvp`, i.e. the player's
+  body/legs. **This is the viewmodel/character contamination, measured, inside the exact population AUTO=2
+  triggers on** — it is not a theory about what went wrong in round 41.
+
+**Pre-registered refutation, unchanged from round 41:** if the plant ends up with far more lights than it has
+visibly lit fixtures, or `guest_light_capped=` climbs, the glow card is **not** the "is lit" signal and this
+is wrong. **The pixel test needs no log:** does the flickering bulb's light flicker with it, and do unlit
+fixtures stay dark.
+
+**Reading the new counters.** `guest_light_vmref=` and `guest_light_unstable=` both 0 **with
+`guest_lights=0`** does **not** mean the gates are working — it means the population never reached them; look
+upstream at `guest_light_match=`. `guest_light_cells=` pinned at 4096 means the prune is running every frame
+and the gate is degraded. `guest_light_reaped=` must now be **large and climbing**; 0 means `GUESTLIGHTIDLE`
+is inert and there will be no flicker.
+
+---
+
+### PRIORITY 2 — smooth normals: already shipped, already global, and it is not the lever
+
+The brief asked for a knob that sets `REMIXAPI_INSTANCE_CATEGORY_BIT_SMOOTH_NORMALS` per draw. **It already
+exists and is already armed.** `RPCS3_REMIX_SMOOTHNORMALS=1` at launcher `:266`, consumed in
+`classify_draw()`, which sets the bit ahead of the hash-list gate precisely so it is not dead for anyone who
+never filled a category list in.
+
+**MEASURED, round-47 play-test: `cat_smoothnormals=10167672`** — and the total submitted instance count on
+the same line, `xform_mirrored=0/0/10167672`, is the identical number. **The bit is set on 100% of submitted
+instances, including the weapons.** The user reports the weapons still look blocky.
+
+So the conclusion is not "ship the knob" but: **smooth normals is not the lever for blocky weapons.** It
+changes normal interpolation, so it can only change *shading*; it cannot add silhouette vertices. Blockiness
+on a PS3-era low-poly weapon is geometry density, and nothing in the category system addresses it.
+
+**The brief's premise about `rtx.conf` is still correct and worth telling the user:**
+`rtx.smoothNormalsTextures` has exactly one consumer in the deployed runtime, `src/d3d9/d3d9_rtx.cpp`, which
+external draws never reach — so their `rtx.conf` list is inert. It is simply already superseded here.
+
+> **This is the FOURTH confirmed instance of the D3D9-path trap**, after sky rasterization, `ignoreTextures`
+> and terrain baking: a Remix feature whose only call site lives under `src/d3d9/`, which no `remixapi`
+> backend can reach. **Grep the call site before believing any `rtx.conf` list does anything on this
+> backend.** Round 48 adds a corollary: *and grep this backend for a knob that already replaces it* — the
+> replacement had been shipped for rounds and the brief did not know.
+
+---
+
+### Picks resolved this round
+
+* **`5003EB1597BF9DB0`** — the user's *"bulbs that should cast light and do not"*. **It reads `blend=0 dw=1`,
+  i.e. OPAQUE and depth-writing**, `vtx=18`, `ext=0.4302`, `class=vcol_modulate`, `vp=ad7ce9d672a0bf6b`. That
+  makes it `state_fixture`, **not** a glow card, so **`GUESTLIGHTAUTO=2` will never light it** — mode 2 is
+  glow-cards-only by construction. If these bulbs stay dark after this round, that is **expected and
+  diagnostic**, not a failure of the mechanism: it means Haze draws no card for them, and the question
+  becomes whether they are lit in the raster original at all. Do not "fix" it by moving to
+  `GUESTLIGHTAUTO=1` — mode 1 is the whole-census population that put lights on doors in August.
+* `1BF8325ADEF3C986` (helmet) — 1,365 lines. `vtx=1446`, `ext=3.50793`, `eye_dist=1.65711`, `dw=1 blend=0`,
+  `verdict=opaquealias`, `cat=0x1000000`. Note `cat=0x1000000` is bit 24 = `SMOOTH_NORMALS`, confirming the
+  category reaches the helmet draw.
+* `88046E3F4F28137C` (light-bulb ray) — only 12 lines, and it is being processed as a **sun card**:
+  `Remix suncard: ... elev=3.56 deg pinned=0 elected=0`, plus a `sky-census: reject:anchor` with
+  `rawext=1.74e+09`. It is in the sky/sun family, not the fixture family.
+* `6575ACE3A42A78E6` (yellow block) — 409 lines, **all `Remix uiwrap:`**, `vp=6f76ab0ad8d926b1
+  fp=4a1bc009fc6161ef`, `tex=512x512`, `route=2d`, `shrink=50`. It is a **UI 2-D route** draw. Round 47
+  measured `areason=chain` and correctly said the `wdivide` family was the wrong target; this narrows it
+  further — the draw is going through the UI compositor's 2-D path, so the yellow block is a UI element.
+
+### Instrument and process notes
+
+* **A clamped counter is blind at its ceiling and informative below it.** `peak == budget` is a tautology;
+  `peak < budget` strictly is a proof the clamp was never reached. Retiring the whole instrument was too
+  strong. (Corrects round 47's blindness #7.)
+* **"It falls out for free" is a hypothesis about a lifecycle, and lifecycles have defaults.** The flicker
+  was assumed free because a bulb that flickers off stops drawing its card — true — but `GUESTLIGHTIDLE=0`
+  meant nothing ever destroyed the light. **Read the default of every knob the free behaviour depends on.**
+* **Two gates that each fix half a fault can deadlock on each other.** `STABLE` (what may light) and `IDLE`
+  (when a light dies) are individually correct and jointly make a flickering bulb permanently dark unless
+  confirmation is sticky. **When shipping two gates on one lifecycle, trace one full cycle through both.**
+* **Bound any table keyed on the thing you are trying to reject.** The staging table's worst case is exactly
+  its rejection population.
+* **Check whether the feature you were asked to build already exists.** Smooth normals cost this round
+  nothing only because the counter was checked before the code was written.
+* **`rem` lines in the launcher are parsed for `|`, `>` and `&`.** 257 pre-existing lines contain them and
+  produce console noise (`'dome' is not recognized...`) on every launch; round 48's added lines were scrubbed
+  to zero. A dry run of the **pristine** launcher produces byte-identical errors, which is how they were
+  shown not to be this round's doing — **always run the control before blaming your own diff.**
+
+## Round 47 (2026-08-29) — `DEFERVIEWMODEL` was inert because a rescue 610 lines downstream cancelled it
+
+Deployed: `bin\rpcs3.exe` = `bin\rpcs3-next.exe` = **`AC7245342F3E9627`** (was `24506F89A9259722`).
+`bin\remix\d3d9.dll` unchanged at `16A0B512F33EBB66`; `bin\rtx.conf` unchanged at `B24C0FA70F098F98` —
+neither was opened. MSBuild `Release|x64` exit **0**, **0 errors**, and the only warning from anything under
+`Emu\RSX\Remix\` is the pre-existing C4723, moved by this round's insertions from `RemixGSRender.cpp:11674`
+to **`:11799`** — **zero new warnings.**
+
+Everything measured below comes from the **round-46 play-test**, which survived this time:
+`bin\log\RPCS3.log` (65.4 MB, 08:40, NOT truncated) and `bin\remix_dump.log` from byte **1,260,857,444**
+(51.9 MB slice), `build=Aug 29 2026 03:57:52`, **52,208 flips**, `deferpreanchor=1 deferviewmodel=1`.
+
+### 0. CONCURRENCY
+
+HEAD `7810224be` at the start of the round, `7810224be` at the end — **the tree did not move.** Round 46's
+work was still uncommitted and this round added to it. Per round 46's own lesson, every diff below is pinned
+to the explicit SHA `7810224be`, never to `HEAD`.
+
+### 1. THE FINDING: round 46 fixed the right gate and a second one threw the population straight back out
+
+`DEFERVIEWMODEL=1` and `DEFERPREANCHOR=1` were both armed for the whole play-test, and the counter round 46
+built the entire play-test card on read **`defer_viewmodel = 0`** — against `vm_tagged = 148,913`.
+
+Round 46's change was correct. `viewmodel_place = viewmodel_draw && !viewmodel_tag_only()`
+(`RemixGSRender.cpp:17838`), and `VMTAGONLY=1` is this title's shipped value, so the exclusion at `:17874`
+genuinely stops firing and viewmodel draws genuinely become deferral candidates. What round 46 did not check
+is whether anything **downstream** un-does that — and its own comment at `:17883` names the two candidates
+("the two cancellation sites (tail rescue, proj split)") without measuring either.
+
+**MEASURED, and the separation is total:**
+
+| reading | value | what it settles |
+| --- | --- | --- |
+| `proj_split_applied == vm_tagged` | **814 / 814** `Remix live:` samples | the proj_split population **is** the viewmodel population |
+| consecutive-delta mismatches | **0 / 813** | not a coincidence of totals — it tracks increment for increment |
+| `Remix tail-rescue: outcome=projsplit` with `age=1` | **281 / 281** census lines | **not one rescue in the run had a fresh anchor to cross with** |
+| `gauge_prev − defer_buffered − proj_split_applied` | **constant 1,725** across the run | this one line is **98.85%** of the candidate→buffered shortfall |
+| `defer_viewmodel` / `defer_spilled` | **0 / 0** together | the population never reached the buffering block *at all* — it was not rejected there |
+
+`defer_viewmodel = 0` **and** `defer_spilled = 0` together is the signature that matters. The buffering block
+has exactly two arms that can decline a viewmodel draw, and neither fired, so the draw never arrived. That is
+what sends you upstream instead of auditing the counter again.
+
+**ROOT CAUSE, at `RemixGSRender.cpp:18493` (pre-edit).** The proj_split acceptance branch ran
+
+```cpp
+m_ref_pick_source = (cross_age == 0) ? ref_source::anchor : ref_source::anchor_prev;
+...
+// Placed by an anchor of its own pass shape, which is exactly what the
+// pre-anchor deferral holds draws waiting for.
+m_scratch_defer_pending = false;          // <- UNCONDITIONAL
+```
+
+**The line above the cancellation already knows the premise is false.** It records `anchor_prev` whenever
+`cross_age != 0` — the rescue crossed the draw's own projection with a view recovered from **last frame's**
+anchor. The deferral waits for **this** frame's. A rescue that used a stale anchor has not delivered the
+event the deferral is waiting for; it has delivered precisely the one-frame-stale placement the deferral
+exists to remove. And `cross_age` was `1` on 281 of 281 census lines.
+
+> **A cancellation whose own sibling line computes the condition it should have been gated on is the highest-
+> yield thing to grep for.** The provenance assignment and the cancellation are two lines apart and disagree.
+
+### 2. WHY THE OBVIOUS FIX WOULD HAVE BEEN A REGRESSION — read the flush before deferring anything into it
+
+Deleting the cancellation is **not** the fix, and this is the part worth carrying. `flush_deferred_for_anchor`
+rebuilds the placement with
+
+```cpp
+world = remix_rsx::mat4_multiply(entry.fused, anchor.inverse);   // the PLAIN division
+```
+
+and the tail-rescue ladder runs **only at the exit where that division has already been rejected** —
+MEASURED `residue = 2.96 .. 3.14` on this title's own census lines against `tol = 0.02`. proj_split exists to
+replace it with `(V_anchor × P_draw)^-1`. So a proj_split draw flushed through the plain divide would be
+handed back the exact residue the rescue removed, and `mat4_is_finite` would not catch it — 3.14 is perfectly
+finite. **The deferral would have "fixed" the lag by breaking the placement.**
+
+The flush's own comment says the affine gate is "deliberately NOT re-run: this draw already passed it". True
+for every other deferred draw; **false for a proj_split draw, which failed it.**
+
+### 3. WHAT SHIPPED — one mechanism, on the existing `DEFERVIEWMODEL` knob, no new knob
+
+1. `:18493` — the cancellation becomes `if (cross_age == 0 || !defer_viewmodel_enabled())`. The stale arm
+   instead sets a new scratch flag `m_scratch_defer_projsplit`.
+2. The buffering site carries it into the record as `deferred_instance::used_projsplit` and counts
+   `defer_projsplit`, beside `defer_viewmodel` and for the same reason — it is the first line at which the
+   draw is certainly held.
+3. `flush_deferred_for_anchor` gains a **re-cross** branch selected by that flag: split `entry.fused` and
+   `anchor.fused`, refuse a transposed or over-error split, `cross = V_anchor × P_draw`, invert, and divide.
+   This is the ladder's construction verbatim, through the same `proj_split_max_error()` accessor, so there
+   is no second copy of the tolerance or the multiply order. **Nothing but the one bool is stored** — both
+   inputs are already in the record and the anchor, so no captured matrix can drift from the ladder's.
+4. The proj_split arm **re-runs the `is_affine` gate**, because the flush's premise for skipping it
+   ("this draw already passed it") does not hold for a draw that failed it. On refusal the draw keeps the
+   transform it already carries and is still submitted. **But see 4b — this gate is inert, and the safety
+   property does not actually rest on it.**
+4b. **The `vdelta` refusal, added after the review of this round's own diff.** The ladder's acceptance is a
+   **three**-part conjunction — split, `PROJSPLITVDELTA`, `is_affine` — and the first draft of the flush
+   carried only two. `PROJSPLITVDELTA` measures the construction's real premise (`V_draw == V_anchor`) and
+   refuses the cross when the views are further apart than the tolerance. It is **inert at the shipped
+   `PROJSPLITVDELTA=0`, which is exactly why no run would ever have found the omission** — and the launcher
+   stages arming it as the next test of proj_split's premise. Without it the flush would install, against a
+   fresh anchor, crosses the ladder itself refuses, and book them as `defer_projsplit_fresh`.
+5. **The flag is LATCHED beside `defer_pending`**, at `:20703`, and the buffering site reads the latch rather
+   than the member — same lifetime, same hazard, and the consequence of getting it wrong is asymmetric: a
+   proj_split draw that reaches the flush with the flag cleared takes the **plain division**, i.e. a silent
+   placement regression rather than a missed optimisation. Round 46's review established that the hazard's
+   stated cause is overstated (`dump_vertex_program`'s only call site is *above* `submit_subdraw`'s own, so
+   no re-entry occurs today), so this is belt-and-braces — deliberately, because it costs one bool and stops
+   being a question the next reader has to re-derive from a comment already known to be wrong.
+
+**The change is no-worse-than-round-46 by construction — but NOT for the reason the first draft of this
+section gave, and the correction is the more useful half.** An independent review of the diff falsified it:
+
+* **The re-run `is_affine` gate is structurally incapable of refusing, so it is not the safety net.**
+  Round 19's own note, 30 lines from the ladder at `RemixGSRender.cpp:18500-18503`, already says why:
+  `try_split_once` builds both views from an **orthonormal** basis, so `fused * cross^-1 = V_draw * V_anchor^-1`
+  is **rigid, hence affine, hence accepted, ALWAYS** — *"the gate is not selective, it is inert"*, which is why
+  `proj_split_refused` reads 0 in every measured run. Independently: `is_affine` tests **only column 3**
+  (`RemixTransforms.cpp:9493-9501`), and in this file's row-vector convention `(A*B)[i][3] == A[i][3]` when `B`
+  is affine, so `is_affine(object_space * world)` reduces to `is_affine(object_space)` — the identical test
+  the ladder already passed with the identical `object_space`. **A fresh anchor cannot change the outcome.**
+* **The real safety property is the rigidity, not the gate.** The cross cannot produce a non-affine placement
+  because both views are orthonormal; and if the split or the invert fails, `world_built` is false and the
+  draw keeps the transform it already carries. No arm drops geometry — the conclusion survives, the argument
+  did not.
+* **Therefore `defer_projsplit_kept` can only ever count a split/invert/vdelta failure, never an affine
+  refusal**, and the `_fresh`/`_kept` split carries **no information about placement quality**. Read `_fresh`
+  as *"the population that was rebuildable"*, not *"the population that improved"* — a stationary camera
+  re-crosses to a numerically identical placement and is still booked `_fresh`.
+
+> **A gate copied from an accepting path is not a check.** The ladder's `is_affine` was already known inert;
+> re-running it in the flush inherited that, and the first draft of this section presented it as the safety
+> argument. Grep the gate you are about to rely on for a note saying it never fires.
+
+**The vm_op replay stays inside the placed branch.** On the kept arm the carried transform already has the
+operator applied at the submit site; replaying it there would compose it twice — the doubling round 46 named
+as this family's own failure mode.
+
+At `DEFERVIEWMODEL=0` every one of these is bit-exact round 46. **REVERT: `set "RPCS3_REMIX_DEFERVIEWMODEL=0"`.**
+
+#### 3b. New reading on `Remix live:` — `defer_projsplit=<held>/<fresh>/<kept>`
+
+* **`held` > 0 is this round's pass/fail.** `held == 0` with both knobs armed means a **third** gate exists
+  downstream of this one, exactly as round 46's zero did — and the same diagnostic applies: check whether
+  `defer_spilled` moved at the same time. If both are 0 the draw never reached the block.
+* `fresh` is the population whose placement actually improved. `kept` is unchanged, not lost.
+* **`fresh + kept < held` is EXPECTED and is not a leak.** The residual is the draws whose anchor never landed,
+  which leave through `flush_deferred_at_flip` and touch neither counter. There is a second, structural reason:
+  the ladder's anchor lookup ignores `surface_offset` while the flush matches on it, so the flush is strictly
+  the narrower match. Less coverage, never a wrong one.
+
+**Format audit:** `scratchpad\r45\fmtaudit45.py` = **109 `fmt::format` calls, 0 mismatches**. Position-by-
+position, not just counts: `Remix live:` is **378 specs / 378 args**, and the three new args sit at indices
+**103–105**, immediately after `m_stats.defer_vm_op_replayed` and immediately before `m_stats.nectar_published`
+— the same two anchors the format string uses. Verified against `git show 7810224be:` (369/369, with
+`nectar_published` at index 98): the arg list grew by exactly **8** before that anchor, which is round 46's
+5 counters plus this round's 3, and by **1** after it, which is round 46's `deferviewmodel=%d` knob echo.
+Round 46's KNOBS reported "374/374" for this line and the true figure was 375 — it did not count its own
+knob echo.
+
+#### 3c. The pre-registered way this fix goes inert, and why it will not
+
+A proj_split draw is also viewmodel-tagged (that is the 814/814 identity), so the buffering site's
+`m_scratch_defer_is_viewmodel && !m_scratch_defer_vm_op_valid` arm would **spill** it — never buffer it — if
+the operator capture were ever declined. Declining is gated on
+`VMROTAXIS < 4 && VMROTPIVOT == 0 && (VMBASIS == 0 || VMBASISPIVOT == 0)`. The launcher arms
+**`VMBASISPIVOT=1`**, which the round-46 card lists as a declining value — but `VMBASIS=0` satisfies the
+disjunct, so it is harmless, and MEASURED `vm_op = 148913/0/0/0` confirms `declined = 0`. **Do not raise
+`VMBASIS` while this is on**: it would flip 148,913 draws from held to spilled and the knob would silently
+stop working, with `defer_spilled` (not `defer_projsplit`) as the tell.
+
+### 4. `STATICINDEXBUDGET` 128 → 512 — the lever may be right, but `peak=` CANNOT judge it
+
+`peak == budget == 128` was read as "saturated". **`peak` is structurally incapable of reading otherwise.**
+`m_static_index_rebuilds` is only ever incremented inside `if (... m_static_index_rebuilds < budget)`, so
+`m_static_index_rebuilds <= budget` always, and `peak = max(peak, rebuilds)` is a **run-cumulative** max that
+never resets. **`peak <= budget` is an invariant.** Over 52,208 frames a single spiking frame pins it, and it
+says nothing whatever about how often. It cannot refute anything, and "if `peak` pins at 512 again the budget
+is not the binding constraint" is therefore not a runnable test.
+
+> **INSTRUMENT BLINDNESS #7: a counter clamped by the quantity it is being compared against.** `peak` is
+> capped at `budget` by construction, so `peak == budget` is a tautology the moment the cap is touched once.
+
+**`dropped` is the only number that measures the loss, and it does NOT refute the bulb/door hypothesis.**
+MEASURED at `budget=128`, from 774 `Remix static-index:` lines (~67 flips apart):
+
+| reading | value |
+| --- | --- |
+| `dropped` (cumulative) | **5,521** over 52,208 flips = 0.106/frame, 0.069% of the 153.3 draws/frame submitted |
+| census intervals with any drop | **39 of 773 (5.0%)** |
+| largest single-interval burst | **1,303 drops in ~67 frames ≈ 19.4/frame sustained** |
+| `stale` / `nomesh` | 62 / 0 — the drop exit is the whole defect |
+| `resident` / `entries` | 3,809 / 13,997 — **72.8% evicted** |
+
+The run-average of 0.106 drops/frame looks far too small to hide a door and **that reading is wrong**, because
+the drops are **bursty**: 95% of the run has none, and the worst window loses ~19 draws every frame for two
+seconds. That is comfortably enough to make a door vanish for a visible interval, and the 5%-of-the-run
+pattern matches the user's "only in the copper plant level". **The hypothesis survives.**
+
+`STATICINDEXBUDGET=512` is armed (launcher `:405`, MEASURED by dry-run parse, single `set`, no duplicate) and
+512 is the clamp **ceiling** (`RemixTransforms.cpp:10824`, `std::clamp(env_u32(..., 4), 1u, 512u)`), so there
+is no headroom above it — which makes the reading clean either way.
+
+**PRE-REGISTERED, on `dropped` and never on `peak`:**
+* `dropped`/flip falls by ≥80% from 0.106 → **the budget was the binding constraint.**
+* `dropped`/flip stays within ~±30% of 0.106 → **the budget is NOT the constraint**, and the launcher's own
+  round-34 note at `:400` already names the successor: *"the answer is the reaper, not the budget: MESHIDLE=600
+  is what evicts them, and the untaken lever is a longer idle window scoped to static-index UNION meshes only,
+  which is a code change and NOT this knob."* `MESHIDLE=600` is armed (launcher `:432`; default is 300) and
+  `evicted/entries = 72.8%` is the supporting reading.
+* Cost: a saturated frame can now mint 512 union meshes instead of 128. At the measured `mesh_create = 0.25 ms`
+  for `44.7 creates/frame` (≈5.6 µs each) that is **+2.15 ms in a saturated frame** — a hitch, not a sustained
+  cost. Watch `mesh_live` (46,649 last run) for growth across the session; `MESHCAP=0` means there is no ceiling.
+
+**ATTRIBUTION WARNING.** Two things changed this round. They share no counter — `defer_projsplit` can only
+move with the code fix, `Remix static-index: dropped=` can only move with the budget — and they have separate
+pixel tests (gun tracking vs the bulb/door). **The one confound is frame rate**, which either could move.
+
+### 5. `Remix cost:` read at last, and the deferral is not the cost
+
+From `RPCS3.log`, the round-46 run's last `Remix timing:` (49 frames):
+
+```
+frame_ms=41.56 | flip=7.24 | draw=33.30 (ui=2.45 mesh_create=0.25 tex_bind=0.58 uv=2.98
+  draw_instance=0.45 decode=5.57 audit=10.14 hash=3.06 xform=0.31 rest=7.50)
+  | deferred_instance=0.03 | other=34.33
+```
+
+**`deferred_instance = 0.03 ms` of a 41.56 ms frame — 0.07%.** The deferral is free, as round 46 predicted, and
+`xform = 0.31` (which *encloses* `deferred_instance`) confirms it. The frame is `audit = 10.14 ms` (24.4%),
+`rest = 7.50`, `decode = 5.57`. **The largest single named child of `draw` is `audit` — the diagnostics.**
+That is the fps lever nobody has pulled, and unlike everything else in this file it costs no visual risk.
+
+### 6. Priority-3 picks — one correction worth having
+
+All eight new picks resolved in the run. None belongs to the proj_split family (`830d7d1b9681c475` /
+`f39f504649b6f442`), so **this round's fix does not touch them.** Two readings change what to try next:
+
+* **`6575ACE3A42A78E6` (the solid yellow block) reads `areason=chain`, not `wdivide`** — `vp=6f76ab0ad8d926b1`,
+  `extent=0.85`, `blend=1`, `depth_write=0`, `sampled=0x1`, `material=1`, `ref=anchor`. It is a **no-matrix-
+  chain-into-HPOS** refusal, a different family from every other pick in the list, which all read `wdivide`.
+  The carried suggestion to grep the UI compositor's `have_uv ? entry : nullptr` is testing the wrong family:
+  a material *was* resolved (`material=1`). Test against `areason=chain`.
+* **`88046E3F4F28137C` (a light-bulb ray) reads `areason=no ref=camera anchor_vp=0000000000000000`** — no
+  anchor of any kind. That is the `gauge_absent` population, i.e. exactly what `DEFERPREVONLY=0` addresses.
+
+### Lessons
+
+- **`defer_X = 0` together with `defer_spilled = 0` means the population never ARRIVED, not that it was
+  rejected.** Two zeros in a block whose arms partition the outcomes point upstream, not at the counter.
+- **Read the consumer before you route anything new into it.** The flush's divide is the one that already
+  failed for this population; the "obvious" one-line deletion would have shipped a placement regression
+  wearing a fixed counter.
+- **A counter clamped by the quantity it is compared against can only ever confirm.** `peak <= budget` is an
+  invariant, so `peak == budget` is a tautology (blindness #7).
+- **A run average hides a bursty defect.** 0.106 drops/frame reads as negligible and the worst window is
+  19.4/frame. Difference the cumulative census before concluding a rate is small.
+- **Two lines apart, and they disagree.** The proj_split branch computed `anchor_prev` provenance from
+  `cross_age` and then cancelled the deferral as if the anchor were fresh. Grep for a condition that is
+  computed and then not used by its neighbour.
+- **Round 46's own comment listed the two cancellation sites and neither was measured.** A comment that
+  enumerates the places a thing can go wrong is a checklist, not a reassurance.
+- **When you copy an accepting condition, copy ALL of its conjuncts — and the one you will drop is the one
+  that is inert today.** The ladder's acceptance is `split && !vdelta_refused && is_affine`; the first draft
+  of the flush carried two of three, and the missing one is disabled at the shipped `PROJSPLITVDELTA=0`, so
+  **no run could ever have found it** — only reading the two sites side by side did. Round 46 shipped the
+  same shape of defect (`Op` not replayable at three reachable-but-unshipped knob values) and caught it the
+  same way. Diff the conjunction, not the outcome.
+- **A gate copied from an accepting path is not a check.** The re-run `is_affine` is provably inert (round
+  19 wrote that down 30 lines from the ladder), so it cannot be the safety property — the *rigidity of the
+  construction* is. Before leaning on a gate, grep it for a note saying it never fires.
+- **Review the diff against the source, every round.** Round 46's review caught 3 defects, this round's
+  caught 2 majors plus 4 reading errors. Both times the finding was invisible to any run at the shipped
+  config, and both times it came from reading two sites side by side rather than from a measurement.
+
+## Round 46 (2026-08-29) — a fresh anchor is EXACT, and the viewmodel is the one thing still denied one
+
+Deployed: `bin\rpcs3.exe` = `bin\rpcs3-next.exe` = **`24506F89A9259722`**. `bin\remix\d3d9.dll` unchanged at
+`16A0B512F33EBB66`; `bin\rtx.conf` unchanged at `B24C0FA70F098F98` (its round-45 value — I never opened it).
+MSBuild `Release|x64` exit 0, **0 errors**, and the only warning from anything under
+`Emu\RSX\Remix\` is the pre-existing C4723, now at `RemixGSRender.cpp:11674` — **zero new warnings.**
+
+Everything measured below comes from the **user's round-45 play-test**: `bin\remix_dump.log` bytes
+1,202,181,926.., `build=Aug 29 2026 02:41:26`, `deferpreanchor=1`, **44,375 flips**, 45.4 MB.
+
+### 0. CONCURRENCY — THE TREE MOVED MID-ROUND, and it caught me out
+
+Round 46 opened with HEAD **`398f3f1ed`** and seven modified files (round 45's uncommitted work). It closed
+with HEAD **`7810224be`**, *"Remix: the teleporting props were a stale anchor, not the gauge donor"*, author
+BRAGme, **committed 2026-08-29 03:26:11** — i.e. the user committed round 45's work **while this round was
+running**, between my opening `git log` and my first `git diff`.
+
+Nothing was lost and nothing conflicted: round 45's content was already in my working tree, I only *added* to
+those files, and `git diff --numstat` against the new HEAD shows exactly and only my changes —
+`RemixGSRender.cpp` +253/-4, `RemixGSRender.h` +38, `RemixTransforms.cpp` +11, `RemixTransforms.h` +36,
+`launch-haze-remix.cmd` **+59/-0 in a single hunk**, `KNOBS.md` insert-only.
+
+**But the mid-round commit silently re-based every diff I took, and I misread it.** An earlier draft of this
+section asserted that round 45's work "IS committed in `398f3f1ed`" and that the `M` flags were
+`core.autocrlf` noise, on the evidence that `git show HEAD:` contained `refage=%d`. That evidence was taken
+*after* HEAD had already advanced. **MEASURED, correctly, at the close:**
+`git show 398f3f1ed:...RemixGSRender.cpp | grep -c "refage=%d"` = **0**;
+`git show 7810224be:...` = **1**. The round-45 inbox was right and I was wrong.
+
+> **`git show HEAD:` is not a fixed reference.** Re-run `git log --oneline -3` at the END of a round and
+> compare it to the start, and pin diffs to an explicit SHA rather than to `HEAD`. A commit landing mid-round
+> re-bases every measurement taken after it without changing a single byte of the working tree.
+
+### 1. `Remix stats:` AND `Remix timing:` FROM THE ROUND-45 PLAY-TEST NO LONGER EXIST
+
+`bin\log\RPCS3.log` is 14,991 bytes dated 2026-08-29 03:19 and contains a **PKG install session** — the user
+launched rpcs3 again, four minutes after the play-test, to install a DLC pack, and rpcs3 **truncates that log
+on every launch**. `RPCS3.log.gz` is the same 14,860-byte session. The play-test's `deferred_instance=` — the
+counter round 32 added for the *sole purpose* of pricing `DEFERPREANCHOR`, and the number Priority 2 of the
+round-46 brief was built on — **was destroyed by a launch that drew no frames.**
+
+MEASURED: 0 `Remix stats:` and 0 `Remix timing:` lines in the 45.4 MB dump slice, against 525 `Remix live:`,
+9,544 `Remix albedo-trace:`, 28,990 `Remix watch:` and 403 `Remix worldid-census:`.
+
+**FIXED, this build.** A new `Remix cost:` line is written to `remix_dump.log` beside the timing notice,
+carrying `frames frame_ms draw draw_instance deferred_instance rest other | defer/frame buffered fresh flip vm`.
+Deliberately a *new, 12-argument* line rather than a redirect of `Remix timing:` — that line carries 30
+arguments and this project has shipped an argument-ordering bug on a line that size twice (rounds 18, 19).
+
+**HOW TO READ IT, and this is not optional.** Round 34's review left an open finding that is now LIVE for the
+first time: **`xform` ENCLOSES `deferred_instance`.** `per_draw_transform` -> `capture_gauge_anchor` ->
+`write_gauge_anchor` -> `flush_deferred_for_anchor` -> `submit_deferred` all run inside the `xform` timing
+scope, so the anchor-flush half of the deferral's cost is counted twice — once as itself and once inside
+`xform`. It was inert while `DEFERPREANCHOR=0` (the flush early-returns on an empty buffer) and it is inert no
+longer.
+
+* `deferred_instance` is a **SUBSET of `xform`**, not a sibling of it. **Never add it to `draw` to form a
+  total** — that double-counts.
+* True per-draw transform math is `xform - deferred_instance`.
+* `rest` is still a valid residual (`deferred_instance` is not in its subtraction) and `frame_ms` is still the
+  wall clock, so the *headline* comparison — `deferred_instance` against `frame_ms` — is sound as printed.
+* Round 32's claim that *"`xform` is the only child whose cost is INVARIANT to vertex count, which makes it
+  the discriminator"* is **false at `DEFERPREANCHOR=1`**, i.e. false in exactly the run it was staged for.
+
+> **INSTRUMENT BLINDNESS #6: a log another launch can truncate is not a record.** Anything a play-test is
+> judged on must reach `remix_dump.log`, which is append-mode.
+
+### 2. THE HEADLINE: a fresh anchor does not merely place better. It places EXACTLY
+
+`Remix albedo-trace:` on `E40BF80AF519848A` / `c2003391127734f6`, **9,544 continuous samples, camera free**,
+cross-tabbing the translation residue against the new `ref=` field:
+
+| `ref=` | draws | share | residue < 0.01 | mode | max residue |
+| --- | --- | --- | --- | --- | --- |
+| `anchor` (refage=0) | 5,622 | 58.9% | **5,622 of 5,622 = 100.0%** | exactly 0.000 | **0.000** |
+| `anchor_prev` (refage=1) | 2,099 | 22.0% | **0 of 2,099 = 0.0%** | 32–128 (26.0%) | 393.97 |
+| `camera` (refage=-1) | 1,823 | 19.1% | **0 of 1,823 = 0.0%** | 32–128 (**68.5%**) | 184.26 |
+
+**Perfect separation, both ways, over 9,544 samples.** Not one draw placed by this frame's own anchor is off
+by as much as a hundredth of a unit, and not one draw placed by anything else is on.
+
+Two things follow and both retire open questions:
+
+* **Round 34's ±0.28% anisotropic basis error is not a placement defect on the world path.** A draw with a
+  fresh anchor has residue 0.000 *and* — measured over the same 9,544 `matrix=` fields — a median
+  orthogonality residual of **0.000000** and a median anisotropy of **0.000000**. The basis error lives
+  entirely in the stale population.
+* **There is no second error source to look for.** The whole remaining world defect is one sentence:
+  *41.1% of draws never get a fresh anchor.*
+
+### 3. THE VIEWMODEL IS THE SOLE SURVIVING `anchor_prev` POPULATION — 4/4 against 0/15
+
+`Remix picked:`, all 19 picks of the run:
+
+| population | picks | `anchor` / `identity-bypass` | `anchor_prev` |
+| --- | --- | --- | --- |
+| viewmodel `830d7d1b9681c475` | 4 | 0 | **4** |
+| world + props (5 programs) | 15 | **15** | **0** |
+
+Round 45 read the light fixture `anchor_prev` 5/5 and round 4 read it 9/9. This run: **zero**, across every
+world and prop pick. The user's report is the same split in words — *"light fixture is now stable, props are
+not moving as camera turns"* against *"my character still looks like he has parkinsons"*.
+
+Every viewmodel pick reads `areason=wdivide ref=anchor_prev anchor_frame=<frame-1> anchor_vp=ad7ce9d672a0bf6b`
+— divided by the **world** program's anchor, one frame stale, with `cam_age=0` (the camera itself is fresh).
+Its `det` swings `0.9962 .. 1.0032` and its basis is **never** exact: over 3,293 `Remix vmbasis:` lines the
+median orthogonality residual is `0.001423` and the median anisotropy `0.001537`, against `0.000000` and
+`0.000000` for the world.
+
+**ROOT CAUSE, in the source.** `RemixGSRender.cpp` has an explicit exclusion that takes viewmodel draws back
+out of the deferral, and it is gated on the **tag**, not on the **placement**:
+
+```cpp
+if (viewmodel_draw)          // <- round 45 and earlier
+{
+    defer_candidate = false;
+}
+```
+
+Its comment argues *"a viewmodel draw is placed relative to the weapon camera, so no world anchor for its
+render source will ever make it more correct."* **That premise is false at the shipped `VMTAGONLY=1`**, which
+decouples the tag from the placement and sends the arms down the ordinary world path — which is exactly what
+`areason=wdivide` on all four picks says. **Round 34 already reached this conclusion for the twin gate ~130
+lines below**, the tail-rescue ladder, and moved that one to `viewmodel_place` with the identical argument
+written out in full. This is the sibling it left behind.
+
+Two further measurements say deferral is the *only* remedy for this population:
+
+* `defer_fresh 867,086 / defer_buffered 874,746` = **99.1% of held draws DO get a fresh anchor later in the
+  same frame.** A held viewmodel draw is overwhelmingly likely to be flushed against one.
+* the tail rescue is **already armed** for these draws (its gate is `viewmodel_place`) and has **never once
+  succeeded**: `tail_rescued_cur + tail_rescued_aged = 0` against `tail_rescue_failed = 131,774`, with
+  `tail_rescue_same_ref = 99,428` — and `vm_tagged = 100,226`. **No alternative EXISTING anchor helps.**
+  Only waiting for this frame's does.
+
+#### 3b. The baseline the fix will be judged against — a continuous, motion-capable viewmodel instrument
+
+`Remix vmbasis:` carries `cpre=`, the viewmodel centroid resolved on the camera's own (right, up, fwd) axes.
+For a viewmodel that is rigidly attached to the camera this is a **constant**, so its deviation from the
+run median is the wobble in units — and unlike every pick, it is sampled every frame with the camera free.
+3,293 samples, binned by how far the camera turned since the previous frame:
+
+| camera turn (deg/frame) | n | median error | p95 | max |
+| --- | --- | --- | --- | --- |
+| 0 – 0.05 | 432 | **0.0035** | 0.0957 | 0.617 |
+| 0.05 – 0.2 | 1,467 | 0.0040 | 0.1400 | 2.518 |
+| 0.2 – 0.5 | 734 | 0.0086 | 0.1879 | 2.737 |
+| 0.5 – 1 | 211 | 0.0671 | 0.1932 | 0.243 |
+| 1 – 2 | 166 | 0.0708 | 0.1778 | 0.235 |
+| 2 – 4 | 179 | 0.0767 | 0.2129 | 0.282 |
+| > 4 | 104 | **0.1134** | 0.2174 | 0.273 |
+
+**A clean monotone dose-response, 32x from the slowest bin to the fastest** — which is precisely what a
+one-frame-stale placement predicts (error proportional to camera motion per frame) and what real weapon
+animation does *not* predict, since the gun's animation is uncorrelated with how fast the player turns.
+
+**PRE-REGISTERED for round 47: this table is the judgement.** If `DEFERVIEWMODEL=1` works, the slope
+flattens — the `> 4 deg/frame` bin falls from 0.1134 toward the `0 – 0.05` bin's 0.0035. If the slope is
+unchanged the stale anchor is not the viewmodel wobble and the knob goes back to 0. Analyser:
+`scratchpad\r46\haywire.py`.
+
+**Do NOT read the raw variance instead.** A whole-run regression of `cpre` against a full one-frame-stale
+model removes only 21.9% of its variance (74.7% on `right`, 14.5% on `up`, 17.0% on `fwd`), because `cpre`
+also contains the weapon's genuine in-game animation — the 15 worst samples in the run are frames
+26,306–26,320, where the error grows monotonically 1.26 → 2.74 units while the camera is nearly stationary
+(0.09–0.33 deg/frame, 0.07–0.15 units/frame). That is the gun animating, not a defect. Binning by turn rate
+is what separates the two.
+
+### 4. WHAT SHIPPED — `RPCS3_REMIX_DEFERVIEWMODEL=1`, one knob, one mechanism
+
+The gate becomes `remix_rsx::defer_viewmodel_enabled() ? viewmodel_place : viewmodel_draw`. At the default
+**0** the build is bit-exact round 45.
+
+The exclusion's *second* reason was real and is **handled, not relaxed**. The flush recomputes the transform
+(`entry.info.transform = to_remix_transform(world);`) and does not re-run `apply_viewmodel_basis` /
+`apply_viewmodel_rotation`, which live at the submit site. MEASURED what that would cost: **`dbasis=0` on all
+3,293 census lines** (`VMBASIS=0`, that operator is inert) but **`drot = 1.46 .. 1.99` units on every one of
+them**. Dropping it would be a metre-scale teleport, not a rounding difference.
+
+So the submit site now captures the composite world-space operator it applied,
+
+```
+Op = post * pre^-1 ,   C = A_post * A_pre^-1 ,   o = t_post - C * t_pre
+```
+
+into the deferral record, and the flush replays it onto the re-divided transform with the operators' own
+arithmetic verbatim (a 3x4 row-major left-multiply, `p' = C*p + o`) — so no matrix convention is re-derived
+anywhere. At the shipped `VMROTPIVOT=0` the pivot is the eye, so `Op` does not depend on the placement it was
+measured at and the replay is **exact, not an approximation**. The capture runs unconditionally (a 3x3 inverse
+on ~2.3 draws/frame) so `vm_op_singular` is readable before the knob is ever armed. `flush_deferred_at_flip`
+does not rebuild the transform, so a draw that times out keeps the operator-corrected placement it already had
+and **the operator can never be applied twice**.
+
+New counters on `Remix live:` (which reaches `remix_dump.log`), inserted against their own text between
+`defer_absent_declined` and `nectar_published`: **`defer_viewmodel=`** and
+**`vm_op=<captured>/<declined>/<singular>/<replayed>`**.
+
+#### 4b. What the independent review of this round's diff caught, and it was not cosmetic
+
+The diff was reviewed against the source before deploying. Three findings, all fixed and rebuilt:
+
+1. **`defer_viewmodel` was counted ~150 lines upstream of the arming gate.** The first draft incremented it
+   at the exclusion site. That site is above `if (defer_candidate && defer_pre_anchor_enabled())`, above the
+   two cancellation sites (tail rescue, proj split), above a possible world refusal, and above the three
+   submit-site rejections (skinned, spill, unrecognised extension chain). It would have been **non-zero at
+   `DEFERPREANCHOR=0`, where nothing is deferred at all**, and would have over-counted against
+   `defer_buffered` — producing exactly the false gap its own comment told the reader to interpret as
+   *"flushed viewmodel draws are going out without their rotation."* **The counter the whole play-test card
+   turns on would have inverted its own reading.** Moved to the buffering site, beside `defer_buffered`.
+2. **`Op = post * pre^-1` is not replayable at three reachable knob values.** `VMROTAXIS >= 4` puts
+   `apply_viewmodel_rotation` on a **MODEL-space RIGHT-multiply** (`M' = M*R` — its own comment says so), for
+   which `Op` is a conjugation of the *old* basis and the replay yields `A_pre*R*A_pre^-1*A_new` instead of
+   `A_new*R`; `VMROTPIVOT != 0` and `VMBASISPIVOT != 0` derive the pivot from the placement, making `o`
+   placement-dependent. All three are reachable through their clamps and none is the shipped value, so **no
+   run would ever have found this.** Rather than write a caveat, the capture is **refused** at those
+   settings and the buffering site then refuses to hold the draw — it takes the immediate path, bit-exact
+   round-45 behaviour. Sized by the new `vm_op` `declined` field, which **must read 0** at the shipped knobs.
+3. **`std::isfinite` was applied to the `f64` before the narrowing to `f32`.** An `f64` above `FLT_MAX`
+   would have been stored as `inf` with `valid = true`. Now tested on the narrowed value.
+
+A fourth finding is pre-existing and untouched: the comment at `RemixGSRender.cpp:20556-20557` claims
+`dump_vertex_program` calls `per_draw_transform` "further down". Its only call site is *above*
+`submit_subdraw`'s own call, so the comment gives the wrong reason for why the new scratch flag's lifetime is
+safe. Harmless today; misleading to the next reader who audits it.
+
+### 5. `DEFERPREANCHOR=1` PASSED EVERY PRE-REGISTERED READING — but not by the test the inbox named
+
+| pre-registered reading | threshold | MEASURED | verdict |
+| --- | --- | --- | --- |
+| `defer_flip / defer_buffered` | **< 72%** (round 32's own) | 7,660 / 874,746 = **0.88%** | **PASS, by 82x** |
+| `defer_fresh >> defer_flip` | — | 867,086 vs 7,660 = **113x** | **PASS** |
+| `defer_absent_declined == gauge_absent` | exact | 352,051 == 352,051 | `DEFERPREVONLY` doing exactly its job |
+| `gauge_prev` share of placements | must not rise | **17.42%** (r45 17.31, r43 19.22, r44-bad 37.09) | **flat** |
+| `anchor_promoted` per flip | must not rise | 22/44,375 = **0.00050** (r43 0.00032, r44-bad **0.1360**) | r43 band |
+
+**The inbox's "`anchor_parked`/`recap`/`promoted` MUST stay at 8/0/8" is not a valid invariant** — those were
+absolute counts from one 21,630-flip scene, not a rate. This run reads 4,766/4,744/22, i.e. 0.107/0.107/0.0005
+per flip, which is the **round-43 band** (0.0769/0.0766/0.00032); round 45's 8/0/8 was the outlier. The
+structural claim still holds and is INFERRED, not measured: the deferral calls into no part of the anchor
+election.
+
+**What CANNOT be concluded, and the inbox pre-registered it anyway.** `Remix albedo-trace:` is emitted at
+`RemixGSRender.cpp:~21712` and the deferral buffers at `~23720` — **the trace records `ref=` and `matrix=`
+BEFORE the deferral can act on them**, and so does the pick record. So "`anchor_prev` should collapse on the
+trace" was **unrunnable by construction**: a draw the deferral later fixes still prints `anchor_prev`. The
+58.9%-exact figure against round 45's 24.4% is therefore **NOT attributable to the knob** — it is scene
+variation, and the knob's own confirmation is the user's eyes plus the `defer_fresh` counter.
+
+> **INSTRUMENT BLINDNESS #5: both `ref=` instruments sit upstream of the remedy they were built to judge.**
+
+### 6. RETRACTED — the donor family's *evidence*, though not its conclusion
+
+Round 45 retired donor selection on `gauge_contested = 0` over 21,630 flips: *"there are ~63 later donors per
+frame and every single one AGREES with the first."* **This run reads `gauge_contested = 6,602`,
+`gauge_donor_upgrade_avail = 124`, `gauge_donor_upgraded = 124`.** Contested donors exist and
+`GAUGEDONORBEST=32` fired 124 times. The **conclusion** survives on magnitude — 0.15 contested per flip, and
+only 1.9% of contested frames had a better donor — but *"MEASURED: no choice exists inside the frame"* was
+**scene-specific and is falsified**. Do not re-open the family; do not cite `gauge_contested=0` again.
+
+### 7. The black floor, re-measured with `WATCHALBEDO` on the checkerboard tile
+
+28,990 `Remix watch:` lines. `4094F22DB2A8278A` — the *submitted, clickable* neighbour of the void:
+
+```
+submitted      24,412  (97.9%)      world_refused fail=nocam    515  (2.1%)
+```
+
+So the floor's neighbour is **not being refused**. But its placement provenance is:
+
+| drawn by | draws | ref |
+| --- | --- | --- |
+| `c1d482dcd1b03ed0` (props/tiles) | 9,384 | `anchor` |
+| `ad7ce9d672a0bf6b` (world) | 2,879 | `anchor` |
+| `f39f504649b6f442` | 5,368 | **`anchor_prev`, 100%** |
+| `af06f6d32ec048ee` | 2,315 | **`anchor_prev`, 100%** |
+| `830d7d1b9681c475` (viewmodel prog) | 1,347 | **`anchor_prev`, 100%** |
+| `c1d482dcd1b03ed0` | 1,878 | **`camera`, i.e. no anchor at all** |
+
+**50.2% `anchor` / 40.0% `anchor_prev` / 7.7% `camera`** before deferral. Three whole programs never receive a
+fresh anchor for this albedo. By section 2 the last two rows are displaced **100% of the time**, and `camera`
+lands 32–128 units out on 68.5% of samples — far enough to empty a stairwell.
+
+`Remix worldid-census:`, cumulative, buckets `t = <=1 / <=32 / <=128 / >128`:
+`ad7ce9d672a0bf6b` 2,229,547 draws `t=1,753,910/394,983/882/79,772` tmax 2276.61 — **3.58% beyond 128 units**;
+`c1d482dcd1b03ed0` 170,326 draws, **8.9% beyond 32 units** (round 45 read 10.6%), tmax 1533.32.
+
+### 8. The next knob, already sized and NOT shipped this round
+
+`DEFERPREVONLY=1` declines to defer the `gauge_absent` population: `defer_absent_declined = 352,051`. Section 2
+measures that population as **100% displaced, 68.5% of it 32–128 units out** — and round 32 excluded it on a
+*cost* argument made before anyone knew that. Setting `RPCS3_REMIX_DEFERPREVONLY=0` is a one-line launcher
+change that adds 7.9 draws/frame to a deferral population currently at 19.7/frame (+40%). It is round 47's
+card if the viewmodel knob lands. Pre-registered: `ref=camera` collapses and the exact share rises from 58.9%
+toward ~78%; if `defer_flip/defer_buffered` jumps from 0.88% toward 29% the absent branch genuinely has no
+anchor coming and round 32's exclusion was right after all.
+
+### Method notes earned this round
+
+- **A log another launch can truncate is not a record.** Three of round 45's load-bearing numbers came from
+  `RPCS3.log`; all of them from that run are now gone, destroyed by a session that installed a PKG and drew
+  no frames.
+- **`git show HEAD:` is not a fixed reference, and a mid-round commit re-bases every diff silently.** The
+  user committed round 45's work at 03:26 while this round was measuring. Nothing broke — but a whole
+  concurrency conclusion was drawn from `git show HEAD:` readings taken after the move, and it was wrong.
+  Pin comparisons to the SHA recorded at the start, and re-run `git log --oneline -3` before writing the
+  concurrency line.
+- **Check where the instrument SITS in the call, not only what it prints.** Both `ref=` instruments are
+  ~2,000 lines upstream of the mechanism they were added to judge. A pre-registration against a reading the
+  code cannot produce is worse than no pre-registration.
+- **A comment that argues from a premise a later knob removed is a bug waiting to be found.** The exclusion
+  reasoned from "the viewmodel is placed by the weapon camera"; `VMTAGONLY=1` deleted that premise twelve
+  rounds ago and the comment stayed. Grep for the *premise*, not the symptom.
+- **When a counter reads 0 in one scene, that is a fact about the scene.** `gauge_contested=0` retired an
+  entire family of remedies last round; it reads 6,602 in this one.
+- **Perfect separation is worth more than a large effect size.** `ref=anchor` implies residue 0.000 on 5,622
+  of 5,622, and its negation on 3,922 of 3,922. That single cross-tab replaced four rounds of competing
+  hypotheses about what else might be displacing geometry: nothing else is.
+- **Count a funnel stage where it HAPPENS, not where it is decided.** The first draft's `defer_viewmodel`
+  sat 150 lines and six rejection gates above the point at which a draw is actually held. It would have read
+  non-zero in a configuration where nothing is deferred at all, and the play-test card told the reader to
+  interpret the resulting gap as a rendering fault. **An instrument that can only be wrong in the direction
+  of a false alarm is still wrong.**
+- **A replay of a captured operator inherits every assumption the operator's KNOBS can break.** `Op =
+  post * pre^-1` is replayable only while the operator is a placement-independent world-space left-multiply.
+  Three reachable knob values break that, none of them the shipped value — so testing would never have found
+  it, and a doc caveat would never have been read. Refuse the route at those settings and count the refusal.
+- **Review the diff against the source before deploying, not the deployed build against the symptom.** All
+  three defects above are invisible at the shipped configuration and would have surfaced as a *wrong
+  conclusion* next round rather than as a crash.
 
 ## Round 45 (2026-08-29) — GAUGEDONORBEST was INERT, the skip gates are cleared, and the deferral is back on
 

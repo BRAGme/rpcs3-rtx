@@ -767,7 +767,7 @@ void RemixGSRender::on_init_thread()
 			// Round 30: emissiveper is how many EMISSIVE entries carried their own ':<intensity>'.
 			// 0 with emissive non-zero means the run was launched with the old single-global form, so a
 			// "the bulbs did not get brighter" report can be attributed in the first ten lines.
-			"emissive=%u emissiveint=%.4g emissiveper=%u deferpreanchor=%d fpa2c=%u nectarmode=%u lightpass=%d "
+			"emissive=%u emissiveint=%.4g emissiveper=%u deferpreanchor=%d deferviewmodel=%d fpa2c=%u nectarmode=%u lightpass=%d "
 			// Round 6. On the banner as well as the live line because these are the knobs the
 			// play-test bisects with, and a run launched with the wrong one has to say so in its
 			// first ten lines rather than 8000 lines in.
@@ -916,6 +916,8 @@ void RemixGSRender::on_init_thread()
 			static_cast<f64>(remix_rsx::emissive_intensity()),
 			remix_rsx::emissive_albedo_intensity_count(),
 			remix_rsx::defer_pre_anchor_enabled() ? 1 : 0,
+			// ROUND 46, in the matching position for "deferviewmodel=%d".
+			remix_rsx::defer_viewmodel_enabled() ? 1 : 0,
 			remix_rsx::fp_a2c_mode(),
 			remix_rsx::nectar_mode(),
 			remix_rsx::light_pass_census_enabled() ? 1 : 0,
@@ -1166,6 +1168,9 @@ void RemixGSRender::on_exit()
 	m_self_lit_material = nullptr;
 	m_self_lit_texture = nullptr;
 	m_guest_lights.clear();
+	// ROUND 48. The staging table names positions in a scene that is going away; a confirmed cell
+	// surviving a device teardown would let the next scene light a fixture it has never measured.
+	m_guest_light_cells.clear();
 	// Held instances name mesh handles that are about to be destroyed; dropped rather than flushed,
 	// because the runtime is going down and a DrawInstance here would outlive its own scene.
 	m_deferred_instances.clear();
@@ -2360,7 +2365,87 @@ void RemixGSRender::flush_deferred_for_anchor(const gauge_anchor& anchor)
 		// and a same-frame-anchored draw of the same object are placed by identical code.
 		remix_rsx::mat4 world{};
 
-		if (anchor.inverse_f64_valid && remix_rsx::gauge_f64_enabled())
+		// ROUND 47. False when the fresh reference could not be built at all; the draw then keeps the
+		// transform it already carries, which is the placement the immediate path gave it.
+		bool world_built = true;
+
+		if (entry.used_projsplit)
+		{
+			// --- ROUND 47: a proj_split draw must be re-CROSSED, never re-divided -----------------
+			//
+			// The plain division below is not merely a different route for this draw, it is a route
+			// that is KNOWN to fail for it. The tail-rescue ladder runs only at the exit where
+			// 'fused * anchor.inverse' has already been rejected by the affine gate - MEASURED
+			// residue 2.96 .. 3.14 on this title's own census lines against a tolerance of 0.02 -
+			// and proj_split is what removes that residue, by crossing the ANCHOR'S view with the
+			// DRAW'S own projection. Flushing such a draw through the plain divide would hand it
+			// back the residue the rescue removed, which is why the round-46 exclusion could not
+			// simply be deleted.
+			//
+			// This is the ladder's construction verbatim (RemixGSRender.cpp, the proj_split branch):
+			// split both matrices, refuse a transposed or over-error split, cross = V_anchor *
+			// P_draw, invert. Nothing is carried in the deferral record but the one bool, because
+			// both inputs - entry.fused and anchor.fused - are already here, so there is no captured
+			// matrix that can drift from the ladder's.
+			world_built = false;
+
+			const f32 split_tol = remix_rsx::proj_split_max_error();
+			remix_rsx::vp_split draw_split{};
+			remix_rsx::vp_split anchor_split{};
+			remix_rsx::mat4 cross_inverse{};
+
+			if (remix_rsx::split_view_projection(entry.fused, draw_split)
+				&& !draw_split.used_transpose
+				&& draw_split.l1_error <= split_tol
+				&& remix_rsx::split_view_projection(anchor.fused, anchor_split)
+				&& !anchor_split.used_transpose
+				&& anchor_split.l1_error <= split_tol)
+			{
+				// cross = V_anchor * P_draw. split_view_projection's contract is M = view *
+				// projection, so this is the same multiply order the splitter reconstructs with -
+				// the same sentence the ladder's own comment carries.
+				const remix_rsx::mat4 cross =
+					remix_rsx::mat4_multiply(anchor_split.view, draw_split.projection);
+
+				// ROUND 47, caught by review of this round's own diff. The ladder's acceptance is a
+				// THREE-part conjunction and the first draft of this block only carried two of them:
+				// PROJSPLITVDELTA is the gate that measures the construction's actual premise
+				// (V_draw == V_anchor) and refuses the cross when the two views are further apart
+				// than the tolerance. It is INERT at the shipped PROJSPLITVDELTA=0 - which is exactly
+				// why omitting it would never have been found by a run - but the launcher stages
+				// arming it as the next test of proj_split's premise. Without this the flush would
+				// install, against a fresh anchor, crosses the ladder itself refuses, and book them
+				// as defer_projsplit_fresh with no counter saying otherwise. Same arithmetic and same
+				// comparison direction as the ladder, so the two cannot disagree.
+				f32 view_delta = 0.f;
+
+				for (u32 i = 0; i < 4; ++i)
+				{
+					for (u32 j = 0; j < 4; ++j)
+					{
+						view_delta += std::abs(draw_split.view.m[i][j] - anchor_split.view.m[i][j]);
+					}
+				}
+
+				if (!std::isfinite(view_delta))
+				{
+					view_delta = -1.f;
+				}
+
+				const f32 vdelta_tol = remix_rsx::proj_split_view_delta_max();
+				const bool vdelta_refused = vdelta_tol > 0.f
+					&& !(view_delta >= 0.f && view_delta <= vdelta_tol);
+
+				if (!vdelta_refused
+					&& remix_rsx::mat4_invert(cross, cross_inverse)
+					&& remix_rsx::mat4_is_finite(cross_inverse))
+				{
+					world = remix_rsx::mat4_multiply(entry.fused, cross_inverse);
+					world_built = true;
+				}
+			}
+		}
+		else if (anchor.inverse_f64_valid && remix_rsx::gauge_f64_enabled())
 		{
 			world = remix_rsx::mat4d_to_f32(remix_rsx::mat4d_multiply(
 				remix_rsx::mat4d_from(entry.fused), anchor.inverse_f64));
@@ -2371,6 +2456,11 @@ void RemixGSRender::flush_deferred_for_anchor(const gauge_anchor& anchor)
 			world = remix_rsx::mat4_multiply(entry.fused, anchor.inverse);
 		}
 
+		// ROUND 47. Set when the rebuilt transform was actually installed. The proj_split counters
+		// below are read off it, and it is deliberately not the same thing as world_built: a cross
+		// that constructed can still fail the affine gate.
+		bool placed = false;
+
 		world = remix_rsx::mat4_multiply(entry.object_space, world);
 
 		// Normalise out any projective scale, exactly as per_draw_transform does before its own
@@ -2379,7 +2469,20 @@ void RemixGSRender::flush_deferred_for_anchor(const gauge_anchor& anchor)
 		// geometry that was accepted - the one thing the deferral must never do. A non-finite
 		// result falls back to the transform the draw already carries, which is the old
 		// prev/camera placement and therefore never worse than not deferring at all.
-		if (remix_rsx::mat4_is_finite(world))
+		//
+		// ROUND 47 ANSWERS THAT COMMENT FOR THE PROJ_SPLIT ARM, WHERE ITS PREMISE IS FALSE. A
+		// proj_split draw did NOT pass the affine gate against the plain division - it failed it, and
+		// was accepted only through the ladder's own is_affine test on the CROSS. So "already passed
+		// it" does not apply, and the cross rebuilt here against a different anchor has to face the
+		// same test the stale one did. The refusal is not a drop: the draw is still submitted, with
+		// the placement the immediate path gave it, so the reasoning above still holds - re-running
+		// the gate on this arm can leave a draw where it is, never remove it.
+		//
+		// world_built is false only when the proj_split re-cross above could not be constructed at
+		// all. It is tested HERE rather than as a wrapper block so the accepted path keeps its exact
+		// round-46 shape: 'world' is still the zero matrix in that case, which is finite, so the
+		// conjunct is load-bearing and not a tidy-up.
+		if (world_built && remix_rsx::mat4_is_finite(world))
 		{
 			if (const f32 w = world.m[3][3]; std::abs(w) > 1e-6f && std::abs(w - 1.f) > 1e-6f)
 			{
@@ -2394,9 +2497,72 @@ void RemixGSRender::flush_deferred_for_anchor(const gauge_anchor& anchor)
 				}
 			}
 
-			if (remix_rsx::mat4_is_finite(world))
+			// ROUND 47: the second conjunct is the proj_split arm's gate and is vacuously true for
+			// every other deferred draw, so the non-proj_split path is bit-exact round 46.
+			if (remix_rsx::mat4_is_finite(world)
+				&& (!entry.used_projsplit
+					|| remix_rsx::is_affine(world, remix_rsx::world_affine_tolerance())))
 			{
+				placed = true;
 				entry.info.transform = remix_rsx::to_remix_transform(world);
+
+				// --- ROUND 46: replay the viewmodel operator this flush would otherwise drop ------
+				//
+				// The line above is the reason the deferral used to exclude every VIEW_MODEL-tagged
+				// draw: it rebuilds the transform from fused/anchor and knows nothing of
+				// apply_viewmodel_basis or apply_viewmodel_rotation, which run at the submit site.
+				// entry.vm_op is their composite, Op = post * pre^-1, captured there; this is
+				// their own arithmetic verbatim - a world-space left-multiply, p' = C*p + o, with
+				// C in columns 0..2 and o in column 3 - applied to the re-divided placement.
+				//
+				// MEASURED: without it a flushed viewmodel draw loses drot = 1.46..1.99 units on
+				// this title, so the same object would be placed a metre apart depending only on
+				// whether its frame's anchor happened to land after it.
+				if (entry.has_vm_op)
+				{
+					const remixapi_Transform src = entry.info.transform;
+
+					for (u32 r = 0; r < 3; ++r)
+					{
+						for (u32 col = 0; col < 4; ++col)
+						{
+							f32 sum = 0.f;
+
+							for (u32 k = 0; k < 3; ++k)
+							{
+								sum += entry.vm_op[r][k] * src.matrix[k][col];
+							}
+
+							entry.info.transform.matrix[r][col] = (col == 3)
+								? (sum + entry.vm_op[r][3])
+								: sum;
+						}
+					}
+
+					++m_stats.defer_vm_op_replayed;
+				}
+			}
+		}
+
+		// ROUND 47. Booked here, once, on the one variable that says whether the rebuild actually
+		// reached the instance - not inside the branches, where a future edit could add a third exit
+		// and leave the pair no longer partitioning the population. 'kept' is not a failure to
+		// report: it is the draw keeping the placement round 46 gave it, so the two arms are
+		// "improved" and "unchanged", never "lost".
+		//
+		// The vm_op replay above is deliberately INSIDE the placed branch. On the kept arm the
+		// carried transform already has the operator applied at the submit site, so replaying it
+		// would compose it twice - the exact doubling the round-46 card names as this family's own
+		// failure mode.
+		if (entry.used_projsplit)
+		{
+			if (placed)
+			{
+				++m_stats.defer_projsplit_fresh;
+			}
+			else
+			{
+				++m_stats.defer_projsplit_kept;
 			}
 		}
 
@@ -5397,7 +5563,7 @@ remixapi_MaterialHandle RemixGSRender::self_lit_material(const remixapi_Interfac
 }
 
 void RemixGSRender::maybe_inject_guest_light(u64 vp_hash, u64 fp_hash, u64 albedo_hash,
-	const remixapi_Transform& transform)
+	const remixapi_Transform& transform, bool is_viewmodel)
 {
 	const u64 configured_vp = remix_rsx::guest_light_pair_vp_hash();
 	const u64 configured_fp = remix_rsx::guest_light_pair_fp_hash();
@@ -5511,8 +5677,30 @@ void RemixGSRender::maybe_inject_guest_light(u64 vp_hash, u64 fp_hash, u64 albed
 	// separates cleanly. state_glow IS the discriminator; see guest_light_auto_mode(). Mode 1 keeps
 	// the round-6 meaning exactly, so an old run stays comparable.
 	const u32 auto_mode = remix_rsx::guest_light_auto_mode();
-	const bool auto_wanted = census_candidate && auto_mode != 0
+
+	// --- ROUND 48: the world-geometry gate, half of why GUESTLIGHTAUTO had to be turned off ------
+	// Round 41's AUTO=2 lit the player's own arms and weapon, because a viewmodel draw satisfies
+	// every term of census_candidate - the visor and muzzle layers are blended, non-depth-writing
+	// and bright, which is the glow-card signature exactly. Worse, the position it derives is the
+	// AABB centre of a draw whose transform is the VIEWMODEL transform, so the sphere lands about a
+	// metre in front of the eye and travels with the player: that is the "~21 spheres at wrong
+	// positions" half of the same fault, not a second bug.
+	//
+	// Gated on the AUTO arm ONLY. trigger_match is an albedo the user typed into GUESTLIGHTALBEDO
+	// by hand and is left exactly as it was - if somebody deliberately lists a viewmodel texture,
+	// that is an instruction, not an accident.
+	//
+	// The CENSUS is deliberately NOT gated: report_light_candidate still names a refused viewmodel
+	// draw, so the instrument cannot conceal the population it is rejecting. Same argument the
+	// round-41 extent rejection makes below.
+	const bool auto_shape = census_candidate && auto_mode != 0
 		&& (auto_mode != 2 || state_glow);
+	const bool auto_wanted = auto_shape && !is_viewmodel;
+
+	if (auto_shape && is_viewmodel)
+	{
+		++m_stats.guest_light_vm_refused;
+	}
 
 	// --- round 14: the sun card, hosted here on purpose -----------------------------------------
 	// This function has already decided it is looking at a bright textured draw and is about to pay
@@ -5670,6 +5858,111 @@ void RemixGSRender::maybe_inject_guest_light(u64 vp_hash, u64 fp_hash, u64 albed
 		}
 	}
 
+	// MOVED UP from below the attempt gate, unchanged in value: `position` is final from the
+	// bounding-box walk above and nothing between there and here writes it, so the hash this
+	// computes is bit-identical to the one the create used before. It is needed earlier now because
+	// the stability table is keyed on it - a cell and its light must be the same identity by
+	// construction, or the two can drift apart and the gate would confirm one cell while the dedup
+	// matched another.
+	const s64 qx = std::llround(position[0] * 4.f);
+	const s64 qy = std::llround(position[1] * 4.f);
+	const s64 qz = std::llround(position[2] * 4.f);
+	u64 light_hash = rpcs3::hash64(0x48415A454C494748ull, static_cast<u64>(qx));
+	light_hash = rpcs3::hash64(light_hash, static_cast<u64>(qy));
+	light_hash = rpcs3::hash64(light_hash, static_cast<u64>(qz));
+
+	// --- ROUND 48: the STATIC-FIXTURE gate ------------------------------------------------------
+	// The other half of why GUESTLIGHTAUTO=2 had to be switched off in round 41: it lit SOLDIERS as
+	// they walked. The viewmodel gate above cannot catch that - an NPC is ordinary world geometry -
+	// and no render state distinguishes a suit panel's glow card from a lamp's. What distinguishes
+	// them is that a lamp DOES NOT MOVE.
+	//
+	// So a candidate must be seen in the same quantised cell on GUESTLIGHTSTABLE distinct frames
+	// before it may mint a light. A bolted-down fixture hits one cell every frame it is drawn and
+	// graduates; a walking NPC leaves a trail of cells and never reaches the threshold in any of
+	// them. This runs only for AUTO-only triggers: an explicitly listed GUESTLIGHTALBEDO is the
+	// user's own instruction and keeps its round-41 first-sight behaviour.
+	//
+	// Placed BEFORE the cap and the per-frame attempt budget on purpose. An unstable candidate must
+	// not consume one of the four attempts a frame is allowed, or a crowd of moving NPCs would
+	// starve the real fixtures behind them - which is the failure this gate exists to prevent, and
+	// it would have reappeared one line lower down.
+	//
+	// 'confirmed' is sticky and that is the FLICKER half of the user's request: a bulb that
+	// flickers off loses its card, then its light to GUESTLIGHTIDLE, and on the next on-frame it
+	// re-lights immediately instead of serving the apprenticeship again. Without stickiness any
+	// GUESTLIGHTSTABLE longer than the flicker period would hold a flickering bulb permanently
+	// dark - the exact opposite of what was asked for.
+	if (const u32 stable_frames = remix_rsx::guest_light_stable_frames();
+		stable_frames != 0 && auto_trigger && !trigger_accepted)
+	{
+		// BOUND THE TABLE BEFORE INSERTING INTO IT. This map is keyed on a quantised world
+		// position, and the population it is designed to REJECT - moving emitters - is exactly the
+		// one that mints a brand-new key every frame. Left unbounded a walking NPC would add a cell
+		// per 0.25 units travelled, for the whole session; the round-46 run was 52,208 flips and
+		// this one 83,019, so "it will be fine for a level" is not an argument. The prune drops
+		// UNCONFIRMED cells that have gone quiet, which is precisely the moving-emitter trail, and
+		// never touches a confirmed one - a real fixture the player has walked away from must keep
+		// its graduation or it re-serves the apprenticeship on every re-entry.
+		//
+		// Amortised: it runs only on the insert that would cross the ceiling, and it is a single
+		// pass over a container held at that ceiling.
+		if (m_guest_light_cells.size() >= s_max_guest_light_cells
+			&& !m_guest_light_cells.contains(light_hash))
+		{
+			const u64 quiet_before = (m_frame_counter > s_guest_light_cell_quiet)
+				? m_frame_counter - s_guest_light_cell_quiet
+				: 0;
+
+			for (auto it = m_guest_light_cells.begin(); it != m_guest_light_cells.end();)
+			{
+				if (!it->second.confirmed && it->second.last_frame < quiet_before)
+				{
+					it = m_guest_light_cells.erase(it);
+				}
+				else
+				{
+					++it;
+				}
+			}
+
+			// Still full of live/confirmed cells: refuse the NEW cell rather than grow without a
+			// ceiling. A fixture that is genuinely static will be back next frame, and by then the
+			// quiet window will have retired something.
+			if (m_guest_light_cells.size() >= s_max_guest_light_cells)
+			{
+				++m_stats.guest_light_unstable;
+				return;
+			}
+		}
+
+		guest_light_cell& cell = m_guest_light_cells[light_hash];
+
+		// Once per FRAME, not once per draw. A fixture drawn three times in one frame is one frame
+		// of evidence; counting draws would let a single multi-pass emitter confirm instantly and
+		// would measure batch structure rather than time.
+		if (cell.last_frame != m_frame_counter)
+		{
+			cell.last_frame = m_frame_counter;
+
+			if (cell.frames_seen < stable_frames)
+			{
+				++cell.frames_seen;
+			}
+		}
+
+		if (!cell.confirmed && cell.frames_seen >= stable_frames)
+		{
+			cell.confirmed = true;
+		}
+
+		if (!cell.confirmed)
+		{
+			++m_stats.guest_light_unstable;
+			return;
+		}
+	}
+
 	if (m_guest_lights.size() >= remix_rsx::guest_light_max())
 	{
 		++m_stats.guest_light_capped;
@@ -5687,13 +5980,6 @@ void RemixGSRender::maybe_inject_guest_light(u64 vp_hash, u64 fp_hash, u64 albed
 		return;
 	}
 	++m_guest_light_attempts;
-
-	const s64 qx = std::llround(position[0] * 4.f);
-	const s64 qy = std::llround(position[1] * 4.f);
-	const s64 qz = std::llround(position[2] * 4.f);
-	u64 light_hash = rpcs3::hash64(0x48415A454C494748ull, static_cast<u64>(qx));
-	light_hash = rpcs3::hash64(light_hash, static_cast<u64>(qy));
-	light_hash = rpcs3::hash64(light_hash, static_cast<u64>(qz));
 
 	remixapi_LightInfoSphereEXT sphere{};
 	sphere.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
@@ -17102,6 +17388,17 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 	// non-current gauge sets it, and a refused draw must never leave it armed for the next one.
 	m_scratch_defer_pending = false;
 
+	// ROUND 47, same lifetime and the same reason: the proj_split branch below is the only writer,
+	// and a draw that did not take that branch must never inherit the previous draw's verdict - the
+	// flush would then re-cross a placement that was built by the plain division.
+	m_scratch_defer_projsplit = false;
+
+	// ROUND 46, same lifetime. Written at the submit site by the viewmodel operator block, which is
+	// the only place that knows whether an operator ran; cleared here so a non-viewmodel draw can
+	// never carry the previous viewmodel draw's rotation into the deferral record.
+	m_scratch_defer_vm_op_valid = false;
+	m_scratch_defer_is_viewmodel = false;
+
 	// Same lifetime, same reason: the world-refused census prints this per refusal, and a draw
 	// refused before the affinity gate must report "n/a" rather than inherit the last gated draw's
 	// verdict. "off" is written by the gate itself when the knob is off.
@@ -17805,13 +18102,43 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 		//
 		// If the basis operator is ever wanted on deferred draws, the fix is to re-apply it inside the
 		// flush, not to relax this line.
-		if (viewmodel_draw)
+		//
+		// --- ROUND 46: both halves of round 34's note are now answered ---------------------------
+		//
+		// FIRST HALF, the placement premise, REFUTED at the shipped config. "A viewmodel draw is
+		// placed relative to the weapon camera" is false while RPCS3_REMIX_VMTAGONLY=1: the tag is
+		// decoupled and the draw goes down the ordinary world path. MEASURED - all four viewmodel
+		// picks of the round-45 play-test read 'areason=wdivide ref=anchor_prev
+		// anchor_vp=ad7ce9d672a0bf6b', i.e. divided by the WORLD program's anchor, one frame stale,
+		// while all fifteen world/prop picks in the same run read anchor or identity-bypass. Round 34
+		// drew exactly this conclusion for the tail-rescue twin ~130 lines below and moved it to
+		// viewmodel_place; this is the sibling it left behind.
+		//
+		// SECOND HALF, the lost operators, HANDLED rather than relaxed. The submit site now captures
+		// the composite world-space operator apply_viewmodel_basis + apply_viewmodel_rotation applied
+		// (Op = post * pre^-1) into the deferral record, and flush_deferred_for_anchor replays it
+		// onto the re-divided transform, so a flushed viewmodel draw carries the same correction an
+		// immediate one does. MEASURED size of what would otherwise be lost: dbasis=0 on every one of
+		// 3,293 census lines (VMBASIS=0, that operator is inert) but drot=1.46..1.99 units on all of
+		// them, so dropping it would be a visible teleport, not a rounding difference.
+		//
+		// RPCS3_REMIX_DEFERVIEWMODEL=0 (the default) keeps this gate on viewmodel_draw and is
+		// bit-exact round-45 behaviour.
+		if (remix_rsx::defer_viewmodel_enabled() ? viewmodel_place : viewmodel_draw)
 		{
 			// A viewmodel draw is placed relative to the weapon camera, so no world anchor for its
 			// render source will ever make it more correct. Take it back out of the deferral
 			// population rather than hold it for an event that cannot help it.
 			defer_candidate = false;
 		}
+
+		// NO COUNTER HERE, and that is the round-46 review's finding. This site is ~150 lines above
+		// the arming gate 'if (defer_candidate && defer_pre_anchor_enabled())', above the two
+		// cancellation sites (tail rescue, proj split), above a possible world refusal, and above the
+		// three submit-site rejections (skinned, spill, unknown extension chain). A counter here
+		// would climb at DEFERPREANCHOR=0 while nothing was deferred at all, and would over-count
+		// against defer_buffered - which is exactly the shape of misreading the whole play-test card
+		// turns on. defer_viewmodel is counted at the buffering site instead.
 
 		if (viewmodel_place)
 		{
@@ -18409,9 +18736,52 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 							m_ref_pick_vp = cross_pick->vp_hash;
 							m_scratch_rescue = "projsplit";
 
-							// Placed by an anchor of its own pass shape, which is exactly what the
-							// pre-anchor deferral holds draws waiting for.
-							m_scratch_defer_pending = false;
+							// --- ROUND 47: this cancellation was the reason DEFERVIEWMODEL read zero ---
+							//
+							// The old line here was an unconditional 'm_scratch_defer_pending = false;'
+							// on the premise, one comment up, that the draw had been "placed by an
+							// anchor of its own pass shape, which is exactly what the pre-anchor
+							// deferral holds draws waiting for". That premise is only true when
+							// cross_age == 0. The line ABOVE this one already knows it is not: it
+							// records ref_source::anchor_PREV whenever cross_age != 0, i.e. the rescue
+							// crossed the draw's own projection with a view recovered from LAST
+							// frame's anchor. The deferral waits for THIS frame's. A rescue that used
+							// a stale anchor has not delivered the event; it has delivered exactly the
+							// one-frame-stale placement the deferral exists to remove.
+							//
+							// MEASURED on the round-46 play-test (build Aug 29 2026 03:57:52, 52,208
+							// flips, DEFERVIEWMODEL=1 and DEFERPREANCHOR=1 both armed):
+							//   * proj_split_applied == vm_tagged == 148,913 on 814 of 814 'Remix live:'
+							//     samples, with 0 of 813 consecutive-delta mismatches - so this branch's
+							//     population IS the viewmodel population, increment for increment.
+							//   * 281 of 281 'Remix tail-rescue: outcome=projsplit' census lines read
+							//     age=1. Not one rescue in the run had a fresh anchor to cross with.
+							//   * gauge_prev - defer_buffered - proj_split_applied is CONSTANT at 1,725
+							//     across the whole run, so this one line accounts for 98.85% of the
+							//     draws that became deferral candidates and were never buffered.
+							// Round 46 moved the exclusion at :17874 off the tag and onto the placement,
+							// which was correct and necessary - and then this site, ~610 lines further
+							// down, threw the draw straight back out. defer_viewmodel read 0 and
+							// defer_spilled read 0 together, which is the signature of a population that
+							// never reached the buffering block at all rather than one it rejected.
+							//
+							// Held only when the knob that wants these draws deferred is on, so
+							// DEFERVIEWMODEL=0 is bit-exact round-46 behaviour at this site too.
+							if (cross_age == 0 || !remix_rsx::defer_viewmodel_enabled())
+							{
+								m_scratch_defer_pending = false;
+							}
+							else
+							{
+								// The flush MUST NOT use the plain division on this draw. The ladder
+								// only runs at the exit where that division already failed the affine
+								// gate - MEASURED residue 2.96 .. 3.14 on this title's census lines
+								// against a tolerance of 0.02 - so 'fused * anchor.inverse' would hand
+								// the draw back the very residue the cross removed. flush_deferred_for_
+								// anchor re-crosses instead, and its own comment about not re-running
+								// the affine gate is answered there.
+								m_scratch_defer_projsplit = true;
+							}
 
 							// --- round 19: print the matrix this actually placed the draw with ---
 							//
@@ -20484,6 +20854,18 @@ void RemixGSRender::submit_subdraw()
 	// dump_vertex_program path calls per_draw_transform again further down, which would otherwise
 	// overwrite the flag with a verdict about a diagnostic re-run.
 	const bool defer_pending = world_resolved && m_scratch_defer_pending;
+
+	// ROUND 47. Latched HERE, beside defer_pending, and read at the buffering site ~3,300 lines below
+	// instead of the member. Same lifetime, same hazard, and the consequence of getting it wrong is
+	// asymmetric: a proj_split draw that reaches the flush with this flag cleared takes the PLAIN
+	// division, which is the one arithmetic already known to fail for it (residue ~3.1 against a
+	// tolerance of 0.02) - a silent placement regression rather than a missed optimisation.
+	//
+	// Round 46's review established that the comment above overstates the hazard - dump_vertex_program's
+	// only call site is ABOVE submit_subdraw's own call, so no re-entry actually occurs between here and
+	// the buffering site today. This latch is therefore belt-and-braces, and deliberately so: it costs
+	// one bool and it stops being a question the next reader has to re-derive.
+	const bool defer_projsplit_pending = defer_pending && m_scratch_defer_projsplit;
 
 	const u64 world_identity_vp = remix_rsx::world_identity_vp_hash();
 
@@ -22587,7 +22969,34 @@ void RemixGSRender::submit_subdraw()
 	};
 	r2_candidate_probe("before-audit");
 
-	if (run_audits || r2_ca_candidate)
+	// --- ROUND 48: DRAWAUDIT=0 no longer disarms SKIPEXTENTVP ------------------------------------
+	// This is the decoupling round 34 asked for and then declined to make. The launcher's own note
+	// records why DRAWAUDIT=0 was left at 1 for four rounds: the SKIPEXTENTVP gate ~40 lines below
+	// reads '&& m_streak_measured', which is written ONLY inside audit_world_extent, so switching
+	// the audit off silently stopped a REFUSAL gate that is armed on 57A12323F22F4988 - one of the
+	// near-depth viewmodel programs. That made a 20-25 ms saving unavailable because it was welded
+	// to a behaviour change.
+	//
+	// The weld is unnecessary. The gate only ever fires for ONE program hash, so measure that one
+	// program and skip the rest: the gate keeps its input exactly, and every other draw in the
+	// scene stops paying. This is not "trusting the counter" - it preserves the gate's behaviour by
+	// construction rather than by an argument about what a run happened to measure.
+	//
+	// MEASURED on the round-47 play-test (build Aug 29 2026 09:22:04, 83,019 flips) for the two
+	// OTHER consumers, which is what makes DRAWAUDIT=0 safe rather than merely cheap:
+	//   wext_refused=0   - the refusal inside audit_world_extent never fired all session
+	//   skipg_extent=0   - and neither did SKIPEXTENTVP itself, though it is armed and its program
+	//                      IS drawn (three glow-card census lines name vp=57a12323f22f4988), so the
+	//                      gate is live and simply never met its 128-unit threshold
+	// The third consumer, extent_plausible in maybe_inject_guest_light, becomes unconditionally
+	// true when the audit is skipped. That is a COST change and not a behaviour change: it only
+	// removes an early-out, and the real ceiling - small_enough, computed from the same transformed
+	// AABB - still gates the trigger. The tell if it matters is 'rest' climbing on the timing line
+	// while 'audit' falls, because that bounding-box walk is not inside any named timer.
+	const u64 extent_gate_vp = remix_rsx::skip_extent_vp_hash();
+	const bool extent_gate_armed = extent_gate_vp != 0 && extent_gate_vp == m_current_vp_hash;
+
+	if (run_audits || r2_ca_candidate || extent_gate_armed)
 	{
 		scope_us audit_timer{ m_timing.audit };
 
@@ -22830,6 +23239,140 @@ void RemixGSRender::submit_subdraw()
 
 		report_viewmodel_basis_census(vm_pre, vm_mid, transform, vertex_count, vm_pivot,
 			vm_pivot_source, vm_rot_pivot, vm_rot_pivot_source);
+
+		// --- ROUND 46: capture the composite operator so the deferral flush can replay it ---------
+		//
+		// Both operators above are world-space LEFT-multiplies of the form p' = C*p + o, so their
+		// composition is one too, and it is recoverable from the pair of transforms this block
+		// already holds: Op = post * pre^-1. Writing 3x4 affines as [A|t],
+		//
+		//     pre^-1 : p = A_pre^-1 * p' - A_pre^-1 * t_pre
+		//     Op     : C = A_post * A_pre^-1 ,  o = t_post - C * t_pre
+		//
+		// which is exact and, at the shipped VMROTPIVOT=0 (the eye), independent of the placement it
+		// was measured at - so replaying it onto a re-divided transform is not an approximation.
+		// Deliberately computed in the same remixapi_Transform row layout the two operators write, so
+		// the replay in flush_deferred_for_anchor is their arithmetic verbatim and no matrix
+		// convention is re-derived anywhere.
+		//
+		// Unconditional, not gated on DEFERVIEWMODEL: it is a 3x3 inverse on ~2.3 draws per frame
+		// (vm_tagged 100,226 over 44,375 flips) and running it while the knob is OFF is what lets
+		// vm_op_singular be read before the knob is ever armed.
+		//
+		// --- THE PREMISE, AND THE THREE KNOB VALUES THAT BREAK IT --------------------------------
+		//
+		// "Op = post * pre^-1 is replayable onto a different placement" holds only while both
+		// operators are PLACEMENT-INDEPENDENT WORLD-SPACE LEFT-multiplies. Three knob values make
+		// that false, all of them reachable, none of them the shipped value:
+		//
+		//   VMROTAXIS >= 4   apply_viewmodel_rotation takes its MODEL-space branch - its own comment
+		//                    reads "Right-multiplication, M' = M * R". Then Op = A_pre*R*A_pre^-1 is
+		//                    a conjugation of the OLD basis, and replaying it gives
+		//                    A_pre*R*A_pre^-1*A_new instead of A_new*R. Wrong, not approximate.
+		//   VMROTPIVOT != 0  the rotation pivot becomes the geometry centroid or the transform's own
+		//                    translation column, so 'o' is a function of the placement it was
+		//                    measured at.
+		//   VMBASISPIVOT != 0 (and VMBASIS != 0) the same, for the reflection operator.
+		//
+		// Caught in review of this round's diff, not by testing - the shipped config is
+		// VMROTAXIS=1 VMROTPIVOT=0 VMBASIS=0, where all three hold and the replay is EXACT, so no
+		// run would have found it. Rather than document a caveat nobody would read at 3 a.m., the
+		// capture is REFUSED at those settings: m_scratch_defer_vm_op_valid stays false, the
+		// buffering site then refuses to hold the draw at all, and it takes the immediate path -
+		// bit-exact round-45 behaviour for that draw. Sized by vm_op_declined.
+		m_scratch_defer_is_viewmodel = true;
+
+		const bool vm_op_replayable =
+			remix_rsx::viewmodel_rotate_axis() < 4
+			&& remix_rsx::viewmodel_rotate_pivot() == 0
+			&& (remix_rsx::viewmodel_basis_flip() == 0 || remix_rsx::viewmodel_basis_pivot() == 0);
+
+		if (!vm_op_replayable)
+		{
+			++m_stats.defer_vm_op_declined;
+		}
+		else
+		{
+			const auto& P = vm_pre.matrix;
+			const auto& Q = transform.matrix;
+
+			const f64 c00 = static_cast<f64>(P[1][1]) * P[2][2] - static_cast<f64>(P[1][2]) * P[2][1];
+			const f64 c01 = static_cast<f64>(P[1][2]) * P[2][0] - static_cast<f64>(P[1][0]) * P[2][2];
+			const f64 c02 = static_cast<f64>(P[1][0]) * P[2][1] - static_cast<f64>(P[1][1]) * P[2][0];
+			const f64 det = static_cast<f64>(P[0][0]) * c00 + static_cast<f64>(P[0][1]) * c01
+				+ static_cast<f64>(P[0][2]) * c02;
+
+			if (std::abs(det) > 1e-9)
+			{
+				const f64 inv = 1.0 / det;
+
+				// adjugate/det, i.e. A_pre^-1, cofactors transposed.
+				const f64 ip[3][3] = {
+					{ c00 * inv,
+					  (static_cast<f64>(P[0][2]) * P[2][1] - static_cast<f64>(P[0][1]) * P[2][2]) * inv,
+					  (static_cast<f64>(P[0][1]) * P[1][2] - static_cast<f64>(P[0][2]) * P[1][1]) * inv },
+					{ c01 * inv,
+					  (static_cast<f64>(P[0][0]) * P[2][2] - static_cast<f64>(P[0][2]) * P[2][0]) * inv,
+					  (static_cast<f64>(P[0][2]) * P[1][0] - static_cast<f64>(P[0][0]) * P[1][2]) * inv },
+					{ c02 * inv,
+					  (static_cast<f64>(P[0][1]) * P[2][0] - static_cast<f64>(P[0][0]) * P[2][1]) * inv,
+					  (static_cast<f64>(P[0][0]) * P[1][1] - static_cast<f64>(P[0][1]) * P[1][0]) * inv }
+				};
+
+				bool finite = true;
+
+				for (u32 r = 0; r < 3; ++r)
+				{
+					f64 row[3]{};
+
+					for (u32 c = 0; c < 3; ++c)
+					{
+						for (u32 k = 0; k < 3; ++k)
+						{
+							row[c] += static_cast<f64>(Q[r][k]) * ip[k][c];
+						}
+					}
+
+					f64 off = static_cast<f64>(Q[r][3]);
+
+					for (u32 k = 0; k < 3; ++k)
+					{
+						off -= row[k] * static_cast<f64>(P[k][3]);
+					}
+
+					// isfinite on the NARROWED value, not on the f64. An f64 that is finite but
+					// larger than FLT_MAX becomes inf on the cast, and testing the wide form would
+					// have stored that inf with valid=true.
+					for (u32 c = 0; c < 3; ++c)
+					{
+						const f32 narrowed = static_cast<f32>(row[c]);
+						m_scratch_defer_vm_op[r][c] = narrowed;
+						finite = finite && std::isfinite(narrowed);
+					}
+
+					const f32 narrowed_off = static_cast<f32>(off);
+					m_scratch_defer_vm_op[r][3] = narrowed_off;
+					finite = finite && std::isfinite(narrowed_off);
+				}
+
+				m_scratch_defer_vm_op_valid = finite;
+
+				if (finite)
+				{
+					++m_stats.defer_vm_op_captured;
+				}
+				else
+				{
+					++m_stats.defer_vm_op_singular;
+				}
+			}
+			else
+			{
+				// The draw keeps its immediate placement; it simply opts out of the replay, which is
+				// the safe direction. Named rather than silent so a non-zero count is readable.
+				++m_stats.defer_vm_op_singular;
+			}
+		}
 	}
 
 	instance.mesh = it->second.handle;
@@ -23656,6 +24199,16 @@ void RemixGSRender::submit_subdraw()
 		{
 			++m_stats.defer_skipped_skinned;
 		}
+		// ROUND 46. A viewmodel draw whose operator could not be captured MUST NOT be held: the
+		// flush rebuilds the transform from fused/anchor and would submit the mesh without a
+		// correction it has no way to reconstruct - MEASURED drot = 1.46..1.99 units on this title,
+		// i.e. a visible teleport. It takes the immediate path instead, which is bit-exact round-45
+		// behaviour for that draw. Sized by vm_op_declined + vm_op_singular; no counter of its own,
+		// because those two already say WHY and this arm says nothing they do not.
+		else if (m_scratch_defer_is_viewmodel && !m_scratch_defer_vm_op_valid)
+		{
+			++m_stats.defer_spilled;
+		}
 		else if (m_deferred_instances.size() >= remix_rsx::defer_pre_anchor_max())
 		{
 			// Hard cap from the risk note: a pathological frame degrades to the old immediate path
@@ -23673,6 +24226,28 @@ void RemixGSRender::submit_subdraw()
 			held.color_target = m_scratch_defer_target;
 			held.clip_width = m_scratch_defer_clip_w;
 			held.clip_height = m_scratch_defer_clip_h;
+
+			// ROUND 47. Selects the flush's re-cross path. Carried rather than re-derived because the
+			// ladder's acceptance is what proves the cross is the right construction for this draw;
+			// re-testing it here would be a second, drifting copy of that decision.
+			held.used_projsplit = defer_projsplit_pending;
+
+			// ROUND 46. Carried by value with everything else, for the same reason: the flush rebuilds
+			// the transform and would otherwise submit a viewmodel draw with the world placement and
+			// none of its rotation. False on every non-viewmodel draw, which is the whole population
+			// before DEFERVIEWMODEL is armed, so this is a no-op at the old config.
+			held.has_vm_op = m_scratch_defer_vm_op_valid;
+
+			if (held.has_vm_op)
+			{
+				for (u32 r = 0; r < 3; ++r)
+				{
+					for (u32 c = 0; c < 4; ++c)
+					{
+						held.vm_op[r][c] = m_scratch_defer_vm_op[r][c];
+					}
+				}
+			}
 
 			// The extension chain, copied by value. Walked by sType rather than mirrored from the
 			// chaining sites above so a future extension cannot be silently dropped here without
@@ -23707,6 +24282,25 @@ void RemixGSRender::submit_subdraw()
 			{
 				deferred = true;
 				++m_stats.defer_buffered;
+
+				// ROUND 46. THE counter the play-test card turns on, and it is here rather than at
+				// the election site on purpose: this is the first line at which the draw is
+				// certainly held. Structurally 0 unless DEFERVIEWMODEL=1 and DEFERPREANCHOR=1 both,
+				// and it cannot count a draw that a later gate rejected.
+				if (held.has_vm_op)
+				{
+					++m_stats.defer_viewmodel;
+				}
+
+				// ROUND 47, same site and the same discipline. Kept SEPARATE from defer_viewmodel
+				// rather than folded into it: the two are equal only because this title happens to
+				// tag every proj_split draw as a viewmodel (MEASURED, proj_split_applied ==
+				// vm_tagged on 814/814 samples), and reading one as a proxy for the other is exactly
+				// the kind of scene-specific identity round 46 was burned by elsewhere.
+				if (held.used_projsplit)
+				{
+					++m_stats.defer_projsplit;
+				}
 			}
 			else
 			{
@@ -23790,7 +24384,13 @@ void RemixGSRender::submit_subdraw()
 
 	// Only geometry that survived every refusal and reached Remix may seed a persistent guest
 	// light. This keeps rejected auxiliary passes from leaving phantom lamps in the scene.
-	maybe_inject_guest_light(m_current_vp_hash, m_current_fp_hash, albedo_hash, transform);
+	// ROUND 48: is_viewmodel is the local computed for THIS draw earlier in this same function, so
+	// the light gate sees the same verdict the viewmodel tagging did. Deliberately not
+	// m_scratch_defer_is_viewmodel: that member is set inside the vm_op capture block and stays
+	// false at VIEWMODELCAM 0 and 1, which would make the gate silently inert at two reachable knob
+	// values - the exact defect shape rounds 46 and 47 both shipped.
+	maybe_inject_guest_light(m_current_vp_hash, m_current_fp_hash, albedo_hash, transform,
+		is_viewmodel);
 
 	if (static_entry && has_static_submit_signature)
 	{
@@ -25456,6 +26056,55 @@ void RemixGSRender::log_stats()
 			m_timing.mesh_create_buckets[3],
 			m_timing.mesh_create_buckets[4]);
 
+		// --- ROUND 46: the cost numbers, in the log that SURVIVES ---------------------------------
+		//
+		// 'Remix timing:' and 'Remix stats:' go only to bin\log\RPCS3.log, which rpcs3 TRUNCATES on
+		// its next launch. That is not a theoretical risk: the round-45 play-test's timing lines were
+		// destroyed four minutes after the session ended, when the user started rpcs3 again to
+		// install a DLC package - and deferred_instance=, the counter round 32 added for the sole
+		// purpose of pricing DEFERPREANCHOR, went with them. The round-46 brief asked "measure where
+		// the time actually goes" and the instrument for it no longer existed.
+		//
+		// Deliberately a NEW, SHORT line rather than a redirect of 'Remix timing:'. That line carries
+		// 30 arguments and this project has shipped an argument-ordering bug on a line of that size
+		// twice (rounds 18 and 19); nine fields that answer the cost question are worth more than a
+		// risky edit to a format string that is already audited. Read deferred_instance= against
+		// frame_ms= and defer/frame: buffering N POD structs cannot cost more than the submit it
+		// defers, and if deferred_instance is ~0 while frame_ms is large the deferral is not the cost
+		// and the next suspect is what it exposes - draw= minus its nine children, i.e. rest=.
+		{
+			const std::string line = fmt::format(
+				"Remix cost: frames=%llu frame_ms=%.2f draw=%.2f draw_instance=%.2f "
+				"deferred_instance=%.2f rest=%.2f other=%.2f | "
+				// The five defer fields are CUMULATIVE run totals, unlike the ms figures above which
+				// are per-frame averages over this window; defer/frame divides by m_frame_counter to
+				// put them on the same footing. Labelled here because reading a cumulative count as
+				// a windowed one is exactly how the "27.6 draws per frame" figure would be misread.
+				"defer/frame=%.2f buffered=%llu fresh=%llu flip=%llu vm=%llu",
+				m_timing.frames,
+				ms(m_timing.window),
+				ms(m_timing.draw),
+				ms(m_timing.draw_instance),
+				ms(m_timing.deferred_instance),
+				ms(m_timing.draw - std::min(m_timing.draw,
+					m_timing.ui + m_timing.mesh_create + m_timing.tex_bind + m_timing.uv
+					+ m_timing.draw_instance + m_timing.decode + m_timing.audit + m_timing.hash
+					+ m_timing.xform)),
+				ms(m_timing.window > m_timing.flip ? m_timing.window - m_timing.flip : 0),
+				static_cast<f64>(m_stats.defer_buffered) / static_cast<f64>(std::max<u64>(1, m_frame_counter)),
+				m_stats.defer_buffered,
+				m_stats.defer_flushed_fresh,
+				m_stats.defer_flushed_flip,
+				m_stats.defer_viewmodel);
+
+			rsx_log.notice("%s", line);
+
+			if (fs::file out{ fs::get_executable_dir() + "remix_dump.log", fs::write + fs::create + fs::append })
+			{
+				out.write(line + '\n');
+			}
+		}
+
 		// Which programs minted the window's mesh handles. Printed per frame so the number is
 		// directly comparable against the ~350 sub-draws a frame submits: a program at 30
 		// creates/frame is producing a brand-new BLAS for every one of its draws, every frame.
@@ -25766,6 +26415,11 @@ void RemixGSRender::log_stats()
 			// albedo trigger fired; capped non-zero is the shared-texture spam risk firing;
 			// mat_emissive is how many fixture materials are glowing.
 			"guest_lights=%llu guest_light_match=%llu guest_light_capped=%llu guest_light_toobig=%llu guest_light_reaped=%llu "
+			// ROUND 48, inserted BETWEEN reaped and mat_emissive - the arg list below is edited at
+			// the same position. vmref sizes the viewmodel refusal, unstable sizes the
+			// static-fixture refusal, cells is the staging table's occupancy against the 4096
+			// ceiling (at the ceiling, the prune is running every frame and the gate is degraded).
+			"guest_light_vmref=%llu guest_light_unstable=%llu guest_light_cells=%llu "
 			"mat_emissive=%llu | "
 			// Alpha to coverage: the two detection bits and the replay. ctrl/reg both 0 across a
 			// run is the negative verdict on the cutout theory, with bytes behind it.
@@ -25778,7 +26432,28 @@ void RemixGSRender::log_stats()
 			// defer_skinned and nectar_published, rather than appended at the end of the argument list
 			// - it belongs to the defer group and rounds 18/19 both shipped an ordering bug by
 			// appending. Its argument goes in the matching position below.
-			"defer_skinned=%llu defer_absent_declined=%llu nectar_published=%llu | "
+			"defer_skinned=%llu defer_absent_declined=%llu "
+			// ROUND 46: the tag-only viewmodel deferral, inserted against its OWN text between
+			// defer_absent_declined and nectar_published - the five arguments go in the matching
+			// position below and nowhere else.
+			//   defer_viewmodel  viewmodel draws ACTUALLY BUFFERED, counted at the buffering site.
+			//                    Structurally 0 unless DEFERVIEWMODEL=1 and DEFERPREANCHOR=1 both.
+			//   vm_op = captured / declined / singular / replayed. captured sizes the viewmodel
+			//                    population on any run; declined is the config values at which Op is
+			//                    not replayable (VMROTAXIS>=4, VMROTPIVOT!=0, VMBASISPIVOT!=0) and
+			//                    should be 0 at the shipped knobs; singular is a failed inverse;
+			//                    replayed is bounded above by defer_viewmodel and the gap is exactly
+			//                    the draws that reached flip.
+			"defer_viewmodel=%llu vm_op=%llu/%llu/%llu/%llu "
+			// ROUND 47. defer_projsplit = held / re-crossed fresh / kept stale. THE reading of this
+			// round: held > 0 says the cancellation at the proj_split acceptance branch is no longer
+			// throwing the population back out, and fresh/held says how much of it the flush could
+			// actually re-place. fresh + kept < held is expected and is not a leak - the residual is
+			// the draws whose anchor never landed and which went out through flush_deferred_at_flip.
+			// held == 0 with DEFERVIEWMODEL=1 and DEFERPREANCHOR=1 both armed means a THIRD gate
+			// exists downstream of this one, exactly as round 46's zero did.
+			"defer_projsplit=%llu/%llu/%llu "
+			"nectar_published=%llu | "
 			// Round 6, primary 1 - the untextured 41 per cent. shadowonly vs colorunit IS the verdict:
 			// colorunit ~0 means these draws sample nothing but depth buffers and should not be
 			// submitted as white surfaces at all; colorunit large means the walk was refusing
@@ -25972,7 +26647,7 @@ void RemixGSRender::log_stats()
 			// a run has to be able to say what it was launched with.
 			"glalbedos=%u glradiance=%.4g glradius=%.4g glradiusscale=%.4g glcolor=%d "
 			"glidle=%u glmax=%u emissive=%u emissiveint=%.4g emissiveper=%u "
-			"deferpreanchor=%d fpa2c=%u nectarmode=%u lightpass=%d "
+			"deferpreanchor=%d deferviewmodel=%d fpa2c=%u nectarmode=%u lightpass=%d "
 			// Round 6's knobs. Every one of these changes what a counter above means, and every
 			// one of them is a bisect step in the play-test card - so a run has to be able to
 			// state what it was launched with without anyone reading the launcher.
@@ -26226,6 +26901,9 @@ void RemixGSRender::log_stats()
 			m_stats.guest_light_capped,
 			m_stats.guest_light_toobig,
 			m_stats.guest_lights_reaped,
+			m_stats.guest_light_vm_refused,
+			m_stats.guest_light_unstable,
+			static_cast<u64>(m_guest_light_cells.size()),
 			m_textures.stats().materials_emissive,
 			m_stats.a2c_ctrl,
 			m_stats.a2c_reg,
@@ -26236,6 +26914,18 @@ void RemixGSRender::log_stats()
 			m_stats.defer_spilled,
 			m_stats.defer_skipped_skinned,
 			m_stats.defer_absent_declined,
+			// ROUND 46, in the matching position for
+			// "defer_viewmodel=%llu vm_op=%llu/%llu/%llu/%llu" = captured/declined/singular/replayed.
+			m_stats.defer_viewmodel,
+			m_stats.defer_vm_op_captured,
+			m_stats.defer_vm_op_declined,
+			m_stats.defer_vm_op_singular,
+			m_stats.defer_vm_op_replayed,
+			// ROUND 47, in the matching position for
+			// "defer_projsplit=%llu/%llu/%llu" = held/fresh/kept.
+			m_stats.defer_projsplit,
+			m_stats.defer_projsplit_fresh,
+			m_stats.defer_projsplit_kept,
 			m_stats.nectar_published,
 			m_stats.tex_none_shadowonly,
 			m_stats.tex_none_colorunit,
@@ -26386,6 +27076,8 @@ void RemixGSRender::log_stats()
 			static_cast<f64>(remix_rsx::emissive_intensity()),
 			remix_rsx::emissive_albedo_intensity_count(),
 			remix_rsx::defer_pre_anchor_enabled() ? 1 : 0,
+			// ROUND 46, in the matching position for "deferviewmodel=%d".
+			remix_rsx::defer_viewmodel_enabled() ? 1 : 0,
 			remix_rsx::fp_a2c_mode(),
 			remix_rsx::nectar_mode(),
 			remix_rsx::light_pass_census_enabled() ? 1 : 0,

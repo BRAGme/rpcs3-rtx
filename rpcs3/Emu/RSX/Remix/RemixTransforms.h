@@ -2038,6 +2038,42 @@ namespace remix_rsx
 	// defer_buffered. 0 reproduces round 31 exactly. INERT while DEFERPREANCHOR=0 (its current value).
 	bool defer_prev_only_enabled();
 
+	// --- ROUND 46 -------------------------------------------------------------------------------
+	// RPCS3_REMIX_DEFERVIEWMODEL=1: let a TAG-ONLY viewmodel draw into the pre-anchor deferral, i.e.
+	// gate the exclusion at RemixGSRender.cpp on viewmodel_PLACE instead of viewmodel_DRAW.
+	//
+	// The exclusion's own comment argues from PLACEMENT - "a viewmodel draw is placed relative to
+	// the weapon camera, so no world anchor for its render source will ever make it more correct".
+	// RPCS3_REMIX_VMTAGONLY=1 (this title's shipped value) removes exactly that premise: with the
+	// tag decoupled from the placement the draw IS a world draw, divided by the world gauge. Round
+	// 34 already corrected the twin gate on the tail-rescue ladder to viewmodel_place with this same
+	// argument (see ':17939'); this is that correction's missing sibling.
+	//
+	// MEASURED, round-45 play-test, 44,375 flips:
+	//   * every viewmodel pick reads ref=anchor_prev anchor_vp=ad7ce9d672a0bf6b - the WORLD program
+	//     one frame stale - 4/4, while all 15 world/prop picks read anchor or identity-bypass, 0/15
+	//     anchor_prev. That split is the user's split: props stable, arms and helmet wobbling.
+	//   * 'Remix albedo-trace:', 9,544 continuous samples with the camera free: ref=anchor gives a
+	//     translation residue of EXACTLY 0.000 on 5,622 of 5,622 draws, and ref=anchor_prev/camera
+	//     is displaced on 3,922 of 3,922. A fresh anchor is not merely better, it is exact.
+	//   * defer_fresh 867,086 of defer_buffered 874,746 = 99.1% of held draws DO get a fresh anchor
+	//     later in the same frame, so a held viewmodel draw is overwhelmingly likely to be flushed
+	//     against one rather than time out.
+	//   * the tail rescue is already armed for these draws (its gate is viewmodel_place) and never
+	//     succeeds: tail_rescued_cur + tail_rescued_aged = 0 of 131,774 attempts, 99,428 of them
+	//     failing 'same_ref'. No ALTERNATIVE EXISTING anchor helps. Only waiting for this frame's.
+	//
+	// The exclusion's second reason is real and is handled rather than relaxed: the flush recomputes
+	// the transform and does not re-run apply_viewmodel_basis / apply_viewmodel_rotation, so a
+	// deferred viewmodel draw would silently lose them. MEASURED this run: dbasis=0 (VMBASIS=0, the
+	// operator is inert) but drot = 1.46..1.99 units on every one of 3,293 census lines. The submit
+	// site therefore captures the composite world-space operator it applied, Op = post * pre^-1, and
+	// the flush replays it onto the re-divided transform. At the shipped VMROTPIVOT=0 the pivot is
+	// the eye, so Op does not depend on the placement it was measured at and the replay is exact.
+	//
+	// Default 0: bit-exact round-45 behaviour, so this is a one-line A/B.
+	bool defer_viewmodel_enabled();
+
 	// RPCS3_REMIX_FPA2C=1 (default): read the two alpha-to-coverage bits the RSX carries - the
 	// fragment shader control word's RSX_SHADER_CONTROL_ALPHA_TO_COVERAGE (gcm_enums.h:468) and
 	// NV4097_SET_ANTI_ALIASING_CONTROL's msaa_alpha_to_coverage - and replay them as an instance
@@ -2673,6 +2709,11 @@ namespace remix_rsx
 	// hunting hashes before any lighting improved at all. Dynamic - Remix promotes an instance to
 	// kUpdateBVH when the category is added or removed, so toggling mid-frame is handled.
 	bool smooth_normals_enabled();
+
+	// RPCS3_REMIX_GUESTLIGHTSTABLE=<frames>: a GUESTLIGHTAUTO candidate must re-appear in the same
+	// quantised cell on this many DISTINCT frames before it may create a light. 0 = off (round-41
+	// behaviour). Clamped to 600. Full derivation on the definition in RemixTransforms.cpp.
+	u32 guest_light_stable_frames();
 
 	// RPCS3_REMIX_SKYEXTENT=<units>: a draw that writes no depth, is anchored on the camera
 	// (sky_max_anchor) and spans at least this much in its widest axis *in world units* is the

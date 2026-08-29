@@ -1069,6 +1069,18 @@ private:
 		// and the two cannot be confused. RPCS3_REMIX_GUESTLIGHTLISTEXT=0 restores round 40.
 		u64 guest_light_toobig = 0;
 
+		// --- round 48 -------------------------------------------------------------------------
+		// AUTO candidates refused because the draw was the player's own viewmodel. Round 41's
+		// GUESTLIGHTAUTO=2 put lights on the arms/weapon and on soldiers; this counter sizes the
+		// first half. It counts REFUSALS, not draws, so it can exceed the number of fixtures.
+		u64 guest_light_vm_refused = 0;
+		// AUTO candidates that had not yet re-appeared in the same quantised cell on
+		// GUESTLIGHTSTABLE distinct frames. A walking NPC's glow card lands here every frame and
+		// never graduates; a bolted-down lamp graduates after N. 0 with GUESTLIGHTSTABLE non-zero
+		// and guest_lights also 0 means the population never REACHED the gate - look upstream at
+		// guest_light_match, not here.
+		u64 guest_light_unstable = 0;
+
 		// --- round 5: alpha-to-coverage (the cutout mechanism this backend never read) -----------
 		// Draws whose fragment shader control word carries RSX_SHADER_CONTROL_ALPHA_TO_COVERAGE,
 		// and draws with NV4097_SET_ANTI_ALIASING_CONTROL's alpha-to-coverage bit set. Both are
@@ -1102,6 +1114,63 @@ private:
 		// Non-zero here with DEFERPREANCHOR=0 is expected and harmless - the count is taken at the
 		// election, which runs regardless; it only changes behaviour when deferral is enabled.
 		u64 defer_absent_declined = 0;
+
+		// --- ROUND 46: the tag-only viewmodel population, and its operator replay -----------------
+		// A FUNNEL, and each stage is counted where it actually happens rather than where it is
+		// decided. Round 46's own review caught the first draft counting defer_viewmodel ~150 lines
+		// upstream of the arming gate, which made it non-zero at DEFERPREANCHOR=0 (where nothing is
+		// deferred at all) and left it over-counting against three cancellation sites and three
+		// submit-site rejections - inverting the reading its comment prescribed.
+		//
+		// vm_op_captured   : submit-site captures of Op = post * pre^-1, the composite of
+		//                    apply_viewmodel_basis and apply_viewmodel_rotation. Counted whether or
+		//                    not the draw is then deferred, and whether or not any knob is armed, so
+		//                    it sizes the viewmodel population per frame on ANY run.
+		// vm_op_declined   : viewmodel draws whose operator is NOT a placement-independent
+		//                    world-space left-multiply at the current knob values, so Op cannot be
+		//                    replayed onto a re-divided transform. VMROTAXIS >= 4 is a MODEL-space
+		//                    right-multiply (M' = M*R); VMROTPIVOT != 0 and VMBASISPIVOT != 0 derive
+		//                    the pivot from the placement itself. These draws are refused entry to
+		//                    the deferral and take the immediate path, i.e. exactly round-45
+		//                    behaviour. Non-zero at the shipped VMROTAXIS=1 VMROTPIVOT=0 VMBASIS=0
+		//                    would mean a knob moved.
+		// vm_op_singular   : captures abandoned because the pre-operator 3x3 would not invert, or the
+		//                    result did not survive the narrowing to f32. Same consequence as
+		//                    declined: no deferral, immediate path, nothing lost.
+		// defer_viewmodel  : viewmodel draws ACTUALLY BUFFERED, counted at the buffering site beside
+		//                    defer_buffered. Structurally 0 unless BOTH DEFERVIEWMODEL=1 and
+		//                    DEFERPREANCHOR=1, and it cannot count a draw that a later gate rejected.
+		//                    0 with both knobs armed means the route has no candidates and the
+		//                    diagnosis, not the plumbing, is wrong.
+		// vm_op_replayed   : flushes that re-applied a captured Op. Bounded above by defer_viewmodel;
+		//                    the gap is exactly the draws that timed out to flip, which keep the
+		//                    operator-corrected transform they already carried. A gap ~equal to
+		//                    defer_viewmodel means every held viewmodel draw reached flip and the
+		//                    knob changed nothing visible.
+		u64 defer_viewmodel = 0;
+		u64 defer_vm_op_captured = 0;
+		u64 defer_vm_op_declined = 0;
+		u64 defer_vm_op_singular = 0;
+		u64 defer_vm_op_replayed = 0;
+
+		// --- ROUND 47: the proj_split half of the deferral -----------------------------------------
+		// defer_projsplit      : draws BUFFERED that the proj_split rescue placed with a stale anchor.
+		//                        Counted at the buffering site beside defer_buffered, so like
+		//                        defer_viewmodel it cannot count a draw a later gate rejected.
+		//                        Structurally 0 unless DEFERVIEWMODEL=1 and DEFERPREANCHOR=1 both.
+		// defer_projsplit_fresh: flushes where the cross was REBUILT against the anchor that just
+		//                        landed and passed the same is_affine gate the ladder accepts on.
+		//                        This is the population whose placement actually improved.
+		// defer_projsplit_kept : flushes where the fresh cross was not constructible or failed that
+		//                        gate, so the draw KEPT the stale placement the ladder gave it. This
+		//                        arm is bit-exact round-46 behaviour for that draw - the change can
+		//                        never be worse than not deferring, only inert.
+		//                        fresh + kept == defer_projsplit is NOT an invariant: a draw whose
+		//                        anchor never lands goes out through flush_deferred_at_flip, which
+		//                        touches neither counter. The residual is exactly that population.
+		u64 defer_projsplit = 0;
+		u64 defer_projsplit_fresh = 0;
+		u64 defer_projsplit_kept = 0;
 
 		// --- round 5: nectar publish gate --------------------------------------------------------
 		// Flips on which haze.nectar_disruption was published as "1". 0 at NECTARMODE=0.
@@ -1841,8 +1910,13 @@ private:
 	// False when the light could not be created; the caller then just has no sun.
 	bool ensure_sun_light();
 	void reap_idle_guest_lights();
+	// ROUND 48: is_viewmodel is the caller's own per-draw viewmodel verdict (the local at the
+	// submit site, not m_scratch_defer_is_viewmodel - that one is gated on has_vm_op and reads
+	// false at VIEWMODELCAM 0/1, which would make this gate silently inert at two reachable knob
+	// values). It refuses the AUTO trigger only; an explicitly listed GUESTLIGHTALBEDO is the
+	// user's own instruction and is left alone.
 	void maybe_inject_guest_light(u64 vp_hash, u64 fp_hash, u64 albedo_hash,
-		const remixapi_Transform& transform);
+		const remixapi_Transform& transform, bool is_viewmodel);
 	void publish_nectar_disruption();
 
 	// Remix instance categories for one draw, from the albedo hash lists. Replaces the
@@ -2553,6 +2627,29 @@ private:
 	};
 
 	std::vector<guest_light_entry> m_guest_lights;
+
+	// --- ROUND 48: the static-fixture staging table --------------------------------------------
+	// Keyed by the SAME quantised-position hash the light itself uses, so a cell and its light are
+	// the same identity by construction and cannot drift apart.
+	//
+	// 'confirmed' is deliberately sticky and is the flicker half of the feature. Once a cell has
+	// proved itself static, a bulb that flickers off - loses its card, loses its light to
+	// GUESTLIGHTIDLE - and flickers back on re-lights on the first frame its card returns. Without
+	// stickiness any stability window longer than the flicker period would hold the bulb dark
+	// forever, which is precisely the symptom the feature exists to fix.
+	struct guest_light_cell
+	{
+		// Distinct frames this cell has been seen on. Saturates at the knob value; it is a
+		// graduation counter, not a census.
+		u32 frames_seen = 0;
+		// Guards the once-per-frame increment. A fixture drawn three times in one frame is one
+		// frame of evidence, not three - otherwise a single multi-pass draw confirms instantly and
+		// the gate measures draw count instead of time.
+		u64 last_frame = umax;
+		bool confirmed = false;
+	};
+
+	std::unordered_map<u64, guest_light_cell> m_guest_light_cells;
 	u64 m_guest_light_attempt_frame = umax;
 	u32 m_guest_light_attempts = 0;
 
@@ -2560,6 +2657,20 @@ private:
 	// here. Round 4 created four bulbs in the exact room the user called too dark and wrote them
 	// to rsx_log only, where nobody could read them until the emulator exited.
 	static constexpr u32 s_max_guest_light_lines = 128;
+
+	// --- ROUND 48: the staging table's ceiling and its quiet window ------------------------------
+	// The table is keyed on a quantised world position and the population it exists to REJECT is
+	// the one that mints a new key every frame, so it must be bounded or a walking NPC grows it for
+	// the whole session. 4096 cells is ~40x the GUESTLIGHTMAX of 128 and comfortably covers a level
+	// of real fixtures plus the transient trails in flight at any moment.
+	//
+	// The quiet window is what the prune retires: an UNCONFIRMED cell not seen for this many frames
+	// is a trail, not a fixture. It is deliberately much longer than any plausible
+	// GUESTLIGHTSTABLE so a fixture that is drawn intermittently - a bulb seen through a doorway,
+	// or one that flickers - accumulates its evidence across the gaps instead of being reset by
+	// them. Confirmed cells are never pruned at all.
+	static constexpr u32 s_max_guest_light_cells = 4096;
+	static constexpr u64 s_guest_light_cell_quiet = 900;
 	u32 m_guest_light_lines = 0;
 
 	bool m_nectar_disruption_seen = false;
@@ -2598,6 +2709,25 @@ private:
 
 		// For poisoning on a failed submit, exactly as the immediate path does.
 		u64 mesh_hash = 0;
+
+		// ROUND 46. The composite world-space operator the submit site applied to a VIEW_MODEL-tagged
+		// draw - apply_viewmodel_basis followed by apply_viewmodel_rotation - captured as
+		// Op = post * pre^-1 and stored in the SAME 3x4 row layout remixapi_Transform uses, so the
+		// replay below is the identical arithmetic those two operators perform and no matrix
+		// convention has to be re-derived. The flush recomputes the transform from fused/anchor and
+		// would otherwise drop the correction entirely: MEASURED drot = 1.46..1.99 units on all 3,293
+		// census lines of the round-45 play-test, so the loss would be a teleport, not a rounding
+		// difference. has_vm_op == false means "no operator ran", which is every non-viewmodel draw
+		// and any draw whose pre-operator basis would not invert.
+		f32 vm_op[3][4]{};
+		bool has_vm_op = false;
+
+		// ROUND 47. This draw was placed by the proj_split rescue (V_anchor x P_draw)^-1, not by the
+		// plain division, so the flush must rebuild it the same way against the anchor that just
+		// landed. Nothing else is stored: the cross is a pure function of 'fused' and the anchor's own
+		// 'fused', both of which the flush already holds, so there is no captured matrix here to drift
+		// from the construction in the ladder.
+		bool used_projsplit = false;
 	};
 
 	std::vector<deferred_instance> m_deferred_instances;
@@ -2606,12 +2736,33 @@ private:
 	// the submit path immediately after that call. The fused/object-space matrices and the source
 	// key travel beside it for the same reason.
 	bool m_scratch_defer_pending = false;
+
+	// ROUND 47. Set by the proj_split acceptance branch of the tail-rescue ladder when it placed the
+	// draw with a STALE anchor (cross_age != 0) and therefore left the deferral armed. It selects the
+	// flush's re-cross path: a proj_split draw failed the plain division by construction - the ladder
+	// only runs at that exit - so flushing it through 'fused * anchor.inverse' would hand it back the
+	// very residue the rescue removed. False on every other deferred draw.
+	bool m_scratch_defer_projsplit = false;
+
 	remix_rsx::mat4 m_scratch_defer_fused{};
 	remix_rsx::mat4 m_scratch_defer_object_space{};
 	u32 m_scratch_defer_surface = 0;
 	u32 m_scratch_defer_target = 0;
 	u32 m_scratch_defer_clip_w = 0;
 	u32 m_scratch_defer_clip_h = 0;
+
+	// ROUND 46. Same lifetime and the same reason as the fields above, but written LATER in the
+	// draw - per_draw_transform cannot know it, because the two viewmodel operators run at the
+	// submit site after the tag is decided. Cleared at the top of per_draw_transform so a refused or
+	// non-viewmodel draw can never inherit the previous draw's operator.
+	f32 m_scratch_defer_vm_op[3][4]{};
+	bool m_scratch_defer_vm_op_valid = false;
+
+	// True for any draw that ran the viewmodel operator block, whether or not the operator capture
+	// succeeded. The buffering site needs BOTH: '_is_viewmodel && !_vm_op_valid' is the one
+	// combination that must never be deferred, because the flush would rebuild the transform and
+	// submit the mesh without a correction it cannot reconstruct.
+	bool m_scratch_defer_is_viewmodel = false;
 
 	// Submits every buffered instance whose source key matches, re-divided by 'anchor'. Called from
 	// capture_gauge_anchor the moment a frame's anchor for that source lands.
