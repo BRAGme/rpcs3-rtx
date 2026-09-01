@@ -1,0 +1,109 @@
+RPCS3 with a native RTX Remix render backend
+============================================
+
+This build submits PlayStation 3 geometry to the RTX Remix runtime through the
+Remix API, so a PS3 title is path traced rather than rasterised. It is a research
+build, not a product. Read the "What works" section before filing anything.
+
+Source and full documentation:
+  https://github.com/BRAGme/rpcs3-rtx
+
+
+TWO THINGS ARE NOT IN THIS ZIP AND IT WILL NOT RUN WITHOUT THEM
+---------------------------------------------------------------
+
+1. THE REMIX PLUS RUNTIME.
+
+   This backend does NOT work with the stock NVIDIA RTX Remix runtime. Stock is
+   on the 0.6.x API line; this build needs the Remix Plus fork, which reserves
+   REMIXAPI_VERSION_MINOR = 1000. The version handshake rejects stock outright.
+
+   Get it here:
+     https://github.com/RemixProjGroup/dxvk-remix   (maintainer: Kim2091)
+     Release tag: remix-plus-1.5.1
+     Asset:       Remix_Plus_v1.5.1_x64_games_release.zip
+
+   Unzip it into a subfolder called  remix\  next to rpcs3.exe:
+
+     rpcs3.exe
+     remix\d3d9.dll
+     remix\...
+
+   DO NOT put d3d9.dll directly beside rpcs3.exe. Anything else in the process
+   that resolves that name would pick it up. The subfolder is mandatory, not a
+   convention. If you keep the runtime elsewhere, set RPCS3_REMIX_DLL to the
+   full path of its d3d9.dll instead.
+
+   It is not bundled here because that folder contains third-party redistributables
+   (nvngx_dlss*.dll, cudart64_13.dll, GFSDK_Aftermath, libxess.dll,
+   amd_fidelityfx_vk.dll) with their own terms, inside someone else's fork build.
+   Get it from the people who made it.
+
+2. PS3 FIRMWARE. Same as stock RPCS3 -- install it yourself from a PS3UPDAT.PUP
+   you own. No firmware, games or keys are included or ever will be.
+
+
+ENABLING THE BACKEND
+--------------------
+
+  Settings -> GPU -> Renderer -> RTX Remix
+
+There is also a Settings -> RTX Remix tab for the backend's own knobs. Every knob
+also has an RPCS3_REMIX_* environment variable, which always wins over the GUI.
+The full table is in docs/remix/KNOBS.md in the repository.
+
+Per-title configs for a few titles ship in config\custom_configs\ and apply
+automatically when you run those titles.
+
+
+WHAT WORKS, AND WHAT DOES NOT
+-----------------------------
+
+Three titles have been run. They are not equally exercised, so what each one
+actually establishes is listed rather than a "works / doesn't" verdict.
+
+  Resistance 2 (NPEA00431)  -- the primary development title, and where nearly
+    every measurement comes from: camera recovery from vertex-program ucode,
+    world transforms, texcoords and albedo, both skinning families, per-draw
+    blend state, sky classification, 2D UI compositing.
+
+  Haze (BLUS30094)          -- a second, structurally different engine. It skins
+    on the SPU, so vertices reach RSX already animated, and it has no 'layered'
+    vertex programs at all. Matching ADD's src2 constant here recovered 71% of
+    world transforms that had been drawing at identity. This title is the
+    evidence the ucode approach is not fitted to one game.
+
+  Minecraft: PS3 Edition (NPUB31419) -- camera parity, quantised chunk meshes,
+    and the texture-cache design. Texture identity is descriptor-only rather
+    than content-sampled because of a measurement here: content-rehashing
+    dragged mesh creation from 5,881 creates / 887 live to 188,427 / 31,793
+    over 9,120 frames, because the albedo hash folds into the mesh key.
+
+Not working / known bad:
+  - A subset of draws still lands at runaway positions and reads as white shards.
+  - Frame rate swings hard with view complexity: ~55 fps in a bounded interior,
+    ~12 fps on a wide outdoor draw list.
+  - Haze's shadow-receiving draws land untextured. They bind a 2048x2048 DEPTH16
+    shadow map on the lowest referenced texture unit and the ucode names no
+    albedo unit, so 55,360 draws in one capture reached Remix with no texture.
+    Commit 0d3d3517 walks past that refusal and IS in this build, but it is
+    build-verified and NOT run-verified. RPCS3_REMIX_RETRYUNSUP=0 reverts it.
+  - Only these three titles have ever been run. Anything not named above is
+    untested, which is not the same as broken.
+  - Keyboard input is dead under Remix unless rtx.useNewGuiInputMethod = False
+    is set in rtx.conf. Controllers are unaffected.
+
+The repository README is honest about the rest and cites the measurements.
+
+
+BUILD PROVENANCE
+----------------
+
+  rpcs3.exe built from  BRAGme/rpcs3-rtx  branch remix-backend, commit @GIT_SHORT@,
+  reporting @GIT_REV@.
+  Everything here is buildable from that commit; see BUILDING.md in the repo,
+  and the "Known traps on Windows" section of the README, which will save you
+  the four failures we hit.
+
+RPCS3 is GPL-2.0. This is a modified fork; the complete corresponding source is
+the repository linked at the top.

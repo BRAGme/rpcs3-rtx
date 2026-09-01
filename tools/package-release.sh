@@ -6,6 +6,8 @@ set -euo pipefail
 
 BIN="${1:?usage: package-release.sh <bin dir> <staging dir>}"
 OUT="${2:?usage: package-release.sh <bin dir> <staging dir>}"
+# Repo root, resolved from this script rather than the caller's cwd.
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
 rm -rf "$OUT"
 mkdir -p "$OUT"
@@ -49,4 +51,48 @@ for d in dev_bdvd dev_flash dev_flash2 dev_flash3 dev_hdd0 dev_hdd1 \
   mkdir -p "$OUT/$d"
 done
 
+# --- SETUP.txt ------------------------------------------------------------
+# The zip's own instructions. This was hand-written and hand-added for preview 1, so the
+# packaging step could not reproduce its own output: a second release cut with this script
+# alone would have shipped without it. Templated now -- prose in tools/SETUP.txt.in, and only
+# the volatile build-provenance line substituted here, so it cannot drift from the build it
+# ships beside.
+GIT_SHORT="$(git -C "$REPO" rev-parse --short=8 HEAD)"
+GIT_REV="$(git -C "$REPO" describe --tags 2>/dev/null || echo "$GIT_SHORT")"
+sed -e "s/@GIT_SHORT@/$GIT_SHORT/g" -e "s/@GIT_REV@/$GIT_REV/g" \
+    "$REPO/tools/SETUP.txt.in" > "$OUT/SETUP.txt"
+
 echo "staged: $(find "$OUT" -type f | wc -l) files, $(du -sh "$OUT" | cut -f1)"
+
+# --- the distributable zip ------------------------------------------------
+# Everything lives under a single top-level rpcs3-rtx-remix/ folder, so extracting the zip
+# cannot scatter hundreds of files across whatever directory the user was in. This wrapping
+# was also done by hand for preview 1 and is now part of the script.
+#
+# Git Bash on Windows ships no `zip`, so 7-Zip is a fallback rather than a hard failure.
+ZIP_NAME="rpcs3-rtx-remix-$GIT_SHORT-win64.zip"
+ZIP_PATH="$(cd "$(dirname "$OUT")" && pwd)/$ZIP_NAME"
+SEVENZIP=""
+if command -v 7z >/dev/null 2>&1; then
+  SEVENZIP="7z"
+elif [ -x "/c/Program Files/7-Zip/7z.exe" ]; then
+  SEVENZIP="/c/Program Files/7-Zip/7z.exe"
+fi
+
+if command -v zip >/dev/null 2>&1 || [ -n "$SEVENZIP" ]; then
+  WRAP="$(dirname "$OUT")/.pkgwrap"
+  rm -rf "$WRAP"
+  mkdir -p "$WRAP"
+  cp -r -- "$OUT" "$WRAP/rpcs3-rtx-remix"
+  rm -f "$ZIP_PATH"
+  if command -v zip >/dev/null 2>&1; then
+    ( cd "$WRAP" && zip -qr "$ZIP_PATH" rpcs3-rtx-remix )
+  else
+    ( cd "$WRAP" && "$SEVENZIP" a -tzip -bso0 -bsp0 "$ZIP_PATH" rpcs3-rtx-remix )
+  fi
+  rm -rf "$WRAP"
+  echo "zipped: $ZIP_PATH ($(du -h "$ZIP_PATH" | cut -f1))"
+else
+  echo "zip: SKIPPED -- neither 'zip' nor 7-Zip found. Staged tree is at $OUT;"
+  echo "     archive it yourself with a single top-level rpcs3-rtx-remix/ folder."
+fi
