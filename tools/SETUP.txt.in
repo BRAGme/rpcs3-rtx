@@ -52,7 +52,27 @@ There is also a Settings -> RTX Remix tab for the backend's own knobs. Every kno
 also has an RPCS3_REMIX_* environment variable, which always wins over the GUI.
 The full table is in docs/remix/KNOBS.md in the repository.
 
-Per-title configs for a few titles ship in config\custom_configs\ and apply
+PER-GAME REMIX PROFILES, new in preview 2. A file named <TITLEID>.conf next to
+rpcs3.exe is read once at backend init and pushed into the environment before any
+knob is read. BLUS30094.conf ships here: 217 measured settings for Haze that until
+now existed only in a launcher script on the developer's machine and reached nobody
+who downloaded a build. If you played preview 1 and wondered why it looked worse
+than the screenshots, this is why.
+
+A variable already set in your environment always beats the file, so a launcher
+script still overrides it and an A/B harness stays authoritative.
+
+The load is reported in remix_dump.log as a line beginning "Remix game-config:",
+naming the file, how many keys it applied, how many it skipped because they were
+already set, and how many it ignored. If a setting seems to do nothing, read that
+line first -- and note the config is read ONCE, so changing it needs a restart.
+
+Writing one for another title is the single most useful thing you can contribute.
+See CONTRIBUTING.md in the repository; you do not need git, and the one rule is to
+label which numbers you measured and which you guessed.
+
+RPCS3's own per-title configs in config\custom_configs\ are separate and still ship
+for a few titles, applying
 automatically when you run those titles.
 
 
