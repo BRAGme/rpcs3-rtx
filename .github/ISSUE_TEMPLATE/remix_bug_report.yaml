@@ -1,0 +1,78 @@
+name: Remix backend bug
+description: Something renders wrong, crashes, or behaves oddly with the RTX Remix backend
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Check this first:** does it also happen with the Remix backend turned off? If it does, it
+        is an upstream RPCS3 issue and they can help you far better than we can.
+
+  - type: input
+    id: game
+    attributes:
+      label: Game and title ID
+      placeholder: "Haze — BLUS30073"
+    validations:
+      required: true
+
+  - type: input
+    id: build
+    attributes:
+      label: Build
+      description: "The version this fork reports, or the commit you built from."
+      placeholder: "remix-preview-1"
+    validations:
+      required: true
+
+  - type: input
+    id: runtime
+    attributes:
+      label: Remix runtime
+      description: "Which dxvk-remix build is in your `remix\\` folder. Right-click `d3d9.dll` → Properties → Details → Product name."
+      placeholder: "dxvk-remix (remix-main+abbae23d)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens
+      description: What you see, and what you expected instead. Screenshots or a short clip help far more than a description — most of the faults in this backend are motion defects that a still cannot show.
+    validations:
+      required: true
+
+  - type: input
+    id: camlock
+    attributes:
+      label: The `camlock=` value from the first ten lines of `remix_dump.log`
+      description: |
+        This one line decides whether your report is measurable. `camlock=0000000000000000` means the
+        launcher never ran, so no knob was set, the camera pin was absent, and nothing in that session
+        reflects the intended configuration. Paste the value even if it is zeros — it is not a mistake
+        on your part, it just changes what the log means.
+      placeholder: "camlock=7f3d3abcefc8b057"
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Logs
+      description: |
+        Two files, and they carry different things:
+
+        - `remix_dump.log` next to the executable — the backend's own per-frame output, readable while
+          the emulator is running.
+        - `log/RPCS3.log` — carries the `Remix stats:` and `Remix timing:` lines, and is locked while
+          the emulator runs, so grab it after closing.
+
+        Attach both if you can.
+      render: shell
+
+  - type: textarea
+    id: knobs
+    attributes:
+      label: Which `RPCS3_REMIX_*` variables were set
+      description: "Paste your launcher script or the environment you ran with. A variable that is already set beats every other source, so this is often the whole explanation."
+      render: shell

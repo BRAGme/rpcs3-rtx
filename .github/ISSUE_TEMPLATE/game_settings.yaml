@@ -1,0 +1,66 @@
+name: Settings that worked for a title
+description: Share the RPCS3_REMIX_* knob set you found for a game, so the next person does not start from nothing
+labels: ["config", "untested title"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Only one title has had real work done on it. Anything you find on a second game is new ground,
+        and a knob set that gets a title rendering at all is worth more than it looks.
+
+        Note this fork has **no per-game config file** — settings come through `RPCS3_REMIX_*`
+        environment variables, usually from a launcher script. So paste the launcher, not a `.conf`.
+
+        **One rule:** only state numbers you actually measured on that title. A guess labelled as a
+        measurement is worse than no measurement, because the next person tunes against it and cannot
+        tell. "I tried values until it looked right" is a perfectly good and useful answer — just say
+        that rather than implying a measurement.
+
+  - type: input
+    id: game
+    attributes:
+      label: Game and title ID
+      placeholder: "Uncharted: Drake's Fortune — BCUS98103"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: state
+    attributes:
+      label: How far does it get?
+      options:
+        - Renders the world, broadly correct
+        - Renders, but the camera or anchoring is wrong
+        - Renders something, mostly wrong
+        - Boots but submits nothing
+        - Crashes or hangs
+    validations:
+      required: true
+
+  - type: textarea
+    id: knobs
+    attributes:
+      label: The launcher / environment
+      description: "Paste the whole thing. The comments explaining why a value is what it is are the valuable part."
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: measured
+    attributes:
+      label: What did you measure, and what did you tune by eye?
+      description: |
+        Be specific and it will be taken at face value. "I read the FOV off the log's own camera line;
+        the radiance value I just turned up until it looked right" is exactly the right level of detail.
+    validations:
+      required: true
+
+  - type: input
+    id: camlock
+    attributes:
+      label: The `camlock=` value from your run
+      description: "From the first ten lines of `remix_dump.log`. If it is all zeros the launcher did not run and none of the knobs above were actually applied."
+      placeholder: "camlock=7f3d3abcefc8b057"
+    validations:
+      required: true

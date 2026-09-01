@@ -12,6 +12,12 @@ view-projection is folded into whatever constant slots the game's own vertex pro
 use. Recovering it is the central problem this fork solves -- see
 [How the camera is recovered](#how-the-camera-is-recovered).
 
+Trying a game, or want to share the settings that got one working? [CONTRIBUTING.md](CONTRIBUTING.md)
+covers it -- essentially all the work so far has been on one title, so anything you learn on a second
+is new ground. The project is discussed in the
+[PCSX2/Remix thread](https://discord.com/channels/1028444667789967381/1535734598317637782) on the RTX
+Remix Showcase Discord -- [join here](https://discord.gg/j6sh7JD3v9) if that link does not open.
+
 The sibling project is [pcsx2-rtx-remix](https://github.com/BRAGme/pcsx2-rtx-remix), the same idea
 for PlayStation 2. The consoles need genuinely different techniques (VU1 microcode back-slicing
 there, vertex-program fingerprinting here), so the two READMEs are worth reading together if you
