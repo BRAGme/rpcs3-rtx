@@ -582,6 +582,7 @@ target_sources(rpcs3_emu PRIVATE
 if(WIN32)
     target_sources(rpcs3_emu PRIVATE
         RSX/Remix/RemixCompositor.cpp
+        RSX/Remix/RemixGameConfig.cpp
         RSX/Remix/RemixGSRender.cpp
         RSX/Remix/RemixRuntime.cpp
         RSX/Remix/RemixTextures.cpp

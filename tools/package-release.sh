@@ -45,6 +45,14 @@ cp -r -- "$BIN/GuiConfigs/light" "$OUT/GuiConfigs/light"
 mkdir -p "$OUT/config/custom_configs"
 cp -- "$BIN/config/custom_configs/"config_*.yml "$OUT/config/custom_configs/"
 
+# --- per-game Remix profiles (<TITLEID>.conf) ----------------------------
+# Read once at backend init, before any knob latches; see RemixGameConfig.h. These are the
+# settled per-title configuration that used to live in a launcher script and therefore never
+# reached anyone but the developer, which is most of what a build is worth on this fork.
+for c in "$BIN"/[A-Z][A-Z][A-Z][A-Z][0-9][0-9][0-9][0-9][0-9].conf; do
+  [ -e "$c" ] && cp -- "$c" "$OUT/$(basename "$c")"
+done
+
 # --- directories rpcs3 expects to exist ----------------------------------
 for d in dev_bdvd dev_flash dev_flash2 dev_flash3 dev_hdd0 dev_hdd1 \
          dev_usb000 games savestates shaderlog sounds ppu_progs spu_progs; do

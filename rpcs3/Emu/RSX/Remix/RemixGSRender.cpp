@@ -13,6 +13,7 @@
 #include "Emu/Memory/vm_locking.h"
 #include "Emu/RSX/Common/BufferUtils.h"
 #include "Emu/RSX/Program/ProgramStateCache.h"
+#include "Emu/RSX/Remix/RemixGameConfig.h"
 #include "Emu/RSX/Remix/RemixVertexDecode.h"
 #include "Emu/RSX/Overlays/overlay_manager.h"
 #include "Emu/RSX/Overlays/overlays.h"
@@ -734,6 +735,13 @@ void RemixGSRender::on_init_thread()
 	GSRender::on_init_thread();
 
 #ifdef _WIN32
+	// FIRST, before anything reads a knob. Nearly every accessor in this backend is a
+	// static const latched on first call, so a per-game config applied any later would be a
+	// silent no-op. This therefore precedes both m_remix.initialize() -- which reads
+	// RPCS3_REMIX_DLL -- and the run-start banner below, which reads dozens of knobs in order
+	// to print them. See RemixGameConfig.h for why load-once is the right shape here.
+	dump_line(remix_rsx::load_game_config());
+
 	// Init, submit and present all have to happen on this thread.
 	if (!m_frame)
 	{
