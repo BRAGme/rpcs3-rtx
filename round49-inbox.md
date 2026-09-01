@@ -1,3 +1,68 @@
+# READ THIS BEFORE THE REST OF THIS FILE — it was written before the play-test
+
+The round-48 play-test came back as **"the entire area is warping like crazy"**, and everything below the
+horizontal rule was written before that. Two things in it are now WRONG:
+
+1. **`DRAWAUDIT=0` did NOT ship and is NOT armed.** It is back at 1. Do not read the section below as
+   describing the deployed state.
+2. **The exe below is stale.** Deployed is now **`8F2BA918B753840E`**.
+
+**THE WARPING WAS NOT `DRAWAUDIT=0`. The launcher never ran.** MEASURED from that run's own first line:
+`camlock=0000000000000000`, plus `emissive=0 watchlist=0 projsplit=0 vmtagonly=0 hidepairvp=0
+glradiance=30 glmax=64 deferviewmodel=0` — **every knob at its built-in default**. The emulator was started
+directly from the exe or the GUI, so `CAMLOCKVP` was never set, the camera pin was gone, and election ran
+unconstrained: `cam_fallback` was **43.5%** of frames (1071/2464) against **3.5%** (2945/83019) in the
+healthy round-47 run. That is the FOV 114.6 / near-far 3.7-6.1 camera.
+
+**FIRST THING EVERY ROUND, before reading any counter:** check `camlock=` in the first ten lines of
+`binemix_dump.log`. `7f3d3abcefc8b057` = the launcher ran and the run is valid. `0000000000000000` = it
+did not, **nothing is armed, and no measurement from that session means anything.**
+
+**The audit feeds nothing the camera reads.** Every reader of `m_streak_*`, `m_world_extent_median` and
+`audit_vertex_extent`'s outputs was enumerated: the `SKIPEXTENTVP` gate, `extent_plausible`, `VTXREFUSE`
+(off), `shape_key`, and census/`note_watch` sites. **None is camera election, `cam_clipgate`, or a near/far
+derivation.** One real round-48 error was found — the claim that `audit_world_extent` has no `return false`
+came from an `awk` window that stopped 15 lines short of the only one — but that path is guarded by
+`wext_refused` and is structurally unreachable at the shipped `STREAKGATE=0`, so the conclusion held. It held
+by luck. **Bound a search by the function, not by a line count.**
+
+## What is deployed now — `8F2BA918B753840E`
+
+| artefact | SHA256 (first 16) |
+| --- | --- |
+| `binpcs3.exe` = `binpcs3-next.exe` | **`8F2BA918B753840E`** |
+| `binemix\d3d9.dll` | `16A0B512F33EBB66` (unchanged, not opened) |
+
+MSBuild exit 0, 0 errors, one pre-existing C4723 moved `:11922` → `:12031`. **Zero new warnings.**
+**HEAD moved between sessions:** round 48 is committed as `2dca174d4`. I did not commit it.
+
+**Newly armed this round — one mechanism:**
+* `RPCS3_REMIX_CAMSANITY=0` (`:1654`) — **census only.** `remixapi`'s `SetupCamera` validates nothing, so a
+  degenerate/ortho UI matrix that wins the election becomes a live world camera *in silence*. This names it
+  on `Remix camera-sanity: INSANE ...` and counts `cam_insane=`, and **still submits it**. `=1` refuses.
+  Shipped off because round 48 shipped a behaviour change on an argument and it cost a play-test.
+* `RPCS3_REMIX_CAMSANITYTOL=0.5` (`:1660`) — FOV deviation from a reference latched as the median of the
+  first 120 resolved frames. Set by two measurements: the failure is 72.0 to 114.6 (+59%, caught), an ADS is
+  72 to ~50 (-31%, must not trip).
+* **Observability fixes:** `run-start` now prints `glstable= glidle= drawaudit= camsanity= camsanitytol=`,
+  and **`glauto=` now prints the MODE** — it was a bool, so round 48's mode 2 printed as `glauto=1`,
+  indistinguishable from mode 1, the rule that put lights on doors.
+
+**Watch on the next play-test:** `cam_insane=` should be 0 or very small in a healthy run. If it climbs while
+the picture looks fine, **raise `CAMSANITYTOL`; do not arm `CAMSANITY`.** Also check the one-off
+`camera-sanity: latched ref_fov=` line — Haze's value is ~72, and a reference latched during a menu would
+disarm the gate for the whole run.
+
+**`DRAWAUDIT` stays at 1 and was NOT re-armed.** It has still never been observed in a run that applied the
+launcher. Next round: launch from the launcher, confirm `drawaudit=1` in line 1, flip to 0, confirm
+`drawaudit=0`, *then* read the timing line. The 35.5% is still there to reclaim.
+
+**Round 48's lights are still UNJUDGED** — `GUESTLIGHTAUTO=2`, `GUESTLIGHTSTABLE=30`, `GUESTLIGHTIDLE=4`,
+`STATICINDEXBUDGET=512` and `DEFERVIEWMODEL=1` all remain armed. The play-test could not evaluate them
+because the camera made the scene unreadable *and* because the launcher's values were never applied.
+
+---
+
 # Round 49 inbox — RPCS3 RTX Remix backend, Haze (BLUS30094)
 
 Written at the close of round 48, 2026-08-29. Branch `remix-backend`.

@@ -1072,37 +1072,40 @@ private:
 		// quantised cells, i.e. it walked. Counted rather than only logged, so a run can be judged
 		// without grepping: this climbing while guest_light lines stay flat is the gate working.
 		u64 guest_light_moving = 0;
-		
-		// --- ROUND 50: the silent returns --------------------------------------------------
-		// Every counter that existed measured a path that was not the problem. Standing in a lit
-		// room the log said match=31845, unstable=111, capped=0, toobig=0, vmref=0 and
-		// guest_lights=0 -- thirty-one thousand candidates gone with no counter naming where.
-		// maybe_inject_guest_light() has seven returns and only three were instrumented, so the
-		// loss was structurally invisible. These are the other four.
-		
-		// The per-frame attempt cap (4) turning a candidate away.
+		// ROUND 50: the two SILENT drops on the path from "matched" to "a light exists".
+		// 31,845 matches produced 0 live lights and neither of these had a counter, so the
+		// loss was invisible: guest_light_budget is the per-frame attempt cap (4) turning a
+		// candidate away, guest_light_createfail is remixapi CreateLight refusing it. Without
+		// these two, "matched but no light" has no explanation anywhere in the log.
 		u64 guest_light_budget = 0;
-		// remixapi CreateLight refusing one. Previously this had no else branch at all, so a run
-		// where the runtime rejected every light looked identical to one where none was tried.
 		u64 guest_light_createfail = 0;
-		// Survived every gate and reached the cap/budget stage. Splits "the gates ate them" from
-		// "something past the gates ate them" in one run, which is what localised this.
+		// ROUND 50 probe: candidates that survived every gate and reached the cap/budget stage.
+		// match=4956 with created=0, budget=0 and createfail=0 is only consistent with nothing
+		// arriving here at all, which localises the loss to the gates above rather than to the
+		// budget or the runtime. This counter is what tells the two halves apart.
 		u64 guest_light_reached = 0;
-		// The AUTO path size test. guest_light_toobig guards only the EXPLICIT-list path, so an
-		// auto candidate rejected purely on extent was indistinguishable from one no rule wanted.
+		// ROUND 50: the AUTO path size test, which had no counter -- guest_light_toobig guards only
+		// the explicit-list path. GUESTLIGHTMAXEXT is 6 while this title draws the bulb at ext=8.304
+		// under one of its two vertex programs, so this is the prime suspect for 5,439 candidates
+		// disappearing between match and the cap stage.
 		u64 guest_light_autobig = 0;
-		// Neither an accepted explicit trigger nor an auto candidate, for a reason other than
-		// size -- in practice most of the scene, which is why it is large and not a fault.
+		// Neither an accepted explicit trigger nor an auto candidate, for a reason other than size.
 		u64 guest_light_notrigger = 0;
-		// A source the motion gate condemned on an earlier frame. guest_light_moving counts the
-		// ONE frame of condemnation; this counts every draw turned away afterwards. Without the
-		// pair, a correctly-suppressed emitter and a starved pipeline look the same.
+		// A source already disqualified by the motion gate on an earlier frame. guest_light_moving
+		// counts the ONE frame it was condemned; this counts every draw it is turned away after.
 		u64 guest_light_movingrepeat = 0;
 
 		// --- round 48 -------------------------------------------------------------------------
 		// AUTO candidates refused because the draw was the player's own viewmodel. Round 41's
 		// GUESTLIGHTAUTO=2 put lights on the arms/weapon and on soldiers; this counter sizes the
 		// first half. It counts REFUSALS, not draws, so it can exceed the number of fixtures.
+		// --- round 49 -------------------------------------------------------------------------
+		// Cameras whose vertical FOV deviated from the title's own latched reference by more than
+		// CAMSANITYTOL, or whose projection is degenerate. At the shipped CAMSANITY=0 these are
+		// COUNTED AND STILL SUBMITTED, so a non-zero value is a diagnosis and not a refusal.
+		// cam_insane climbing while the scene looks correct means the tolerance is too tight -
+		// widen it before ever arming the refusal.
+		u64 cam_insane = 0;
 		u64 guest_light_vm_refused = 0;
 		// AUTO candidates that had not yet re-appeared in the same quantised cell on
 		// GUESTLIGHTSTABLE distinct frames. A walking NPC's glow card lands here every frame and
@@ -2704,6 +2707,19 @@ private:
 	};
 
 	std::unordered_map<u64, guest_light_source> m_guest_light_sources;
+
+	// --- ROUND 49: the camera FOV reference ------------------------------------------------------
+	// Absolute FOV limits cannot separate "an ortho UI matrix won the election" from "this title
+	// uses a wide angle", so the reference is the TITLE'S OWN early history: the median vertical FOV
+	// of the first s_cam_fov_warmup resolved frames, latched once and never moved afterwards.
+	// Latched rather than tracked so a run of bad cameras cannot drag the reference onto itself,
+	// which is the failure that would silently disarm the gate exactly when it is needed.
+	std::vector<f32> m_cam_fov_warmup;
+	f32 m_cam_fov_ref = 0.f;
+	bool m_cam_fov_latched = false;
+	u32 m_cam_insane_lines = 0;
+	static constexpr u32 s_cam_fov_warmup = 120;
+	static constexpr u32 s_max_cam_insane_lines = 64;
 	u64 m_guest_light_attempt_frame = umax;
 	u32 m_guest_light_attempts = 0;
 

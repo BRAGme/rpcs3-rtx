@@ -779,7 +779,18 @@ void RemixGSRender::on_init_thread()
 			// Round 6. On the banner as well as the live line because these are the knobs the
 			// play-test bisects with, and a run launched with the wrong one has to say so in its
 			// first ten lines rather than 8000 lines in.
-			"notexmat=%d skipshadowonly=%d walksampled=%d tailrescue=%d tailrescueage=%u glauto=%d "
+			// ROUND 49: glauto now prints the MODE, not a bool. It was fed
+			// `guest_light_auto_enabled() ? 1 : 0`, so mode 2 - the glow-card rule, the whole point
+			// of round 48 - printed as `glauto=1` and was INDISTINGUISHABLE FROM MODE 1, which is
+			// the rule that put lights on doors. Round 41's own notes record being confused by
+			// exactly this and it was never fixed.
+			//
+			// drawaudit and camsanity are added because DRAWAUDIT had NO field anywhere in the log.
+			// Round 48 shipped it at 0 and a play-test then warped; the run could not be checked
+			// against the knob because the knob was structurally unobservable. A knob that changes
+			// 35% of the frame MUST appear in the first ten lines.
+			"notexmat=%d skipshadowonly=%d walksampled=%d tailrescue=%d tailrescueage=%u glauto=%u "
+			"glstable=%u glcells=%u glidle=%u drawaudit=%d camsanity=%u camsanitytol=%.3g "
 			// Round 7, same reason. uiclamp is the UI seam fix and is what the play-test card
 			// checks first; clampalbedos is the lever count for the GPU route; mainclipmax and
 			// skipccconst change what two existing counters mean.
@@ -934,7 +945,13 @@ void RemixGSRender::on_init_thread()
 			remix_rsx::walk_sampled_enabled() ? 1 : 0,
 			remix_rsx::tail_rescue_enabled() ? 1 : 0,
 			remix_rsx::tail_rescue_age(),
-			remix_rsx::guest_light_auto_enabled() ? 1 : 0,
+			remix_rsx::guest_light_auto_mode(),
+			remix_rsx::guest_light_stable_frames(),
+			remix_rsx::guest_light_max_cells(),
+			remix_rsx::guest_light_idle_frames(),
+			remix_rsx::draw_audit_enabled() ? 1 : 0,
+			remix_rsx::camera_sanity_mode(),
+			static_cast<f64>(remix_rsx::camera_sanity_tolerance()),
 			remix_rsx::ui_clamp_subrect_mode(),
 			remix_rsx::clamp_albedo_count(),
 			remix_rsx::main_clip_max_enabled() ? 1 : 0,
@@ -5853,9 +5870,10 @@ void RemixGSRender::maybe_inject_guest_light(u64 vp_hash, u64 fp_hash, u64 albed
 
 	if (!trigger_accepted && !auto_trigger)
 	{
-		// Split by REASON: two different outcomes were wearing one uncounted return. auto_trigger
-		// is auto_wanted && small_enough, so a candidate the AUTO rule WANTED and rejected purely
-		// on size landed here indistinguishable from one no rule ever asked for.
+		// Counted as of round 50, split by REASON, because these are two different bugs wearing
+		// one return. auto_trigger is auto_wanted && small_enough, so a candidate the AUTO rule
+		// wanted and rejected purely on size lands here indistinguishable from one no rule ever
+		// asked for. guest_light_toobig does NOT cover this -- it guards the explicit-list path.
 		if (auto_wanted)
 		{
 			++m_stats.guest_light_autobig;
@@ -5864,7 +5882,7 @@ void RemixGSRender::maybe_inject_guest_light(u64 vp_hash, u64 fp_hash, u64 albed
 		{
 			++m_stats.guest_light_notrigger;
 		}
-		
+
 		return;
 	}
 
@@ -6079,9 +6097,9 @@ void RemixGSRender::maybe_inject_guest_light(u64 vp_hash, u64 fp_hash, u64 albed
 		}
 	}
 
-	// Everything above this line has had its say.
+	// ROUND 50 probe: everything above this line has had its say.
 	++m_stats.guest_light_reached;
-	
+
 	if (m_guest_lights.size() >= remix_rsx::guest_light_max())
 	{
 		++m_stats.guest_light_capped;
@@ -6096,6 +6114,9 @@ void RemixGSRender::maybe_inject_guest_light(u64 vp_hash, u64 fp_hash, u64 albed
 
 	if (m_guest_light_attempts >= 4)
 	{
+		// Counted as of round 50. This return was silent, and it is the most likely place for a
+		// level full of fixtures to lose its lights: four attempts a frame against tens of
+		// thousands of matches. If this dominates, the budget is the bug, not the brightness.
 		++m_stats.guest_light_budget;
 		return;
 	}
@@ -6142,12 +6163,15 @@ void RemixGSRender::maybe_inject_guest_light(u64 vp_hash, u64 fp_hash, u64 albed
 
 	remixapi_LightHandle handle = nullptr;
 	const u32 status = remix_rsx::guarded_create_light(m_remix.api().CreateLight, &info, &handle);
-	
+
+	// Counted as of round 50. A refusal here was completely silent -- no counter, no log, no
+	// else branch -- so a run in which the runtime rejected every light looked identical to a
+	// run in which none was ever attempted.
 	if (status != REMIXAPI_ERROR_CODE_SUCCESS || !handle)
 	{
 		++m_stats.guest_light_createfail;
 	}
-	
+
 	if (status == REMIXAPI_ERROR_CODE_SUCCESS && handle)
 	{
 		guest_light_entry& light = m_guest_lights.emplace_back();
@@ -6350,6 +6374,99 @@ void RemixGSRender::submit_camera()
 		// milestone probe into the title's UI until gameplay produces the first camera.
 		submit_debug_scene(remix_rsx::nocam_enabled());
 		return;
+	}
+
+	// --- ROUND 49: the camera sanity gate, BEFORE anything is installed -------------------------
+	// remixapi's SetupCamera validates nothing - none of the shear/FOV rejection the D3D9 path
+	// applies - so a degenerate or ortho UI matrix that wins the election becomes a live world
+	// camera and the scene is destroyed in silence. This converts that into one line in the log.
+	//
+	// The reference is the title's own early history rather than a constant, because the measured
+	// failure (FOV 114.6 against Haze's 72.0) is not an absurd FOV in the abstract - only the
+	// title's own history separates it from a legitimate wide angle.
+	{
+		remix_rsx::projection_params params{};
+		const bool described = remix_rsx::describe_projection(m_active_camera.projection, params);
+
+		// Unconditionally broken, independent of any reference: no describable projection, a
+		// non-finite or non-positive near plane, or an FOV outside the range any perspective
+		// camera can occupy. These are judged from frame one - they need no warmup.
+		bool insane = !described
+			|| !std::isfinite(params.fov_y_degrees)
+			|| params.fov_y_degrees <= 1.f
+			|| params.fov_y_degrees >= 179.f
+			|| !std::isfinite(params.near_plane)
+			|| params.near_plane <= 0.f;
+		const char* reason = insane ? "degenerate" : "ok";
+
+		if (!insane)
+		{
+			if (!m_cam_fov_latched)
+			{
+				m_cam_fov_warmup.push_back(params.fov_y_degrees);
+
+				if (m_cam_fov_warmup.size() >= s_cam_fov_warmup)
+				{
+					const usz mid = m_cam_fov_warmup.size() / 2;
+					std::nth_element(m_cam_fov_warmup.begin(), m_cam_fov_warmup.begin() + mid,
+						m_cam_fov_warmup.end());
+					m_cam_fov_ref = m_cam_fov_warmup[mid];
+					m_cam_fov_latched = true;
+					m_cam_fov_warmup.clear();
+					m_cam_fov_warmup.shrink_to_fit();
+
+					// Printed so the latch itself can be audited. A reference latched during a
+					// menu would disarm the gate for the whole run, and this is the only way to
+					// see that it happened.
+					dump_line(fmt::format("Remix camera-sanity: latched ref_fov=%.4g from %u frames "
+						"tol=%.3g mode=%u frame=%llu",
+						static_cast<f64>(m_cam_fov_ref), s_cam_fov_warmup,
+						static_cast<f64>(remix_rsx::camera_sanity_tolerance()),
+						remix_rsx::camera_sanity_mode(), m_frame_counter));
+				}
+			}
+			else if (m_cam_fov_ref > 1e-4f)
+			{
+				const f32 deviation = std::fabs(params.fov_y_degrees - m_cam_fov_ref) / m_cam_fov_ref;
+
+				if (deviation > remix_rsx::camera_sanity_tolerance())
+				{
+					insane = true;
+					reason = "fov";
+				}
+			}
+		}
+
+		if (insane)
+		{
+			++m_stats.cam_insane;
+
+			if (m_cam_insane_lines < s_max_cam_insane_lines)
+			{
+				++m_cam_insane_lines;
+				dump_line(fmt::format("Remix camera-sanity: INSANE reason=%s fov=%.4g ref_fov=%.4g "
+					"aspect=%.5g near=%.6g described=%d mode=%u vp=%016llx pos=[%.4g %.4g %.4g] "
+					"frame=%llu",
+					reason, static_cast<f64>(params.fov_y_degrees), static_cast<f64>(m_cam_fov_ref),
+					static_cast<f64>(params.aspect), static_cast<f64>(params.near_plane),
+					described ? 1 : 0, remix_rsx::camera_sanity_mode(), m_active_camera.vp_hash,
+					static_cast<f64>(m_active_camera.position[0]),
+					static_cast<f64>(m_active_camera.position[1]),
+					static_cast<f64>(m_active_camera.position[2]),
+					m_frame_counter));
+			}
+
+			// CAMSANITY=1 refuses. It takes the SAME path the no-camera case already takes rather
+			// than a new one: submit nothing, keep the last presented frame, and let cam_fallback
+			// count it. An empty frame is a better failure than a 6-unit far plane, but this is
+			// still a behaviour change and is off by default.
+			if (remix_rsx::camera_sanity_mode() != 0)
+			{
+				++m_stats.cam_fallback;
+				submit_debug_scene(remix_rsx::nocam_enabled());
+				return;
+			}
+		}
 	}
 
 	m_camera_ever_valid = true;
@@ -26476,7 +26593,10 @@ void RemixGSRender::log_stats()
 			// means the arm is armed but the canopy programs never reached the matcher this run.
 			"madlanemap=%llu/%llu | "
 			"world_refused=%llu wext_refused=%llu | "
-			"cam_resolved=%llu cam_fallback=%llu cam_held=%llu world_refused_nocam=%llu | "
+			// ROUND 49: cam_insane appended here; the arg list is edited at the same position.
+			// At the shipped CAMSANITY=0 an insane camera is COUNTED AND STILL SUBMITTED, so a
+			// non-zero value diagnoses without having changed anything.
+			"cam_resolved=%llu cam_fallback=%llu cam_held=%llu world_refused_nocam=%llu cam_insane=%llu | "
 			// The wobble fix, stated as a ratio. Fresh >> stale is the success reading; stale
 			// dominant says the relatch could not reach most of the scene and deferred submission
 			// is the next step. relatch counts how often it fired at all.
@@ -26988,6 +27108,7 @@ void RemixGSRender::log_stats()
 			m_stats.cam_fallback,
 			m_stats.cam_held,
 			m_stats.world_refused_nocam,
+			m_stats.cam_insane,
 			m_stats.world_ref_fresh,
 			m_stats.world_ref_stale,
 			m_stats.cam_relatch_midframe,

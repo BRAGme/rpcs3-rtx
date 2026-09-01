@@ -1158,6 +1158,138 @@ refutation has two independent derivations, not one.
   carried forward as "the fp does not partition the rig" — but it partitions the body from the rig
   perfectly. Re-test a rejected key against the new question.
 
+## Round 49 (2026-08-29) — the warping was a launcher that never ran, and a camera nothing validated
+
+Deployed: `bin\rpcs3.exe` = `bin\rpcs3-next.exe` = **`8F2BA918B753840E`** (was `5B6B6396A7A8FE50`).
+`bin\remix\d3d9.dll` unchanged at `16A0B512F33EBB66` — not opened. MSBuild `Release|x64` exit **0**,
+**0 errors**, one warning: the pre-existing C4723, moved `RemixGSRender.cpp:11922` → **`:12031`** by this
+round's insertions. **Zero new warnings.**
+
+**HEAD MOVED while round 48 was between sessions.** Round 48's work is now committed as
+`2dca174d4 "Remix: wire the viewmodel deferral end to end, glow-card lights, reclaim 35% of the frame"`.
+I did not commit it. The only working-tree change I inherited was a revert of `DRAWAUDIT` to 1.
+
+---
+
+### The warping was NOT `DRAWAUDIT=0`. It was a run in which the launcher never executed.
+
+A play-test after round 48 came back as *"the entire area is warping like crazy"* — untextured white
+fragments in a black void — with the Remix dev menu reporting `MAIN FOV 114.6, Near/Far 3.7 / 6.1` against
+this title's healthy `72.0` and `8.1 / 13991.5`. `DRAWAUDIT=0` was reverted on the reasonable inference that
+the audit must feed camera validation.
+
+**That inference is refuted by the run's own first line.** MEASURED, `Remix run-start:` of the warping run
+(pid 2184, build `Aug 29 2026 11:24:35`):
+
+| knob | warping run | launcher value / healthy round-47 run |
+| --- | --- | --- |
+| **`camlock`** | **`0000000000000000`** | `7f3d3abcefc8b057` |
+| `emissive` | 0 | 3 |
+| `watchlist` | 0 | 2 |
+| `projsplit` / `vmtagonly` | 0 / 0 | 1 / 1 |
+| `hidepairvp` | `0000000000000000` | `f39f504649b6f442` |
+| `glradiance` / `glmax` / `texidle` | 30 / 64 / 21600 | 1200 / 128 / 36000 |
+| `deferviewmodel` / `nectarmode` | 0 / 1 | 1 / 0 |
+
+**Every value is the built-in default.** `launch-haze-remix.cmd` never ran — the emulator was started
+directly from the exe or the RPCS3 GUI. Both runs on that build show `camlock=0`.
+
+With `CAMLOCKVP` unset the camera-lock pin is gone and election runs unconstrained. The consequence is
+measured:
+
+| | warping run | healthy round-47 run |
+| --- | --- | --- |
+| `cam_resolved` / `cam_fallback` | 1,393 / 1,071 over 2,464 flips | 80,074 / 2,945 over 83,019 flips |
+| **fallback rate** | **43.5%** | **3.5%** |
+
+A 12x fallback rate is exactly what losing the camera pin produces, and an unpinned election is how a
+degenerate matrix becomes the world camera.
+
+**And `DRAWAUDIT` could not have been read from that run in any case: it has no field anywhere in the log.**
+`grep -c drawaudit` returns **0** against both the warping run and the healthy round-47 run. Round 48 shipped
+a knob that changes 35% of the frame and is **structurally unobservable** — that is instrument blindness #8,
+and it is mine.
+
+**What the audit actually feeds — enumerated properly this time.** Every reader of everything the two audit
+functions write:
+
+| written by | member | consumers |
+| --- | --- | --- |
+| `audit_world_extent` | `m_streak_extent`, `m_streak_measured`, `m_streak_raw_extent`, `m_streak_flagged` | `SKIPEXTENTVP` gate, `extent_plausible` in `maybe_inject_guest_light`, `shape_key`, and ~15 census/`note_watch` sites |
+| `audit_world_extent` | `m_scratch_world_extents` → `m_world_extent_median` | **only the streak gate itself**, plus `shape_key` and diagnostics |
+| `audit_vertex_extent` | `m_vertex_flagged`, `m_scratch_outlier_indices`, `m_scratch_vertex_spread`, `m_vertex_spread_seen` | `VTXREFUSE` (off by default) and its own census |
+
+**Not one of them is read by camera election, `cam_clipgate`, or any near/far derivation.** The coordinator's
+hypothesis is not supported by the source.
+
+**One genuine round-48 error was found, though it does not change the conclusion.** Round 48 asserted
+`audit_world_extent` had no `return false` path, from an `awk` window of `s+260` lines. The function's only
+`return false` is at **+276** — the scan missed it by 15 lines. It is guarded by `++m_stats.wext_refused`
+immediately above, so `wext_refused=0` did prove zero drops; and `gate_on = (streak_extent_ratio() > 0)` is
+**false** at the shipped `STREAKGATE=0`, making the refusal *structurally* unreachable. The conclusion
+survived, but **it survived by luck, not by the scan.** Bound a search by the function, never by a line count.
+
+---
+
+### What shipped: observability, then a gate — measurement armed, behaviour off
+
+**1. Three knobs made observable.** `Remix run-start:` now prints `glstable=`, `glidle=`, `drawaudit=`,
+`camsanity=`, `camsanitytol=`. And **`glauto=` now prints the MODE, not a bool** — it was fed
+`guest_light_auto_enabled() ? 1 : 0`, so round 48's `GUESTLIGHTAUTO=2` (the glow-card rule) printed as
+`glauto=1`, **indistinguishable from mode 1 — the rule that put lights on doors.** Round 41's notes record
+being confused by exactly this and it was never fixed.
+
+**2. `RPCS3_REMIX_CAMSANITY` — the camera sanity gate, in `submit_camera()` before `SetupCamera`.**
+`remixapi`'s `SetupCamera` performs none of the shear/FOV rejection the D3D9 path applies, so a degenerate or
+ortho UI matrix that wins the election becomes a live world camera and the scene is destroyed in silence.
+48 rounds of logging would not have named it.
+
+It reuses the existing `describe_projection()` derivation rather than inventing one, and judges in two tiers:
+
+* **unconditional** — no describable projection, non-finite/non-positive near plane, or FOV outside
+  `(1, 179)`. Judged from frame one; needs no warmup.
+* **relative to the title's own history** — the median vertical FOV of the first **120 resolved frames**,
+  latched once and never moved. Latched rather than tracked so a run of bad cameras cannot drag the reference
+  onto itself, which would disarm the gate exactly when it is needed. Flags deviation beyond `CAMSANITYTOL`
+  (default **0.5**).
+
+A **relative** test is used because 114.6 is not an absurd FOV in the abstract — only the title's own history
+separates it from a legitimate wide angle. The threshold is set by two measurements: the failure is
+72.0 → 114.6 = **+59%** (caught with margin), and a rifle ADS narrows FOV ~72 → ~50 = **−31%** (must not
+trip), which sets the floor.
+
+**Shipped at `CAMSANITY=0` = census only: named on `Remix camera-sanity: INSANE ...`, counted as
+`cam_insane=`, and submitted anyway. Zero behaviour change.** `=1` refuses, via the same submit-nothing path
+`cam_fallback` already uses.
+
+> **This is round 6's rule, which round 48 broke:** *"ship the measurement armed and the behaviour off"*.
+> Round 48 shipped `DRAWAUDIT=0` on an argument rather than a reading and cost a play-test. A refusal that is
+> too tight replaces a warped scene with a frozen one, which is not obviously better.
+
+The latch prints one line (`camera-sanity: latched ref_fov=`) so it can be audited — **a reference latched
+during a menu would disarm the gate for the whole run**, and this is the only way to see that it happened.
+Haze's own value is ~72.
+
+**3. `DRAWAUDIT` left at 1 and deliberately NOT re-armed.** It has still never been observed in a run that
+applied the launcher, and one mechanism per knob means `CAMSANITY` ships alone. Next round: launch from the
+launcher, confirm `drawaudit=1` in line 1, then flip to 0 and confirm `drawaudit=0` — *then* read the timing.
+
+**4. A launcher banner.** The first 30 lines now state that the game must be started from that file, with the
+`camlock=` one-line test for whether it was.
+
+### Instrument and process notes
+
+* **Bound a source search by the function, never by a line count.** `awk 'NR<=s+260'` missed the only
+  `return false` at +276 and round 48's safety claim survived on luck.
+* **A knob that changes behaviour must print itself in the run's first line.** `DRAWAUDIT` was unobservable
+  for 15 rounds, so the one play-test that mattered could not be checked against it.
+* **A counter that collapses a mode to a bool hides the mode.** `glauto=1` meant either "the rule that works"
+  or "the rule that put lights on doors".
+* **Check whether the config was applied before believing any measurement from a run.** `camlock=0` in line 1
+  invalidates the whole session, and nothing else in the log says so.
+* **Before accepting a causal story, check whether the accused change was even active.** `DRAWAUDIT` had no
+  field in the log at all, and every other knob in that run was at its default.
+
 ## Round 48 (2026-08-29) — the glow-card lights, and `audit` was a third of the frame
 
 Deployed: `bin\rpcs3.exe` = `bin\rpcs3-next.exe` = **`5B6B6396A7A8FE50`** (was `AC7245342F3E9627`).

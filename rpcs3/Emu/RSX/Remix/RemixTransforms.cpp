@@ -11975,6 +11975,46 @@ namespace remix_rsx
 	// frame its card returns rather than serving the N-frame apprenticeship again. Without that,
 	// any stability window longer than the flicker period would make a flickering bulb permanently
 	// dark - the exact opposite of what was asked for.
+	// --- ROUND 49: the camera sanity gate ------------------------------------------------------
+	// Round 48 shipped DRAWAUDIT=0 and the next play-test came back as "the entire area is warping
+	// like crazy" - a field of untextured fragments in a black void. The dev menu named the cause
+	// outright: MAIN camera at FOV 114.6 with near/far 3.7 / 6.1, against this title's usual 72.0
+	// and 8.1 / 13991.5. A 6.1-unit far plane clips the whole level.
+	//
+	// That run turns out NOT to have been a DRAWAUDIT failure - it ran with camlock=0 and every
+	// other knob at its built-in default, i.e. the launcher environment was never applied - but the
+	// FAILURE MODE is real and is documented for this backend: remixapi's SetupCamera performs none
+	// of the shear/FOV rejection the D3D9 path applies, so a degenerate or ortho UI matrix that wins
+	// the election becomes a live world camera and NOTHING says so. The scene is destroyed and the
+	// log is silent.
+	//
+	// 0 = CENSUS ONLY and it is the shipped value: measure, name it on 'Remix camera-sanity:',
+	// count it as cam_insane, and submit the camera anyway. 1 = refuse, taking the same
+	// no-camera path submit_camera already has for cam_fallback.
+	//
+	// SHIPPED OFF DELIBERATELY. This file's own round-6 note says "ship the measurement armed and
+	// the behaviour off", and round 48 ignored that and shipped a behaviour change on an argument
+	// rather than on a reading. A refusal that is too tight replaces a warped scene with a frozen
+	// one, which is not obviously better; the census costs nothing and says whether the thresholds
+	// are right before anything acts on them.
+	u32 camera_sanity_mode()
+	{
+		static const u32 value = std::min(env_u32(L"RPCS3_REMIX_CAMSANITY", 0), 1u);
+		return value;
+	}
+
+	// Fractional deviation of vertical FOV from the title's own latched reference before a camera is
+	// called insane. 0.5 = 50%. The measured failure is 72.0 -> 114.6, i.e. +59%, so 0.5 catches it
+	// with margin; a rifle ADS narrows the FOV (72 -> ~50, i.e. -31%) and must NOT trip it, which is
+	// what sets the floor. A RELATIVE test is used rather than absolute limits on purpose: 114.6 is
+	// not an absurd FOV for some titles, so only the title's own history separates it from a
+	// legitimate wide angle. env_float rejects 0.
+	f32 camera_sanity_tolerance()
+	{
+		static const f32 value = env_float(L"RPCS3_REMIX_CAMSANITYTOL", 0.5f);
+		return value;
+	}
+
 	// A MOTION test, where GUESTLIGHTSTABLE is a DWELL test, and the difference is the whole point.
 	//
 	// The dwell gate asks "did this stay put?", and a soldier on an idle animation stays put. Round

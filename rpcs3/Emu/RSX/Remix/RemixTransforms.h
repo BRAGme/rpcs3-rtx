@@ -2722,6 +2722,12 @@ namespace remix_rsx
 	// behaviour). Clamped to 600. Full derivation on the definition in RemixTransforms.cpp.
 	u32 guest_light_stable_frames();
 
+	// RPCS3_REMIX_CAMSANITY: 0 = census only (shipped), 1 = refuse an insane camera before
+	// SetupCamera. RPCS3_REMIX_CAMSANITYTOL is the fractional FOV deviation from the title's own
+	// latched reference that counts as insane. Full derivation on the definitions.
+	u32 camera_sanity_mode();
+	f32 camera_sanity_tolerance();
+
 	// RPCS3_REMIX_SKYEXTENT=<units>: a draw that writes no depth, is anchored on the camera
 	// (sky_max_anchor) and spans at least this much in its widest axis *in world units* is the
 	// title's sky dome, and is tagged SKY. Haze draws its sky as an 82-vertex, 10,000-unit
