@@ -11975,6 +11975,34 @@ namespace remix_rsx
 	// frame its card returns rather than serving the N-frame apprenticeship again. Without that,
 	// any stability window longer than the flicker period would make a flickering bulb permanently
 	// dark - the exact opposite of what was asked for.
+	// A MOTION test, where GUESTLIGHTSTABLE is a DWELL test, and the difference is the whole point.
+	//
+	// The dwell gate asks "did this stay put?", and a soldier on an idle animation stays put. Round
+	// 48 reasoned that "a lamp DOES NOT MOVE", which is true -- but so is "an idle NPC does not
+	// move", so no threshold on that axis separates them. It can only make the NPC stand still for
+	// longer before it lights. Measured on Haze at STABLE=30, every mint grouped by trigger albedo:
+	//
+	//   F613BD83DAF2B4E2 (suit glow card)  26 distinct cells, 35 mints
+	//   422F2F6C911FC378 (fixture)          1 distinct cell,   4 mints
+	//   0F86FCEDC4226D3B (fixture)          1 distinct cell,   1 mint
+	//   06201102B0E4566E (fixture)          1 distinct cell,   2 mints
+	//
+	// Every real fixture: one cell. The thing on legs: twenty-six. Unlike dwell time this is not a
+	// property an idle NPC can fake -- faking it would mean having never been anywhere else, which
+	// for something that walked into the room is impossible.
+	//
+	// 4 leaves a 6x margin over the fixtures and disqualifies the suit card six cells into its walk.
+	// Default 0 so this lands dark and is armed from a config, per this project's standing rule.
+	//
+	// THE PAYOFF IS NOT ONLY THE SOLDIERS. With this on, GUESTLIGHTSTABLE can go back to 0 and real
+	// fixtures light on FIRST SIGHT again, as in round 41, instead of serving a dwell apprenticeship
+	// that at 600 frames is ten seconds of standing still before a lamp comes on.
+	u32 guest_light_max_cells()
+	{
+		static const u32 value = std::min(env_u32(L"RPCS3_REMIX_GUESTLIGHTCELLS", 0), 64u);
+		return value;
+	}
+
 	u32 guest_light_stable_frames()
 	{
 		static const u32 value = std::min(env_u32(L"RPCS3_REMIX_GUESTLIGHTSTABLE", 0), 600u);

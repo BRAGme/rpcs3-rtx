@@ -1068,6 +1068,10 @@ private:
 		// guest_light_match still counts the match, so match - toobig is the accepted population
 		// and the two cannot be confused. RPCS3_REMIX_GUESTLIGHTLISTEXT=0 restores round 40.
 		u64 guest_light_toobig = 0;
+		// ROUND 50: sources rejected by the MOTION gate -- seen in more than GUESTLIGHTCELLS distinct
+		// quantised cells, i.e. it walked. Counted rather than only logged, so a run can be judged
+		// without grepping: this climbing while guest_light lines stay flat is the gate working.
+		u64 guest_light_moving = 0;
 
 		// --- round 48 -------------------------------------------------------------------------
 		// AUTO candidates refused because the draw was the player's own viewmodel. Round 41's
@@ -2650,6 +2654,30 @@ private:
 	};
 
 	std::unordered_map<u64, guest_light_cell> m_guest_light_cells;
+
+	// ROUND 50: the MOTION test, keyed on the SOURCE rather than on a position.
+	//
+	// guest_light_cell above answers "has this spot been occupied a while", which an idle NPC
+	// satisfies as readily as a lamp. This answers "has this emitter ever been anywhere else",
+	// which only something with legs can fail. Measured on Haze: every real fixture occupies
+	// exactly ONE quantised cell for a whole scene, the suit glow card occupied 26.
+	//
+	// Keyed on the (albedo, vp, fp) triple, NOT on albedo alone: this title binds one albedo to
+	// eight distinct (vp, fp) pairs, one of them the smoke program, so an albedo-only key would
+	// disqualify a fixture because something unrelated sharing its texture moved.
+	struct guest_light_source
+	{
+		// Distinct cells this source has occupied. Dropped once disqualified -- at that point the
+		// set has served its purpose and only the verdict matters, so a source that wanders the
+		// whole level costs one bool rather than one entry per 0.25 units it travelled.
+		std::unordered_set<u64> cells;
+		bool disqualified = false;
+		// Once-per-frame guard, for the same reason guest_light_cell has one: a fixture drawn three
+		// times in one frame is one observation, not three.
+		u64 last_frame = umax;
+	};
+
+	std::unordered_map<u64, guest_light_source> m_guest_light_sources;
 	u64 m_guest_light_attempt_frame = umax;
 	u32 m_guest_light_attempts = 0;
 

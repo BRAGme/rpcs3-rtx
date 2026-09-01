@@ -2710,6 +2710,13 @@ namespace remix_rsx
 	// kUpdateBVH when the category is added or removed, so toggling mid-frame is handled.
 	bool smooth_normals_enabled();
 
+	// RPCS3_REMIX_GUESTLIGHTCELLS=<count>: a guest-light SOURCE -- the (albedo, vp, fp) triple that
+	// triggered it -- is permanently disqualified once it has been seen in this many DISTINCT
+	// quantised cells. 0 = off. A bolted-down fixture occupies exactly ONE cell for a whole scene;
+	// anything that arrived on legs has a history of others. Derivation on the definition in
+	// RemixTransforms.cpp.
+	u32 guest_light_max_cells();
+
 	// RPCS3_REMIX_GUESTLIGHTSTABLE=<frames>: a GUESTLIGHTAUTO candidate must re-appear in the same
 	// quantised cell on this many DISTINCT frames before it may create a light. 0 = off (round-41
 	// behaviour). Clamped to 600. Full derivation on the definition in RemixTransforms.cpp.

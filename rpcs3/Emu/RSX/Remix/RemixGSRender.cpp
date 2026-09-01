@@ -1179,6 +1179,10 @@ void RemixGSRender::on_exit()
 	// ROUND 48. The staging table names positions in a scene that is going away; a confirmed cell
 	// surviving a device teardown would let the next scene light a fixture it has never measured.
 	m_guest_light_cells.clear();
+	// Same reasoning, same scope: a source disqualified in the scene going away must not carry
+	// that verdict into the next one, where the same texture may well belong to a bolted-down
+	// fixture that has never moved.
+	m_guest_light_sources.clear();
 	// Held instances name mesh handles that are about to be destroyed; dropped rather than flushed,
 	// because the runtime is going down and a DrawInstance here would outlive its own scene.
 	m_deferred_instances.clear();
@@ -5878,6 +5882,97 @@ void RemixGSRender::maybe_inject_guest_light(u64 vp_hash, u64 fp_hash, u64 albed
 	u64 light_hash = rpcs3::hash64(0x48415A454C494748ull, static_cast<u64>(qx));
 	light_hash = rpcs3::hash64(light_hash, static_cast<u64>(qy));
 	light_hash = rpcs3::hash64(light_hash, static_cast<u64>(qz));
+
+	// --- ROUND 50: the MOTION gate --------------------------------------------------------------
+	//
+	// The round-48 gate below tests DWELL and the round-49 play-test found its blind spot: soldiers
+	// standing on an idle animation. "A lamp DOES NOT MOVE" is true, but an idle NPC does not move
+	// either, so no threshold on dwell separates them -- it only makes the NPC stand still longer
+	// before it lights. Raising GUESTLIGHTSTABLE 30 -> 600 did stop them, at the price of ten
+	// seconds of dwell before a genuine lamp may come on.
+	//
+	// This asks a question an idle NPC cannot answer favourably: has this SOURCE ever been anywhere
+	// else? Measured on Haze at STABLE=30, every mint grouped by trigger albedo:
+	//
+	//   F613BD83DAF2B4E2 (suit glow card)  26 distinct cells
+	//   422F2F6C911FC378 (fixture)          1 distinct cell
+	//   0F86FCEDC4226D3B (fixture)          1 distinct cell
+	//   06201102B0E4566E (fixture)          1 distinct cell
+	//
+	// One cell versus twenty-six. Faking it would require having never been anywhere else, which
+	// something that walked into the room cannot do.
+	//
+	// Keyed on the (albedo, vp, fp) triple, not albedo alone: this title binds one albedo to eight
+	// distinct (vp, fp) pairs -- one of them the smoke program -- so an albedo-only key would
+	// disqualify a fixture because something unrelated sharing its texture moved.
+	//
+	// BEFORE the dwell gate, for the same reason the dwell gate sits before the attempt budget: a
+	// disqualified source must not consume one of the four attempts a frame is allowed, or a crowd
+	// of NPCs starves the fixtures behind them.
+	if (const u32 max_cells = remix_rsx::guest_light_max_cells(); max_cells != 0)
+	{
+		// KEYED ON (albedo, vp) -- NOT the fp as well, and that is a correction, not a shortcut.
+		// Including fp split one physical emitter into five sources: measured on the first armed
+		// run, 15 mints across albedo F613BD83DAF2B4E2 and C5313E05DDFAA76E under a single
+		// vp=830d7d1b9681c475 but THREE fps (bbdb0ce4, a6281f0b, 4e5a4c64). Each fp was a fresh
+		// key with a clean history that had to earn its own disqualification, so each minted about
+		// four lights first and the gate fired three times too late to matter. The fp tracks
+		// animation or lighting state; it is not part of what the emitter IS.
+		u64 source_key = rpcs3::hash64(0x474C534F55524345ull, albedo_hash);
+		source_key = rpcs3::hash64(source_key, vp_hash);
+
+		// BOUND THE TABLE BEFORE INSERTING, exactly as the cell map below does. The population this
+		// rejects is the one that mints a new key per 0.25 units travelled, so left unbounded a
+		// level full of NPCs grows it without limit. A disqualified source is cheap to keep -- its
+		// set is already dropped -- so the prune only reclaims sources still under observation.
+		if (m_guest_light_sources.size() >= s_max_guest_light_cells
+			&& !m_guest_light_sources.contains(source_key))
+		{
+			const u64 quiet_before = (m_frame_counter > s_guest_light_cell_quiet)
+				? m_frame_counter - s_guest_light_cell_quiet
+				: 0;
+
+			for (auto it = m_guest_light_sources.begin(); it != m_guest_light_sources.end();)
+			{
+				if (!it->second.disqualified && it->second.last_frame < quiet_before)
+				{
+					it = m_guest_light_sources.erase(it);
+				}
+				else
+				{
+					++it;
+				}
+			}
+		}
+
+		guest_light_source& source = m_guest_light_sources[source_key];
+
+		// Once per frame, same reason as the cell counter: a fixture drawn three times in one frame
+		// is one observation of one cell, not three.
+		if (source.last_frame != m_frame_counter)
+		{
+			source.last_frame = m_frame_counter;
+
+			if (!source.disqualified && source.cells.insert(light_hash).second
+				&& source.cells.size() > max_cells)
+			{
+				source.disqualified = true;
+				source.cells.clear();
+				++m_stats.guest_light_moving;
+
+				dump_line(fmt::format(
+					"Remix guest-light-moving: albedo=%016X vp=%016x fp=%016x cells>%u frame=%u"
+					" -- source disqualified, it moves",
+					albedo_hash, vp_hash, fp_hash, max_cells,
+					static_cast<u32>(m_frame_counter)));
+			}
+		}
+
+		if (source.disqualified)
+		{
+			return;
+		}
+	}
 
 	// --- ROUND 48: the STATIC-FIXTURE gate ------------------------------------------------------
 	// The other half of why GUESTLIGHTAUTO=2 had to be switched off in round 41: it lit SOLDIERS as
