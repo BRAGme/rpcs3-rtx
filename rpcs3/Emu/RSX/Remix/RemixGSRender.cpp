@@ -5853,6 +5853,18 @@ void RemixGSRender::maybe_inject_guest_light(u64 vp_hash, u64 fp_hash, u64 albed
 
 	if (!trigger_accepted && !auto_trigger)
 	{
+		// Split by REASON: two different outcomes were wearing one uncounted return. auto_trigger
+		// is auto_wanted && small_enough, so a candidate the AUTO rule WANTED and rejected purely
+		// on size landed here indistinguishable from one no rule ever asked for.
+		if (auto_wanted)
+		{
+			++m_stats.guest_light_autobig;
+		}
+		else
+		{
+			++m_stats.guest_light_notrigger;
+		}
+		
 		return;
 	}
 
@@ -5970,6 +5982,7 @@ void RemixGSRender::maybe_inject_guest_light(u64 vp_hash, u64 fp_hash, u64 albed
 
 		if (source.disqualified)
 		{
+			++m_stats.guest_light_movingrepeat;
 			return;
 		}
 	}
@@ -6066,6 +6079,9 @@ void RemixGSRender::maybe_inject_guest_light(u64 vp_hash, u64 fp_hash, u64 albed
 		}
 	}
 
+	// Everything above this line has had its say.
+	++m_stats.guest_light_reached;
+	
 	if (m_guest_lights.size() >= remix_rsx::guest_light_max())
 	{
 		++m_stats.guest_light_capped;
@@ -6080,6 +6096,7 @@ void RemixGSRender::maybe_inject_guest_light(u64 vp_hash, u64 fp_hash, u64 albed
 
 	if (m_guest_light_attempts >= 4)
 	{
+		++m_stats.guest_light_budget;
 		return;
 	}
 	++m_guest_light_attempts;
@@ -6125,6 +6142,12 @@ void RemixGSRender::maybe_inject_guest_light(u64 vp_hash, u64 fp_hash, u64 albed
 
 	remixapi_LightHandle handle = nullptr;
 	const u32 status = remix_rsx::guarded_create_light(m_remix.api().CreateLight, &info, &handle);
+	
+	if (status != REMIXAPI_ERROR_CODE_SUCCESS || !handle)
+	{
+		++m_stats.guest_light_createfail;
+	}
+	
 	if (status == REMIXAPI_ERROR_CODE_SUCCESS && handle)
 	{
 		guest_light_entry& light = m_guest_lights.emplace_back();
@@ -26523,6 +26546,9 @@ void RemixGSRender::log_stats()
 			// static-fixture refusal, cells is the staging table's occupancy against the 4096
 			// ceiling (at the ceiling, the prune is running every frame and the gate is degraded).
 			"guest_light_vmref=%llu guest_light_unstable=%llu guest_light_cells=%llu "
+			"guest_light_moving=%llu guest_light_budget=%llu guest_light_createfail=%llu "
+			"guest_lights_created=%llu guest_light_reached=%llu "
+			"guest_light_autobig=%llu guest_light_notrigger=%llu guest_light_movingrepeat=%llu "
 			"mat_emissive=%llu | "
 			// Alpha to coverage: the two detection bits and the replay. ctrl/reg both 0 across a
 			// run is the negative verdict on the cutout theory, with bytes behind it.
@@ -27007,6 +27033,14 @@ void RemixGSRender::log_stats()
 			m_stats.guest_light_vm_refused,
 			m_stats.guest_light_unstable,
 			static_cast<u64>(m_guest_light_cells.size()),
+			m_stats.guest_light_moving,
+			m_stats.guest_light_budget,
+			m_stats.guest_light_createfail,
+			m_stats.guest_lights_created,
+			m_stats.guest_light_reached,
+			m_stats.guest_light_autobig,
+			m_stats.guest_light_notrigger,
+			m_stats.guest_light_movingrepeat,
 			m_textures.stats().materials_emissive,
 			m_stats.a2c_ctrl,
 			m_stats.a2c_reg,

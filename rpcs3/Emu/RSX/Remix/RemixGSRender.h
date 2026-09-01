@@ -1072,6 +1072,32 @@ private:
 		// quantised cells, i.e. it walked. Counted rather than only logged, so a run can be judged
 		// without grepping: this climbing while guest_light lines stay flat is the gate working.
 		u64 guest_light_moving = 0;
+		
+		// --- ROUND 50: the silent returns --------------------------------------------------
+		// Every counter that existed measured a path that was not the problem. Standing in a lit
+		// room the log said match=31845, unstable=111, capped=0, toobig=0, vmref=0 and
+		// guest_lights=0 -- thirty-one thousand candidates gone with no counter naming where.
+		// maybe_inject_guest_light() has seven returns and only three were instrumented, so the
+		// loss was structurally invisible. These are the other four.
+		
+		// The per-frame attempt cap (4) turning a candidate away.
+		u64 guest_light_budget = 0;
+		// remixapi CreateLight refusing one. Previously this had no else branch at all, so a run
+		// where the runtime rejected every light looked identical to one where none was tried.
+		u64 guest_light_createfail = 0;
+		// Survived every gate and reached the cap/budget stage. Splits "the gates ate them" from
+		// "something past the gates ate them" in one run, which is what localised this.
+		u64 guest_light_reached = 0;
+		// The AUTO path size test. guest_light_toobig guards only the EXPLICIT-list path, so an
+		// auto candidate rejected purely on extent was indistinguishable from one no rule wanted.
+		u64 guest_light_autobig = 0;
+		// Neither an accepted explicit trigger nor an auto candidate, for a reason other than
+		// size -- in practice most of the scene, which is why it is large and not a fault.
+		u64 guest_light_notrigger = 0;
+		// A source the motion gate condemned on an earlier frame. guest_light_moving counts the
+		// ONE frame of condemnation; this counts every draw turned away afterwards. Without the
+		// pair, a correctly-suppressed emitter and a starved pipeline look the same.
+		u64 guest_light_movingrepeat = 0;
 
 		// --- round 48 -------------------------------------------------------------------------
 		// AUTO candidates refused because the draw was the player's own viewmodel. Round 41's
