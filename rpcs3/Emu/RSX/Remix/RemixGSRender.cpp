@@ -19,7 +19,7 @@
 #include "Emu/RSX/Overlays/overlay_manager.h"
 #include "Emu/RSX/Overlays/overlays.h"
 #include "Emu/RSX/rsx_methods.h"
-#include "Emu/RSX/rsx_utils.h"
+#include "Emu/RSX/Utils/rsx_utils.h"
 #include "Utilities/stack_trace.h"
 #include "util/fnv_hash.hpp"
 #include "util/sysinfo.hpp"
