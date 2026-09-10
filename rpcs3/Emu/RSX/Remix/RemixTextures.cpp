@@ -18,6 +18,7 @@
 #include "3rdparty/bcdec/bcdec.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 
 namespace remix_rsx
@@ -195,6 +196,50 @@ namespace remix_rsx
 				gcm_format == CELL_GCM_TEXTURE_COMPRESSED_DXT23 ||
 				gcm_format == CELL_GCM_TEXTURE_COMPRESSED_DXT45;
 		}
+
+		// ROUND 60. Applies fragment_texture::decoded_remap() to a finished BGRA8 image, in place.
+		//
+		// decoded_remap()'s two tables are indexed A-R-G-B (index 0 is ALPHA, not blue - see
+		// decode_remap_encoding in Emu/RSX/color_utils.h, "Remapping tables; format is A-R-G-B"),
+		// and channel_map[out] names the INPUT channel in that same A-R-G-B order. This buffer is
+		// BGRA8, so byte 0 is B and byte 3 is A; the in[]/out[] pair below is the A-R-G-B view and
+		// the two scatter/gather lines are the only place the two orders meet. Getting that mapping
+		// backwards is silent - it produces a different wrong picture, not a crash - so it is
+		// written once, here, rather than inline at four call sites.
+		//
+		// control_map values are CELL_GCM_TEXTURE_REMAP_ZERO/ONE/REMAP (0/1/2). The default arm
+		// matches color_utils.h's, which folds the unused encoding 3 into REMAP rather than
+		// asserting on it.
+		void apply_channel_remap(std::vector<u8>& pixels, const rsx::texture_channel_remap_t& map)
+		{
+			for (usz i = 0; (i + 4) <= pixels.size(); i += 4)
+			{
+				u8* const p = pixels.data() + i;
+				const u8 in[4] = { p[3], p[2], p[1], p[0] }; // A, R, G, B
+				u8 out[4]{};
+
+				for (u32 c = 0; c < 4; ++c)
+				{
+					switch (map.control_map[c])
+					{
+					case CELL_GCM_TEXTURE_REMAP_ZERO:
+						out[c] = 0x00;
+						break;
+					case CELL_GCM_TEXTURE_REMAP_ONE:
+						out[c] = 0xFF;
+						break;
+					default:
+						out[c] = in[map.channel_map[c] & 3];
+						break;
+					}
+				}
+
+				p[3] = out[0];
+				p[2] = out[1];
+				p[1] = out[2];
+				p[0] = out[3];
+			}
+		}
 	}
 
 	bool textures_disabled()
@@ -206,6 +251,16 @@ namespace remix_rsx
 	bool blend_state_enabled()
 	{
 		static const bool env = read_env_u32(L"RPCS3_REMIX_BLENDSTATE", 1) != 0;
+		return env;
+	}
+
+	// ROUND 60. See RemixTextures.h for the measurement this exists for. Env-ONLY and default 0, so
+	// RPCS3_REMIX_TEXREMAP=0 is a real "off" rather than the silent no-op an "env || g_cfg" accessor
+	// would make of it - there is no config member for this and there must not be one until the
+	// knob has been A/B'd on more than one title.
+	bool texture_remap_enabled()
+	{
+		static const bool env = read_env_u32(L"RPCS3_REMIX_TEXREMAP", 0) != 0;
 		return env;
 	}
 
@@ -796,6 +851,26 @@ namespace remix_rsx
 			return false;
 		}
 
+		// --- ROUND 60: RPCS3_REMIX_TEXREMAP -------------------------------------------------------
+		// The per-texture channel remap this cache has never read. Counted for every decodable
+		// texture whether or not the knob is on, so remap_seen answers "does this title use the
+		// register at all" without a rebuild, and remap_seen>0 with remap_applied==0 reads as
+		// "knob off" rather than "nothing to fix".
+		//
+		// B8 is EXCLUDED from application on purpose. The B8 arm below hand-writes (v, v, v, 0xFF),
+		// which is itself a spread standing in for the remap the other rpcs3 backends get from this
+		// register; running decoded_remap() over that result would apply the spread twice. The
+		// measured Eat Lead population is A8R8G8B8, so nothing is lost by leaving B8 alone, and
+		// the honest fix for B8 is to replace its hardcoded spread, which is not this round.
+		const u32 remap_ctl = tex.remap();
+		const bool remap_nonidentity = (remap_ctl != RSX_TEXTURE_REMAP_IDENTITY);
+		const bool remap_apply = remap_nonidentity && !is_b8 && texture_remap_enabled();
+
+		if (remap_nonidentity)
+		{
+			++m_stats.remap_seen;
+		}
+
 		const std::vector<rsx::subresource_layout> layouts = rsx::get_subresources_layout(tex);
 
 		const rsx::subresource_layout* mip0 = nullptr;
@@ -833,6 +908,16 @@ namespace remix_rsx
 		u64 hash = fnv_bytes(mip0->data.data<u8>(), mip0->data.size(), rpcs3::fnv_seed);
 		hash = rpcs3::hash64(hash, u64{gcm_format});
 		hash = rpcs3::hash64(hash, u64{width} | (u64{height} << 32));
+
+		// ROUND 60. The remap is part of the interpretation, so two draws that share bytes and
+		// format but not remap must not share a decoded entry. Mixed in ONLY when it is actually
+		// applied: with the knob off - and on every texture whose remap is identity - the hash is
+		// bit-for-bit what every previous round produced, so no existing bin/remix_tex replacement
+		// stops matching because this code shipped.
+		if (remap_apply)
+		{
+			hash = rpcs3::hash64(hash, 0x52454d4150ull ^ u64{remap_ctl});
+		}
 
 		out.content_hash = hash ? hash : 1;
 		out.fingerprint = (texture_rehash_mode() >= 2)
@@ -907,6 +992,15 @@ namespace remix_rsx
 				}
 			}
 
+			// ROUND 60. Every decode arm ends with the same two lines rather than one shared tail,
+			// because three of the four already return from inside their own branch and threading
+			// them through a common exit would move code this round has no measurement for.
+			if (remap_apply)
+			{
+				apply_channel_remap(out.pixels, tex.decoded_remap());
+				++m_stats.remap_applied;
+			}
+
 			return true;
 		}
 
@@ -927,6 +1021,14 @@ namespace remix_rsx
 		{
 			rsx::io_buffer dst{ out.pixels.data(), out.pixels.size() };
 			rsx::upload_texture_subresource(dst, *mip0, static_cast<int>(gcm_format), is_swizzled, caps);
+
+			// ROUND 60. This is the arm the Eat Lead boot logos take (A8R8G8B8 | LN).
+			if (remap_apply)
+			{
+				apply_channel_remap(out.pixels, tex.decoded_remap());
+				++m_stats.remap_applied;
+			}
+
 			return true;
 		}
 
@@ -961,6 +1063,14 @@ namespace remix_rsx
 
 			const u32 bgra = expand(word);
 			std::memcpy(out.pixels.data() + (i * 4), &bgra, sizeof(u32));
+		}
+
+		// ROUND 60. The 16-bit expanders above already produce true RGBA, so the remap applies to
+		// them exactly as it does to the 32-bit arm.
+		if (remap_apply)
+		{
+			apply_channel_remap(out.pixels, tex.decoded_remap());
+			++m_stats.remap_applied;
 		}
 
 		return true;
@@ -1296,7 +1406,11 @@ namespace remix_rsx
 				{
 					opaque.useDrawCallAlphaState = 0u;
 					opaque.blendType_hasvalue = 1;
-					opaque.blendType_value = 6;
+					// The captured Demon's Souls cloud has bright RGB in alpha-zero padding.
+					// AlphaEmissive (1) masks its emission; Emissive (6) ignores that alpha.
+					const bool demons_cloud = sky_emissive && demons_world_enabled()
+						&& entry.content_hash == 0x1716BEA1C9E692F8ull;
+					opaque.blendType_value = demons_cloud ? 1 : 6;
 					++m_stats.materials_sky_unordered;
 				}
 			}
@@ -1374,6 +1488,13 @@ namespace remix_rsx
 			u64 sum_r = 0;
 			u64 texels = 0;
 
+			// ROUND 58 (step 2a). Saturation and luminance spread, accumulated in INTEGERS in this
+			// same pass - no second walk, no rounding drift. sum_s is r+g+b per texel (0..765) and
+			// sum_s2 its square: 765^2 * 4.2M texels is 2.4e12, which u64 holds with room.
+			u64 sum_sat = 0;
+			u64 sum_s = 0;
+			u64 sum_s2 = 0;
+
 			for (usz i = 3; i < entry.pixels.size(); i += 4)
 			{
 				const u8 a = entry.pixels[i];
@@ -1381,9 +1502,20 @@ namespace remix_rsx
 				hi = std::max(hi, a);
 
 				// BGRA8 - the upload format below is B8G8R8A8, so index 0 is blue.
-				sum_b += entry.pixels[i - 3];
-				sum_g += entry.pixels[i - 2];
-				sum_r += entry.pixels[i - 1];
+				const u32 b = entry.pixels[i - 3];
+				const u32 g = entry.pixels[i - 2];
+				const u32 r = entry.pixels[i - 1];
+
+				sum_b += b;
+				sum_g += g;
+				sum_r += r;
+
+				sum_sat += std::max({ r, g, b }) - std::min({ r, g, b });
+
+				const u64 s = u64{r} + g + b;
+				sum_s += s;
+				sum_s2 += s * s;
+
 				++texels;
 			}
 
@@ -1396,6 +1528,15 @@ namespace remix_rsx
 				entry.mean_rgb[0] = static_cast<f32>(static_cast<f64>(sum_r) * scale);
 				entry.mean_rgb[1] = static_cast<f32>(static_cast<f64>(sum_g) * scale);
 				entry.mean_rgb[2] = static_cast<f32>(static_cast<f64>(sum_b) * scale);
+
+				const f64 n = static_cast<f64>(texels);
+				entry.sat_mean = static_cast<f32>(static_cast<f64>(sum_sat) / n);
+
+				// var(s/3) = (E[s^2] - E[s]^2) / 9. Clamped at zero: the subtraction of two large
+				// nearly equal doubles can land a hair below it on a perfectly flat texture.
+				const f64 mean_s = static_cast<f64>(sum_s) / n;
+				const f64 var = ((static_cast<f64>(sum_s2) / n) - (mean_s * mean_s)) / 9.0;
+				entry.lum_sd = static_cast<f32>(std::sqrt(std::max(var, 0.0)));
 			}
 		}
 

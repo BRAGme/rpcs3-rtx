@@ -15,6 +15,7 @@
 #include "Emu/RSX/Program/ProgramStateCache.h"
 #include "Emu/RSX/Remix/RemixGameConfig.h"
 #include "Emu/RSX/Remix/RemixVertexDecode.h"
+#include "Emu/RSX/Remix/RemixDemonsLights.inl"
 #include "Emu/RSX/Overlays/overlay_manager.h"
 #include "Emu/RSX/Overlays/overlays.h"
 #include "Emu/RSX/rsx_methods.h"
@@ -27,9 +28,13 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+// ROUND 52: the authored-light loader parses bin/eatlead_lights/<Level>.lights with a hand
+// tokeniser over string_views and strtoul/strtod/strtoull. Neither header was reached transitively.
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <numeric>
+#include <string_view>
 #include <variant>
 
 namespace
@@ -134,6 +139,15 @@ namespace
 	constexpr f32 s_camera_pending_match_tolerance = 0.5f;
 	constexpr u32 s_camera_switch_confirm_frames = 12;
 
+	// ROUND 53, RPCS3_REMIX_CAMREBASE. How far the relation between two witnesses may drift from the
+	// first one observed before the pair stops being rigid and one of them is declared to be moving.
+	// A genuinely rigid pair differs only by split noise - the clustering loop's own merge tolerance
+	// is 1e-3, two orders below this - while an object walking 0.05 world units per frame crosses
+	// 0.05 relative within about a second at the |t| <= 50 typical of these bases. Measurement only
+	// in this round: the flag skips a witness in the tenure election and is counted, and CAMREBASE
+	// mode 2 (hand over away from a moving incumbent) is deliberately not implemented.
+	constexpr f32 s_camera_witness_tolerance = 0.05f;
+
 	f32 matrix_relative_delta(const remix_rsx::mat4& lhs, const remix_rsx::mat4& rhs)
 	{
 		f32 delta = 0.f;
@@ -149,6 +163,34 @@ namespace
 		}
 
 		return delta / (norm + 1.f);
+	}
+
+	// ROUND 54. A 64-bit fingerprint of a 4x4, used for exactly one question: is the divisor
+	// (m_active_camera.reference_inverse) BIT-IDENTICAL to the one a guest light was last placed
+	// under? That question cannot be answered from latch frames - the two writers of the reference
+	// (the flip latch and the mid-frame relatch) both stamp latch_frame, so equal latches prove the
+	// reference was not refreshed but a changed latch does not prove the matrix changed - and it
+	// cannot be answered by a tolerance, because the whole point is to separate "the divisor did not
+	// change and the light moved anyway" from every kind of staleness. Bit identity on the stored
+	// bytes is the exact test, so this deliberately hashes the raw u32 patterns: -0.0 and +0.0 are
+	// different values here, and a NaN never compares equal to itself, which is the honest answer.
+	//
+	// FNV via rpcs3::hash64, the same chain guest_light_entry::identity is built with. A 64-bit hash
+	// of a 512-bit matrix collides in principle; the consequence of a collision is one drift row
+	// mislabelled G-lamp, which the -mat row's own matrices then contradict.
+	u64 hash_mat4(const remix_rsx::mat4& value)
+	{
+		u64 hash = 0x424153495334ull;
+
+		for (u32 i = 0; i < 4; ++i)
+		{
+			for (u32 j = 0; j < 4; ++j)
+			{
+				hash = rpcs3::hash64(hash, std::bit_cast<u32>(value.m[i][j]));
+			}
+		}
+
+		return hash;
 	}
 
 	// One line per resolved frame under RPCS3_REMIX_CAMTRACE=1. This is intentionally a runtime
@@ -763,9 +805,29 @@ void RemixGSRender::on_init_thread()
 		// counters existed on a stats line - and pick= is the "instrument armed" proof, so a run
 		// with no pick lines is never again ambiguous between a dead instrument and no clicks.
 		// The file is safe to rename or archive between runs: this recreates it.
+		//
+		// ROUND 52: the authored-light offset is the only knob on this banner that is not returned
+		// by value, so it is read into a local here rather than inside the argument list.
+		f32 authored_offset_banner[3]{};
+		remix_rsx::authored_light_offset(authored_offset_banner);
+
 		const std::string line = fmt::format(
 			"Remix run-start: build=%s %s pid=%u title=%s pick=%d gaugeanchor=%d gaugetrace=%u "
-			"camrelatch=%d uvaffineall=%d uvscalelanes=%d uvrangecensus=%d notexcensus=%d "
+			// ROUND 52 appends camrelatchtol immediately after camrelatch with its argument in the
+			// matching position. The relatch is what submit_camera() submits, so a run whose menu
+			// camera still rides a prop has to say in its first ten lines whether the tolerance was
+			// narrowed; 0.8 here means the arm was never armed.
+			// ROUND 52 (step 2b) appends uvscalehop immediately after uvscalelanes with its argument
+			// in the matching position. It DEFAULTS TO 1 and it changes the UV divisor on the
+			// majority of this title's world draws, so a run whose walls tile differently has to be
+			// able to say from its first ten lines whether the hop was armed.
+			// ROUND 58 appends fplerpunit/uvlanes/uvscale2 immediately after uvscalehop, arguments
+			// in the matching positions. All three default to 0 and each CHANGES WHICH TEXTURE a
+			// surface is drawn with, so a run whose walls look different has to say in its first
+			// ten lines which of them was armed. The three are adjacent on purpose - one regex
+			// reads them together.
+			"camrelatch=%d camrelatchtol=%.3g uvaffineall=%d uvscalelanes=%d uvscalehop=%d "
+			"fplerpunit=%d uvlanes=%d uvscale2=%d uvrangecensus=%d notexcensus=%d "
 			"gaugeslots=%u gaugeprevdims=%d gaugecurdims=%d gaugecamhold=%u anchorgaugecensus=%u camanchoreye=%d skipauxuntex=%d watchlist=%u "
 			"fpkil=%d fpkilref=%u gaugef64=%d "
 			// Round 5. The lighting knobs are on the banner as well as the live line because they
@@ -789,8 +851,17 @@ void RemixGSRender::on_init_thread()
 			// Round 48 shipped it at 0 and a play-test then warped; the run could not be checked
 			// against the knob because the knob was structurally unobservable. A knob that changes
 			// 35% of the frame MUST appear in the first ten lines.
-			"notexmat=%d skipshadowonly=%d walksampled=%d tailrescue=%d tailrescueage=%u glauto=%u "
-			"glstable=%u glcells=%u glidle=%u drawaudit=%d camsanity=%u camsanitytol=%.3g "
+			"notexmat=%d skipshadowonly=%d "
+			// ROUND 51. Both default ON and both delete draws, so a run whose picture lost an object
+			// has to be able to say from its first ten lines whether they were armed.
+			"skipcmask=%d skipnotarget=%d "
+			"walksampled=%d tailrescue=%d tailrescueage=%u glauto=%u "
+			// ROUND 52, appended at the END of the guest-light group with its two arguments in the
+			// matching position immediately after glidle's. Both default 0 and both change where a
+			// light is allowed to be, so a run whose lights moved has to be able to say from its
+			// first ten lines whether they were armed.
+			"glstable=%u glcells=%u glidle=%u gltrack=%d glmainclip=%d "
+			"drawaudit=%d camsanity=%u camsanitytol=%.3g "
 			// Round 7, same reason. uiclamp is the UI seam fix and is what the play-test card
 			// checks first; clampalbedos is the lever count for the GPU route; mainclipmax and
 			// skipccconst change what two existing counters mean.
@@ -798,6 +869,28 @@ void RemixGSRender::on_init_thread()
 			// Round 25. uirectshrink is the HUD-font fix and is the first thing its play-test card
 			// checks; a run that shows doubled glyphs with uirectshrink=0 was launched without it.
 			"uirectshrink=%u uirectshrinkpct=%u "
+			// ROUND 52, appended at the END of the UI group with its four arguments in the matching
+			// position immediately after uirectshrinkpct's. uitinttexcoord and uiuvucode DEFAULT TO
+			// 1, which is exactly why they have to be here: a run that still shows a white opaque
+			// menu with uitinttexcoord=1 is a fix that fired and did not work, and one with
+			// uitinttexcoord=0 is a launcher that turned it off - and those two want opposite next
+			// steps. uiforcevpdw defaults 0 and is worthless without a non-empty uiforce_vps, so the
+			// pair has to be readable together. ucodestorefphashes is a LIST SIZE, so an
+			// armed-looking launcher that stores nothing says so here rather than only as an absent
+			// file.
+			"uitinttexcoord=%d uiuvucode=%d uiforcevpdw=%d ucodestorefphashes=%u "
+			// ROUND 59, appended at the END of the same knob group with its one argument in the
+			// matching position. uiforcevpdw now prints the MODE (0/1/2), not a flag, so a conf
+			// that asked for the pre-world variant and a conf that asked for the unconditional one
+			// are distinguishable from the banner alone. uirefusefps is a LIST SIZE, so an
+			// armed-looking launcher that refuses nothing says so here rather than only as a
+			// ui_refused_fp of 0, which is also what an inert knob reads.
+			"uirefusefps=%u "
+			// ROUND 60, appended at the END of the same knob group with its one argument in the
+			// matching position. texremap changes what EVERY decoded texture contains, so a run
+			// that looks different from the last one has to be able to say which side of this it
+			// was launched on without anyone reading the launcher.
+			"texremap=%d "
 			// Round 8. The giant-geometry fix's A/B knob, on the banner because the play-test card
 			// asks the user to flip it between relaunches and a run has to name what it ran with.
 			"wdivwalk=%d "
@@ -816,9 +909,53 @@ void RemixGSRender::on_init_thread()
 			// point of the banner is that the first ten lines of a run say what it was launched
 			// with. vcolbgra in particular has to be visible: the HUD turning amber is the visible
 			// test, and "amber" with vcolbgra=0 would mean the binary is stale.
-			"camclipgate=%d camfbrelatch=%d anchorsticky=%d gaugedonorbest=%u vcolbgra=%d fpvcolalphagate=%d "
+			// ROUND 52: camclipgate now prints the MODE, not a bool - mode 2 (the gate with no lock
+			// configured) would otherwise be indistinguishable from mode 1, which is exactly the
+			// round-49 glauto correction. camsticky is appended immediately after camfbrelatch
+			// with its argument in the matching position; it defaults OFF, so a run whose camera
+			// still flip-flops has to say whether the hysteresis was armed.
+			// ROUND 53: the four CAMTRACK / CAMREBASE knobs appended immediately after camsticky with
+			// their arguments in the matching position. Both default OFF, and the entire round is an
+			// A/B between two conf files, so the first ten lines of a run have to state which arm was
+			// armed rather than leaving it to be inferred from the counters.
+			"camclipgate=%u camfbrelatch=%d camsticky=%u camtrack=%u camtrackpos=%.3g camtrackmiss=%u "
+			// ROUND 54: the two measurement knobs appended immediately after camrebase with their
+			// accessors in the matching position. Both default OFF and both are pure
+			// instrumentation, so a run whose dump has no cam-relatch or -mat rows has to say
+			// whether that is "nothing happened" or "the launcher did not arm them".
+			"camrebase=%u gldriftmat=%u camrelatchtrace=%u camrefsynth=%u "
+			// ROUND 56, appended immediately after camrefsynth with its accessor in the matching
+			// position. This one CHANGES OUTPUT (it un-mirrors the submitted camera's right vector),
+			// so a run whose free camera still strafes the wrong way has to be able to say whether
+			// the arm was armed at all - especially since the conf parser does not strip inline
+			// comments and an inline one has silently zeroed a knob here before.
+			"camxflip=%u "
+			// ROUND 57, appended immediately after camxflip with its accessor in the matching
+			// position. PICKFRESH is pure measurement, so the tell it has to support is the opposite
+			// one: a run with no 'Remix pick-fresh:' rows at all has to say whether that is "the user
+			// never clicked" or "the launcher never armed the instrument".
+			// ROUND 57 step 8, beside pickfresh and for the round-56 reason: DEFERPRERELATCH
+			// CHANGES OUTPUT (it moves ~12 instances a frame from their draw ordinal to the relatch
+			// ordinal), so "the props still swim" has to be separable from "the launcher never armed
+			// the fix". It ships commented out in the conf, so this is how a run says which arm.
+			"pickfresh=%u deferprerelatch=%u "
+			"anchorsticky=%d gaugedonorbest=%u "
+			"vcolbgra=%d fpvcolalphagate=%d "
 			"fpvcolemissive=%.4g fpvcoladditive=%d vmalbedos=%u vmanchorgeo=%d vmalbedocam=%d "
-			"madaccumwalk=%d "
+			// ROUND 50, appended here with its argument in the matching position immediately after
+			// madaccumwalk's. posinput DEFAULTS TO 1, which is exactly why it has to be on the
+			// banner: a run that shows a 0..254 cloud with posinput=1 is a fix that fired and did
+			// not work, and one with posinput=0 is a launcher that turned it off - and those two
+			// want opposite next steps. `pos_input=0/0` on the live line with posinput=1 here means
+			// the arm was armed and no program in the run needed it.
+			"madaccumwalk=%d posinput=%d vertexblend=%d "
+			// The vertex-normal decode and its slot, plus the two Demon's Souls profile knobs,
+			// which were readable ONLY in bin\BLUS30443.conf until now: a run that shows the old
+			// flat shading with vtxnormal=1 is a fix that fired and did not work, and one with
+			// vtxnormal=0 is a launcher that turned it off.
+			"vtxnormal=%d normalattr=%u demonsmenu=%d demonsworld=%d "
+			"uvscalemov=%d uiuvonce=%d "
+			"demonslights=%d demonssunsrc=%u demonslightscale=%.4gdemonshemi=%d "
 			// Round 11. hazefade is the headline visible test and the first thing the play-test
 			// card bisects, so a run that shows a black wall has to be able to say in its first ten
 			// lines whether the fade was even armed; fpvcolroute/vcolfold are the pair the VCOLMOD
@@ -875,6 +1012,13 @@ void RemixGSRender::on_init_thread()
 			// off and every mat_skyemissive counter below is expected to be 0 with it. fpcensusvp
 			// likewise gates the 'Remix fpcandidate:' lines.
 			"skyemissive=%u skyemissiveint=%.4g skyemissiveblend=%d "
+			// ROUND 53, and both belong in the first ten lines for the same reason skyemissive= does:
+			// each has a counter whose 0 reading is ambiguous without the knob beside it.
+			// skytag=0 means every sky rule is measure-only, so cat_sky=0 is a SETTING and not a
+			// rule that found nothing; skyemissivewext=1 means a declared sky texture is exempt from
+			// the world-extent refusal, so wext_exempt_sky=0 means the dome was never drawn rather
+			// than that the exemption failed.
+			"skytag=%d skyemissivewext=%d "
 			// ROUND 39. The dome classifier's six knobs plus the live size of the learned set, all
 			// printing the CLAMPED value so a SKYCLASSIFY=9 that is silently running as mode 3 is
 			// visible here rather than nowhere. skyclassifyset= is not a knob - it is how many hashes
@@ -902,7 +1046,22 @@ void RemixGSRender::on_init_thread()
 			// armed and a completely different thing when the launcher never set it. particlevps
 			// reading 0/0 is the FIRST thing to check if the smoke is still missing.
 			"particlevps=%u/%u particleflip=%u sunspritealbedos=%u vmtriple=%u/%u/%u "
-			"camlock=%016llx",
+			"camlock=%016llx"
+			// ROUND 52, appended at the VERY END of both the format and the argument list - the one
+			// shape of edit to this line that cannot shift an unrelated pair, and the shape rounds
+			// 18/19 each shipped an ordering bug by getting wrong. Eleven specifiers, eleven
+			// arguments, in this order.
+			//
+			// EVERY ONE OF THESE IS OFF BY DEFAULT and the banner is how a run says so.
+			// authoredlevel= empty is the shipped state and means the loader never looked for a
+			// file, so an absent `Remix authored-lights:` line is EXPLAINED rather than suspicious;
+			// authoredlights=0 with a level set is step 1 of the plan (the file loads, nothing is
+			// submitted) and is a RESULT, not a misconfiguration. authoredaxis and authoredoffset
+			// are the two bring-up dials and both print their PARSED values, because an offset typed
+			// with a comma decimal separator parses to 0 and would otherwise be visible only as an
+			// absence of motion.
+			" | authoredlights=%u authoredlevel=%s authoredaxis=%u authoredoffset=[%.4g %.4g %.4g] "
+			"authoredonly=%d authoredradiance=%.4g authoredmax=%u authoreddist=%.4g authoreddump=%u",
 			__DATE__, __TIME__,
 			static_cast<u32>(GetCurrentProcessId()),
 			Emu.GetTitleID(),
@@ -910,8 +1069,18 @@ void RemixGSRender::on_init_thread()
 			remix_rsx::gauge_anchor_enabled() ? 1 : 0,
 			remix_rsx::gauge_trace_frames(),
 			remix_rsx::camera_relatch_enabled() ? 1 : 0,
+			// ROUND 52, in the matching position for the "camrelatchtol=%.3g" appended after
+			// "camrelatch=%d" above.
+			static_cast<f64>(remix_rsx::camera_relatch_tolerance()),
 			remix_rsx::uv_affine_all_enabled() ? 1 : 0,
 			remix_rsx::uv_scale_lanes_enabled() ? 1 : 0,
+			// ROUND 52 (step 2b), in the matching position for the "uvscalehop=%d" appended after
+			// "uvscalelanes=%d" above.
+			remix_rsx::uv_scale_hop_enabled() ? 1 : 0,
+			// ROUND 58, in the matching positions for "fplerpunit=%d uvlanes=%d uvscale2=%d".
+			remix_rsx::fp_lerp_unit_enabled() ? 1 : 0,
+			remix_rsx::uv_lanes_enabled() ? 1 : 0,
+			remix_rsx::uv_scale2_enabled() ? 1 : 0,
 			remix_rsx::uv_range_census_enabled() ? 1 : 0,
 			remix_rsx::notex_census_enabled() ? 1 : 0,
 			remix_rsx::gauge_slot_count(),
@@ -942,6 +1111,10 @@ void RemixGSRender::on_init_thread()
 			remix_rsx::light_pass_census_enabled() ? 1 : 0,
 			remix_rsx::notex_material_enabled() ? 1 : 0,
 			remix_rsx::skip_shadow_only_enabled() ? 1 : 0,
+			// ROUND 51, the pair for 'skipcmask=%d skipnotarget=%d' inserted at the matching
+			// position immediately after skipshadowonly in the same edit.
+			remix_rsx::skip_colour_mask_off_enabled() ? 1 : 0,
+			remix_rsx::skip_no_colour_target_enabled() ? 1 : 0,
 			remix_rsx::walk_sampled_enabled() ? 1 : 0,
 			remix_rsx::tail_rescue_enabled() ? 1 : 0,
 			remix_rsx::tail_rescue_age(),
@@ -949,6 +1122,10 @@ void RemixGSRender::on_init_thread()
 			remix_rsx::guest_light_stable_frames(),
 			remix_rsx::guest_light_max_cells(),
 			remix_rsx::guest_light_idle_frames(),
+			// ROUND 52, the pair for 'gltrack=%d glmainclip=%d' appended at the end of the
+			// guest-light group in the same edit.
+			remix_rsx::guest_light_track_enabled() ? 1 : 0,
+			remix_rsx::guest_light_main_clip_enabled() ? 1 : 0,
 			remix_rsx::draw_audit_enabled() ? 1 : 0,
 			remix_rsx::camera_sanity_mode(),
 			static_cast<f64>(remix_rsx::camera_sanity_tolerance()),
@@ -958,6 +1135,17 @@ void RemixGSRender::on_init_thread()
 			remix_rsx::skip_cc_const_writer_enabled() ? 1 : 0,
 			remix_rsx::ui_rect_shrink_count(),
 			remix_rsx::ui_rect_shrink_percent(),
+			// ROUND 52, in the order of
+			// "uitinttexcoord=%d uiuvucode=%d uiforcevpdw=%d ucodestorefphashes=%u" above.
+			remix_rsx::ui_tint_texcoord_enabled() ? 1 : 0,
+			remix_rsx::ui_uv_ucode_enabled() ? 1 : 0,
+			// ROUND 59: the MODE, not the flag. Prints 0/1/2 and is unchanged at 0 and 1.
+			static_cast<int>(remix_rsx::ui_force_vp_depth_write_mode()),
+			remix_rsx::ucode_store_fp_hash_count(),
+			// ROUND 59, in the order of "uirefusefps=%u" above.
+			remix_rsx::ui_refuse_fp_count(),
+			// ROUND 60, in the order of "texremap=%d" above.
+			remix_rsx::texture_remap_enabled() ? 1 : 0,
 			remix_rsx::wdivide_walk_enabled() ? 1 : 0,
 			remix_rsx::fp_vertex_colour_replay_enabled() ? 1 : 0,
 			remix_rsx::vertex_colour_modulate_enabled() ? 1 : 0,
@@ -968,8 +1156,30 @@ void RemixGSRender::on_init_thread()
 			remix_rsx::texture_reap_safe() ? 1 : 0,
 			remix_rsx::ucode_store_enabled() ? 1 : 0,
 			remix_rsx::texture_idle_frames(),
-			remix_rsx::camera_clip_gate_enabled() ? 1 : 0,
+			// ROUND 52: the MODE for "camclipgate=%u", and camsticky in the matching position for
+			// the "camsticky=%u" appended after "camfbrelatch=%d" above.
+			remix_rsx::camera_clip_gate_mode(),
 			remix_rsx::camera_fallback_relatch_enabled() ? 1 : 0,
+			remix_rsx::camera_sticky_enabled() ? 1u : 0u,
+			// ROUND 53, the four in the matching position for the "camtrack=%u camtrackpos=%.3g
+			// camtrackmiss=%u camrebase=%u" appended after "camsticky=%u" above.
+			remix_rsx::camera_track_mode(),
+			static_cast<f64>(remix_rsx::camera_track_position_tolerance()),
+			remix_rsx::camera_track_miss_frames(),
+			remix_rsx::camera_rebase_mode(),
+			// ROUND 54, the two in the matching position for "gldriftmat=%u camrelatchtrace=%u"
+			// appended after "camrebase=%u" above.
+			remix_rsx::guest_light_drift_matrices(),
+			remix_rsx::camera_relatch_trace_mode(),
+			// ROUND 55, in the matching position for "camrefsynth=%u" appended after
+			// "camrelatchtrace=%u" above. The banner is how a run states which arm it was.
+			remix_rsx::camera_ref_synth_mode(),
+			// ROUND 56, in the matching position for "camxflip=%u" appended after "camrefsynth=%u".
+			remix_rsx::camera_xflip_enabled() ? 1u : 0u,
+			// ROUND 57, in the matching position for "pickfresh=%u deferprerelatch=%u" appended
+			// after "camxflip=%u".
+			remix_rsx::pick_fresh_enabled() ? 1u : 0u,
+			remix_rsx::defer_pre_relatch_enabled() ? 1u : 0u,
 			remix_rsx::gauge_anchor_sticky_enabled() ? 1 : 0,
 			remix_rsx::gauge_donor_best(),
 			remix_rsx::vertex_colour_bgra_enabled() ? 1 : 0,
@@ -980,6 +1190,26 @@ void RemixGSRender::on_init_thread()
 			remix_rsx::viewmodel_anchor_geometry_enabled() ? 1 : 0,
 			remix_rsx::viewmodel_albedo_camera_enabled() ? 1 : 0,
 			remix_rsx::mad_accumulate_walk_enabled() ? 1 : 0,
+			// ROUND 50, in the matching position for the "posinput=%d" appended after
+			// "madaccumwalk=%d" above.
+			remix_rsx::position_input_enabled() ? 1 : 0,
+			// ROUND 52, in the matching position for the "vertexblend=%d" appended after
+			// "posinput=%d" above. Defaults to 1, which is exactly why it is on the banner: an Eat
+			// Lead run with no characters and vertexblend=1 is an arm that fired and did not work,
+			// and one with vertexblend=0 is a launcher that turned it off.
+			remix_rsx::vertex_blend_enabled() ? 1 : 0,
+			// In the matching position for "vtxnormal=%d normalattr=%u demonsmenu=%d
+			// demonsworld=%d" appended after "posinput=%d" above.
+			remix_rsx::vertex_normals_enabled() ? 1 : 0,
+			remix_rsx::normal_attribute_index(),
+			remix_rsx::demons_menu_enabled() ? 1 : 0,
+			remix_rsx::demons_world_enabled() ? 1 : 0,
+			remix_rsx::texcoord_scale_mov_walk() ? 1 : 0,
+			remix_rsx::ui_uv_apply_once() ? 1 : 0,
+			remix_rsx::demons_lights_enabled() ? 1 : 0,
+			remix_rsx::demons_sun_source(),
+			static_cast<f64>(remix_rsx::demons_light_scale()),
+			remix_rsx::demons_hemisphere_enabled() ? 1 : 0,
 			remix_rsx::fp_vcol_route_enabled() ? 1 : 0,
 			remix_rsx::vcol_fold_enabled() ? 1 : 0,
 			remix_rsx::fp_vcol_sky_gate_enabled() ? 1 : 0,
@@ -1026,6 +1256,9 @@ void RemixGSRender::on_init_thread()
 			remix_rsx::sky_emissive_albedo_count(),
 			static_cast<f64>(remix_rsx::sky_emissive_intensity()),
 			remix_rsx::sky_emissive_blend_enabled() ? 1 : 0,
+			// ROUND 53. Two arguments for the two specifiers above, same order: skytag, skyemissivewext.
+			remix_rsx::sky_tag_enabled() ? 1 : 0,
+			remix_rsx::sky_emissive_wext_exempt_enabled() ? 1 : 0,
 			// ROUND 39. Eight arguments for the eight specifiers above, same order: mode, maxext,
 			// minvtx, maxvtx, upv, min, settle, set.
 			remix_rsx::sky_classify_mode(),
@@ -1057,7 +1290,20 @@ void RemixGSRender::on_init_thread()
 			remix_rsx::viewmodel_triple_vp_count(),
 			remix_rsx::viewmodel_triple_fp_count(),
 			remix_rsx::viewmodel_triple_albedo_count(),
-			remix_rsx::camera_lock_vp_hash());
+			remix_rsx::camera_lock_vp_hash(),
+			// ROUND 52, in the matching position for the eleven authored-light specifiers appended
+			// at the end of the format above, in the same order and nowhere else.
+			remix_rsx::authored_light_mode(),
+			remix_rsx::authored_light_level(),
+			remix_rsx::authored_light_axis(),
+			static_cast<f64>(authored_offset_banner[0]),
+			static_cast<f64>(authored_offset_banner[1]),
+			static_cast<f64>(authored_offset_banner[2]),
+			remix_rsx::authored_light_only(),
+			static_cast<f64>(remix_rsx::authored_light_radiance()),
+			remix_rsx::authored_light_max(),
+			static_cast<f64>(remix_rsx::authored_light_distance()),
+			remix_rsx::authored_light_dump());
 
 		rsx_log.success("%s", line);
 
@@ -1136,6 +1382,16 @@ void RemixGSRender::on_exit()
 			remix_rsx::guarded_destroy_light(api.DestroyLight, m_debug_light);
 		}
 
+		if (m_demons_amulet_light)
+			remix_rsx::guarded_destroy_light(api.DestroyLight, m_demons_amulet_light);
+		for (const auto& light : m_demons_fire_lights)
+			if (light.handle) remix_rsx::guarded_destroy_light(api.DestroyLight, light.handle);
+		for (const auto& [key, handle] : m_demons_fire_materials)
+			remix_rsx::guarded_destroy_material(api.DestroyMaterial, handle);
+
+		if (m_demons_water_material)
+			remix_rsx::guarded_destroy_material(api.DestroyMaterial, m_demons_water_material);
+
 		if (m_sun_light)
 		{
 			// Round 26: the ONLY DestroyLight the sun is allowed to see, and it runs at teardown.
@@ -1149,6 +1405,23 @@ void RemixGSRender::on_exit()
 			if (light.handle)
 			{
 				remix_rsx::guarded_destroy_light(api.DestroyLight, light.handle);
+			}
+		}
+
+		// ROUND 52: the authored level lights. THE ONLY DestroyLight they ever see, and it runs at
+		// teardown -- the same rule the sun and the guest lights follow. remixapi_DestroyLight only
+		// QUEUES, and Present drains destroys BEFORE same-frame creates with a tombstone, so a
+		// destroy anywhere in the frame loop would turn every re-place into a delete.
+		for (const authored_light_entry& light : m_authored_lights)
+		{
+			if (light.handle)
+			{
+				remix_rsx::guarded_destroy_light(api.DestroyLight, light.handle);
+			}
+
+			if (light.handle_back)
+			{
+				remix_rsx::guarded_destroy_light(api.DestroyLight, light.handle_back);
 			}
 		}
 
@@ -1176,11 +1449,32 @@ void RemixGSRender::on_exit()
 			remix_rsx::guarded_destroy_texture(api.DestroyTexture, m_self_lit_texture);
 		}
 
+		for (const auto& [key, entry] : m_guest_light_fixture_materials)
+		{
+			if (entry.material)
+			{
+				remix_rsx::guarded_destroy_material(api.DestroyMaterial, entry.material);
+			}
+
+			if (entry.texture)
+			{
+				remix_rsx::guarded_destroy_texture(api.DestroyTexture, entry.texture);
+			}
+		}
+
 		m_textures.destroy_all(api);
 	}
 
 	m_debug_mesh = nullptr;
 	m_debug_light = nullptr;
+	m_demons_amulet_light = nullptr;
+	m_demons_water_material = nullptr;
+	m_demons_fire_materials.clear();
+	m_demons_fire_lights.clear();
+	m_demons_fire_mapping_frame = ~0ull;
+	m_demons_amulet_frame = ~0ull;
+	m_demons_attachment_start = ~0ull;
+	m_demons_amulet_active = false;
 	m_sun_light = nullptr;
 	// Round 14: the aim latch has to die with the handle. A stale m_sun_light_aimed would let the
 	// hysteresis in update_sun_light() compare a freshly-created light against a direction from a
@@ -1192,6 +1486,7 @@ void RemixGSRender::on_exit()
 	m_neutral_texture = nullptr;
 	m_self_lit_material = nullptr;
 	m_self_lit_texture = nullptr;
+	m_guest_light_fixture_materials.clear();
 	m_guest_lights.clear();
 	// ROUND 48. The staging table names positions in a scene that is going away; a confirmed cell
 	// surviving a device teardown would let the next scene light a fixture it has never measured.
@@ -1419,7 +1714,14 @@ void RemixGSRender::pick_callback(const u32* values, u32 count, void* user)
 			// Round 11. The vertex program's half of the colour question (fpcol= above is the
 			// fragment program's), and the guest ROP state that decides whether a dark quad is a
 			// darkening layer doing its job. bsrc/bdst/bop are the raw GCM factors.
-			"fpcol=%s fpalpha=%s fpvcol=%d atest=%d bsrc=%u bdst=%u bop=%u",
+			// ROUND 58, appended at the END so every earlier round's pick lines stay comparable.
+			// elect= is the rule that chose albedo_unit above; would= is the unit the lerp and
+			// lane rules WOULD elect with their knobs off, so a measurement run states the size of
+			// the change before it is armed; lanes= is which pair of its TEXn varying each sampled
+			// unit reads; grey=1 says the texture actually bound measures as a black-and-white
+			// macro/grime map (its 'Remix tex=' row then reads sat<4 lumsd>40).
+			"fpcol=%s fpalpha=%s fpvcol=%d atest=%d bsrc=%u bdst=%u bop=%u "
+			"elect=%s would=%d lanes=%s grey=%d",
 			r.vp_hash, r.fp_hash, r.albedo_hash, r.vertex_count, static_cast<f64>(r.extent),
 			r.sky ? 1 : 0, r.viewmodel ? 1 : 0,
 			remix_rsx::archetype_name(static_cast<remix_rsx::vp_archetype>(r.archetype)),
@@ -1461,7 +1763,11 @@ void RemixGSRender::pick_callback(const u32* values, u32 count, void* user)
 			r.alpha_test ? 1 : 0,
 			u32{r.blend_src},
 			u32{r.blend_dst},
-			u32{r.blend_op});
+			u32{r.blend_op},
+			r.elect_rule ? r.elect_rule : "none",
+			static_cast<s32>(r.elect_would),
+			describe_coord_lanes(r.sampled_mask, r.lanes_packed),
+			r.albedo_grey ? 1 : 0);
 
 		rsx_log.success("%s", line);
 
@@ -1750,6 +2056,11 @@ void RemixGSRender::trace_pick_follow(const pick_record& record)
 		m_pick_follow_last_frame = umax;
 		m_pick_follow_lines = 0;
 		m_pick_follow_have_previous = false;
+		// ROUND 57, the same lifetime and the same reason as m_pick_follow_have_previous above: a
+		// d_rot or a d_fresh measured across two different clicks would be the gap between two
+		// unrelated moments, printed as if it were one frame of motion.
+		m_pick_follow_previous_rot_valid = false;
+		m_pick_follow_fresh_have_previous = false;
 	}
 
 	if (m_pick_follow_generation == 0
@@ -1792,6 +2103,102 @@ void RemixGSRender::trace_pick_follow(const pick_record& record)
 		}
 	}
 
+	// --- ROUND 57: the reference AGE of this draw, and the rotation d_basis cannot see ------------
+	//
+	// age = m_frame_counter - m_active_camera.latch_frame is the SAME predicate per_draw_transform
+	// counts as world_ref_fresh / world_ref_stale, read per object instead of per run. It is the
+	// partition the 0.05-0.25 band lives in: a draw that arrived before the frame's mid-frame
+	// relatch was divided by the flip latch of frame N-1, so it carries the camera's own
+	// frame-to-frame motion Q_N as a pose error, while a draw that arrived after it cancels exactly.
+	// MEASURED on the frozen pid-28088 slice: 298/298 age=1 on the two props that visibly swim, and
+	// 116 of the 122 band rows in the run are theirs. Until now a reader had to subtract two frame
+	// numbers on the row to learn this.
+	u64 age = 0;
+
+	if (!m_active_camera.valid || m_active_camera.latch_frame > m_frame_counter)
+	{
+		// No float sentinel and no negative age: the counter is the flag, and age prints the 0 it is.
+		++m_stats.pf_age_unknown;
+	}
+	else
+	{
+		age = m_frame_counter - m_active_camera.latch_frame;
+	}
+
+	// d_rot is the L1 delta of the ROW-NORMALISED 3x3. d_basis is three row NORMS, which are
+	// invariant under every rigid transform - so d_basis ~ 1e-9 beside d_origin ~ 0.2 rules OUT
+	// every non-rigid mechanism (a gauge mismatch, a projection mismatch, an anisotropic collapse)
+	// and says nothing whatever about rotation. This is the half that can see one.
+	f32 rot_delta = 0.f;
+	f32 rot_now[3][3]{};
+	const bool rot_ok = record.basis[0] > 0.f && record.basis[1] > 0.f && record.basis[2] > 0.f;
+
+	if (!rot_ok)
+	{
+		++m_stats.pf_rot_degenerate;
+	}
+	else
+	{
+		for (u32 i = 0; i < 3; ++i)
+		{
+			for (u32 j = 0; j < 3; ++j)
+			{
+				rot_now[i][j] = record.rot[i][j] / record.basis[i];
+			}
+		}
+
+		if (m_pick_follow_previous_rot_valid)
+		{
+			for (u32 i = 0; i < 3; ++i)
+			{
+				for (u32 j = 0; j < 3; ++j)
+				{
+					rot_delta += std::abs(rot_now[i][j] - m_pick_follow_previous_rot[i][j]);
+				}
+			}
+		}
+	}
+
+	// The band as a census, in the gl_step buckets verbatim so the props and the lights can be read
+	// side by side on one line. The 0.25 drift-census threshold is NOT moved by any of this.
+	// pf_stale + pf_fresh == pf_rows and pf_first + pf_step0..4 == pf_rows are partitions by
+	// construction, and they are the acceptance check for the instrument.
+	++m_stats.pf_rows;
+
+	if (age == 0)
+	{
+		++m_stats.pf_fresh;
+	}
+	else
+	{
+		++m_stats.pf_stale;
+	}
+
+	if (!m_pick_follow_have_previous)
+	{
+		++m_stats.pf_first;
+	}
+	else if (origin_delta < 0.05f)
+	{
+		++m_stats.pf_step0;
+	}
+	else if (origin_delta < 0.25f)
+	{
+		++m_stats.pf_step1;
+	}
+	else if (origin_delta < 1.f)
+	{
+		++m_stats.pf_step2;
+	}
+	else if (origin_delta < 5.f)
+	{
+		++m_stats.pf_step3;
+	}
+	else
+	{
+		++m_stats.pf_step4;
+	}
+
 	const std::string line = fmt::format(
 		"Remix pick-follow: frame=%llu vp=%016llx albedo=%016llX vtx=%u ext=%.4g det=%.6g "
 		"origin=[%.6g %.6g %.6g] "
@@ -1800,7 +2207,15 @@ void RemixGSRender::trace_pick_follow(const pick_record& record)
 		// oscillates while 'ref' flips between anchor and camera IS the reference-selection
 		// flicker, read straight off the trace instead of inferred from two counters.
 		"ref=%s anchor_frame=%llu zfold=%d "
-		"ref_frame=%llu cam_frame=%llu line=%u/%u",
+		"ref_frame=%llu cam_frame=%llu line=%u/%u"
+		// ROUND 57, appended at the END (the round-53 kv-reader rule) with the arguments in the
+		// matching positions at the end of the list. age is the reference age of THIS draw, ord is
+		// how many world draws of the frame preceded it (against m_frame_relatch_ordinal on the
+		// 'Remix cam-relatch:' row, which is where the frame's reference arrived), relatched says
+		// whether the frame relatched at all, d_rot is the rotation d_basis structurally cannot
+		// see, and cpos is the eye - so err ~ r x dtheta can be checked on the row itself. All five
+		// print on BOTH arms; only the pick-fresh row and its stash are behind PICKFRESH.
+		" age=%llu ord=%llu relatched=%d d_rot=%.6g cpos=[%.6g %.6g %.6g]",
 		m_frame_counter,
 		record.vp_hash,
 		record.albedo_hash,
@@ -1823,7 +2238,15 @@ void RemixGSRender::trace_pick_follow(const pick_record& record)
 		m_active_camera.latch_frame,
 		m_frame_counter,
 		m_pick_follow_lines,
-		s_max_pick_follow_lines);
+		s_max_pick_follow_lines,
+		// ROUND 57, the seven in the matching position for the fields appended above.
+		age,
+		m_frame_world_draws,
+		m_frame_relatch_count != 0 ? 1 : 0,
+		static_cast<f64>(rot_delta),
+		static_cast<f64>(m_active_camera.position[0]),
+		static_cast<f64>(m_active_camera.position[1]),
+		static_cast<f64>(m_active_camera.position[2]));
 
 	rsx_log.notice("%s", line);
 
@@ -1832,13 +2255,328 @@ void RemixGSRender::trace_pick_follow(const pick_record& record)
 		out.write(line + '\n');
 	}
 
+	// --- ROUND 57: promote the per-draw scratch into the follow stash ----------------------------
+	//
+	// Here and nowhere else, because this is the point at which every identity test the follow makes
+	// (vp, albedo, vertex count, one row per frame) has already passed - the scratch is written for
+	// any draw that passed the cheap vp/window pre-filter in per_draw_transform, and several of a
+	// frame's draws can pass that. The flip consumes it and re-divides the same fused by the frame's
+	// own relatched reference.
+	if (remix_rsx::pick_fresh_enabled() && m_scratch_pick_valid)
+	{
+		m_pick_follow_stash_valid = true;
+		m_pick_follow_stash_frame = m_frame_counter;
+		m_pick_follow_stash_fused = m_scratch_pick_fused;
+		m_pick_follow_stash_object_space = m_scratch_pick_object_space;
+		m_pick_follow_stash_reference = m_scratch_pick_reference;
+		m_pick_follow_stash_view = m_active_camera.view;
+		m_pick_follow_stash_ord = m_frame_world_draws;
+		m_pick_follow_stash_age = age;
+		// The value picking.objectPickingValue is about to be given at the call site: the record is
+		// pushed AFTER this trace, so the index this draw will carry is size() + 1.
+		m_pick_follow_stash_pick_index = static_cast<u32>(m_pick_table.size() + 1);
+
+		for (u32 i = 0; i < 3; ++i)
+		{
+			m_pick_follow_stash_cam_position[i] = m_active_camera.position[i];
+			m_pick_follow_stash_origin[i] = record.origin[i];
+		}
+	}
+
 	for (u32 i = 0; i < 3; ++i)
 	{
 		m_pick_follow_previous_origin[i] = record.origin[i];
 		m_pick_follow_previous_basis[i] = record.basis[i];
 	}
 
+	if (rot_ok)
+	{
+		for (u32 i = 0; i < 3; ++i)
+		{
+			for (u32 j = 0; j < 3; ++j)
+			{
+				m_pick_follow_previous_rot[i][j] = rot_now[i][j];
+			}
+		}
+	}
+
+	m_pick_follow_previous_rot_valid = rot_ok;
 	m_pick_follow_have_previous = true;
+}
+
+void RemixGSRender::trace_pick_fresh()
+{
+	// One row per followed frame, and only for the frame whose draw filled the stash: a stash that
+	// outlived its frame would be re-divided by the NEXT frame's reference, which is the exact
+	// error this row exists to measure.
+	if (!remix_rsx::pick_fresh_enabled()
+		|| !m_pick_follow_stash_valid
+		|| m_pick_follow_stash_frame != m_frame_counter)
+	{
+		return;
+	}
+
+	m_pick_follow_stash_valid = false;
+
+	// Did this frame's own reference ever arrive? On the ~3% of frames with no relatch there is no
+	// fresh reference to divide by, origin_fresh is the submitted origin, and the row says so with
+	// fresh=0 rather than with an out-of-range number.
+	const bool fresh = m_active_camera.valid && m_active_camera.latch_frame == m_frame_counter;
+
+	// The live arithmetic, in the live ORDER and in f32, copied from per_draw_transform:
+	//     world = fused x reference        (mat4_multiply)
+	//     world = object_space x world     (what prepend_object_space does, by associativity)
+	//     refuse if not finite
+	//     normalise out the projective scale by m[3][3]
+	//     origin = row 3, read through to_remix_transform
+	// Any deviation from that order is what recheck below is built to catch.
+	bool refused = false;
+
+	const auto place = [&](const remix_rsx::mat4& ref, f32 out[3])
+	{
+		remix_rsx::mat4 w = remix_rsx::mat4_multiply(m_pick_follow_stash_fused, ref);
+		w = remix_rsx::mat4_multiply(m_pick_follow_stash_object_space, w);
+
+		if (!remix_rsx::mat4_is_finite(w))
+		{
+			refused = true;
+			out[0] = 0.f;
+			out[1] = 0.f;
+			out[2] = 0.f;
+			return;
+		}
+
+		if (const f32 d = w.m[3][3]; std::abs(d) > 1e-6f && std::abs(d - 1.f) > 1e-6f)
+		{
+			const f32 inv = 1.f / d;
+
+			for (u32 i = 0; i < 4; ++i)
+			{
+				for (u32 j = 0; j < 4; ++j)
+				{
+					w.m[i][j] *= inv;
+				}
+			}
+		}
+
+		const remixapi_Transform t = remix_rsx::to_remix_transform(w);
+
+		for (u32 i = 0; i < 3; ++i)
+		{
+			out[i] = t.matrix[i][3];
+		}
+	};
+
+	// The proof that this recomputation IS the live arithmetic: re-divide by the STALE reference the
+	// draw actually used and the submitted origin must come back, exactly - same operands, same
+	// order, same precision. If it does not, an operator runs between the divide and the submit that
+	// the stash does not carry (a viewmodel, skinned or proj_split route takes a different path), and
+	// err below is not readable at all. pf_recheck_fail is the tell, and it must be 0.
+	f32 origin_recheck[3]{};
+	place(m_pick_follow_stash_reference, origin_recheck);
+
+	f32 recheck = 0.f;
+
+	for (u32 i = 0; i < 3; ++i)
+	{
+		recheck += std::abs(origin_recheck[i] - m_pick_follow_stash_origin[i]);
+	}
+
+	f32 origin_fresh[3]{};
+
+	if (fresh)
+	{
+		place(m_active_camera.reference_inverse, origin_fresh);
+	}
+	else
+	{
+		for (u32 i = 0; i < 3; ++i)
+		{
+			origin_fresh[i] = m_pick_follow_stash_origin[i];
+		}
+	}
+
+	// The pose error: where the object was submitted, minus where the frame's own reference would
+	// have put it. This is the quantity the user SEES - a prop dragging with the camera during a
+	// turn and snapping back when it stops - and d_origin on the follow row is only its derivative.
+	// On an age=0 draw the two references are the same matrix, so this must be exactly 0; that is
+	// the negative control, and it ships with the instrument rather than beside it.
+	f32 err_v[3]{};
+	f32 err_sq = 0.f;
+
+	for (u32 i = 0; i < 3; ++i)
+	{
+		err_v[i] = m_pick_follow_stash_origin[i] - origin_fresh[i];
+		err_sq += err_v[i] * err_v[i];
+	}
+
+	const f32 err = std::sqrt(err_sq);
+
+	// The object's own motion with the reference error removed. H-STALE predicts this at the f32
+	// floor on a static prop whatever the camera does; H-CONSTREAD and H-MOTION both predict it
+	// swimming, so this one number separates them.
+	f32 d_fresh = 0.f;
+
+	if (m_pick_follow_fresh_have_previous)
+	{
+		for (u32 i = 0; i < 3; ++i)
+		{
+			d_fresh += std::abs(origin_fresh[i] - m_pick_follow_fresh_previous_origin[i]);
+		}
+	}
+
+	// r is the eye-to-prop distance, which is the lever arm: a turn of dtheta displaces the prop by
+	// about r x dtheta, so err ~ r x cam_rot (+) cam_step is checkable on the row itself.
+	f32 r_sq = 0.f;
+	f32 cam_step_sq = 0.f;
+
+	for (u32 i = 0; i < 3; ++i)
+	{
+		const f32 dr = origin_fresh[i] - m_active_camera.position[i];
+		const f32 dc = m_active_camera.position[i] - m_pick_follow_stash_cam_position[i];
+		r_sq += dr * dr;
+		cam_step_sq += dc * dc;
+	}
+
+	const f32 r = std::sqrt(r_sq);
+	const f32 cam_step = std::sqrt(cam_step_sq);
+
+	// The angle between the view forward of the reference the draw used and the view forward the
+	// frame ended with. Column 2 of the 3x3 on BOTH sides, so the reading does not depend on which
+	// column this backend calls forward - it is the same column either way, and only the angle
+	// between two of them is used.
+	f32 cam_rot = 0.f;
+	{
+		const f32 a[3] = {
+			m_pick_follow_stash_view.m[0][2],
+			m_pick_follow_stash_view.m[1][2],
+			m_pick_follow_stash_view.m[2][2],
+		};
+		const f32 b[3] = {
+			m_active_camera.view.m[0][2],
+			m_active_camera.view.m[1][2],
+			m_active_camera.view.m[2][2],
+		};
+
+		const f32 la = std::sqrt((a[0] * a[0]) + (a[1] * a[1]) + (a[2] * a[2]));
+		const f32 lb = std::sqrt((b[0] * b[0]) + (b[1] * b[1]) + (b[2] * b[2]));
+
+		if (la > 1e-12f && lb > 1e-12f)
+		{
+			f32 dot = 0.f;
+
+			for (u32 i = 0; i < 3; ++i)
+			{
+				dot += (a[i] / la) * (b[i] / lb);
+			}
+
+			cam_rot = std::acos(std::clamp(dot, -1.f, 1.f));
+		}
+	}
+
+	// ROUND 57, the DEFERPRERELATCH arm. flush_deferred_for_relatch rebuilt this instance's transform
+	// at the relatch, from the deferral's own copies of fused and object_space; origin_fresh above
+	// was rebuilt here, at flip, from the stash. Two independent paths to the same number, so an L1
+	// of exactly 0 is the within-run proof that the transform the runtime RECEIVED is the one this
+	// row reports. Both fields print on both arms: on the control arm deferred=0 and d_deferred=0,
+	// which is the 0 it is and not a sentinel.
+	const bool deferred_seen = m_pick_follow_stash_deferred;
+	f32 d_deferred = 0.f;
+
+	if (deferred_seen)
+	{
+		for (u32 i = 0; i < 3; ++i)
+		{
+			d_deferred += std::abs(m_pick_follow_stash_deferred_origin[i] - origin_fresh[i]);
+		}
+
+		if (d_deferred != 0.f)
+		{
+			++m_stats.pf_deferred_mismatch;
+		}
+	}
+
+	m_pick_follow_stash_deferred = false;
+
+	++m_stats.pf_fresh_rows;
+
+	if (recheck > 1e-5f)
+	{
+		++m_stats.pf_recheck_fail;
+	}
+
+	// Exactly one of these arms fires per row, which is what makes
+	// pf_norelatch + pf_place_refused + pf_err0..4 == pf_fresh_rows a partition rather than a hope.
+	if (refused)
+	{
+		++m_stats.pf_place_refused;
+	}
+	else if (!fresh)
+	{
+		++m_stats.pf_norelatch;
+	}
+	else if (err < 0.05f)
+	{
+		++m_stats.pf_err0;
+	}
+	else if (err < 0.25f)
+	{
+		++m_stats.pf_err1;
+	}
+	else if (err < 1.f)
+	{
+		++m_stats.pf_err2;
+	}
+	else if (err < 5.f)
+	{
+		++m_stats.pf_err3;
+	}
+	else
+	{
+		++m_stats.pf_err4;
+	}
+
+	dump_line(fmt::format(
+		"Remix pick-fresh: frame=%llu albedo=%016llX age=%llu fresh=%d ref_frame=%llu "
+		"origin=[%.6g %.6g %.6g] origin_fresh=[%.6g %.6g %.6g] err=%.6g err_v=[%.6g %.6g %.6g] "
+		"first=%d d_fresh=%.6g r=%.6g cam_step=%.6g cam_rot=%.6g recheck=%.6g "
+		"ord=%llu relatch_ord=%llu line=%u/%u"
+		// ROUND 57 step 8, appended at the END with its two arguments in the matching position.
+		" deferred=%d d_deferred=%.6g",
+		m_frame_counter,
+		m_pick_follow_albedo,
+		m_pick_follow_stash_age,
+		fresh ? 1 : 0,
+		m_active_camera.latch_frame,
+		static_cast<f64>(m_pick_follow_stash_origin[0]),
+		static_cast<f64>(m_pick_follow_stash_origin[1]),
+		static_cast<f64>(m_pick_follow_stash_origin[2]),
+		static_cast<f64>(origin_fresh[0]),
+		static_cast<f64>(origin_fresh[1]),
+		static_cast<f64>(origin_fresh[2]),
+		static_cast<f64>(err),
+		static_cast<f64>(err_v[0]),
+		static_cast<f64>(err_v[1]),
+		static_cast<f64>(err_v[2]),
+		m_pick_follow_fresh_have_previous ? 0 : 1,
+		static_cast<f64>(d_fresh),
+		static_cast<f64>(r),
+		static_cast<f64>(cam_step),
+		static_cast<f64>(cam_rot),
+		static_cast<f64>(recheck),
+		m_pick_follow_stash_ord,
+		m_frame_relatch_count != 0 ? m_frame_relatch_ordinal : 0ull,
+		m_pick_follow_lines,
+		s_max_pick_follow_lines,
+		deferred_seen ? 1 : 0,
+		static_cast<f64>(d_deferred)));
+
+	for (u32 i = 0; i < 3; ++i)
+	{
+		m_pick_follow_fresh_previous_origin[i] = origin_fresh[i];
+	}
+
+	m_pick_follow_fresh_have_previous = true;
 }
 
 void RemixGSRender::capture_gauge_anchor(const remix_rsx::mat4& fused)
@@ -2375,7 +3113,12 @@ void RemixGSRender::flush_deferred_for_anchor(const gauge_anchor& anchor)
 	{
 		deferred_instance& entry = m_deferred_instances[read];
 
-		if (entry.surface_offset != anchor.surface_offset
+		// ROUND 57, the one-line skip: an entry held for the mid-frame RELATCH is not waiting on an
+		// anchor at all, so a matching render-source key must not claim it. Placing it in the
+		// anchor's frame would be the wrong divisor and would also consume the entry before
+		// flush_deferred_for_relatch could reach it. Vacuously false at DEFERPRERELATCH=0.
+		if (entry.waits_relatch
+			|| entry.surface_offset != anchor.surface_offset
 			|| entry.color_target != anchor.color_target
 			|| entry.clip_width != anchor.clip_width
 			|| entry.clip_height != anchor.clip_height)
@@ -2597,6 +3340,103 @@ void RemixGSRender::flush_deferred_for_anchor(const gauge_anchor& anchor)
 
 		submit_deferred(entry);
 		++m_stats.defer_flushed_fresh;
+	}
+
+	m_deferred_instances.resize(write);
+}
+
+void RemixGSRender::flush_deferred_for_relatch()
+{
+	// --- ROUND 57 (RPCS3_REMIX_DEFERPRERELATCH) --------------------------------------------------
+	//
+	// The frame's own camera reference has just been installed by the mid-frame relatch. Every entry
+	// held for that event is now re-divided by it, with the anchor flush's recipe verbatim -
+	// fused x reference, prepend the object space, finite check, normalise, to_remix_transform - so
+	// a held draw and a draw that simply arrived after the relatch are placed by identical
+	// arithmetic. There is nothing to extrapolate and no residual by construction.
+	if (m_deferred_instances.empty())
+	{
+		return;
+	}
+
+	usz write = 0;
+
+	for (usz read = 0; read < m_deferred_instances.size(); ++read)
+	{
+		deferred_instance& entry = m_deferred_instances[read];
+
+		if (!entry.waits_relatch)
+		{
+			// Held for an anchor, not for this. Compacted forward exactly as the anchor flush does.
+			if (write != read)
+			{
+				m_deferred_instances[write] = std::move(entry);
+			}
+
+			++write;
+			continue;
+		}
+
+		if (entry.has_vm_op)
+		{
+			// A viewmodel draw is placed relative to the weapon camera and the world reference is
+			// not the divisor it wants; it keeps the transform the immediate path gave it, which is
+			// today's behaviour for that draw. Structurally 0 on this arm - the viewmodel branch
+			// clears defer_candidate before the relatch arm can set it - and counted so that
+			// "structurally 0" is a reading rather than an assumption.
+			++m_stats.defer_relatch_vmop;
+		}
+		else
+		{
+			remix_rsx::mat4 world = remix_rsx::mat4_multiply(
+				entry.fused, m_active_camera.reference_inverse);
+			world = remix_rsx::mat4_multiply(entry.object_space, world);
+
+			// A non-finite rebuild leaves the draw with the placement it already carries, which is
+			// the stale-reference placement - never worse than not deferring at all, and never a
+			// dropped draw. Same policy as the anchor flush.
+			if (remix_rsx::mat4_is_finite(world))
+			{
+				if (const f32 w = world.m[3][3]; std::abs(w) > 1e-6f && std::abs(w - 1.f) > 1e-6f)
+				{
+					const f32 inv = 1.f / w;
+
+					for (u32 i = 0; i < 4; ++i)
+					{
+						for (u32 j = 0; j < 4; ++j)
+						{
+							world.m[i][j] *= inv;
+						}
+					}
+				}
+
+				if (remix_rsx::mat4_is_finite(world))
+				{
+					entry.info.transform = remix_rsx::to_remix_transform(world);
+
+					// The within-run proof for the pick-fresh row. This transform was rebuilt HERE,
+					// by this function, from the deferral's own copies; trace_pick_fresh computes
+					// origin_fresh at flip from the stash, independently. d_deferred is the L1
+					// between the two and must be exactly 0 - if it is not, the runtime did not
+					// receive what the instrument says it received, and pf_deferred_mismatch says so.
+					if (m_pick_follow_stash_valid
+						&& m_pick_follow_stash_frame == m_frame_counter
+						&& entry.has_picking
+						&& entry.picking.objectPickingValue == m_pick_follow_stash_pick_index)
+					{
+						m_pick_follow_stash_deferred = true;
+
+						for (u32 i = 0; i < 3; ++i)
+						{
+							m_pick_follow_stash_deferred_origin[i] = entry.info.transform.matrix[i][3];
+						}
+					}
+				}
+			}
+		}
+
+		submit_deferred(entry);
+		++m_stats.defer_relatch_flushed;
 	}
 
 	m_deferred_instances.resize(write);
@@ -3078,6 +3918,16 @@ void RemixGSRender::apply_gauge_anchor_camera()
 		if (hold != 0 && m_gauge_cam_hold_valid && m_frame_counter >= m_gauge_cam_hold_frame
 			&& (m_frame_counter - m_gauge_cam_hold_frame) <= hold)
 		{
+			// ROUND 53 TRIPWIRE, no behaviour change. This writes m_active_camera.view from a value
+			// captured outside the rebase, so with RPCS3_REMIX_CAMREBASE live it would put the
+			// submitted camera and the per-draw worlds on different bases. gauge_absent is 100% on
+			// Eat Lead, so this must read 0; non-zero on another title says B needs the gauge path
+			// taught the rebase before it can be armed there.
+			if (m_camera_rebase_valid)
+			{
+				++m_stats.cam_rebase_bypassed;
+			}
+
 			m_active_camera.view = m_gauge_cam_hold_view;
 			m_active_camera.projection = m_gauge_cam_hold_projection;
 			m_active_camera.reference_inverse = m_gauge_cam_hold_reference_inverse;
@@ -3141,6 +3991,14 @@ void RemixGSRender::apply_gauge_anchor_camera()
 	{
 		++m_stats.gauge_cam_split_failed;
 		return;
+	}
+
+	// ROUND 53 TRIPWIRE, no behaviour change - the anchor-split twin of the GAUGECAMHOLD restore
+	// above. An anchor-derived split is expressed in the title's own basis, so installing it while R
+	// is live would leave the submitted camera and the per-draw worlds disagreeing by one bridge.
+	if (m_camera_rebase_valid)
+	{
+		++m_stats.cam_rebase_bypassed;
 	}
 
 	m_active_camera.view = split.view;
@@ -3512,10 +4370,41 @@ bool RemixGSRender::anchor_frame_eye_counted(f32 (&out)[3], bool allow_held)
 void RemixGSRender::flip(const rsx::display_flip_info_t& info)
 {
 #ifdef _WIN32
-	if (m_remix_ok)
+	// The guest alternates full renders with framebuffer-copy-only flips. Presenting
+	// an empty Remix frame for the latter erases the scene and UI it is copying.
+	const bool demons_copy_only = m_remix_ok && info.emu_flip
+		&& remix_rsx::demons_menu_enabled() && Emu.GetTitleID() == "BLUS30443"
+		&& m_demons_ui_frame.calls != 0
+		&& m_demons_ui_frame.calls == m_demons_ui_frame.copy_refused
+		&& m_demons_ui_frame.accepted == 0 && m_demons_ui_frame.non_ui == 0;
+	if (demons_copy_only)
+	{
+		++m_demons_copy_flips_held;
+		if (m_demons_copy_flips_held <= 8 || (m_demons_copy_flips_held % 120) == 0)
+			rsx_log.notice("Remix Demons copy-only flip held: count=%llu frame=%llu copies=%u; retaining completed image",
+				m_demons_copy_flips_held, m_frame_counter, m_demons_ui_frame.copy_refused);
+		m_demons_ui_frame = {};
+		m_compositor_open = false;
+		m_last_flip_us = now_us();
+		// The base and RSX flips below must still acknowledge the guest's request.
+	}
+	else if (m_remix_ok)
 	{
 		const rsx_op_scope _flip_scope("flip");
 		const u64 flip_enter = now_us();
+		if (Emu.GetTitleID() == "BLUS30443" && remix_rsx::demons_menu_enabled())
+		{
+			static u32 guest_flips = 0, native_flips = 0, native_with_guest_ui = 0;
+			if (info.emu_flip) ++guest_flips;
+			else
+			{
+				++native_flips;
+				native_with_guest_ui += m_compositor_open ? 1u : 0u;
+			}
+			if ((guest_flips + native_flips) % 120 == 0)
+				rsx_log.notice("Remix Demons present: guest=%u native=%u native_with_guest_ui=%u",
+					guest_flips, native_flips, native_with_guest_ui);
+		}
 
 		if (m_timing.window_start == 0)
 		{
@@ -3533,6 +4422,16 @@ void RemixGSRender::flip(const rsx::display_flip_info_t& info)
 		// the old prev/camera fallback. Before the camera override and before Present, and before
 		// m_pick_table is cleared - a held instance's objectPickingValue indexes that table.
 		flush_deferred_at_flip();
+
+		// ROUND 57. HERE, and this is the only window that works. m_frame_counter is still N (it is
+		// incremented at the bottom of this function), the relatch state is still N's (reset beside
+		// it), and m_active_camera still holds the reference N's post-relatch draws were divided by -
+		// apply_gauge_anchor_camera() two lines below OVERWRITES reference_inverse, and the flip latch
+		// further down replaces m_active_camera outright. Between the top of flip and this point only
+		// promote_parked_anchors() and flush_deferred_at_flip() have run, and neither writes
+		// m_active_camera. Returns on its first line unless RPCS3_REMIX_PICKFRESH=1 and a followed
+		// draw filled the stash this frame.
+		trace_pick_fresh();
 
 		// Measure first, then override: the trace's whole content is the disagreement between the
 		// elected camera's gauge and the anchor's, which is zero by construction after the
@@ -3557,7 +4456,16 @@ void RemixGSRender::flip(const rsx::display_flip_info_t& info)
 		m_frame_main_clip_width = 0;
 		m_frame_main_clip_height = 0;
 
+		retire_stale_demons_amulet_light();
+		submit_demons_fire_lights();
+		submit_demons_authored_lights();
 		submit_camera();
+		// ROUND 52: immediately after submit_camera(), which is after apply_gauge_anchor_camera()
+		// installed this frame's reference_inverse and before guarded_present(). The same slot and
+		// the same shape as submit_demons_fire_lights() above -- a fixed set of lights re-derived
+		// from a stored mapping every frame, never a cached camera-relative position. Returns on its
+		// first line unless RPCS3_REMIX_AUTHOREDLIGHTLEVEL names a file.
+		submit_authored_lights();
 		publish_nectar_disruption();
 		reap_idle_guest_lights();
 
@@ -3580,6 +4488,17 @@ void RemixGSRender::flip(const rsx::display_flip_info_t& info)
 			m_timing.overlay += now_us() - t0;
 		}
 
+		if (remix_rsx::demons_menu_enabled() && Emu.GetTitleID() == "BLUS30443")
+		{
+			// Consecutive samples reveal alternating missing movie draws without per-flip spam.
+			if ((m_frame_counter % 120) < 4)
+				rsx_log.notice("Remix Demons UI frame=%llu guest=%u open=%u dirty=%u calls=%u accepted=%u fulltex=%u fullflat=%u target_refused=%u copy_refused=%u fullvp=%016llx tex=%08x/%ux%u target=%08x",
+					m_frame_counter, info.emu_flip ? 1u : 0u, m_compositor_open ? 1u : 0u, m_compositor.dirty() ? 1u : 0u,
+					m_demons_ui_frame.calls, m_demons_ui_frame.accepted, m_demons_ui_frame.full_texture, m_demons_ui_frame.full_flat,
+					m_demons_ui_frame.target_refused, m_demons_ui_frame.copy_refused, m_demons_ui_frame.full_vp,
+					m_demons_ui_frame.texture_address, m_demons_ui_frame.texture_width, m_demons_ui_frame.texture_height, m_demons_ui_frame.target);
+			m_demons_ui_frame = {};
+		}
 		const u64 t_submit = now_us();
 		submit_compositor();
 		m_timing.submit += now_us() - t_submit;
@@ -3625,6 +4544,22 @@ void RemixGSRender::flip(const rsx::display_flip_info_t& info)
 		// world_ref_stale / world_ref_fresh state on every stats line how much of the scene that
 		// reached. Nothing here changes: the flip latch still owns camera *switches*, the age, and
 		// the pending-switch confirmation.
+		//
+		// ROUND 53. The witness election runs FIRST, before anything below reads m_frame_candidate,
+		// and expresses itself by rewriting it - so the census rows, the CAMSTICKY accounting, the
+		// source-change test, the 12-frame confirm and the latch all see the elected identity and
+		// nothing below needs a special case. It returns immediately unless RPCS3_REMIX_CAMTRACK is
+		// armed and no camera lock is configured.
+		//
+		// ROUND 55. Cleared HERE as well as at the head of update_camera_tracks, because that function
+		// returns at the top without CAMTRACK (or with a camera lock configured) and these two describe
+		// THIS flip. Without the clear, a drift row on a non-CAMTRACK title would print whatever the
+		// last CAMTRACK flip left behind, and the drift census cannot tell the difference.
+		m_camera_basis_switch_frame = false;
+		m_camera_ref_state = 0;
+
+		update_camera_tracks();
+
 		if (camera_trace_enabled() && !m_frame_candidate.valid && m_active_camera.valid)
 		{
 			for (u32 i = 0; i < m_frame_rejected_camera_candidates_used; ++i)
@@ -3648,7 +4583,9 @@ void RemixGSRender::flip(const rsx::display_flip_info_t& info)
 					static_cast<f64>(projection.fov_y_degrees),
 					static_cast<f64>(projection.aspect),
 					static_cast<f64>(projection.near_plane),
-					static_cast<f64>(matrix_relative_delta(candidate.view, m_active_camera.view)),
+					// ROUND 53: raw views on both sides, so a live CAMREBASE does not turn every
+					// delta on this census into "one whole bridge". Identity while the rebase is off.
+					static_cast<f64>(matrix_relative_delta(raw_view_of(candidate), raw_view_of(m_active_camera))),
 					static_cast<f64>(candidate.position[0]),
 					static_cast<f64>(candidate.position[1]),
 					static_cast<f64>(candidate.position[2]),
@@ -3682,15 +4619,18 @@ void RemixGSRender::flip(const rsx::display_flip_info_t& info)
 				remix_rsx::projection_params projection{};
 				remix_rsx::describe_projection(candidate.projection, projection);
 
+				// ROUND 53: raw views throughout. The winner flag especially - by the time this runs
+				// m_frame_candidate has been rebased and the census clusters have not, so comparing
+				// the submitted matrices would report NO winner in every frame after the first bridge.
 				const f32 view_delta = m_active_camera.valid
-					? matrix_relative_delta(candidate.view, m_active_camera.view)
+					? matrix_relative_delta(raw_view_of(candidate), raw_view_of(m_active_camera))
 					: 0.f;
 				const bool winner = candidate.vp_hash == m_frame_candidate.vp_hash
 					&& candidate.surface_offset == m_frame_candidate.surface_offset
 					&& candidate.color_target == m_frame_candidate.color_target
 					&& candidate.clip_width == m_frame_candidate.clip_width
 					&& candidate.clip_height == m_frame_candidate.clip_height
-					&& matrix_relative_delta(candidate.view, m_frame_candidate.view) <= 1e-6f;
+					&& matrix_relative_delta(raw_view_of(candidate), raw_view_of(m_frame_candidate)) <= 1e-6f;
 
 				const std::string line = fmt::format(
 					"Remix camera cluster: frame=%llu index=%u winner=%d vp=%016llx surf=0x%08x target=%u clip=%ux%u score=%.3f votes=%u fov=%.3f aspect=%.5f near=%.6g view_delta=%.6g pos=%.6g,%.6g,%.6g",
@@ -3724,12 +4664,66 @@ void RemixGSRender::flip(const rsx::display_flip_info_t& info)
 			remix_rsx::projection_params projection{};
 			remix_rsx::describe_projection(m_frame_candidate.projection, projection);
 
+			// ROUND 53: raw views, as on the two censuses above.
 			const f32 view_delta = m_active_camera.valid
-				? matrix_relative_delta(m_frame_candidate.view, m_active_camera.view)
+				? matrix_relative_delta(raw_view_of(m_frame_candidate), raw_view_of(m_active_camera))
 				: 0.f;
 
+			// ROUND 53, appended at the END of the line so kv()-style readers keep working: the
+			// incumbent witness's id and tenure, and whether THIS frame's identity came from a
+			// handover. All three read 0 with RPCS3_REMIX_CAMTRACK off, which is what makes the
+			// acceptance script's "handover=1 frames" column a measurement of the arm and not of the
+			// tracker's bookkeeping.
+			u32 track_id = 0;
+			u64 track_tenure = 0;
+
+			// ROUND 56, appended at the END of the line for the same kv()-reader reason: the two
+			// numbers that separate "the view's basis is mirrored" from "the projection's x-scale is
+			// mirrored". They are printed on BOTH arms, because a measurement that exists only on
+			// the armed run cannot be compared with anything.
+			//
+			// vdet is the f64 determinant of the frame candidate's view 3x3, in the round-20 det3
+			// form (:10828). It reads +1 (to within f32 noise) on EVERY frame, on both arms, and
+			// that is the point: try_split_once builds the view as right = up_hint x forward,
+			// up = forward x right, so (right, up, forward) is an orthonormal triple with det +1 BY
+			// CONSTRUCTION whatever the guest world's handedness. A determinant test on the view is
+			// therefore blind to this bug - which is exactly the trap round 20 walked into with the
+			// viewmodel ("det_pre = +4.8963 ... Our instance transform was not the mirror").
+			//
+			// p00 is the field that DOES name it. The mirror lives in the recovered projection's
+			// x-scale: P = viewToWorld x fused absorbs the left-handed cross-product assumption as a
+			// negative P[0][0], which is why the picture is right while neither factor is. MEASURED
+			// off score_perspective's -0.5 dock before this field existed: 8167 x score=5.500 +
+			// 672 x score=4.500 (pid27232) and 8475 x score=5.500 (pid30572), zero integer scores in
+			// 17,314 resolved frames. Pre-registered: p00 < 0 on every row of this title.
+			const auto view_det3 = [](const remix_rsx::mat4& mm)
+			{
+				const auto e = [&](u32 r, u32 c) { return static_cast<f64>(mm.m[r][c]); };
+				return e(0, 0) * (e(1, 1) * e(2, 2) - e(1, 2) * e(2, 1))
+					- e(0, 1) * (e(1, 0) * e(2, 2) - e(1, 2) * e(2, 0))
+					+ e(0, 2) * (e(1, 0) * e(2, 1) - e(1, 1) * e(2, 0));
+			};
+
+			const f64 vdet = view_det3(m_frame_candidate.view);
+			const f64 p00 = static_cast<f64>(m_frame_candidate.projection.m[0][0]);
+
+			if (m_camera_track_incumbent != umax)
+			{
+				for (const camera_track& track : m_camera_tracks)
+				{
+					if (track.valid && track.id == m_camera_track_incumbent)
+					{
+						track_id = track.id;
+						track_tenure = m_frame_counter - track.first_frame;
+						break;
+					}
+				}
+			}
+
 			const std::string line = fmt::format(
-				"Remix camera trace: frame=%llu vp=%016llx surf=0x%08x target=%u clip=%ux%u score=%.3f votes=%u clusters=%u fov=%.3f aspect=%.5f near=%.6g view_delta=%.6g pos=%.6g,%.6g,%.6g",
+				"Remix camera trace: frame=%llu vp=%016llx surf=0x%08x target=%u clip=%ux%u score=%.3f votes=%u clusters=%u fov=%.3f aspect=%.5f near=%.6g view_delta=%.6g pos=%.6g,%.6g,%.6g track=%u tenure=%llu handover=%d"
+				// ROUND 56, the two appended at the END so kv() readers keep working.
+				" vdet=%.3g p00=%.3g",
 				m_frame_counter,
 				m_frame_candidate.vp_hash,
 				m_frame_candidate.surface_offset,
@@ -3745,7 +4739,14 @@ void RemixGSRender::flip(const rsx::display_flip_info_t& info)
 				static_cast<f64>(view_delta),
 				static_cast<f64>(m_frame_candidate.position[0]),
 				static_cast<f64>(m_frame_candidate.position[1]),
-				static_cast<f64>(m_frame_candidate.position[2]));
+				static_cast<f64>(m_frame_candidate.position[2]),
+				// ROUND 53, the three appended fields in the matching position.
+				track_id,
+				track_tenure,
+				m_camera_track_handover_frame ? 1 : 0,
+				// ROUND 56, the two in the matching position for " vdet=%.3g p00=%.3g" above.
+				vdet,
+				p00);
 
 			if (fs::file out{ fs::get_executable_dir() + "remix_dump.log", fs::write + fs::create + fs::append })
 			{
@@ -3756,6 +4757,34 @@ void RemixGSRender::flip(const rsx::display_flip_info_t& info)
 		m_stats.cam_clusters += m_frame_camera_candidates_used;
 		m_stats.cam_contested += m_frame_camera_candidates_used > 1 ? 1 : 0;
 		m_stats.cam_winner_votes += m_frame_candidate.observations;
+
+		// ROUND 52. The two outcomes of RPCS3_REMIX_CAMSTICKY, accounted where the frame's vote is
+		// already summarised so nothing has to be re-derived from the trace. kept: this frame's
+		// winner IS the active camera's own cluster and some other cluster of the frame had
+		// strictly more votes, i.e. the rank rule is what elected it. lost: the frame had clusters
+		// and none of them was the active camera's own, so the vote alone decided - the population
+		// a sticky HOLD would address, which is deliberately not in this round.
+		if (remix_rsx::camera_sticky_enabled() && m_active_camera.valid && m_frame_candidate.valid)
+		{
+			if (camera_own_cluster(m_frame_candidate, remix_rsx::camera_relatch_tolerance()))
+			{
+				for (u32 i = 0; i < m_frame_camera_candidates_used; ++i)
+				{
+					const camera_candidate& other = m_frame_camera_candidates[i];
+
+					if (other.observations > m_frame_candidate.observations
+						&& !camera_own_cluster(other, remix_rsx::camera_relatch_tolerance()))
+					{
+						++m_stats.cam_sticky_kept;
+						break;
+					}
+				}
+			}
+			else if (m_frame_camera_candidates_used > 0)
+			{
+				++m_stats.cam_sticky_lost;
+			}
+		}
 
 		// --- round 10: the fallback pose-relatch ----------------------------------------------
 		// The dev-menu camera-type flicker, closed at the one site that owns identity switches.
@@ -3853,7 +4882,21 @@ void RemixGSRender::flip(const rsx::display_flip_info_t& info)
 				|| m_frame_candidate.clip_width != m_active_camera.clip_width
 				|| m_frame_candidate.clip_height != m_active_camera.clip_height);
 
-		if (m_frame_candidate.valid && m_active_camera.valid
+		// ROUND 55, RPCS3_REMIX_CAMREFSYNTH mode 2. The 12-frame confirm exists to make a camera SWITCH
+		// survive a frame of noise before it is believed. Under CAMTRACK it can never do that job for a
+		// tracker handover or reset: the outgoing witness is DEAD - that is why the handover happened -
+		// so the confirm can only ever end one way, twelve flips later, and every one of those flips is
+		// a frame whose reference belongs to a witness the tracker already retired. Run 54's holds at
+		// 1365-1370 and 1881-1893 are exactly that. At mode 2 the tracker's own decision is installed
+		// immediately instead. It changes only WHEN the matrices of an already-decided identity are
+		// installed - the election, the identity and the handover accounting are the tracker's and are
+		// untouched - and its cost is one switch per handover rather than one per confirmed window,
+		// which is why it is a separate arm.
+		const bool track_install = remix_rsx::camera_track_mode() != 0
+			&& remix_rsx::camera_ref_synth_mode() >= 2
+			&& m_camera_track_handover_frame;
+
+		if (!track_install && m_frame_candidate.valid && m_active_camera.valid
 			&& (camera_source_changed
 				|| matrix_relative_delta(m_frame_candidate.view, m_active_camera.view) > s_camera_discontinuity_tolerance))
 		{
@@ -3881,16 +4924,42 @@ void RemixGSRender::flip(const rsx::display_flip_info_t& info)
 			{
 				m_frame_candidate = camera_candidate{};
 				++m_stats.cam_discontinuity_held;
+				// ROUND 55: this flip's reference is frozen by the CONFIRM, not by a tracker miss. It is
+				// a distinct population from refsrc 2..6 and only mode 2 (or CAMREBASE, which removes
+				// the handovers that start the windows) can reach it.
+				m_camera_ref_state = 7;
 			}
 		}
 		else
 		{
 			m_pending_camera = camera_candidate{};
 			m_pending_camera_frames = 0;
+
+			// ROUND 55 mode 2: count the bypasses, and only the ones that would otherwise have entered
+			// the block above - a handover flip with both cameras valid. Without both, the block's own
+			// guard would have skipped it anyway and there was nothing to bypass.
+			if (track_install && m_frame_candidate.valid && m_active_camera.valid)
+			{
+				++m_stats.cam_ref_synth_install;
+			}
 		}
 
 		if (m_frame_candidate.valid)
 		{
+			// ROUND 55, MEASUREMENT ONLY, on both arms: did this latch change the witness BASIS? Both
+			// sides are SUBMITTED views - m_active_camera is rebased and rebase_camera has already run
+			// on m_frame_candidate - so a CAMREBASE-bridged handover reads as continuous and is
+			// correctly NOT a switch, while an unbridged one is. 0.5 is s_camera_pending_match_tolerance
+			// used as a READING threshold: nothing branches on it, it only names the visible teleport
+			// on the row (switch=) and in a counter, so the snap that ends a hold stops having to be
+			// reconstructed from neighbouring cam-track rows afterwards.
+			if (m_active_camera.valid
+				&& matrix_relative_delta(m_frame_candidate.view, m_active_camera.view) > s_camera_pending_match_tolerance)
+			{
+				++m_stats.cam_basis_switch;
+				m_camera_basis_switch_frame = true;
+			}
+
 			m_active_camera = m_frame_candidate;
 			// Stamped with the frame that is ending, not the one about to start, because that is
 			// what it is: this reference was built from draws of frame N and will serve frame
@@ -3901,11 +4970,46 @@ void RemixGSRender::flip(const rsx::display_flip_info_t& info)
 		else if (m_active_camera.valid && ++m_camera_age <= remix_rsx::camera_hold_frames())
 		{
 			++m_stats.cam_held;
+
+			// ROUND 55: a hold that no branch above has named. Either CAMTRACK is off, or the frame had
+			// no candidate for a reason that is not a tracker miss and not the confirm (no clusters at
+			// all, the election finding nothing electable). Never overwrite a named state - refsrc 1..7
+			// are all set before this point and each is more specific.
+			if (m_camera_ref_state == 0)
+			{
+				m_camera_ref_state = 8;
+			}
 		}
 		else
 		{
+			// ROUND 56: count the drop, and only a REAL one. This arm is also taken when there was
+			// never a camera to begin with (the else-if short-circuits on !m_active_camera.valid and
+			// does not even increment m_camera_age), and those frames are the menu and the load, not
+			// a dropped camera. Read before the wipe below, which is what makes .valid still mean
+			// "there was a camera a moment ago".
+			//
+			// This is the one number the "the camera dropped and nothing was submitted" reading of the
+			// dev menu's MAIN-block flicker needs. Two frozen runs say it should be 0: 'Remix live:'
+			// cam_fallback climbed 37 -> 552 (pid30572) and 38 -> 634 (pid27232) while cam_resolved
+			// was still 0 - the menu and the load - and then did not move again through cam_resolved
+			// 8807 and 4056 respectively, while cam_held's longest contiguous run was ~200 flips
+			// against a 300-flip hold. Note also that the fallback does NOT submit nothing:
+			// submit_debug_scene always sets up a parameterized origin camera, so a real drop would
+			// read as Position 0,0,0 in the MAIN block and never as '-'.
+			if (m_active_camera.valid)
+			{
+				++m_stats.cam_dropped;
+			}
+
 			m_active_camera = camera_candidate{};
 			m_camera_age = 0;
+
+			// The camera was dropped outright (the hold ran past camera_hold_frames). Same reading as
+			// the arm above: nothing to refresh, and nothing named it.
+			if (m_camera_ref_state == 0)
+			{
+				m_camera_ref_state = 8;
+			}
 		}
 
 		// The viewmodel reference latches on the same flip and holds under the same cap, so the
@@ -3979,6 +5083,33 @@ void RemixGSRender::flip(const rsx::display_flip_info_t& info)
 		++m_timing.mesh_create_buckets[mesh_create_bucket];
 
 		++m_frame_counter;
+
+		// ROUND 52. Reset here rather than at the top of end(): a frame is a flip, not a draw
+		// clause, and the 'Remix ui-route:' census asks "how much of THIS frame's world was already
+		// submitted", which only means anything against a flip boundary.
+		m_frame_world_draws = 0;
+
+		// Same lifetime, same boundary, and reset AFTER submit_compositor() has already read them
+		// (that call is earlier in this same flip): a background belongs to the frame whose clear
+		// produced it and must not be inherited by the next one.
+		m_frame_clear_bgra = 0;
+		m_frame_clear_valid = false;
+
+		// ROUND 54, the same lifetime and the same boundary: the mid-frame relatch's provenance is a
+		// property of ONE frame. It is written during the frame's draws, read by the drift census
+		// later in that frame and by update_camera_tracks at the flip that ends it (which has already
+		// run, above), and must not leak into the next frame - a drift row that inherited the
+		// previous frame's relatch_d would read as S-order when nothing relatched at all.
+		m_frame_relatch_count = 0;
+		m_frame_relatch_step = 0.f;
+		m_frame_relatch_inc = -1;
+		m_frame_relatch_inc_d = 0.f;
+		m_frame_relatch_ordinal = 0;
+		m_frame_relatch_position[0] = 0.f;
+		m_frame_relatch_position[1] = 0.f;
+		m_frame_relatch_position[2] = 0.f;
+		m_frame_relatch_vp = 0;
+
 		m_textures.begin_frame();
 		reap_idle_meshes();
 
@@ -4262,13 +5393,20 @@ bool RemixGSRender::create_debug_scene()
 {
 	const auto& api = m_remix.api();
 
-	// Sphere light, straight from the official remixapi_example_c.c.
-	const f32 origin_light[3] = { 0.f, -1.f, 0.f };
-	place_debug_light(origin_light);
-
-	if (!m_debug_light)
+	// The runtime keeps created lights active even without later DrawLightInstance calls.
+	const bool create_origin_light = Emu.GetTitleID() != "BLUS30443" || remix_rsx::camera_light_radiance() > 0.f;
+	if (create_origin_light)
 	{
-		return false;
+		const f32 origin_light[3] = { 0.f, -1.f, 0.f };
+		place_debug_light(origin_light);
+		if (!m_debug_light)
+		{
+			return false;
+		}
+	}
+	else
+	{
+		rsx_log.notice("Remix Demons: startup debug light disabled (camera fill off)");
 	}
 
 	// Debug triangle at z = 10, in front of the hardcoded camera at the origin.
@@ -4368,6 +5506,461 @@ void RemixGSRender::submit_debug_scene(bool with_triangle)
 	{
 		remix_rsx::guarded_draw_light_instance(api.DrawLightInstance, m_debug_light);
 	}
+}
+
+bool RemixGSRender::apply_demons_particle_fade(u32 first_vertex, u32 vertex_count, u64 albedo_hash)
+{
+	if (!remix_rsx::demons_world_enabled() || m_current_vp_hash != 0x7f4d3587c70d02daull
+		|| m_current_fp_hash != 0x845ff76b3b14e33full || !m_current_fingerprint
+		|| !m_current_fingerprint->demons_particle_depth) return false;
+	attribute_view colors{}, sizes{};
+	if (map_attribute(3, first_vertex, vertex_count, colors) != attribute_status::ok || colors.size < 4
+		|| map_attribute(10, first_vertex, vertex_count, sizes) != attribute_status::ok) return false;
+	f32 c0[4]{}, c466[4]{}, c467[4]{};
+	remix_rsx::mat4 matrix{};
+	if (!remix_rsx::read_slot(0, c0) || !remix_rsx::read_slot(466, c466)
+		|| !remix_rsx::read_slot(467, c467) || !remix_rsx::read_group_matrix(*m_current_fingerprint, 0, matrix)) return false;
+	std::vector<u32> packed(vertex_count);
+	f32 alpha_min = 1.f, alpha_max = 0.f, size_min = std::numeric_limits<f32>::max(), size_max = 0.f;
+	f32 raw_alpha_min = std::numeric_limits<f32>::max(), raw_alpha_max = 0.f;
+	for (u32 i = 0; i < vertex_count; ++i)
+	{
+		f32 rgba[4]{}, size[4]{};
+		if (!remix_rsx::decode_position(colors.at(i), colors.type, colors.size, rgba)
+			|| !remix_rsx::decode_position(sizes.at(i), sizes.type, sizes.size, size)
+			|| !std::isfinite(size[0]) || size[0] <= 0.f) return false;
+		const auto& v = m_scratch_vertices[i];
+		f64 w = matrix.m[3][3];
+		for (u32 k = 0; k < 3; ++k) w += static_cast<f64>(v.position[k]) * matrix.m[k][3];
+		const f64 half_width = static_cast<f64>(size[0]) * c467[0];
+		if (!std::isfinite(w) || !std::isfinite(half_width) || half_width <= 0.) return false;
+		const f64 t = std::clamp((c0[3] - (w - half_width)) / half_width, 0., 1.);
+		const f64 fade = c466[0] - t * t * (c467[3] - t * c467[2]);
+		// VP alpha divides by ATTR10.x; FP multiplies by min(sceneDepth-D, ATTR10.x).
+		// Without the guest depth texture, restore the upper bound where that divisor cancels.
+		// Soft intersection fading and the VP atmospheric RGB terms remain unsupported.
+		const f64 alpha = rgba[3] * fade;
+		if (!std::isfinite(alpha)) return false;
+		for (u32 k = 0; k < 4; ++k) if (!std::isfinite(rgba[k])) return false;
+		const auto channel = [](f64 x) -> u32 { return static_cast<u32>(std::clamp(x, 0., 1.) * 255. + .5); };
+		const u32 r = channel(rgba[0]), g = channel(rgba[1]), b = channel(rgba[2]), a = channel(alpha);
+		packed[i] = remix_rsx::vertex_colour_bgra_enabled()
+			? b | (g << 8) | (r << 16) | (a << 24) : r | (g << 8) | (b << 16) | (a << 24);
+		alpha_min = std::min(alpha_min, static_cast<f32>(alpha)); alpha_max = std::max(alpha_max, static_cast<f32>(alpha));
+		raw_alpha_min = std::min(raw_alpha_min, rgba[3]); raw_alpha_max = std::max(raw_alpha_max, rgba[3]);
+		size_min = std::min(size_min, size[0]); size_max = std::max(size_max, size[0]);
+	}
+	for (u32 i = 0; i < vertex_count; ++i) m_scratch_vertices[i].color = packed[i];
+	static u32 lines = 0;
+	if (lines < 24 || (m_frame_counter % 120 == 0 && lines < 128))
+	{
+		++lines;
+		rsx_log.notice("Remix Demons particle fade: albedo=%016llX frame=%llu vtx=%u raw_alpha=%.6g..%.6g attr10=%.6g..%.6g alpha=%.6g..%.6g near=%.6g",
+			albedo_hash, m_frame_counter, vertex_count, raw_alpha_min, raw_alpha_max, size_min, size_max, alpha_min, alpha_max, c0[3]);
+	}
+	return true;
+}
+
+remixapi_MaterialHandle RemixGSRender::get_demons_water_material()
+{
+	if (m_demons_water_material) return m_demons_water_material;
+	// The captured shader uses scene refraction, environment reflection and wave normals,
+	// with no diffuse sampler. Remix supplies refraction/reflection from scene geometry.
+	remixapi_MaterialInfoTranslucentEXT water{};
+	water.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_TRANSLUCENT_EXT;
+	water.refractiveIndex = 1.333f;
+	water.transmittanceColor = { .0784314f, .0705882f, .0392157f };
+	water.transmittanceMeasurementDistance = 1.f;
+	water.thinWallThickness_hasvalue = 1;
+	water.thinWallThickness_value = .1f;
+	remixapi_MaterialInfo info{};
+	info.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
+	info.pNext = &water;
+	info.hash = 0x44454d4f57415452ull;
+	info.spriteSheetRow = 1;
+	info.spriteSheetCol = 1;
+	remixapi_MaterialHandle handle = nullptr;
+	const u32 status = remix_rsx::guarded_create_material(m_remix.api().CreateMaterial, &info, &handle);
+	if (status == REMIXAPI_ERROR_CODE_SUCCESS && handle)
+	{
+		m_demons_water_material = handle;
+		rsx_log.notice("Remix Demons: captured water surface uses refractive material with shader tint");
+	}
+	else
+	{
+		static bool reported_failure = false;
+		if (!reported_failure)
+		{
+			reported_failure = true;
+			rsx_log.notice("Remix Demons: refractive water material unavailable (status=%u); surface omitted", status);
+		}
+	}
+	return m_demons_water_material;
+}
+
+remixapi_MaterialHandle RemixGSRender::get_demons_fire_material(const remix_rsx::texture_entry& entry)
+{
+	const u64 key = rpcs3::hash64(entry.material_hash, 0x44454d4f46495245ull);
+	if (const auto found = m_demons_fire_materials.find(key); found != m_demons_fire_materials.end()) return found->second;
+	if (m_demons_fire_materials.size() >= 8) return entry.material;
+	wchar_t path[32]{};
+	::swprintf_s(path, L"0x%016llX", entry.content_hash);
+	remixapi_MaterialInfoOpaqueEXT opaque{};
+	opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
+	opaque.albedoConstant = { 1.f, 1.f, 1.f };
+	opaque.opacityConstant = 1.f;
+	opaque.roughnessConstant = .7f;
+	opaque.useDrawCallAlphaState = 1;
+	opaque.alphaTestType = entry.alpha_func;
+	opaque.alphaReferenceValue = entry.alpha_ref;
+	remixapi_MaterialInfo info{};
+	info.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
+	info.pNext = &opaque;
+	info.hash = key;
+	info.albedoTexture = path;
+	info.emissiveTexture = path;
+	info.emissiveIntensity = 2.f;
+	info.emissiveColorConstant = { 1.f, 1.f, 1.f };
+	info.spriteSheetRow = 1;
+	info.spriteSheetCol = 1;
+	info.filterMode = 1;
+	info.wrapModeU = entry.wrap_u;
+	info.wrapModeV = entry.wrap_v;
+	remixapi_MaterialHandle handle = nullptr;
+	const u32 status = remix_rsx::guarded_create_material(m_remix.api().CreateMaterial, &info, &handle);
+	if (status != REMIXAPI_ERROR_CODE_SUCCESS || !handle) return entry.material;
+	m_demons_fire_materials.emplace(key, handle);
+	rsx_log.notice("Remix Demons fire material: albedo=%016llX material=%016llX emission=2 atlas-alpha preserved", entry.content_hash, key);
+	return handle;
+}
+
+void RemixGSRender::track_demons_fire(bool fire_surface, u32 vertex_count)
+{
+	if (!remix_rsx::demons_world_enabled() || !m_current_fingerprint || !m_active_camera.valid
+		|| static_cast<u32>(rsx::method_registers.surface_color_target()) != 1) return;
+	const auto& fp = *m_current_fingerprint;
+	if (fp.group_count != 1 || !fp.demons_particle_depth
+		|| m_current_vp_hash != 0x7f4d3587c70d02daull) return;
+	remix_rsx::mat4 outer{}, inverse{};
+	if (!remix_rsx::read_group_matrix(fp, 0, outer)
+		|| !remix_rsx::mat4_invert(remix_rsx::mat4_multiply(m_active_camera.view, m_active_camera.projection), inverse)) return;
+	outer = remix_rsx::fold_viewport_z(outer, rsx::method_registers.viewport_scale_z(), rsx::method_registers.viewport_offset_z());
+	auto mapping = remix_rsx::mat4_multiply(outer, inverse);
+	if (!remix_rsx::mat4_is_finite(mapping) || std::abs(mapping.m[3][3]) < 1e-8f) return;
+	const f32 w = mapping.m[3][3];
+	for (u32 r = 0; r < 4; ++r) for (u32 c = 0; c < 4; ++c) mapping.m[r][c] /= w;
+	if (!remix_rsx::mat4_is_finite(mapping)) return;
+	for (u32 i = 0; i < 3; ++i)
+	{
+		if (std::abs(mapping.m[i][3]) > 1e-4f) return;
+		for (u32 j = 0; j < 3; ++j)
+		{
+			f64 dot = 0.;
+			for (u32 k = 0; k < 3; ++k) dot += static_cast<f64>(mapping.m[i][k]) * mapping.m[j][k];
+			if (std::abs(dot - (i == j ? 1. : 0.)) > .02) return;
+		}
+	}
+	// Exact 7f particles carry absolute source-world positions. Other 7f effects can
+	// refresh this mapping while fire is culled; palette draws use a different origin.
+	m_demons_fire_mapping = mapping;
+	m_demons_fire_mapping_frame = m_frame_counter;
+	if (!fire_surface || vertex_count < 4 || vertex_count > 512 || vertex_count % 4) return;
+	f64 center[3]{};
+	for (u32 i = 0; i < vertex_count; ++i) for (u32 k = 0; k < 3; ++k)
+	{
+		const f32 value = m_scratch_vertices[i].position[k];
+		if (!std::isfinite(value)) return;
+		center[k] += static_cast<f64>(value) / vertex_count;
+	}
+	for (u32 i = 0; i < vertex_count; ++i)
+	{
+		f64 distance2 = 0.;
+		for (u32 k = 0; k < 3; ++k) distance2 += std::pow(m_scratch_vertices[i].position[k] - center[k], 2);
+		if (distance2 > 4.) return; // One compact captured flame cluster, never an entire level's batch.
+	}
+	const f32 peak = std::max({ m_scratch_albedo_mean_rgb[0], m_scratch_albedo_mean_rgb[1], m_scratch_albedo_mean_rgb[2] });
+	if (!(peak > 1e-6f) || !std::isfinite(peak)) return;
+	for (f32 tint : m_scratch_albedo_mean_rgb) if (!std::isfinite(tint)) return;
+	usz slot = m_demons_fire_lights.size();
+	for (usz i = 0; i < m_demons_fire_lights.size(); ++i)
+	{
+		f64 distance2 = 0.;
+		for (u32 k = 0; k < 3; ++k) distance2 += std::pow(m_demons_fire_lights[i].source[k] - center[k], 2);
+		if (distance2 < .25) { slot = i; break; }
+	}
+	if (slot == m_demons_fire_lights.size())
+	{
+		if (slot < 8) m_demons_fire_lights.emplace_back();
+		else
+		{
+			for (usz i = 0; i < m_demons_fire_lights.size(); ++i)
+				if (m_frame_counter > m_demons_fire_lights[i].seen + 300) { slot = i; break; }
+			if (slot == m_demons_fire_lights.size()) return;
+		}
+	}
+	auto& light = m_demons_fire_lights[slot];
+
+	for (u32 k = 0; k < 3; ++k)
+	{
+		light.source[k] = static_cast<f32>(center[k]);
+		light.tint[k] = std::clamp(m_scratch_albedo_mean_rgb[k] / peak, 0.f, 1.f);
+	}
+	light.seen = m_frame_counter;
+}
+
+void RemixGSRender::submit_demons_authored_lights()
+{
+	// The rest of the preset: LIGHT_BANK dir1 and dir2, and the hemisphere ambient. dir0 is NOT
+	// here - it retargets the existing sun on handle 0x4 in update_sun_light(), so the scene keeps
+	// exactly one key light and gains no second shadow.
+	const auto* preset = static_cast<const remix_rsx::demons_light_preset*>(m_demons_preset);
+
+	if (!m_remix_ok || !remix_rsx::demons_lights_enabled() || !preset)
+	{
+		return;
+	}
+
+	const auto& api = m_remix.api();
+	const f32 scale = remix_rsx::demons_light_scale();
+
+	// A hemisphere is not a light type Remix has - the dome light needs a colorTexture and ignores
+	// radiance entirely (remix_c.h:687-692), so it cannot carry a flat authored colour. Two very
+	// wide distant lights are the honest approximation: the shader divides a distant light's
+	// radiance by sin^2(halfAngle) and samples the cone uniformly, so a 150-degree light delivers
+	// roughly pi * radiance of irradiance from its whole hemisphere, which is what the authored
+	// value means. The approximation is HERE, not in the table.
+	constexpr f32 hemisphere_degrees = 150.f;
+	constexpr f32 up_travel[3] = { 0.f, -1.f, 0.f };
+	constexpr f32 down_travel[3] = { 0.f, 1.f, 0.f };
+
+	const struct
+	{
+		const f32* travel;
+		const f32* rgb;
+		f32 degrees;
+	} entries[4] = {
+		{ preset->dir[1], preset->rgb[1], remix_rsx::sun_angular_diameter() },
+		{ preset->dir[2], preset->rgb[2], remix_rsx::sun_angular_diameter() },
+		{ up_travel, preset->hemi_up, hemisphere_degrees },
+		{ down_travel, preset->hemi_dn, hemisphere_degrees },
+	};
+
+	for (u32 i = 0; i < 4; ++i)
+	{
+		// Entries 2 and 3 are the hemisphere halves; DEMONSHEMI zeroes them without disturbing
+		// dir1/dir2 or the sun, so the alpha-card question is one variable.
+		const f32 gate = (i >= 2 && !remix_rsx::demons_hemisphere_enabled()) ? 0.f : scale;
+		const f32 radiance[3] = {
+			entries[i].rgb[0] * gate, entries[i].rgb[1] * gate, entries[i].rgb[2] * gate };
+
+		// A preset that does not author this light submits it at ZERO radiance rather than
+		// destroying it. Round 26 established that destroy is queued to end-of-frame while create
+		// is immediate, so destroy-then-create is a delete and a handle that has been destroyed
+		// never comes back. A black light contributes nothing and cannot lose the handle.
+		remixapi_LightInfoDistantEXT distant{};
+		distant.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_DISTANT_EXT;
+		distant.pNext = nullptr;
+		distant.direction = { entries[i].travel[0], entries[i].travel[1], entries[i].travel[2] };
+		distant.angularDiameterDegrees = entries[i].degrees;
+		distant.volumetricRadianceScale = 1.f;
+
+		remixapi_LightInfo info{};
+		info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
+		info.pNext = &distant;
+		// Fixed handles, so re-creating with the same hash UPDATES in place exactly the way the
+		// sun's 0x4 does. 0x4 is the sun; 0x10..0x13 are these four.
+		info.hash = 0x10ull + i;
+		info.radiance = { radiance[0], radiance[1], radiance[2] };
+		// Without this an external light stops accepting updates once updateLightStaticSleep's
+		// budget runs out - the same trap the sun documents at its own create site.
+		info.isDynamic = 1;
+
+		remixapi_LightHandle handle = nullptr;
+		const u32 status = remix_rsx::guarded_create_light(api.CreateLight, &info, &handle);
+
+		if (status == REMIXAPI_ERROR_CODE_SUCCESS && handle)
+		{
+			m_demons_lights[i] = handle;
+		}
+	}
+}
+
+void RemixGSRender::submit_demons_fire_lights()
+{
+	if (!remix_rsx::demons_world_enabled()) return;
+	for (usz i = 0; i < m_demons_fire_lights.size(); ++i)
+	{
+		auto& light = m_demons_fire_lights[i];
+		// Brief source culling must not blink a stationary fire. Always use current-frame
+		// world mapping; an old camera-relative position is never held across camera motion.
+		bool active = m_demons_fire_mapping_frame == m_frame_counter && m_frame_counter <= light.seen + 300;
+		f32 position[3]{};
+		if (active) for (u32 c = 0; c < 3; ++c)
+		{
+			position[c] = m_demons_fire_mapping.m[3][c];
+			for (u32 k = 0; k < 3; ++k) position[c] += light.source[k] * m_demons_fire_mapping.m[k][c];
+			active = active && std::isfinite(position[c]);
+		}
+		if (!active && !light.active) continue;
+		if (!active) std::fill_n(position, 3, 0.f);
+		remixapi_LightInfoSphereEXT sphere{};
+		sphere.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
+		sphere.position = { position[0], position[1], position[2] };
+		sphere.radius = .1f;
+		sphere.volumetricRadianceScale = 1.f;
+		remixapi_LightInfo info{};
+		info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
+		info.pNext = &sphere;
+		info.hash = 0x44454d4649524500ull + i;
+		info.isDynamic = 1;
+		info.radiance = active ? remixapi_Float3D{ 30.f * light.tint[0], 30.f * light.tint[1], 30.f * light.tint[2] } : remixapi_Float3D{ 0.f, 0.f, 0.f };
+		remixapi_LightHandle handle = nullptr;
+		const auto& api = m_remix.api();
+		const u32 status = remix_rsx::guarded_create_light(api.CreateLight, &info, &handle);
+		if (status == REMIXAPI_ERROR_CODE_SUCCESS && handle)
+		{
+			light.handle = handle;
+			light.active = active;
+			if (active) remix_rsx::guarded_draw_light_instance(api.DrawLightInstance, handle);
+		}
+		static u32 logs = 0;
+		if (logs < 8 || (m_frame_counter % 120 == 0 && logs < 128))
+		{
+			++logs;
+			rsx_log.notice("Remix Demons fire light: slot=%llu frame=%llu source=[%.6g %.6g %.6g] position=[%.6g %.6g %.6g] active=%u age=%llu update=%u",
+				static_cast<u64>(i), m_frame_counter, light.source[0], light.source[1], light.source[2], position[0], position[1], position[2], active ? 1u : 0u, m_frame_counter - light.seen, status);
+		}
+	}
+}
+
+void RemixGSRender::place_demons_amulet_light(u64 albedo_hash, const remixapi_Transform& transform, u32 vertex_count)
+{
+	if (!remix_rsx::demons_world_enabled() || m_current_vp_hash != 0x7f4d3587c70d02daull
+		|| m_current_fp_hash != 0x845ff76b3b14e33full || albedo_hash != 0xf93bc40e183c1f8dull
+		|| !m_current_fingerprint || !m_current_fingerprint->demons_particle_depth
+		|| m_demons_amulet_frame == m_frame_counter)
+		return;
+	const auto report_amulet_rejection = [&](const char* reason, f64 value)
+	{
+		static u32 lines = 0;
+		if (lines++ < 64)
+			rsx_log.notice("Remix Demons amulet rejected: frame=%llu vertices=%u reason=%s value=%.9g", m_frame_counter, vertex_count, reason, value);
+	};
+	if (vertex_count != 36 && vertex_count != 40 && vertex_count != 44)
+	{
+		report_amulet_rejection("count", vertex_count);
+		return;
+	}
+	// The captured nine-, ten-, and eleven-quad halo variants share one center.
+	f64 center[3]{}, source_center[3]{};
+	for (u32 quad = 0; quad < vertex_count / 4; ++quad)
+	{
+		f64 current[3]{};
+		for (u32 corner = 0; corner < 4; ++corner)
+		{
+			const auto& v = m_scratch_vertices[quad * 4 + corner];
+			if (quad == 0) for (u32 k = 0; k < 3; ++k) source_center[k] += static_cast<f64>(v.position[k]) * .25;
+			for (u32 r = 0; r < 3; ++r)
+			{
+				f64 value = transform.matrix[r][3];
+				for (u32 c = 0; c < 3; ++c) value += static_cast<f64>(transform.matrix[r][c]) * v.position[c];
+				if (!std::isfinite(value) || std::abs(value) > std::numeric_limits<f32>::max()) { report_amulet_rejection("nonfinite", value); return; }
+				current[r] += value * .25;
+			}
+		}
+		if (quad == 0) std::copy_n(current, 3, center);
+		else for (u32 r = 0; r < 3; ++r) if (std::abs(current[r] - center[r]) > .01) { report_amulet_rejection("quad-center", current[r] - center[r]); return; }
+	}
+	remixapi_LightInfoSphereEXT sphere{};
+	sphere.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
+	sphere.position = { static_cast<f32>(center[0]), static_cast<f32>(center[1]), static_cast<f32>(center[2]) };
+	sphere.radius = .06f;
+	sphere.volumetricRadianceScale = 1.f;
+	remixapi_LightInfo info{};
+	info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
+	info.pNext = &sphere;
+	// Runtime CreateLight derives the handle from this hash; addExternalLight updates the
+	// existing map entry. isDynamic prevents static-sleep from freezing that updated pose.
+	info.hash = 0x44454d4f4e414d55ull;
+	info.radiance = { 20.f, 20.f, 20.f };
+	info.isDynamic = 1;
+	const auto& api = m_remix.api();
+	remixapi_LightHandle handle = nullptr;
+	const u32 created = remix_rsx::guarded_create_light(api.CreateLight, &info, &handle);
+	u32 drawn = created;
+	if (created == REMIXAPI_ERROR_CODE_SUCCESS && handle)
+	{
+		m_demons_amulet_light = handle;
+		if (m_demons_amulet_frame != ~0ull && m_frame_counter > m_demons_amulet_frame + 1)
+		{
+			static u32 gap_lines = 0;
+			if (gap_lines++ < 32) rsx_log.notice("Remix Demons amulet reappeared: frame=%llu missing_frames=%llu", m_frame_counter, m_frame_counter - m_demons_amulet_frame - 1);
+		}
+		for (u32 k = 0; k < 3; ++k) m_demons_amulet_source[k] = static_cast<f32>(source_center[k]);
+		if (m_demons_attachment_start == ~0ull) m_demons_attachment_start = m_frame_counter;
+		if (m_frame_counter - m_demons_attachment_start < 12)
+		{
+			const std::string directory = fs::get_executable_dir() + "remix_attachment/";
+			fs::create_dir(directory);
+			const std::string path = fmt::format("%s%llu_amulet.txt", directory, m_frame_counter);
+			const std::string data = fmt::format("amulet frame=%llu world %.9g %.9g %.9g source %.9g %.9g %.9g\n",
+				m_frame_counter, center[0], center[1], center[2], source_center[0], source_center[1], source_center[2]);
+			if (fs::file output{ path, fs::write + fs::create + fs::trunc }) output.write(data.data(), data.size());
+		}
+		m_demons_amulet_frame = m_frame_counter;
+		m_demons_amulet_active = true;
+		drawn = remix_rsx::guarded_draw_light_instance(api.DrawLightInstance, handle);
+	}
+	static u32 light_lines = 0;
+	if (light_lines < 8 || m_frame_counter % 120 == 0)
+	{
+		++light_lines;
+		rsx_log.notice("Remix Demons amulet: frame=%llu center=[%.9g %.9g %.9g] radius=0.06 radiance=20 create=%u draw=%u",
+			m_frame_counter, center[0], center[1], center[2], created, drawn);
+	}
+}
+
+void RemixGSRender::retire_stale_demons_amulet_light()
+{
+	if (!remix_rsx::demons_world_enabled() || !m_demons_amulet_light || !m_demons_amulet_active
+		|| m_demons_amulet_frame == m_frame_counter)
+		return;
+
+	// Bridge at most two missing halo draws in authored coordinates, using a fresh
+	// verified particle mapping. Never retain a previous camera-relative position.
+	bool bridge = m_frame_counter > m_demons_amulet_frame && m_frame_counter - m_demons_amulet_frame <= 2
+		&& m_demons_fire_mapping_frame == m_frame_counter;
+	f32 position[3]{};
+	if (bridge) for (u32 c = 0; c < 3; ++c)
+	{
+		f64 value = m_demons_fire_mapping.m[3][c];
+		for (u32 k = 0; k < 3; ++k) value += static_cast<f64>(m_demons_amulet_source[k]) * m_demons_fire_mapping.m[k][c];
+		if (!std::isfinite(value) || std::abs(value) > std::numeric_limits<f32>::max()) bridge = false;
+		else position[c] = static_cast<f32>(value);
+	}
+	if (!bridge) std::fill_n(position, 3, 0.f);
+	remixapi_LightInfoSphereEXT sphere{};
+	sphere.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
+	sphere.position = { position[0], position[1], position[2] };
+	sphere.radius = .06f;
+	sphere.volumetricRadianceScale = 1.f;
+	remixapi_LightInfo info{};
+	info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
+	info.pNext = &sphere;
+	info.hash = 0x44454d4f4e414d55ull;
+	info.radiance = bridge ? remixapi_Float3D{ 20.f, 20.f, 20.f } : remixapi_Float3D{ 0.f, 0.f, 0.f };
+	info.isDynamic = 1;
+	remixapi_LightHandle handle = nullptr;
+	const u32 status = remix_rsx::guarded_create_light(m_remix.api().CreateLight, &info, &handle);
+	if (status == REMIXAPI_ERROR_CODE_SUCCESS && handle)
+	{
+		m_demons_amulet_light = handle;
+		m_demons_amulet_active = bridge;
+		if (bridge) remix_rsx::guarded_draw_light_instance(m_remix.api().DrawLightInstance, handle);
+	}
+	static u32 lines = 0;
+	if (lines++ < 32)
+		rsx_log.notice("Remix Demons amulet gap: frame=%llu last_source=%llu bridge=%u update=%u", m_frame_counter, m_demons_amulet_frame, bridge ? 1u : 0u, status);
 }
 
 void RemixGSRender::place_debug_light(const f32 (&position)[3])
@@ -4899,7 +6492,20 @@ void RemixGSRender::update_sun_light()
 	const u32 sun_hold = remix_rsx::sun_sprite_hold_frames();
 	const bool sky_held = m_sky_sun_have && m_sky_sun_frame + 1 + sun_hold >= m_frame_counter;
 
-	if (sky_held && m_sky_sun_source == 2)
+	// The game's OWN key light, ahead of every heuristic source below it. The scattering sun
+	// those sources recover paints the SKY; LIGHT_BANK dir0 is what the game shades with, and on
+	// the measured level they are 10 degrees apart in both pitch and yaw. Every shadow in the
+	// scene was being cast from the wrong one of the two.
+	const auto* demons_preset = static_cast<const remix_rsx::demons_light_preset*>(m_demons_preset);
+	const bool demons_fresh = demons_preset && remix_rsx::demons_sun_source() != 0
+		&& m_demons_preset_frame + 1 + sun_hold >= m_frame_counter;
+
+	if (demons_fresh)
+	{
+		want = demons_preset->dir[0];
+		want_source = "demons-lightbank";
+	}
+	else if (sky_held && m_sky_sun_source == 2)
 	{
 		want = m_sky_sun_travel;
 		want_source = sky_fresh ? "sunmap" : "sunmaphold";
@@ -4943,14 +6549,15 @@ void RemixGSRender::update_sun_light()
 		want_source = "sky";
 		want_albedo = m_sky_sun_albedo;
 	}
-	else if (remix_rsx::sun_track_mode() != 0 && m_sun_track_have
+	else if ((remix_rsx::sun_track_mode() != 0
+		|| (remix_rsx::demons_world_enabled() && m_sun_track_albedo == 0xF93BC40E183C1F8Dull)) && m_sun_track_have
 		// The candidate is latched per frame; a stale latch would keep re-aiming at a card that is
 		// no longer being drawn (e.g. the player walked indoors), which is worse than holding the
 		// last good aim. One frame of tolerance covers a card submitted after this call site.
 		&& m_sun_track_frame + 1 >= m_frame_counter)
 	{
 		want = m_sun_track_travel;
-		want_source = "card";
+		want_source = remix_rsx::demons_world_enabled() && m_sun_track_albedo == 0xF93BC40E183C1F8Dull ? "demons-c111" : "card";
 		want_albedo = m_sun_track_albedo;
 	}
 
@@ -5023,7 +6630,22 @@ void RemixGSRender::update_sun_light()
 	// registers them persistent (rtx_remix_api.cpp:1479, :1543-1550), so re-using it replaces the
 	// old light rather than accumulating a second sun per retarget.
 	light_info.hash = 0x4;
-	light_info.radiance = { radiance, radiance, radiance };
+
+	// Authored colour when the preset is known, flat white otherwise. The authored triple is
+	// rgb 0..1 already multiplied by the intensity percent, so DEMONSLIGHTSCALE is the only
+	// conversion left, and 3.0 puts a 100%-white authored light exactly where sun_radiance()
+	// had it - the key light changes DIRECTION this round without changing brightness.
+	{
+		f32 sun_rgb[3] = { radiance, radiance, radiance };
+
+		if (demons_fresh)
+		{
+			const f32 scale = remix_rsx::demons_light_scale();
+			for (u32 k = 0; k < 3; ++k) sun_rgb[k] = demons_preset->rgb[0][k] * scale;
+		}
+
+		light_info.radiance = { sun_rgb[0], sun_rgb[1], sun_rgb[2] };
+	}
 
 	// ROUND 26, and it is NOT cosmetic. updateLightStaticSleep (rtx_fork_light.cpp:123-157) is the
 	// function addExternalLight calls for an existing handle, and for a light with isDynamic == 0 it
@@ -5591,9 +7213,993 @@ remixapi_MaterialHandle RemixGSRender::self_lit_material(const remixapi_Interfac
 	return m_self_lit_material;
 }
 
+remixapi_MaterialHandle RemixGSRender::guest_light_fixture_material(const remixapi_Interface& api,
+	const remix_rsx::texture_entry& source)
+{
+	if (!remix_rsx::guest_light_fixture_material_enabled()
+		|| source.width == 0 || source.height == 0
+		|| source.pixels.size() != static_cast<usz>(source.width) * source.height * 4)
+	{
+		return nullptr;
+	}
+
+	u64 key = rpcs3::hash64(0x524D5842554C424Bull, source.content_hash); // "RMXBULBK"
+	key = rpcs3::hash64(key, source.material_hash);
+	auto& cached = m_guest_light_fixture_materials[key];
+
+	if (cached.material || cached.failed)
+	{
+		return cached.material;
+	}
+
+	// Eat Lead's bulb program samples a packed green atlas, discards tex0 RGB, builds its visible
+	// colour procedurally, and writes alpha = tex0.r * 0.6. The fixed-function material path cannot
+	// replay that fragment program. Remap only this pair's texture to the warm endpoint while carrying
+	// the red-channel coverage into alpha while leaving RGB straight (un-premultiplied);
+	// retaining the mask avoids an opaque card without applying coverage twice during blending.
+	constexpr f32 warm_b = 0.858824f;
+	const u8 warm_b8 = static_cast<u8>(std::lround(warm_b * 255.f));
+	std::vector<u8> pixels(source.pixels.size());
+
+	for (usz i = 0; i < pixels.size(); i += 4)
+	{
+		const u8 mask = source.pixels[i + 2]; // decoded BGRA; the fragment program samples tex0.r
+		pixels[i + 0] = warm_b8;
+		pixels[i + 1] = 255;
+		pixels[i + 2] = 255;
+		pixels[i + 3] = static_cast<u8>((153u * mask + 127) / 255); // round(255 * 0.6 * tex0.r)
+	}
+
+	u64 texture_hash = rpcs3::hash64(0x524D5842554C4254ull, key); // "RMXBULBT"
+	if (texture_hash == 0)
+	{
+		texture_hash = 1;
+	}
+
+	remixapi_TextureInfo texture{};
+	texture.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_INFO;
+	texture.hash = texture_hash;
+	texture.width = source.width;
+	texture.height = source.height;
+	texture.depth = 1;
+	texture.mipLevels = 1;
+	texture.format = remix_rsx::textures_linear()
+		? REMIXAPI_FORMAT_B8G8R8A8_UNORM
+		: REMIXAPI_FORMAT_B8G8R8A8_SRGB;
+	texture.data = pixels.data();
+	texture.dataSize = pixels.size();
+
+	const u32 tex_status = remix_rsx::guarded_create_texture(api.CreateTexture, &texture, &cached.texture);
+	if (tex_status != REMIXAPI_ERROR_CODE_SUCCESS || !cached.texture)
+	{
+		dump_line(fmt::format("Remix guest-light-fixture-mat: FAILED texture source=%016llX status=%s (%u)",
+			source.content_hash, remix_rsx::error_name(tex_status), tex_status));
+		cached.texture = nullptr;
+		cached.failed = true;
+		return nullptr;
+	}
+
+	wchar_t albedo_path[32]{};
+	::swprintf_s(albedo_path, L"0x%016llX", texture_hash);
+
+	remixapi_MaterialInfoOpaqueEXT opaque{};
+	opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
+	opaque.albedoConstant = { 1.f, 1.f, 1.f };
+	opaque.opacityConstant = 1.f;
+	opaque.roughnessConstant = 0.35f;
+	opaque.metallicConstant = 0.f;
+	opaque.useDrawCallAlphaState = remix_rsx::blend_state_enabled() ? 1u : 0u;
+	opaque.alphaTestType = source.alpha_func;
+	opaque.alphaReferenceValue = source.alpha_ref;
+
+	remixapi_MaterialInfo material{};
+	material.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
+	material.pNext = &opaque;
+	material.hash = key == 0 ? 1 : key;
+	material.albedoTexture = albedo_path;
+	material.emissiveTexture = nullptr;
+	material.emissiveIntensity = 0.f;
+	material.emissiveColorConstant = { 0.f, 0.f, 0.f };
+	material.spriteSheetRow = 1;
+	material.spriteSheetCol = 1;
+	material.spriteSheetFps = 0;
+	material.filterMode = 1;
+	material.wrapModeU = source.wrap_u;
+	material.wrapModeV = source.wrap_v;
+
+	const u32 status = remix_rsx::guarded_create_material(api.CreateMaterial, &material,
+		&cached.material);
+
+	if (status != REMIXAPI_ERROR_CODE_SUCCESS || !cached.material)
+	{
+		dump_line(fmt::format("Remix guest-light-fixture-mat: FAILED material source=%016llX status=%s (%u)",
+			source.content_hash, remix_rsx::error_name(status), status));
+		remix_rsx::guarded_destroy_texture(api.DestroyTexture, cached.texture);
+		cached.texture = nullptr;
+		cached.material = nullptr;
+		cached.failed = true;
+		return nullptr;
+	}
+
+	dump_line(fmt::format("Remix guest-light-fixture-mat: applied source=%016llX remap=%016llX size=%ux%u "
+		"warm=[1 1 %.6g] frame=%llu", source.content_hash, texture_hash,
+		source.width, source.height, static_cast<f64>(warm_b), m_frame_counter));
+	return cached.material;
+}
+
+// =================================================================================================
+// ROUND 52: AUTHORED LEVEL LIGHTS
+//
+// Eat Lead (BLUS30267) ships a full analytic light list in its own region containers, and
+// tools/eatlead/extract_lights.py has extracted all of it: bin/eatlead_lights/<Level>.lights,
+// 2,422 records over 10 levels, 2,285 with a world placement, container parse verified two
+// independent ways over all 63 containers. Mission 1 is 01_JapaneseRestaurant1.lights, 398 records,
+// all 398 placed.
+//
+// This is the other half of the guest-light problem. maybe_inject_guest_light() DERIVES a light
+// from an emissive glow card's albedo, so it can only ever be as accurate as the card and carries
+// no authored colour, cone or intensity; this path READS the authored fixture list, so it has all
+// three and needs no texture at all. The two are modes of one knob (AUTHOREDLIGHTS: 0 off, 1
+// authored only, 2 both) rather than rivals, and mode 2 exists precisely so the derived lights can
+// serve as render-space ground truth while the authored path's placement is being pinned.
+//
+// THE PLACEMENT TRANSFORM IS NOT YET PROVEN AND NOTHING HERE PRETENDS OTHERWISE.
+// What is established, and it changes the SHAPE of the problem rather than solving it:
+//
+//   * Between frames the render space differs by a PURE TRANSLATION, no rotation. 11 of 11 frame
+//     pairs gave a full fit; the best case (frames 1142 -> 1174) has residuals of 0.002 units
+//     across three independent difference vectors, and nine of the eleven translations have t.z
+//     exactly 0. So there is no unknown per-frame rotation to solve.
+//   * The scale is 1:1, by a rigid-invariant intra-frame distance test (renderer pairwise
+//     distances p25/p50/p75 = 5.11/8.26/13.22; authored mission-1 nearest-neighbour p25/p50 =
+//     1.76-3.40 / 2.84-8.59 per region -- the same band).
+//   * "Z is negated" is RETRACTED. It does not survive a wrong-level control: on a mission-1
+//     capture, 04_BelAirMansion scored a perfect 4/4 under the same 48-permutation vote while
+//     mission 1 never beat the field. With four simultaneous lights at 0.6 m the test has no
+//     discriminating power at all, in either direction.
+//
+// So the map is DERIVED, not guessed: geometry reaches Remix as `world = fused * reference_inverse`
+// (per_draw_transform), and a point given in world space has model = I, hence
+// `p_render = p_world * view * projection * reference_inverse` -- both halves of which the backend
+// already holds. That is authored_light_map(). AUTHOREDLIGHTAXIS and AUTHOREDLIGHTOFFSET absorb the
+// ONE remaining unknown (is the file's authoring frame the guest's runtime world frame?) and are
+// deliberately conf knobs rather than constants in this file, because the measurement that would
+// entitle anyone to hardcode an answer -- section 6.3 of the plan, WITH its wrong-level control --
+// has not been taken.
+// =================================================================================================
+
+// One `Remix authored-lights:` line per run, and at most this many `Remix authored-map:` lines. The
+// map line is the cheapest available answer to "is view * projection the fused matrix of an
+// identity-model world draw in this frame?", which is the question the whole derivation rests on.
+static constexpr u32 s_max_authored_map_lines = 8;
+
+void RemixGSRender::load_authored_lights()
+{
+	if (m_authored_lights_loaded)
+	{
+		return;
+	}
+
+	// Latched on the FIRST call whatever happens, so a missing file is reported once and not once
+	// per flip.
+	m_authored_lights_loaded = true;
+
+	const std::string level = remix_rsx::authored_light_level();
+
+	if (level.empty())
+	{
+		// The shipped state. No knob, no file, no line -- byte-identical to a build without this.
+		return;
+	}
+
+	const std::string path = fs::get_executable_dir() + remix_rsx::authored_light_dir() + "/" + level + ".lights";
+
+	fs::file f{path};
+
+	if (!f)
+	{
+		dump_line(fmt::format("Remix authored-lights: level=%s file=%s MISSING", level, path));
+		return;
+	}
+
+	const std::string text = f.to_string();
+
+	std::string map_id = "0000000000000000";
+	u32 declared = 0;
+	u32 malformed = 0;
+	u32 placed = 0;
+	// Omni 627, Spot 631, Area 746, SpotOmni 1942927012, DualArea 1111553989, then anything else.
+	u32 classes[6]{};
+
+	// A hand tokeniser rather than sscanf. Three reasons, in order: MSVC treats sscanf as a
+	// deprecated unsafe function; the record mixes decimal, float and hex fields (two of the three
+	// hex fields carry a 0x prefix and one does not) so the format string would be doing more work
+	// than it looks like; and an EXACT token count is the acceptance test that catches a truncated
+	// or re-ordered line, which a partial sscanf match would silently accept.
+	std::vector<std::string_view> tokens;
+	tokens.reserve(40);
+
+	const auto tokenise = [&tokens](std::string_view line)
+	{
+		tokens.clear();
+		usz at = 0;
+
+		while (at < line.size())
+		{
+			while (at < line.size() && (line[at] == ' ' || line[at] == '\t'))
+			{
+				++at;
+			}
+
+			if (at >= line.size())
+			{
+				break;
+			}
+
+			const usz start = at;
+
+			while (at < line.size() && line[at] != ' ' && line[at] != '\t')
+			{
+				++at;
+			}
+
+			tokens.push_back(line.substr(start, at - start));
+		}
+	};
+
+	// Each returns false on anything the whole token is not. Whole-token, not prefix: "1.5x" is a
+	// malformed record and must be counted as one, not read as 1.5.
+	char number_buffer[64]{};
+
+	const auto to_cstr = [&number_buffer](std::string_view token) -> const char*
+	{
+		const usz length = std::min<usz>(token.size(), std::size(number_buffer) - 1);
+		std::memcpy(number_buffer, token.data(), length);
+		number_buffer[length] = '\0';
+		return number_buffer;
+	};
+
+	const auto parse_u32 = [&to_cstr](std::string_view token, u32& out) -> bool
+	{
+		const char* text_begin = to_cstr(token);
+		char* end = nullptr;
+		const unsigned long value = std::strtoul(text_begin, &end, 10);
+
+		if (end == text_begin || *end != '\0' || value > 0xFFFFFFFFul)
+		{
+			return false;
+		}
+
+		out = static_cast<u32>(value);
+		return true;
+	};
+
+	const auto parse_f32 = [&to_cstr](std::string_view token, f32& out) -> bool
+	{
+		const char* text_begin = to_cstr(token);
+		char* end = nullptr;
+		const double value = std::strtod(text_begin, &end);
+
+		if (end == text_begin || *end != '\0' || !std::isfinite(value))
+		{
+			return false;
+		}
+
+		out = static_cast<f32>(value);
+		return true;
+	};
+
+	// strtoull base 16 accepts an optional 0x prefix, which srcOff and flags carry and guid does not.
+	const auto parse_hex = [&to_cstr](std::string_view token, u64& out) -> bool
+	{
+		const char* text_begin = to_cstr(token);
+		char* end = nullptr;
+		const unsigned long long value = std::strtoull(text_begin, &end, 16);
+
+		if (end == text_begin || *end != '\0')
+		{
+			return false;
+		}
+
+		out = static_cast<u64>(value);
+		return true;
+	};
+
+	usz pos = 0;
+
+	while (pos <= text.size())
+	{
+		const usz nl = text.find('\n', pos);
+		std::string line = text.substr(pos, (nl == std::string::npos ? text.size() : nl) - pos);
+		pos = (nl == std::string::npos) ? text.size() + 1 : nl + 1;
+
+		// The file is written on Windows and read on Windows, but it is also hand-edited during
+		// bring-up and may arrive with either line ending.
+		while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
+		{
+			line.pop_back();
+		}
+
+		if (line.empty() || line[0] == '#')
+		{
+			continue;
+		}
+
+		tokenise(line);
+
+		if (tokens.empty())
+		{
+			continue;
+		}
+
+		if (tokens[0] == "M")
+		{
+			// `M <16HEX mapAssetId> <levelName>`. Reported, never acted on: the map id is what step
+			// 6's automatic level identification will key on (the guest opens
+			// /dev_bdvd/PS3_GAME/USRDIR/Maps/<16HEX>.map, and that stem IS this field), and having
+			// it on the load line now means that step can be verified against a run taken today.
+			if (tokens.size() >= 2)
+			{
+				map_id = std::string(tokens[1]);
+			}
+
+			continue;
+		}
+
+		if (tokens[0] == "N")
+		{
+			// The extractor's own record count. Kept only so the load line can state it beside the
+			// count this loader actually read: declared != records is a corrupt or truncated file.
+			if (tokens.size() >= 2)
+			{
+				u32 total = 0;
+
+				if (parse_u32(tokens[1], total))
+				{
+					declared = total;
+				}
+			}
+
+			continue;
+		}
+
+		if (tokens[0] != "L")
+		{
+			// V (version) and S (source container) carry nothing the injector needs.
+			continue;
+		}
+
+		// 35 tokens, ALWAYS -- the record type plus the 34 fields, in the fixed order the format
+		// states. An exact count, so a truncated or re-ordered line is a counted malformation rather
+		// than a silently half-filled record.
+		if (tokens.size() != 35)
+		{
+			++malformed;
+			continue;
+		}
+
+		u32 field[5]{};
+		f32 p[3]{}, basis[9]{}, param[9]{};
+		u32 argb[4]{};
+		u64 src_off = 0, flags = 0, guid = 0;
+		bool ok = true;
+
+		for (u32 i = 0; i < 5 && ok; ++i)
+		{
+			ok = parse_u32(tokens[1 + i], field[i]);
+		}
+
+		for (u32 i = 0; i < 3 && ok; ++i)
+		{
+			ok = parse_f32(tokens[6 + i], p[i]);
+		}
+
+		for (u32 i = 0; i < 9 && ok; ++i)
+		{
+			ok = parse_f32(tokens[9 + i], basis[i]);
+		}
+
+		for (u32 i = 0; i < 4 && ok; ++i)
+		{
+			ok = parse_u32(tokens[18 + i], argb[i]);
+		}
+
+		for (u32 i = 0; i < 9 && ok; ++i)
+		{
+			ok = parse_f32(tokens[22 + i], param[i]);
+		}
+
+		ok = ok && parse_hex(tokens[31], src_off);
+		ok = ok && parse_hex(tokens[32], flags);
+		ok = ok && parse_hex(tokens[33], guid);
+
+		if (!ok)
+		{
+			++malformed;
+			continue;
+		}
+
+		authored_light_entry entry{};
+		entry.light.cls = field[0];
+		entry.light.tmpl = static_cast<u8>(std::min(field[1], 255u));
+		entry.light.has_xform = static_cast<u8>(std::min(field[2], 255u));
+		entry.light.has_params = static_cast<u8>(std::min(field[3], 255u));
+		entry.light.src = static_cast<u8>(std::min(field[4], 255u));
+		std::copy_n(p, 3, entry.light.pos);
+		std::copy_n(basis, 9, entry.light.basis);
+		std::copy_n(param, 9, entry.light.p);
+
+		for (u32 i = 0; i < 4; ++i)
+		{
+			entry.light.argb[i] = static_cast<u8>(std::min(argb[i], 255u));
+		}
+
+		entry.light.src_off = src_off;
+		entry.light.flags = flags;
+		entry.light.guid = guid;
+
+		{
+			const usz length = std::min<usz>(tokens[34].size(), std::size(entry.light.name) - 1);
+			std::memcpy(entry.light.name, tokens[34].data(), length);
+			entry.light.name[length] = '\0';
+		}
+
+		switch (field[0])
+		{
+		case 627: ++classes[0]; break;
+		case 631: ++classes[1]; break;
+		case 746: ++classes[2]; break;
+		case 1942927012u: ++classes[3]; break;
+		case 1111553989u: ++classes[4]; break;
+		default: ++classes[5]; break;
+		}
+
+		++m_stats.authored_loaded;
+
+		// THE 137 UNPLACED RECORDS ARE NOT PARSE FAILURES and must not be submitted. They are the
+		// light components of effect, weapon and prop prefabs (FX_Derez_muzFlash,
+		// ps_TestGrenade02_size, o_saloon_doors_d, dyn_zombiepit03, ...) whose owner places them at
+		// runtime; parse_report.txt names every one. Dropped at a region origin they would look
+		// exactly like a transform error, which is the one failure this round cannot afford to
+		// manufacture. They are still COUNTED into authored_loaded above, so loaded - placed is the
+		// prefab population and the two can never be confused.
+		if (!entry.light.has_xform)
+		{
+			continue;
+		}
+
+		++placed;
+
+		// FRAME-INVARIANT BY CONSTRUCTION. The position cannot be the identity on a camera-relative
+		// title -- it changes every frame - so the hash is over the level name and the record's own
+		// place in the container set, which never change. Built once, here, and used as the runtime
+		// light hash for the whole run, so every frame's re-place is an in-place update.
+		u64 hash = 0x41555448544c4754ull;
+
+		// The level name folded in byte by byte rather than through std::hash: std::hash for
+		// std::string is implementation-defined and MSVC seeds it per build, so a light's runtime
+		// identity would silently change between two builds of the same binary. This is stable.
+		for (const char c : level)
+		{
+			hash = rpcs3::hash64(hash, static_cast<u64>(static_cast<u8>(c)));
+		}
+
+		hash = rpcs3::hash64(hash, static_cast<u64>(entry.light.src));
+		hash = rpcs3::hash64(hash, entry.light.src_off);
+		// The low bit is reserved: a DualAreaLight's back face is submitted under `hash ^ 1`, and
+		// clearing it here is what stops the pair colliding with a neighbouring light's hash.
+		entry.hash = hash & ~1ull;
+
+		m_authored_lights.push_back(entry);
+	}
+
+	m_stats.authored_placed = placed;
+
+	dump_line(fmt::format(
+		"Remix authored-lights: level=%s map=%s file=%s records=%llu placed=%u declared=%u "
+		"malformed=%u classes={omni=%u spot=%u area=%u spotomni=%u dualarea=%u other=%u} "
+		"mode=%u axis=%u only=%d radiance=%.4g max=%u dist=%.4g",
+		level, map_id, path, m_stats.authored_loaded, placed, declared, malformed,
+		classes[0], classes[1], classes[2], classes[3], classes[4], classes[5],
+		remix_rsx::authored_light_mode(), remix_rsx::authored_light_axis(),
+		remix_rsx::authored_light_only(), static_cast<f64>(remix_rsx::authored_light_radiance()),
+		remix_rsx::authored_light_max(), static_cast<f64>(remix_rsx::authored_light_distance())));
+}
+
+// M = view * projection * reference_inverse, row-vector (p' = p * M), which is exactly the map
+// per_draw_transform applies to geometry with model = I. to_remix_transform() truncates the
+// perspective row, so this is consumed AFFINELY -- no w divide -- and a light placed with it lands
+// wherever a world-space vertex at the same coordinates would land, by construction.
+bool RemixGSRender::authored_light_map(remix_rsx::mat4& out) const
+{
+	if (!m_active_camera.valid || !m_active_camera.has_reference)
+	{
+		return false;
+	}
+
+	// f64 for the multiply chain, matching per_draw_transform's divide. NOTE THE DIFFERENCE, because
+	// it is a real limitation and not a detail: per_draw_transform can use an inverse that was
+	// COMPUTED in f64 (gauge_anchor::inverse_f64), and camera_candidate carries no such field --
+	// m_active_camera.reference_inverse is an f32 cofactor inverse of an ill-conditioned matrix. So
+	// the f64 here removes the multiply's cancellation and NOT the inverse's. On BLUS30267, where
+	// gauge_absent is 100% of draws, per_draw_transform is in exactly the same position, so the two
+	// paths agree -- which is what matters for a light that has to land on the geometry.
+	if (remix_rsx::gauge_f64_enabled())
+	{
+		const remix_rsx::mat4d view_proj = remix_rsx::mat4d_multiply(
+			remix_rsx::mat4d_from(m_active_camera.view),
+			remix_rsx::mat4d_from(m_active_camera.projection));
+		const remix_rsx::mat4d map = remix_rsx::mat4d_multiply(
+			view_proj, remix_rsx::mat4d_from(m_active_camera.reference_inverse));
+
+		if (!remix_rsx::mat4d_is_finite(map))
+		{
+			return false;
+		}
+
+		out = remix_rsx::mat4d_to_f32(map);
+	}
+	else
+	{
+		out = remix_rsx::mat4_multiply(
+			remix_rsx::mat4_multiply(m_active_camera.view, m_active_camera.projection),
+			m_active_camera.reference_inverse);
+	}
+
+	return remix_rsx::mat4_is_finite(out);
+}
+
+void RemixGSRender::submit_authored_lights()
+{
+	// The load runs whether or not anything will be submitted. That is what makes "prove the file
+	// loads" a step rather than a claim: with AUTHOREDLIGHTLEVEL set and AUTHOREDLIGHTS still 0,
+	// this run prints one `Remix authored-lights:` line and changes nothing else about the frame.
+	load_authored_lights();
+
+	const u32 mode = remix_rsx::authored_light_mode();
+
+	if (mode == 0 || m_authored_lights.empty() || !m_remix.ok())
+	{
+		return;
+	}
+
+	// A probe index past the end of this level's list submits NOTHING and would otherwise look
+	// exactly like a placement failure: `submitted=0` with every other counter also 0. Said once,
+	// with both numbers, so the two cannot be confused.
+	if (const s32 probe = remix_rsx::authored_light_only();
+		probe >= 0 && static_cast<usz>(probe) >= m_authored_lights.size() && m_authored_map_lines == 0)
+	{
+		m_authored_map_lines = s_max_authored_map_lines;
+		dump_line(fmt::format("Remix authored-lights: AUTHOREDLIGHTONLY=%d IS OUT OF RANGE -- this "
+			"level has %llu placed lights (valid indices 0..%llu). Nothing will be submitted.",
+			probe, static_cast<u64>(m_authored_lights.size()),
+			static_cast<u64>(m_authored_lights.size() - 1)));
+		return;
+	}
+
+	remix_rsx::mat4 map{};
+	const bool have_map = authored_light_map(map);
+
+	// --- THE DIAGNOSTIC THAT ANSWERS SECTION 6.4 ------------------------------------------------
+	// `identity_l1` is max |M - I| over all sixteen entries. It is not cosmetic: m_active_camera's
+	// view and projection are the SPLIT of the electing draw's own fused matrix, and
+	// reference_inverse is the inverse of that same fused matrix, so IF the split is exact and
+	// direct then view * projection == fused and M is the identity -- i.e. the file's coordinates
+	// would be used raw and the derivation contributes nothing. If instead the split took the
+	// TRANSPOSE branch (vp_split::used_transpose), M is fused^T * fused^-1 and is not the identity.
+	// Which of the two happens on this title is a live fact, not an argument, and this line is how
+	// it gets read. Nobody should draw a conclusion about the placement from anything else until
+	// this number is known.
+	//
+	// THE BUDGET IS ONLY SPENT ON A FRAME THAT HAS A MAP. The first flips of a run routinely have no
+	// camera at all (cam_fallback), so a single counter shared by both outcomes would be exhausted by
+	// the loading screen and the one line this whole diagnostic exists for would never print -- the
+	// starved-instrument failure this codebase has already shipped twice. The no-map case is
+	// rate-limited instead, so a run where the camera never resolves still says so, forever, without
+	// spamming.
+	if (have_map ? (m_authored_map_lines < s_max_authored_map_lines) : ((m_frame_counter % 600) == 0))
+	{
+		if (have_map)
+		{
+			++m_authored_map_lines;
+		}
+
+		f32 identity_l1 = 0.f;
+
+		if (have_map)
+		{
+			for (u32 i = 0; i < 4; ++i)
+			{
+				for (u32 j = 0; j < 4; ++j)
+				{
+					identity_l1 = std::max(identity_l1,
+						std::abs(map.m[i][j] - (i == j ? 1.f : 0.f)));
+				}
+			}
+		}
+
+		dump_line(fmt::format("Remix authored-map: frame=%llu have=%d identity_l1=%.6g vp=%016llx "
+			"eye=[%.5g %.5g %.5g] M=%s",
+			m_frame_counter, have_map ? 1 : 0, static_cast<f64>(identity_l1), m_active_camera.vp_hash,
+			static_cast<f64>(m_active_camera.position[0]), static_cast<f64>(m_active_camera.position[1]),
+			static_cast<f64>(m_active_camera.position[2]),
+			have_map ? remix_rsx::format_matrix(map) : std::string("none")));
+	}
+
+	if (!have_map)
+	{
+		return;
+	}
+
+	// --- THE BRING-UP DIALS ---------------------------------------------------------------------
+	// AUTHOREDLIGHTAXIS = permutation * 8 + signs. Permutation 0 with no signs is the EXACT
+	// identity: the table's first row is (0,1,2) and the sign mask is 0, so a value of 0 performs no
+	// arithmetic on the file's numbers at all. That is the point -- no axis convention is baked into
+	// this file, and none may be until the section-6.3 measurement supports one.
+	static constexpr u32 s_axis_perm[6][3] = {
+		{ 0, 1, 2 }, { 0, 2, 1 }, { 1, 0, 2 }, { 1, 2, 0 }, { 2, 0, 1 }, { 2, 1, 0 }
+	};
+
+	const u32 axis = remix_rsx::authored_light_axis();
+	const u32(&perm)[3] = s_axis_perm[axis / 8];
+	const f32 sign[3] = {
+		(axis & 1) ? -1.f : 1.f,
+		(axis & 2) ? -1.f : 1.f,
+		(axis & 4) ? -1.f : 1.f
+	};
+
+	f32 offset[3]{};
+	remix_rsx::authored_light_offset(offset);
+
+	// File frame -> authoring-corrected frame. Applied to the position and to each basis row alike;
+	// a basis row is a direction, so it takes the permutation and the signs but never the offset.
+	const auto permute = [&perm, &sign](const f32 (&in)[3], f32 (&res)[3])
+	{
+		for (u32 i = 0; i < 3; ++i)
+		{
+			res[i] = sign[i] * in[perm[i]];
+		}
+	};
+
+	// Row-vector affine transform by M, the same shape submit_demons_fire_lights() uses and the same
+	// shape to_remix_transform() hands to the runtime.
+	const auto to_render = [&map](const f32 (&in)[3], f32 (&res)[3])
+	{
+		for (u32 c = 0; c < 3; ++c)
+		{
+			res[c] = map.m[3][c];
+
+			for (u32 k = 0; k < 3; ++k)
+			{
+				res[c] += in[k] * map.m[k][c];
+			}
+		}
+	};
+
+	// A direction takes M's 3x3 block and no translation.
+	const auto to_render_dir = [&map](const f32 (&in)[3], f32 (&res)[3])
+	{
+		for (u32 c = 0; c < 3; ++c)
+		{
+			res[c] = 0.f;
+
+			for (u32 k = 0; k < 3; ++k)
+			{
+				res[c] += in[k] * map.m[k][c];
+			}
+		}
+	};
+
+	const auto normalise = [](f32 (&v)[3]) -> bool
+	{
+		const f32 length = std::sqrt((v[0] * v[0]) + (v[1] * v[1]) + (v[2] * v[2]));
+
+		if (!std::isfinite(length) || length < 1e-6f)
+		{
+			return false;
+		}
+
+		v[0] /= length;
+		v[1] /= length;
+		v[2] /= length;
+		return true;
+	};
+
+	// The eye, in RENDER space. m_active_camera.position is row 3 of inverse(view), and `view` is
+	// the split of the electing draw's own fused matrix -- so it is already in the same space the
+	// transformed light positions land in, which is exactly why culling by distance is safe before
+	// the placement is settled. anchor_frame_eye() is preferred where it exists (it does not on this
+	// title: it is provenance-gated on a gauge anchor, and gauge_absent is 100% of draws here).
+	f32 eye[3] = { m_active_camera.position[0], m_active_camera.position[1], m_active_camera.position[2] };
+	f32 anchor_eye[3]{};
+
+	if (anchor_frame_eye(anchor_eye))
+	{
+		std::copy_n(anchor_eye, 3, eye);
+	}
+
+	const s32 only = remix_rsx::authored_light_only();
+	const f32 cull = remix_rsx::authored_light_distance();
+	const f32 min_radius = remix_rsx::authored_light_min_radius();
+	const f32 cone_softness = remix_rsx::authored_light_cone_softness();
+	const f32 radiance_scale = remix_rsx::authored_light_radiance();
+	const remixapi_Bool ignore_vm = remix_rsx::authored_light_ignore_viewmodel() ? 1u : 0u;
+	const u32 dump_max = remix_rsx::authored_light_dump();
+
+	if (m_authored_dump_frame != m_frame_counter)
+	{
+		m_authored_dump_frame = m_frame_counter;
+		m_authored_dump_frame_lines = 0;
+	}
+
+	// Pass 1: place every eligible light and measure it against the eye.
+	m_authored_order.clear();
+
+	for (u32 index = 0; index < m_authored_lights.size(); ++index)
+	{
+		authored_light_entry& entry = m_authored_lights[index];
+
+		// AUTHOREDLIGHTONLY is the single-light probe and it is EXEMPT from both the distance cull
+		// and the handle cap. A probe that can be silently dropped answers no question at all.
+		if (only >= 0 && static_cast<u32>(only) != index)
+		{
+			continue;
+		}
+
+		f32 world[3]{};
+		permute(entry.light.pos, world);
+
+		for (u32 c = 0; c < 3; ++c)
+		{
+			world[c] += offset[c];
+		}
+
+		to_render(world, entry.render_pos);
+
+		if (!std::isfinite(entry.render_pos[0]) || !std::isfinite(entry.render_pos[1])
+			|| !std::isfinite(entry.render_pos[2]))
+		{
+			++m_stats.authored_createfail;
+			continue;
+		}
+
+		const f32 dx = entry.render_pos[0] - eye[0];
+		const f32 dy = entry.render_pos[1] - eye[1];
+		const f32 dz = entry.render_pos[2] - eye[2];
+		entry.eye_distance = std::sqrt((dx * dx) + (dy * dy) + (dz * dz));
+
+		if (only < 0 && entry.eye_distance > cull)
+		{
+			++m_stats.authored_culled_dist;
+			continue;
+		}
+
+		m_authored_order.push_back(index);
+
+		if (dump_max != 0 && m_authored_dump_frame_lines < dump_max)
+		{
+			++m_authored_dump_frame_lines;
+
+			// BOTH SPACES ON ONE LINE, IN ONE FRAME, IS THE WHOLE POINT. This row is the input to
+			// the section-6.3 measurement and the only thing that makes the residual solvable
+			// offline: `world` is post-axis, post-offset, i.e. exactly what was fed to M.
+			dump_line(fmt::format("Remix authored-light: idx=%u hash=%016llx cls=%u name=%s "
+				"file=[%.6g %.6g %.6g] world=[%.6g %.6g %.6g] render=[%.6g %.6g %.6g] dist=%.5g "
+				"rgb=[%u %u %u] f0=%.4g f1=%.4g f6=%.4g f7=%.4g f8=%.4g frame=%llu",
+				index, entry.hash, entry.light.cls, static_cast<const char*>(entry.light.name),
+				static_cast<f64>(entry.light.pos[0]), static_cast<f64>(entry.light.pos[1]),
+				static_cast<f64>(entry.light.pos[2]),
+				static_cast<f64>(world[0]), static_cast<f64>(world[1]), static_cast<f64>(world[2]),
+				static_cast<f64>(entry.render_pos[0]), static_cast<f64>(entry.render_pos[1]),
+				static_cast<f64>(entry.render_pos[2]), static_cast<f64>(entry.eye_distance),
+				static_cast<u32>(entry.light.argb[1]), static_cast<u32>(entry.light.argb[2]),
+				static_cast<u32>(entry.light.argb[3]),
+				static_cast<f64>(entry.light.p[0]), static_cast<f64>(entry.light.p[1]),
+				static_cast<f64>(entry.light.p[6]), static_cast<f64>(entry.light.p[7]),
+				static_cast<f64>(entry.light.p[8]), m_frame_counter));
+		}
+	}
+
+	// Pass 2: nearest first, then the cap.
+	const u32 budget = remix_rsx::authored_light_max();
+
+	if (only < 0 && m_authored_order.size() > budget)
+	{
+		std::sort(m_authored_order.begin(), m_authored_order.end(), [this](u32 a, u32 b)
+		{
+			return m_authored_lights[a].eye_distance < m_authored_lights[b].eye_distance;
+		});
+
+		m_stats.authored_capped += m_authored_order.size() - budget;
+		m_authored_order.resize(budget);
+	}
+
+	// Pass 3: create. CreateLight on an existing hash is an IN-PLACE UPDATE, not a second light
+	// (LightManager::addExternalLight looks the handle up and calls updateLightStaticSleep), and
+	// DestroyLight only QUEUES -- Present drains destroys first and tombstones a same-frame create,
+	// so destroy-then-create inside one frame is a delete. Nothing here destroys; teardown does.
+	const auto& api = m_remix.api();
+
+	for (const u32 index : m_authored_order)
+	{
+		authored_light_entry& entry = m_authored_lights[index];
+		const authored_light& light = entry.light;
+
+		// The file's own colour and intensity, which is the whole reason this path beats the derived
+		// one: the derived path emits a fixed white radiance=30 sphere for every fixture. Alpha is
+		// 0xFF on 2,415 of 2,422 records and 0xD6 on 7, and is ignored. f[1] (range in metres) is
+		// deliberately NOT folded in: Remix spheres fall off physically and have no cutoff, so range
+		// has no direct equivalent, and silently reusing it as a second radiance term would make the
+		// calibration in step 5 unreadable.
+		//
+		// AUTHOREDLIGHTONLY multiplies by 10 so the one light it selects is unmistakable.
+		const f32 gain = radiance_scale * light.p[0] * ((only >= 0) ? 10.f : 1.f);
+		const remixapi_Float3D radiance = {
+			(static_cast<f32>(light.argb[1]) / 255.f) * gain,
+			(static_cast<f32>(light.argb[2]) / 255.f) * gain,
+			(static_cast<f32>(light.argb[3]) / 255.f) * gain
+		};
+
+		// Row 1 of the basis IS the aim. Rows 0 and 2 are the rect's x and y axes.
+		const f32 row0[3] = { light.basis[0], light.basis[1], light.basis[2] };
+		const f32 row1[3] = { light.basis[3], light.basis[4], light.basis[5] };
+		const f32 row2[3] = { light.basis[6], light.basis[7], light.basis[8] };
+
+		f32 axis_x[3]{}, aim[3]{}, axis_y[3]{};
+		permute(row0, axis_x);
+		permute(row1, aim);
+		permute(row2, axis_y);
+
+		f32 dir_render[3]{}, x_render[3]{}, y_render[3]{};
+		to_render_dir(axis_x, x_render);
+		to_render_dir(aim, dir_render);
+		to_render_dir(axis_y, y_render);
+
+		const bool has_dir = normalise(dir_render);
+
+		remixapi_LightInfo info{};
+		info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
+		info.hash = entry.hash;
+		info.radiance = radiance;
+		// MANDATORY, and not a copy of the derived path's `track ? 1 : 0`. Analytical lights are
+		// SLEPT and vanish from LIGHT STATISTICS unless isDynamic is set -- updateLightStaticSleep
+		// stops copying position into a non-dynamic light once isStaticCount reaches
+		// getNumFramesToPutLightsToSleep() -- and dome lights are immune, which disguises the
+		// failure as "no lights reach the runtime". These move every frame by construction, because
+		// the space is camera-relative, so they are dynamic whether or not the fixture moves.
+		info.isDynamic = 1;
+		info.ignoreViewModel = ignore_vm;
+
+		remixapi_LightInfoSphereEXT sphere{};
+		remixapi_LightInfoRectEXT rect{};
+
+		const bool is_rect = (light.cls == 746u || light.cls == 1111553989u);
+
+		if (is_rect)
+		{
+			// Rect lights need xAxis, yAxis and direction mutually orthonormal. The extracted basis
+			// is orthonormal to 1e-3 by construction (one of the parse's acceptance tests), but M
+			// need not be exactly orthogonal, so re-orthonormalise here rather than trusting it.
+			bool usable = has_dir;
+
+			if (usable)
+			{
+				const f32 dx = (x_render[0] * dir_render[0]) + (x_render[1] * dir_render[1]) + (x_render[2] * dir_render[2]);
+
+				for (u32 c = 0; c < 3; ++c)
+				{
+					x_render[c] -= dx * dir_render[c];
+				}
+
+				usable = normalise(x_render);
+			}
+
+			if (usable)
+			{
+				const f32 dy = (y_render[0] * dir_render[0]) + (y_render[1] * dir_render[1]) + (y_render[2] * dir_render[2]);
+				const f32 xy = (y_render[0] * x_render[0]) + (y_render[1] * x_render[1]) + (y_render[2] * x_render[2]);
+
+				for (u32 c = 0; c < 3; ++c)
+				{
+					y_render[c] -= (dy * dir_render[c]) + (xy * x_render[c]);
+				}
+
+				usable = normalise(y_render);
+			}
+
+			if (!usable)
+			{
+				// Counted rather than dropped in silence. Structurally 0 unless M is degenerate;
+				// a non-zero reading here means the map is not near-rigid and the placement work
+				// has a bigger problem than an axis convention.
+				++m_stats.authored_createfail;
+				continue;
+			}
+
+			rect.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_RECT_EXT;
+			rect.position = { entry.render_pos[0], entry.render_pos[1], entry.render_pos[2] };
+			rect.xAxis = { x_render[0], x_render[1], x_render[2] };
+			rect.xSize = std::max(light.p[6], 1e-3f);
+			rect.yAxis = { y_render[0], y_render[1], y_render[2] };
+			rect.ySize = std::max(light.p[7], 1e-3f);
+			rect.direction = { dir_render[0], dir_render[1], dir_render[2] };
+			rect.volumetricRadianceScale = 1.f;
+			info.pNext = &rect;
+		}
+		else
+		{
+			sphere.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
+			sphere.position = { entry.render_pos[0], entry.render_pos[1], entry.render_pos[2] };
+			// f[6] is the source extent; on SpotOmniLight f[6] == f[7] and it is a radius.
+			sphere.radius = std::max(light.p[6], min_radius);
+			sphere.volumetricRadianceScale = 1.f;
+
+			// SpotLight (631) and SpotOmniLight (1942927012) carry a cone; OmniLight (627) does not.
+			// f[8] is the FULL cone angle in degrees -- its histogram lands on round values 90, 60,
+			// 70, 80, 50, 65, 30, 40, 10, 120, 100 -- and Remix's coneAngleDegrees is a half angle.
+			if ((light.cls == 631u || light.cls == 1942927012u) && has_dir)
+			{
+				sphere.shaping_hasvalue = 1;
+				sphere.shaping_value.direction = { dir_render[0], dir_render[1], dir_render[2] };
+				sphere.shaping_value.coneAngleDegrees = light.p[8] * .5f;
+				sphere.shaping_value.coneSoftness = cone_softness;
+				sphere.shaping_value.focusExponent = 0.f;
+			}
+
+			info.pNext = &sphere;
+		}
+
+		const u32 status = remix_rsx::guarded_create_light(api.CreateLight, &info, &entry.handle);
+
+		if (status != REMIXAPI_ERROR_CODE_SUCCESS || !entry.handle)
+		{
+			++m_stats.authored_createfail;
+			continue;
+		}
+
+		++m_stats.authored_submitted;
+
+		// DualAreaLight (1111553989): Remix has no two-sided rect, so the back face is a second rect
+		// at the same place with the direction and one axis negated, under `hash ^ 1`.
+		if (light.cls == 1111553989u)
+		{
+			remixapi_LightInfoRectEXT back = rect;
+			back.direction = { -dir_render[0], -dir_render[1], -dir_render[2] };
+			back.xAxis = { -x_render[0], -x_render[1], -x_render[2] };
+
+			remixapi_LightInfo back_info = info;
+			back_info.hash = entry.hash ^ 1ull;
+			back_info.pNext = &back;
+
+			const u32 back_status = remix_rsx::guarded_create_light(api.CreateLight, &back_info, &entry.handle_back);
+
+			if (back_status != REMIXAPI_ERROR_CODE_SUCCESS || !entry.handle_back)
+			{
+				++m_stats.authored_createfail;
+			}
+			else
+			{
+				++m_stats.authored_submitted;
+			}
+		}
+	}
+}
+
 void RemixGSRender::maybe_inject_guest_light(u64 vp_hash, u64 fp_hash, u64 albedo_hash,
 	const remixapi_Transform& transform, bool is_viewmodel)
 {
+	// --- ROUND 52: AUTHOREDLIGHTS=1 is "authored only" -------------------------------------------
+	// Before the albedo match below, so nothing on this path runs at all. Counted rather than
+	// achieved by blanking RPCS3_REMIX_GUESTLIGHTALBEDO: blanking the list would hide the change
+	// from the run-start banner (glalbedos would read 0 for a reason that has nothing to do with the
+	// list) and make the A/B against mode 2 unreadable. Structurally 0 at modes 0 and 2, and mode 0
+	// is the shipped default, so this gate is inert until the conf says otherwise.
+	if (remix_rsx::authored_light_mode() == 1)
+	{
+		++m_stats.guest_light_suppressed;
+		return;
+	}
+
 	const u64 configured_vp = remix_rsx::guest_light_pair_vp_hash();
 	const u64 configured_fp = remix_rsx::guest_light_pair_fp_hash();
 	const u64 configured_albedo2 = remix_rsx::guest_light_pair2_albedo_hash();
@@ -5793,6 +8399,24 @@ void RemixGSRender::maybe_inject_guest_light(u64 vp_hash, u64 fp_hash, u64 albed
 		}
 	}
 
+	// --- ROUND 52: the LOCAL box, named --------------------------------------------------------
+	// Both quantities were computed and discarded. They are the only basis-independent facts about
+	// this draw: `position` below is `local` pushed through a world transform that on a title with
+	// no gauge anchor is `fused * m_active_camera.reference_inverse`, i.e. a per-frame
+	// camera-relative basis, while `local` is the fixture's own vertex data and does not depend on
+	// the camera at all. The frame-invariant identity is keyed on it, and printing `lext` beside
+	// `extent` is what separates "the divisor was wrong" from "this is a different mesh".
+	//
+	// NOT substituted into the position loop below: `a * (lo+hi) * 0.5f` and `a * ((lo+hi)*0.5f)`
+	// are not the same float, and the off arm has to be bit-exact with today at the runtime
+	// boundary. The loop is left byte-for-byte as it was.
+	const f32 local[3] = {
+		(lo[0] + hi[0]) * 0.5f,
+		(lo[1] + hi[1]) * 0.5f,
+		(lo[2] + hi[2]) * 0.5f
+	};
+	const f32 lext = std::max({ hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2] });
+
 	f32 position[3]{};
 	for (u32 row = 0; row < 3; ++row)
 	{
@@ -5859,6 +8483,12 @@ void RemixGSRender::maybe_inject_guest_light(u64 vp_hash, u64 fp_hash, u64 albed
 	if (trigger_match && !trigger_size_ok)
 	{
 		++m_stats.guest_light_toobig;
+		// ROUND 52. This was the largest population on the whole path and it had no rows behind it:
+		// 22553 of 23518 matches (96%) on run pid=29940. `lext` against `extent` on the census line
+		// is what decides between the two hypotheses that fit that number - an aux-pass draw under
+		// the main camera's inverse (small lext, large extent) or a bigger mesh sharing the bulb
+		// texture (large lext) - and they want opposite next steps.
+		report_guest_light_refused("toobig", albedo_hash, position, world_extent, local, lext);
 	}
 
 	const bool trigger_accepted = trigger_match && trigger_size_ok;
@@ -5884,6 +8514,448 @@ void RemixGSRender::maybe_inject_guest_light(u64 vp_hash, u64 fp_hash, u64 albed
 		}
 
 		return;
+	}
+
+	// --- ROUND 52: the MAIN-CLIP gate (RPCS3_REMIX_GUESTLIGHTMAINCLIP) --------------------------
+	// An aux-pass copy of the fixture is divided by the MAIN camera's inverse exactly like a
+	// main-pass one, so it lands at a projectively wrong scale and place - and there was no clip
+	// gate anywhere on this path. MEASURED on BLUS30267: the bulb program 30086232b02bc73a is the
+	// only vp whose 'Remix notex:' rows read clip=128x128 target=1, and both dump runs carry bulb
+	// rows at 2.2-4.1x the main-pass extent for the same albedo (extent=1.281 and 1.732 at
+	// [50.27 23.17 4.82] / [31.82 54.56 6.00] on run pid=29940 frame 1258; 1.556 and 2.068 on run
+	// pid=20656 frame 2724; 0.5 / 0.578 everywhere else).
+	//
+	// Placed AFTER the census and the sun-card call so 'Remix light-candidate:' and 'Remix suncard:'
+	// still NAME an aux draw - a refusal that also silenced the instrument would be self-concealing,
+	// the argument the round-41 size gate makes above. Placed BEFORE the dedup because an aux copy
+	// must neither stamp an existing light, re-place it, nor mint one.
+	if (remix_rsx::guest_light_main_clip_enabled() && !guest_light_clip_ok())
+	{
+		++m_stats.guest_light_auxclip;
+		report_guest_light_refused("auxclip", albedo_hash, position, world_extent, local, lext);
+		return;
+	}
+
+	// --- ROUND 52: ONE creation path, used by the mint below and by the re-place just under ------
+	// The radius, the tint and the radiance are hoisted here rather than left inside the lambda so
+	// the 'Remix guest-light:' line can still print the values that were actually submitted without
+	// re-deriving them from a second copy of the same formula. They depend only on this draw, and
+	// both call sites are this draw, so a single computation serves both - which is why the lambda
+	// takes no extent parameter.
+	const bool track = remix_rsx::guest_light_track_enabled();
+
+	// The embedding fix. A fixed 0.2 sphere placed at the bbox *centre* of a 2.6-unit lamp housing
+	// sits inside its own shade, and the path tracer then occludes the light with the very mesh it
+	// was derived from - which is why four bulbs already existed in Haze's dark cargo area and the
+	// room was still dark. Scaling with the draw's own world extent pokes the emitter back out.
+	// GUESTLIGHTRADIUSSCALE=0 (unparsable / non-positive) falls back to the knob default, and the
+	// max() below means the fixed radius is always the floor.
+	const f32 light_radius = std::max(remix_rsx::guest_light_radius(),
+		world_extent * remix_rsx::guest_light_radius_scale());
+
+	// The fixture's own colour, normalised so the largest component is 1: GUESTLIGHTRADIANCE stays
+	// the single brightness control and this only moves the hue. GUESTLIGHTCOLOR=0 restores the
+	// fixed warm 1 / 0.86 / 0.68 constant that shipped in round 4.
+	f32 tint[3] = { 1.f, 0.86f, 0.68f };
+
+	if (remix_rsx::guest_light_color_enabled())
+	{
+		const f32 peak = std::max({ m_scratch_albedo_mean_rgb[0], m_scratch_albedo_mean_rgb[1],
+			m_scratch_albedo_mean_rgb[2] });
+
+		if (peak > 1e-4f)
+		{
+			tint[0] = m_scratch_albedo_mean_rgb[0] / peak;
+			tint[1] = m_scratch_albedo_mean_rgb[1] / peak;
+			tint[2] = m_scratch_albedo_mean_rgb[2] / peak;
+		}
+	}
+
+	const f32 radiance = remix_rsx::guest_light_radiance();
+
+	// CreateLight on an EXISTING hash is an in-place update, not a second light: remixapi_CreateLight
+	// is immediate and LightManager::addExternalLight looks the handle up and calls
+	// updateLightStaticSleep when it is already present (rtx_light_manager.cpp:726-736). DestroyLight
+	// is deliberately never called here - it only QUEUES, and Present drains destroys FIRST and
+	// tombstones any same-frame create for the same handle, so destroy-then-create in one frame is a
+	// delete. That is round 26's sun bug verbatim; see update_sun_light().
+	//
+	// isDynamic is REQUIRED under TRACK and is not cosmetic: for a light with isDynamic == 0
+	// updateLightStaticSleep STOPS COPYING the new data once isStaticCount reaches
+	// getNumFramesToPutLightsToSleep() (rtx_fork_light.cpp:123-145), and the counter is never reset
+	// for an external light - so a re-placed light would silently freeze after a few updates. With
+	// TRACK off it stays 0, which is bit-exactly what shipped.
+	const auto create_or_update = [this, track, light_radius, radiance, &tint]
+		(u64 hash, const f32 (&pos)[3], remixapi_LightHandle& handle) -> u32
+	{
+		remixapi_LightInfoSphereEXT sphere{};
+		sphere.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
+		sphere.position = { pos[0], pos[1], pos[2] };
+		sphere.radius = light_radius;
+		sphere.volumetricRadianceScale = 1.f;
+
+		remixapi_LightInfo info{};
+		info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
+		info.pNext = &sphere;
+		info.hash = hash;
+		info.radiance = { radiance * tint[0], radiance * tint[1], radiance * tint[2] };
+		info.ignoreViewModel = 1;
+		info.isDynamic = track ? 1 : 0;
+
+		const u32 status = remix_rsx::guarded_create_light(m_remix.api().CreateLight, &info, &handle);
+
+		// Counted as of round 50. A refusal here was completely silent -- no counter, no log, no
+		// else branch -- so a run in which the runtime rejected every light looked identical to a
+		// run in which none was ever attempted.
+		if (status != REMIXAPI_ERROR_CODE_SUCCESS || !handle)
+		{
+			++m_stats.guest_light_createfail;
+		}
+
+		return status;
+	};
+
+	// --- ROUND 52: the FRAME-INVARIANT identity -------------------------------------------------
+	// Computed here rather than beside light_hash below because the identity LOOKUP has to run
+	// before the world-distance dedup: on this title the dedup's own key is a world position, so
+	// after a re-basing it fails to recognise a fixture it has already lit and mints a duplicate.
+	// The local AABB centre is the fixture's own vertex data - on this title the raw s16 attribute
+	// values, so the 0.25-unit quantisation is exact - and does not depend on the camera at all.
+	// Same hash64 chain and same quantisation as light_hash, in vertex units instead of world ones.
+	u64 identity = rpcs3::hash64(0x474C4944454E5449ull, albedo_hash);
+	identity = rpcs3::hash64(identity, vp_hash);
+	identity = rpcs3::hash64(identity, static_cast<u64>(std::llround(local[0] * 4.f)));
+	identity = rpcs3::hash64(identity, static_cast<u64>(std::llround(local[1] * 4.f)));
+	identity = rpcs3::hash64(identity, static_cast<u64>(std::llround(local[2] * 4.f)));
+
+	for (guest_light_entry& light : m_guest_lights)
+	{
+		if (light.identity != identity)
+		{
+			continue;
+		}
+
+		const f32 dx = position[0] - light.position[0];
+		const f32 dy = position[1] - light.position[1];
+		const f32 dz = position[2] - light.position[2];
+		const f32 d = std::sqrt((dx * dx) + (dy * dy) + (dz * dz));
+
+		// CONFLICT: a second draw claimed this identity at a different place in the SAME frame, i.e.
+		// two instances of one fixture sharing a local AABB centre. Nothing sound can be done with
+		// one light and two places, so this falls through to today's world dedup on BOTH arms rather
+		// than picking one. Must read 0 on this title; non-zero means the identity needs an instance
+		// term before TRACK is trusted anywhere else.
+		if (light.placed_frame == m_frame_counter && d > 1.5f)
+		{
+			++m_stats.guest_light_track_conflict;
+			report_guest_light_refused("conflict", albedo_hash, position, world_extent, local, lext);
+			break;
+		}
+
+		// TRACK owns an identity across rebases, so an identity hit keeps it alive. With tracking off,
+		// only the world-distance dedup below may refresh the entry: stamping a far identity match here
+		// would make the old, displaced light immortal while a new world-cell light was also minted.
+		if (track)
+		{
+			light.last_matched_frame = m_frame_counter;
+		}
+
+		// Taken BEFORE the re-place, which overwrites light.position. Without it the census line
+		// would print new=new on every successful update and the one number the drift census exists
+		// to show - where the light was against where the fixture is now - would be lost.
+		const f32 old_position[3] = { light.position[0], light.position[1], light.position[2] };
+
+		// ROUND 54, taken here for exactly the reason old_position is: the re-place below overwrites
+		// placed_frame / placed_latch / placed_ref_hash / placed_rebase_gen, and the census that
+		// prints them runs AFTER it. Read them there and every row would say "the old placement was
+		// made this frame under this reference", which is a tautology, not a measurement.
+		//
+		// old_age is the age of the reference the OLD placement was made under. E3 of the round-54
+		// plan is the whole reason it exists: the 68 run-B rows at (cam_age=0, frame-latch=0) cannot
+		// be read without it, because the row after a hold is one of them and IS the snap-back.
+		// umax on either half means the entry was never placed, which the identity-match loop makes
+		// unreachable - counted rather than assumed, and printed as a plain 0.
+		const bool old_age_known = light.placed_frame != umax && light.placed_latch != umax
+			&& light.placed_frame >= light.placed_latch;
+		const u64 old_age = old_age_known ? (light.placed_frame - light.placed_latch) : 0ull;
+		const u64 old_ref_hash = light.placed_ref_hash;
+		const u32 old_rebase_gen = light.placed_rebase_gen;
+
+		bool replaced = false;
+
+		// --- ROUND 54: THE DENOMINATOR, AND THE STEP HISTOGRAM (branch d) ---------------------------
+		// Counted here, on every identity re-hit, whichever arm is armed and whether or not the step
+		// clears any threshold. This is the number the drift census has never had: how many times a
+		// tracked lamp was DRAWN. Every published drift figure so far was normalised per camera flip,
+		// which counts frames the player was not looking at a lamp exactly the same as frames they
+		// were, and the two runs being compared differed mostly in how the player moved. Three
+		// sessions have now been measured and the drift-per-flip rate tracked the play, not the
+		// config - so no rate is comparable across runs, and every acceptance in this round is
+		// answerable inside ONE run.
+		//
+		// The five buckets are the threshold branch: the census fires at 0.25, and whether that is a
+		// clean separator or an arbitrary cut through a continuum is not decidable from the rows it
+		// prints. gl_step0+..+gl_step4 == gl_tracked by construction, which is the acceptance check
+		// that says the instrumentation itself is sound.
+		++m_stats.gl_tracked;
+
+		if (d < 0.05f)
+		{
+			++m_stats.gl_step0;
+		}
+		else if (d < 0.25f)
+		{
+			++m_stats.gl_step1;
+		}
+		else if (d < 1.f)
+		{
+			++m_stats.gl_step2;
+		}
+		else if (d < 5.f)
+		{
+			++m_stats.gl_step3;
+		}
+		else
+		{
+			++m_stats.gl_step4;
+		}
+
+		// TRACK=1: re-place the light at THIS frame's recovered position, on the SAME hash, which is
+		// an in-place update. On failure keep the handle and the old position - the light that was
+		// there a moment ago was fine, and dropping it because one update failed would turn a
+		// tracking miss into a dark room (update_sun_light's own reasoning).
+		if (track && d > s_guest_light_track_eps)
+		{
+			remixapi_LightHandle handle = light.handle;
+
+			if (create_or_update(light.identity, position, handle) == REMIXAPI_ERROR_CODE_SUCCESS
+				&& handle)
+			{
+				light.handle = handle;
+				std::copy(std::begin(position), std::end(position), light.position);
+				light.placed_frame = m_frame_counter;
+				light.placed_latch = m_active_camera.latch_frame;
+				// ROUND 54, stamped wherever placed_latch is stamped and for the same reason: the
+				// next drift row on this light has to be able to say what it was divided by LAST
+				// time, not merely when that reference was latched.
+				light.placed_ref_hash = hash_mat4(m_active_camera.reference_inverse);
+				light.placed_rebase_gen = m_camera_rebase_generation;
+				++m_stats.guest_light_replaced;
+				replaced = true;
+			}
+		}
+
+		// MEASURED ON BOTH ARMS, the camframe_corrected discipline: a TRACK=0 run says how far a
+		// TRACK=1 run would have moved this light. Note the two arms measure different things and
+		// the printed old/new pair is what disambiguates them - with TRACK on, `light.position` was
+		// refreshed on the last re-place so `d` is per-frame drift; with it off `light.position` is
+		// still the MINT position, so `d` is cumulative drift since the light was created.
+		if (d > 0.25f)
+		{
+			++m_stats.guest_light_drift;
+
+			// --- ROUND 54: MAKE THE ROW SELF-CLASSIFYING ------------------------------------------
+			// Every field below is either already computed and thrown away or one comparison at a
+			// site that is already here. Nothing in this block moves a matrix, changes a submission
+			// or alters what is rendered; it only names which of the six mechanisms this row is.
+			//
+			//   new_age   frames since the ACTIVE reference was latched. >= 2 is a HOLD: the tracker
+			//             had the incumbent unmatched at the flip, the latch did not move, and every
+			//             draw's fused matrix carries the current camera while the divisor is frozen -
+			//             so the whole world slides by the camera's motion and snaps back at the next
+			//             fresh frame. Cumulative, with an exact return; already measured on both a
+			//             lamp and a Ctrl-clicked prop over the SAME frames (4425-4428 accumulate
+			//             +0.914, 4429 returns -0.914).
+			//   old_age   the same age for the placement being compared against. Without it a row at
+			//             new_age 0 is ambiguous between "fresh and still moved" and "the snap-back".
+			//   ref_same  bit identity of the divisor now against the divisor then. This is the only
+			//             direct test of "did the reference change at all". 1 with a large d is the
+			//             G-lamp branch (the guest moved the fixture, or the decode wobbled) and is
+			//             expected to read 0 rows; if it does not, GLDRIFTMAT's row splits the two.
+			//   rgen      the CAMREBASE generation tripwire; frozen at 0 while CAMREBASE is off.
+			//   relatch_* what the mid-frame relatch did before this draw: whether it fired, how far
+			//             it moved the submitted eye, whether the draw it took was the incumbent
+			//             witness (1), a different object (0) or unjudgeable (-1), and how many world
+			//             draws had already been placed on the previous reference.
+			//   inc_moving the last flip's verdict on the incumbent witness itself moving. READ THIS
+			//             AS STRUCTURALLY 0 WHILE CAMREBASE IS OFF - the block that sets it is gated
+			//             on the rebase - so on the off arm M-witness is decided by comparing d
+			//             against the incumbent's own eye step on the cam-relatch row instead.
+			const u64 new_age = m_frame_counter >= m_active_camera.latch_frame
+				&& m_active_camera.latch_frame != umax
+				? (m_frame_counter - m_active_camera.latch_frame)
+				: 0ull;
+			const bool ref_same = hash_mat4(m_active_camera.reference_inverse) == old_ref_hash;
+
+			if (!old_age_known)
+			{
+				++m_stats.gl_drift_noold;
+			}
+
+			// The transition classes, unconditional and cheap: f = placed on a reference latched in
+			// its own frame, s = on an older one. fs is one frame of camera motion appearing, sf is
+			// the snap-back, ss is the change of motion between two equally stale placements, and ff
+			// is the population that needs ref_same to say anything at all.
+			if (old_age == 0)
+			{
+				++(new_age == 0 ? m_stats.gl_drift_ff : m_stats.gl_drift_fs);
+			}
+			else
+			{
+				++(new_age == 0 ? m_stats.gl_drift_sf : m_stats.gl_drift_ss);
+			}
+
+			if (m_camera_age != 0)
+			{
+				// The held-camera share. The divisor is a stale view while every draw's fused matrix
+				// carries the current one, so the whole scene drifts by the camera's motion since
+				// the hold - measured as a straight ~1.9 units/frame line over frames 1255-1258 of
+				// run pid=29940 with the camera byte-identical and cam_age climbing 0,1,2,3.
+				++m_stats.guest_light_drift_stale;
+			}
+
+			// The window is rolled BEFORE the cap is tested, the order report_light_candidate uses.
+			// Testing the cap first looks equivalent and is not: once the first window fills, the
+			// reset is never reached again and the census goes silent for the rest of the session.
+			const u64 drift_window = m_frame_counter / s_stats_interval_flips;
+
+			if (m_gldrift_window != drift_window)
+			{
+				m_gldrift_window = drift_window;
+				m_gldrift_lines = 0;
+			}
+
+			if (remix_rsx::diag_lines_enabled() && m_gldrift_lines < s_max_gldrift_lines)
+			{
+				++m_gldrift_lines;
+
+				dump_line(fmt::format(
+					"Remix guest-light-drift: albedo=%016llX vp=%016llx id=%016llx "
+					"local=[%.4g %.4g %.4g] old=[%.4g %.4g %.4g] new=[%.4g %.4g %.4g] d=%.3g "
+					"extent=%.4g clip=%ux%u cam_age=%u cam_vp=%016llx latch=%llu replaced=%d "
+					// ROUND 54, inserted BEFORE frame=/cam_track=/line= (the round-53 D2 rule: new
+					// fields go before line=, and kv() readers key on the name, not the column).
+					// These ten are the decision table: see the block above for what each one means
+					// and for the two fields that read a structural 0 while CAMREBASE is off.
+					"old_age=%llu new_age=%llu ref_same=%d rgen=%u rgen_old=%u relatch_n=%u "
+					"relatch_d=%.3g relatch_inc=%d relatch_ord=%llu inc_moving=%d "
+					// ROUND 55, the same D2 rule again - inserted BEFORE frame=/cam_track=/line=.
+					//   refsrc    WHERE this flip's reference came from, and therefore what a hold on this row
+					//             is: 0 fresh (the incumbent's own cluster, or no CAMTRACK), 1 synthesised from
+					//             a co-present witness, 2 miss/no witness, 3 miss/one co-present frame,
+					//             4 miss/witness moving, 5 miss/not in the incumbent's basis, 6 miss/bad
+					//             relation, 7 the 12-frame discontinuity confirm, 8 no candidate for any other
+					//             reason or the camera dropped, 9 a miss with CAMREFSYNTH off (today's
+					//             behaviour). refsrc=1 with new_age >= 2 is IMPOSSIBLE by construction and is
+					//             the tripwire that a synthesised flip failed to stamp latch_frame.
+					//   switch    this flip installed a submitted view more than 0.5 from the outgoing one -
+					//             a change of witness BASIS. Nine of run 54's eleven hold-ending snaps were
+					//             this and not a thaw, so the snap now names itself on the row instead of
+					//             being reconstructed from neighbouring cam-track rows afterwards.
+					"refsrc=%u switch=%d "
+					// ROUND 53, appended LAST so kv() readers keep working: the incumbent witness id.
+					// The acceptance pairs a light jump with a handover by frame and TRACK, because
+					// cam_vp is cosmetic - one moving viewpoint's first-observed program alternates.
+					"frame=%llu cam_track=%u line=%u/%u",
+					albedo_hash,
+					vp_hash,
+					light.identity,
+					static_cast<f64>(light.local_centre[0]), static_cast<f64>(light.local_centre[1]),
+					static_cast<f64>(light.local_centre[2]),
+					static_cast<f64>(old_position[0]), static_cast<f64>(old_position[1]),
+					static_cast<f64>(old_position[2]),
+					static_cast<f64>(position[0]), static_cast<f64>(position[1]),
+					static_cast<f64>(position[2]),
+					static_cast<f64>(d),
+					static_cast<f64>(world_extent),
+					rsx::method_registers.surface_clip_width(),
+					rsx::method_registers.surface_clip_height(),
+					m_camera_age,
+					m_active_camera.vp_hash,
+					m_active_camera.latch_frame,
+					replaced ? 1 : 0,
+					// ROUND 54, the ten in the matching position for the block appended above.
+					old_age,
+					new_age,
+					ref_same ? 1 : 0,
+					m_camera_rebase_generation,
+					old_rebase_gen,
+					m_frame_relatch_count,
+					static_cast<f64>(m_frame_relatch_step),
+					m_frame_relatch_inc,
+					m_frame_relatch_ordinal,
+					m_camera_incumbent_moving_frame ? 1 : 0,
+					// ROUND 55, the two in the matching position for "refsrc=%u switch=%d" above. Both
+					// describe the LAST COMPLETED FLIP when read from a draw, exactly as inc_moving does.
+					m_camera_ref_state,
+					m_camera_basis_switch_frame ? 1 : 0,
+					m_frame_counter,
+					// ROUND 53, in the matching position for the "cam_track=%u" appended above.
+					m_camera_track_incumbent == umax ? 0u : m_camera_track_incumbent,
+					m_gldrift_lines,
+					s_max_gldrift_lines));
+
+				// --- ROUND 54: the raw matrices, under RPCS3_REMIX_GLDRIFTMAT ---------------------
+				// The row above says WHETHER the divisor changed; this says what the two matrices
+				// were, so a later reader can split "the guest moved the fixture" (translation row
+				// only) from "the decode wobbled" (spread through the entries) without costing
+				// another attended run. %a because the residual being looked for is invisible at %g.
+				// Inside the same cap and window as the drift row it belongs to, and emitted
+				// immediately after it so the pair is adjacent in the dump.
+				if (remix_rsx::guest_light_drift_matrices() != 0)
+				{
+					std::string mat_line = fmt::format(
+						"Remix guest-light-drift-mat: id=%016llx frame=%llu",
+						light.identity,
+						m_frame_counter);
+
+					mat_line += " fused=[";
+
+					for (u32 i = 0; i < 16; ++i)
+					{
+						fmt::append(mat_line, "%s%a", i ? " " : "",
+							static_cast<f64>(m_ref_pick_fused.m[i / 4][i % 4]));
+					}
+
+					mat_line += "] ref=[";
+
+					for (u32 i = 0; i < 16; ++i)
+					{
+						fmt::append(mat_line, "%s%a", i ? " " : "",
+							static_cast<f64>(m_active_camera.reference_inverse.m[i / 4][i % 4]));
+					}
+
+					// fused is m_ref_pick_fused, written on per_draw_transform's has_reference
+					// branch. Only the VALIDITY FLAG is reset at the head of every call - the matrix
+					// itself is left alone - so on fused_valid=0 the fused block is some EARLIER
+					// draw's matrix and must be discarded, not read as this lamp's. That is what the
+					// flag is for; the ref block is always this frame's. world_branch names which
+					// reference the draw actually divided by, i.e. WHICH other branch it took.
+					if (!m_ref_pick_fused_valid)
+					{
+						++m_stats.gl_mat_unavailable;
+					}
+
+					fmt::append(mat_line, "] fused_valid=%d world_branch=%s line=%u/%u",
+						m_ref_pick_fused_valid ? 1 : 0,
+						ref_source_name(m_ref_pick_source),
+						m_gldrift_lines,
+						s_max_gldrift_lines);
+
+					dump_line(mat_line);
+				}
+			}
+		}
+
+		// TRACK=1 owns this fixture from here: falling through would run the world dedup, miss (the
+		// light moved further than 1.5 units - that is the whole fault) and mint a duplicate.
+		// TRACK=0 falls through to the dedup and everything below it, untouched.
+		if (track)
+		{
+			return;
+		}
+
+		break;
 	}
 
 	for (guest_light_entry& light : m_guest_lights)
@@ -6122,55 +9194,13 @@ void RemixGSRender::maybe_inject_guest_light(u64 vp_hash, u64 fp_hash, u64 albed
 	}
 	++m_guest_light_attempts;
 
-	remixapi_LightInfoSphereEXT sphere{};
-	sphere.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
-	sphere.position = { position[0], position[1], position[2] };
-	// The embedding fix. A fixed 0.2 sphere placed at the bbox *centre* of a 2.6-unit lamp housing
-	// sits inside its own shade, and the path tracer then occludes the light with the very mesh it
-	// was derived from - which is why four bulbs already existed in Haze's dark cargo area and the
-	// room was still dark. Scaling with the draw's own world extent pokes the emitter back out.
-	// GUESTLIGHTRADIUSSCALE=0 (unparsable / non-positive) falls back to the knob default, and the
-	// max() below means the fixed radius is always the floor.
-	sphere.radius = std::max(remix_rsx::guest_light_radius(),
-		world_extent * remix_rsx::guest_light_radius_scale());
-	sphere.volumetricRadianceScale = 1.f;
-
-	// The fixture's own colour, normalised so the largest component is 1: GUESTLIGHTRADIANCE stays
-	// the single brightness control and this only moves the hue. GUESTLIGHTCOLOR=0 restores the
-	// fixed warm 1 / 0.86 / 0.68 constant that shipped in round 4.
-	f32 tint[3] = { 1.f, 0.86f, 0.68f };
-
-	if (remix_rsx::guest_light_color_enabled())
-	{
-		const f32 peak = std::max({ m_scratch_albedo_mean_rgb[0], m_scratch_albedo_mean_rgb[1],
-			m_scratch_albedo_mean_rgb[2] });
-
-		if (peak > 1e-4f)
-		{
-			tint[0] = m_scratch_albedo_mean_rgb[0] / peak;
-			tint[1] = m_scratch_albedo_mean_rgb[1] / peak;
-			tint[2] = m_scratch_albedo_mean_rgb[2] / peak;
-		}
-	}
-
-	const f32 radiance = remix_rsx::guest_light_radiance();
-	remixapi_LightInfo info{};
-	info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
-	info.pNext = &sphere;
-	info.hash = light_hash;
-	info.radiance = { radiance * tint[0], radiance * tint[1], radiance * tint[2] };
-	info.ignoreViewModel = 1;
-
+	// ROUND 52: the mint now goes through the same create path the re-place above uses, so the two
+	// cannot drift apart in radius, tint, radiance, ignoreViewModel or isDynamic. The HASH is the
+	// one difference: with TRACK on it is the frame-invariant identity, so a later re-place of the
+	// same fixture is an in-place update of THIS light; with it off it is the 0.25-unit world cell,
+	// bit-exactly what shipped.
 	remixapi_LightHandle handle = nullptr;
-	const u32 status = remix_rsx::guarded_create_light(m_remix.api().CreateLight, &info, &handle);
-
-	// Counted as of round 50. A refusal here was completely silent -- no counter, no log, no
-	// else branch -- so a run in which the runtime rejected every light looked identical to a
-	// run in which none was ever attempted.
-	if (status != REMIXAPI_ERROR_CODE_SUCCESS || !handle)
-	{
-		++m_stats.guest_light_createfail;
-	}
+	const u32 status = create_or_update(track ? identity : light_hash, position, handle);
 
 	if (status == REMIXAPI_ERROR_CODE_SUCCESS && handle)
 	{
@@ -6178,21 +9208,47 @@ void RemixGSRender::maybe_inject_guest_light(u64 vp_hash, u64 fp_hash, u64 albed
 		light.handle = handle;
 		light.last_matched_frame = m_frame_counter;
 		std::copy(std::begin(position), std::end(position), light.position);
+		// Stored on BOTH arms: with TRACK off these are what make the drift measurable, which is
+		// the whole point of the off arm still measuring.
+		light.identity = identity;
+		std::copy(std::begin(local), std::end(local), light.local_centre);
+		light.placed_frame = m_frame_counter;
+		light.placed_latch = m_active_camera.latch_frame;
+		// ROUND 54, the mint half of the same stamp the re-place makes, so the FIRST drift row a
+		// light ever produces has a real old_age / ref_same rather than a default-initialised one.
+		light.placed_ref_hash = hash_mat4(m_active_camera.reference_inverse);
+		light.placed_rebase_gen = m_camera_rebase_generation;
 		++m_stats.guest_lights_created;
 
 		// Mirrored to remix_dump.log, not rsx_log alone. Four of these lines were written in the
 		// exact room the user reported as too dark and nobody could see them, because RPCS3.log is
 		// held exclusively locked until the emulator exits. Bounded so a level full of fixtures
 		// cannot flood the dump.
+		// ROUND 52, appended: the line as shipped printed pos/extent only, so an aux-pass mint, a
+		// mint made while the camera was HELD and a good mint were indistinguishable on disk. `local`
+		// / `lext` are the basis-independent pair, `clip`/`target` name the pass the divisor was
+		// wrong for, and `cam_age`/`cam_vp`/`latch` say what the divisor WAS - which is what turns
+		// four lights on a straight line into a diagnosis.
 		const std::string message = fmt::format(
 			"Remix guest-light: pos=[%.4g %.4g %.4g] radius=%.3g radiance=%.3g rgb=[%.3g %.3g %.3g] "
-			"extent=%.4g albedo=%016llX vp=%016llx fp=%016llx live=%llu frame=%llu",
+			"extent=%.4g albedo=%016llX vp=%016llx fp=%016llx live=%llu frame=%llu "
+			"local=[%.4g %.4g %.4g] lext=%.4g clip=%ux%u target=%u cam_age=%u cam_vp=%016llx "
+			"latch=%llu id=%016llx",
 			static_cast<f64>(position[0]), static_cast<f64>(position[1]), static_cast<f64>(position[2]),
-			static_cast<f64>(sphere.radius), static_cast<f64>(radiance),
+			static_cast<f64>(light_radius), static_cast<f64>(radiance),
 			static_cast<f64>(tint[0]), static_cast<f64>(tint[1]), static_cast<f64>(tint[2]),
 			static_cast<f64>(world_extent),
 			albedo_hash, vp_hash, fp_hash,
-			static_cast<u64>(m_guest_lights.size()), m_frame_counter);
+			static_cast<u64>(m_guest_lights.size()), m_frame_counter,
+			static_cast<f64>(local[0]), static_cast<f64>(local[1]), static_cast<f64>(local[2]),
+			static_cast<f64>(lext),
+			rsx::method_registers.surface_clip_width(),
+			rsx::method_registers.surface_clip_height(),
+			static_cast<u32>(rsx::method_registers.surface_color_target()),
+			m_camera_age,
+			m_active_camera.vp_hash,
+			m_active_camera.latch_frame,
+			identity);
 
 		rsx_log.notice("%s", message);
 
@@ -6482,6 +9538,85 @@ void RemixGSRender::submit_camera()
 	remix_rsx::to_camera_matrix(m_active_camera.view, camera_info.view);
 	remix_rsx::to_camera_matrix(m_active_camera.projection, camera_info.projection);
 
+	// --- round 56: the submitted view's right vector is mirrored, and P[0][0] has been hiding it ----
+	//
+	// try_split_once does not RECOVER the view, it CONSTRUCTS it. forward and up_hint are unprojected
+	// out of the fused matrix and carry no convention, but the basis is then closed with
+	// right = up_hint x forward (cross3(up_hint, forward, right)) and up = forward x right, and that
+	// cross-product ORDER assumes the guest's world is left-handed. Eat Lead's is right-handed, so the
+	// constructed row 0 points screen-LEFT, and the recovered P = viewToWorld x fused absorbs the
+	// error as a negative x-scale. The product V x P is right; NEITHER FACTOR IS.
+	//
+	// MEASURED with no rebuild, off score_perspective's own -0.5 dock for m[0][0] < 0 (which makes an
+	// integer score impossible once it fires): 'Remix camera trace:' rows read 8167 x score=5.500 +
+	// 672 x score=4.500 on run pid27232 and 8475 x score=5.500 on run pid30572 - ZERO integer scores
+	// in 17,314 resolved frames. P[0][0] < 0 on 100% of them, and P[1][1] > 0 on all of them too,
+	// since the -1.0 dock for m[1][1] < 0 would have restored an integer.
+	//
+	// A determinant test on the view clears this and is WRONG: right = up x forward makes
+	// (right, up, forward) orthonormal with det = +1 BY CONSTRUCTION on every frame, whatever the
+	// world's handedness. That is the round-20 viewmodel trap again (det_pre = det_post = +4.8963,
+	// "Our instance transform was not the mirror"). p00= is the field that names this bug; vdet= is
+	// on the trace row beside it precisely to show that it cannot.
+	//
+	// Why it is user-visible and in exactly one axis: RtCamera::getRight() is viewToWorld[0].xyz()
+	// verbatim, the runtime's free camera strafes along it (currentPosition += moveLeftRight *
+	// freeCamViewToWorld.data[0].xyz()) and ties yaw to the same row, while pitch reads row 1 and
+	// forward/back row 2. Reported symptom: left/right reversed for movement AND turning, pitch and
+	// forward correct. One cause, exactly that symptom set.
+	//
+	// The fix is S = diag(-1,1,1,1) inserted between the SUBMITTED V and P, and nowhere else:
+	//
+	//     V' = V x S   negates the view's COLUMN 0        (view[r][0], all four rows, translation too)
+	//     P' = S x P   negates the projection's ROW 0     (projection[0][c], all four columns)
+	//     V'P' = V S S P = VP                             EXACTLY - the image cannot change
+	//
+	// remixapi_SetupCamera applies the matrices verbatim, primary rays come from the inverse of the
+	// PRODUCT, and determineInstanceFlags' global winding test reads viewToProjection x worldToView -
+	// also the product. What does change: viewToWorld' row 0 is the true screen-right and its 3x3
+	// determinant is -1, which is what Remix's convention for a right-handed world under a
+	// left-handed projection is; and P'[0][0] > 0. P[2][2], P[3][3], near, far and fov are untouched,
+	// so MathLib's bLeftHanded = a22 > 0 still reads Left-handed and only the dev menu's 'Overall
+	// Handedness' (isLHS ^ isMirrorTransform(viewToWorld)) flips - Left-handed today, Right-handed on
+	// the arm. That flip plus an unchanged image is the whole acceptance test.
+	//
+	// Boundary-only, and that is the point: this runs AFTER both to_camera_matrix copies, so
+	// m_active_camera is never written and the split, the tracker, the relatch, the rebase, the
+	// reference synthesis, the drift census and every light placement never see it. They could not
+	// care anyway - every internal quantity is S-invariant (view x projection = fused,
+	// reference_inverse = inverse(folded), rel = view_J x view_I^-1, and position = row 3 of
+	// inverse(view), which survives because S negates only column 0 of V so inverse(V') =
+	// S x inverse(V) keeps row 3). CAMTRACK / CAMREFSYNTH / CAMREBASE therefore cannot regress from
+	// it, and every census row keeping its shape on the armed arm is the pre-registered refutation.
+	//
+	// The sky and viewmodel twins below copy camera_info AFTER this point and inherit the flip; the
+	// viewmodel twin's std::copysign(x_scale, camera_info.projection[0][0]) then copies a POSITIVE
+	// sign, which is the sign it should have had all along.
+	//
+	// NOT the root cause. try_split_once's cross-product order is where the mirror is born, but every
+	// continuity predicate, relation table and rebase in three shipped rounds compares views produced
+	// by that function, so changing it there moves internal state on every frame and cannot be A/B'd
+	// at the boundary. This is exact and complete for the API; the split is a later round.
+	if (camera_info.projection[0][0] < 0.f)
+	{
+		++m_stats.cam_xmirror;
+
+		if (remix_rsx::camera_xflip_enabled())
+		{
+			for (u32 r = 0; r < 4; ++r)
+			{
+				camera_info.view[r][0] = -camera_info.view[r][0];
+			}
+
+			for (u32 c = 0; c < 4; ++c)
+			{
+				camera_info.projection[0][c] = -camera_info.projection[0][c];
+			}
+
+			++m_stats.cam_xflip;
+		}
+	}
+
 	const u32 status = remix_rsx::guarded_setup_camera(api.SetupCamera, &camera_info);
 	if (status != REMIXAPI_ERROR_CODE_SUCCESS)
 	{
@@ -6741,8 +9876,155 @@ void RemixGSRender::submit_camera()
 	}
 }
 
+u32 RemixGSRender::demons_preview_target() const
+{
+	if (!remix_rsx::demons_world_enabled()
+		|| static_cast<u32>(rsx::method_registers.surface_color_target()) != 1) return 0;
+	const u32 width = rsx::method_registers.surface_clip_width();
+	const u32 height = rsx::method_registers.surface_clip_height();
+	if (width != height || (width != 128 && width != 512)) return 0;
+	const auto targets = get_color_surface_addresses();
+	for (const u32 target : targets)
+	{
+		if (!target) continue;
+		for (u32 i = 0; i < display_buffers_count; ++i)
+			if (target == rsx::get_address(display_buffers[i].offset, CELL_GCM_LOCATION_LOCAL)) return 0;
+		return target;
+	}
+	return 0;
+}
+
+RemixGSRender::demons_preview_surface* RemixGSRender::prepare_demons_preview(u32 address, u32 width, u32 height)
+{
+	if (!address) return nullptr;
+	auto found = m_demons_previews.find(address);
+	if (found == m_demons_previews.end())
+	{
+		if (m_demons_previews.size() >= 8) return nullptr;
+		found = m_demons_previews.try_emplace(address).first;
+	}
+	auto& target = found->second;
+	if (target.frame != m_frame_counter || target.raster.width != width || target.raster.height != height)
+	{
+		target.raster.reset(width, height);
+		target.frame = m_frame_counter;
+		target.texture.width = width;
+		target.texture.height = height;
+		target.texture.alpha_min = 0;
+		target.texture.alpha_max = 255;
+		target.texture.wrap_u = 0;
+		target.texture.wrap_v = 0;
+		target.texture.content_hash = 0x4453505200000000ull | address;
+	}
+	return &target;
+}
+
+bool RemixGSRender::rasterize_demons_preview(u32 vertex_count, int albedo_unit)
+{
+	const u32 address = demons_preview_target();
+	const auto& fp = *m_current_fingerprint;
+	if (!address || !fp.palette_implicit_w || fp.group_count != 1) return false;
+	const u32 width = rsx::method_registers.surface_clip_width();
+	const u32 height = rsx::method_registers.surface_clip_height();
+	auto* target = prepare_demons_preview(address, width, height);
+	if (!target) return true;
+	remix_rsx::mat4 projection{};
+	if (!remix_rsx::read_group_matrix(fp, 0, projection)) return true;
+	projection = remix_rsx::fold_viewport_z(projection,
+		rsx::method_registers.viewport_scale_z(), rsx::method_registers.viewport_offset_z());
+
+	const remix_rsx::texture_entry* albedo = nullptr;
+	if (albedo_unit >= 0)
+		m_textures.bind(m_remix.api(), rsx::method_registers.fragment_textures[albedo_unit], m_frame_counter, &albedo, true);
+	remix_rsx::preview_raster::texture_view image{};
+	if (albedo && !albedo->pixels.empty())
+	{
+		image.pixels = reinterpret_cast<const u32*>(albedo->pixels.data());
+		image.width = albedo->width;
+		image.height = albedo->height;
+		image.wrap_u = albedo->wrap_u == 1;
+		image.wrap_v = albedo->wrap_v == 1;
+	}
+	image.force_opaque = !rsx::method_registers.alpha_test_enabled() && !rsx::method_registers.blend_enabled();
+	std::vector<remix_rsx::preview_raster::vertex> vertices(vertex_count);
+	for (u32 i = 0; i < vertex_count; ++i)
+	{
+		const auto& input = m_scratch_vertices[i];
+		f32 world[4] = { 0.f, 0.f, 0.f, 1.f };
+		if (m_indexed_world_valid)
+		{
+			for (u32 c = 0; c < 3; ++c)
+				world[c] = input.position[0] * m_indexed_world.m[0][c] + input.position[1] * m_indexed_world.m[1][c]
+					+ input.position[2] * m_indexed_world.m[2][c] + m_indexed_world.m[3][c];
+		}
+		else
+		{
+			for (u32 bone = 0; bone < m_scratch_bones_per_vertex; ++bone)
+			{
+				const usz tuple = usz{i} * m_scratch_bones_per_vertex + bone;
+				if (tuple >= m_scratch_bone_indices.size() || tuple >= m_scratch_bone_weights.size()) return true;
+				const u32 index = m_scratch_bone_indices[tuple];
+				const f32 weight = m_scratch_bone_weights[tuple];
+				if (weight <= 0.f) continue;
+				if (index >= m_scratch_bone_transforms.size()) return true;
+				const auto& matrix = m_scratch_bone_transforms[index].matrix;
+				for (u32 c = 0; c < 3; ++c)
+					world[c] += weight * (matrix[c][0] * input.position[0] + matrix[c][1] * input.position[1]
+						+ matrix[c][2] * input.position[2] + matrix[c][3]);
+			}
+		}
+		auto& output = vertices[i];
+		for (u32 c = 0; c < 4; ++c)
+		{
+			output.clip[c] = 0.f;
+			for (u32 k = 0; k < 4; ++k) output.clip[c] += world[k] * projection.m[k][c];
+		}
+		output.uv[0] = input.texcoord[0];
+		output.uv[1] = input.texcoord[1];
+		output.color = input.color;
+		if (!remix_rsx::vertex_colour_bgra_enabled())
+			output.color = (input.color & 0xff00ff00u) | ((input.color & 0xffu) << 16) | ((input.color >> 16) & 0xffu);
+	}
+	remix_rsx::preview_raster::viewport viewport{};
+	viewport.scale_x = rsx::method_registers.viewport_scale_x();
+	viewport.scale_y = rsx::method_registers.viewport_scale_y();
+	viewport.offset_x = rsx::method_registers.viewport_offset_x();
+	viewport.offset_y = rsx::method_registers.viewport_offset_y();
+	viewport.clip_left = static_cast<f32>(rsx::method_registers.scissor_origin_x());
+	viewport.clip_top = static_cast<f32>(rsx::method_registers.scissor_origin_y());
+	viewport.clip_right = std::min<f32>(static_cast<f32>(width), viewport.clip_left + rsx::method_registers.scissor_width());
+	viewport.clip_bottom = std::min<f32>(static_cast<f32>(height), viewport.clip_top + rsx::method_registers.scissor_height());
+	for (usz i = 0; i + 2 < m_scratch_indices.size(); i += 3)
+	{
+		const u32 a = m_scratch_indices[i], b = m_scratch_indices[i + 1], c = m_scratch_indices[i + 2];
+		if (a >= vertices.size() || b >= vertices.size() || c >= vertices.size()) continue;
+		target->raster.draw_triangle({ vertices[a], vertices[b], vertices[c] }, viewport, image,
+			rsx::method_registers.depth_write_enabled(), rsx::method_registers.blend_enabled(),
+			rsx::method_registers.alpha_test_enabled()
+				? static_cast<u32>(std::clamp(rsx::method_registers.alpha_ref(), 0.f, 1.f) * 255.f + .5f) : 0,
+			rsx::method_registers.depth_test_enabled());
+	}
+	static u32 preview_lines = 0;
+	if (preview_lines < 16)
+	{
+		++preview_lines;
+		rsx_log.notice("Remix Demons preview raster: target=%08x size=%ux%u vp=%016llx vertices=%u frame=%llu; albedo raster",
+			address, width, height, m_current_vp_hash, vertex_count, m_frame_counter);
+	}
+	return true;
+}
+
+bool RemixGSRender::is_demons_menu_draw() const
+{
+	return Emu.GetTitleID() == "BLUS30443" && remix_rsx::demons_menu_enabled()
+		&& (m_current_vp_hash == 0xf2577d351159c828ull || m_current_vp_hash == 0xfc7a78150c4515d7ull);
+}
+
 bool RemixGSRender::is_screen_space_draw() const
 {
+	if (m_current_fingerprint->demons_particle_depth) return false;
+	if (is_demons_menu_draw()) return true;
+
 	const remix_rsx::vp_fingerprint& fp = *m_current_fingerprint;
 
 	if (fp.archetype == remix_rsx::vp_archetype::screen_space)
@@ -6774,7 +10056,210 @@ bool RemixGSRender::is_screen_space_draw() const
 	return remix_rsx::is_orthographic(outer) && !rsx::method_registers.depth_write_enabled();
 }
 
-u32 RemixGSRender::albedo_unit_mask(bool* from_ucode, bool* from_narrow) const
+// ROUND 52. The same walk, stated instead of inferred, for the 'Remix ui-route:' census.
+//
+// Kept beside is_screen_space_draw() and in the SAME ORDER on purpose: a census that re-derived the
+// reason from a different sequence of tests could disagree with the routing it is supposed to be
+// describing, and the whole value of the line is that "route=world reason=ortho-dw" is exactly the
+// clause that refused the draw. Const and side-effect free, like the classifier.
+//
+// 'ortho-dw' is the one that matters: an orthographic outer block with depth writes ON. That is UI
+// geometry by every other test and is refused only by the !depth_write guard, which exists so an
+// orthographic depth-writing WORLD pass on another title is not mistaken for UI. Eat Lead's menu
+// text is in exactly that population.
+const char* RemixGSRender::screen_space_reason() const
+{
+	if (!m_current_fingerprint)
+	{
+		return "nofp";
+	}
+
+	if (m_current_fingerprint->demons_particle_depth)
+	{
+		return "particledepth";
+	}
+
+	if (is_demons_menu_draw())
+	{
+		return "demonsmenu";
+	}
+
+	const remix_rsx::vp_fingerprint& fp = *m_current_fingerprint;
+
+	if (fp.archetype == remix_rsx::vp_archetype::screen_space)
+	{
+		return "screenarch";
+	}
+
+	if (!fp.has_outer())
+	{
+		return "noouter";
+	}
+
+	remix_rsx::slot_block slots{};
+
+	if (!remix_rsx::read_slot_block(fp.outer_base(), slots))
+	{
+		return "noslots";
+	}
+
+	const remix_rsx::mat4 outer = remix_rsx::slots_to_matrix(slots, fp.outer_shape());
+
+	if (remix_rsx::mat4_is_identity(outer, 1e-5f))
+	{
+		return "identity";
+	}
+
+	if (!remix_rsx::is_orthographic(outer))
+	{
+		return "persp";
+	}
+
+	return rsx::method_registers.depth_write_enabled() ? "ortho-dw" : "ortho";
+}
+
+// --- ROUND 58 (steps 3 and 4d) -----------------------------------------------------------------
+// Both new rules, applied to whichever candidate mask albedo_unit_mask() arrived at - the resolved
+// path's 'colour' or the declining path's 'referenced'/'wide'. Each is containment-tested exactly
+// like the narrow rule: change nothing unless the elected unit actually differs. Returning the
+// input mask untouched is always a legal answer and is what every refusal does.
+// 'force' ignores both knobs. It exists so the census and the pick line can print would=, i.e.
+// what the rules WOULD elect, on a run with nothing armed - which is what sizes the change before
+// anyone turns it on. Nothing behavioural reads the forced answer.
+u32 RemixGSRender::apply_albedo_rules(u32 mask, bool force, bool* from_lerp, bool* from_lane) const
+{
+	if (!m_current_fp_fingerprint || mask == 0)
+	{
+		return mask;
+	}
+
+	const remix_rsx::fp_fingerprint& fp = *m_current_fp_fingerprint;
+
+	// --- the lerp rule ------------------------------------------------------------------------
+	// colour = tex[a] + w * (tex[b] - tex[a]) with w > 0.5 says the program itself treats tex[b]
+	// as the surface and tex[a] as a minor term. On Eat Lead's interior programs w is 0.85..1.15
+	// and tex[a] is a black-and-white grime map. w <= 0.5 is the other way round and is left
+	// alone - 0B7312EE9A170A62.fp reads 0.35 and its unit 0 is the plaster, which is correct
+	// today. See fp_fingerprint::lerp_valid for the quoted ucode.
+	if ((force || remix_rsx::fp_lerp_unit_enabled()) && fp.lerp_valid && fp.lerp_weight > 0.5f
+		&& fp.lerp_a < 16 && fp.lerp_b < 16)
+	{
+		const u32 minor = 1u << fp.lerp_a;
+		const u32 major = 1u << fp.lerp_b;
+
+		// Both ends have to be in play: dropping the minor one when the major one is not even a
+		// candidate would elect a third unit the program never named.
+		if ((mask & minor) && (mask & major))
+		{
+			const u32 candidate = mask & ~minor;
+
+			// Containment, as the narrow rule: a different AND bindable unit, or nothing happens.
+			const int elected = albedo_texture_unit_in(candidate, 0);
+
+			if (elected >= 0 && elected != albedo_texture_unit_in(mask, 0))
+			{
+				mask = candidate;
+
+				if (from_lerp)
+				{
+					*from_lerp = true;
+				}
+			}
+		}
+	}
+
+	// --- the lane rule ------------------------------------------------------------------------
+	// The same fact from the vertex side, for the programs whose colour target is an overlay
+	// rather than a constant lerp (C940394021B83EE7.fp). When the vertex program marks exactly one
+	// lane pair as the macro pair and a wide colour unit is sampled through the OTHER pair, the
+	// units sampled through the macro pair are not the surface colour.
+	if ((force || remix_rsx::uv_lanes_enabled()) && m_current_fingerprint)
+	{
+		const u32 wide = u32{fp.sampled_mask} & ~u32{fp.narrow_sample_mask};
+		u32 macro_units = 0;
+
+		// MEASURED 2026-09-09, and the reason this guard exists. On 8d67dbfcc9db7a96 /
+		// 4b4a3d795e2d8435 (bin\remix_ucode\D57D44C02167F820.fp, the uv_affine_two_scales family)
+		// the census reads 'lerp=0>1:0.7 lanes=0:xy,1:xy,2:zw,3:zw,4:zw macro=xy': the fragment
+		// program states outright that unit 1 is 70% of its colour, and unit 1 sits on the macro
+		// pair, so the lane rule on its own demoted it to unit 2. The lerp is a DIRECT statement
+		// of the program's colour arithmetic and the macro pair is an inference from coordinate
+		// scale, so where the two disagree the statement wins and the lane rule leaves that unit
+		// alone. Strictly conservative: it can only ever refuse.
+		const u32 protected_unit = (fp.lerp_valid && fp.lerp_weight > 0.5f && fp.lerp_b < 16)
+			? (1u << fp.lerp_b) : 0u;
+
+		// Set bits only: this runs once (twice with would=) per submitted draw and the masks hold
+		// two or three units, not sixteen.
+		for (u32 rest = mask & 0xffffu; rest; rest &= rest - 1)
+		{
+			const u32 unit = std::countr_zero(rest);
+			const u8 lanes = fp.coord_lanes[unit];
+
+			if (lanes != remix_rsx::s_fp_lanes_xy && lanes != remix_rsx::s_fp_lanes_zw)
+			{
+				continue;
+			}
+
+			// Which TEXn output feeds this unit decides WHOSE lane pair is macro: a unit sampled
+			// through TEX4 is judged by TEX4's forms, never by TEX0's.
+			const u32 coord = static_cast<u32>((fp.coord_inputs >> (unit * 4)) & 0xf);
+
+			if ((fp.coord_ambiguous_mask & (1u << unit)) || coord >= 8)
+			{
+				continue;
+			}
+
+			const u8 macro = m_current_fingerprint->texcoord_macro_lanes[coord];
+			const u8 macro_pair = (macro == 1) ? remix_rsx::s_fp_lanes_xy
+				: ((macro == 2) ? remix_rsx::s_fp_lanes_zw : remix_rsx::s_fp_lanes_none);
+
+			if (macro_pair != remix_rsx::s_fp_lanes_none && lanes == macro_pair
+				&& !(protected_unit & (1u << unit)))
+			{
+				macro_units |= 1u << unit;
+			}
+		}
+
+		const u32 keep = mask & ~macro_units;
+
+		// Never demote the last wide colour unit: if everything that survives is a narrow map the
+		// draw would go from wrong texture to no texture, which is the failure the retry guard
+		// exists to prevent.
+		if (macro_units != 0 && keep != 0 && (keep & wide) != 0)
+		{
+			const int elected = albedo_texture_unit_in(keep, 0);
+
+			if (elected >= 0 && elected != albedo_texture_unit_in(mask, 0))
+			{
+				mask = keep;
+
+				if (from_lane)
+				{
+					*from_lane = true;
+				}
+			}
+		}
+	}
+
+	return mask;
+}
+
+// Every exit of albedo_unit_mask() goes through here, so the rules and the would= answer can never
+// be applied at one exit and forgotten at another.
+u32 RemixGSRender::finish_albedo_mask(u32 mask, bool* from_lerp, bool* from_lane,
+	int* would_unit) const
+{
+	if (would_unit)
+	{
+		*would_unit = albedo_texture_unit_in(apply_albedo_rules(mask, true, nullptr, nullptr), 0);
+	}
+
+	return apply_albedo_rules(mask, false, from_lerp, from_lane);
+}
+
+u32 RemixGSRender::albedo_unit_mask(bool* from_ucode, bool* from_narrow,
+	bool* from_lerp, bool* from_lane, int* would_unit) const
 {
 	// referenced_textures_mask comes from the fragment ucode disassembly that
 	// analyse_current_rsx_pipeline() already ran, so it costs nothing here. GL and VK iterate
@@ -6793,6 +10278,18 @@ u32 RemixGSRender::albedo_unit_mask(bool* from_ucode, bool* from_narrow) const
 	if (from_narrow)
 	{
 		*from_narrow = false;
+	}
+
+	// ROUND 58, cleared here for the same reason: every caller reads false when the branch that
+	// could set them is not taken.
+	if (from_lerp)
+	{
+		*from_lerp = false;
+	}
+
+	if (from_lane)
+	{
+		*from_lane = false;
 	}
 
 	if (!remix_rsx::fp_albedo_enabled() || !m_current_fp_fingerprint)
@@ -6822,7 +10319,10 @@ u32 RemixGSRender::albedo_unit_mask(bool* from_ucode, bool* from_narrow) const
 		// not a mask to narrow - there is no evidence there to refine.
 		if (!remix_rsx::fp_albedo_narrow_enabled() || colour == 0 || !m_current_fp_fingerprint)
 		{
-			return referenced;
+			// ROUND 58: the two new rules still get a look at the mask this branch settled on -
+			// they are independent of the narrow rule and of the knob that gates it. Both are
+			// default-off and both leave the mask untouched unless they change the elected unit.
+			return finish_albedo_mask(referenced, from_lerp, from_lane, would_unit);
 		}
 
 		// Drop the units that cannot be carrying RGB. See fp_fingerprint::narrow_sample_mask.
@@ -6830,7 +10330,7 @@ u32 RemixGSRender::albedo_unit_mask(bool* from_ucode, bool* from_narrow) const
 
 		if (wide == 0 || wide == referenced)
 		{
-			return referenced;
+			return finish_albedo_mask(referenced, from_lerp, from_lane, would_unit);
 		}
 
 		// THE CONTAINMENT, and the whole lesson of round 43's first attempt. Ask both questions
@@ -6849,7 +10349,7 @@ u32 RemixGSRender::albedo_unit_mask(bool* from_ucode, bool* from_narrow) const
 
 		if (narrowed_unit < 0 || narrowed_unit == albedo_texture_unit_in(referenced, 0))
 		{
-			return referenced;
+			return finish_albedo_mask(referenced, from_lerp, from_lane, would_unit);
 		}
 
 		// NOTE what is deliberately NOT set: from_ucode stays false, so the retry guard at
@@ -6862,7 +10362,7 @@ u32 RemixGSRender::albedo_unit_mask(bool* from_ucode, bool* from_narrow) const
 			*from_narrow = true;
 		}
 
-		return wide;
+		return finish_albedo_mask(wide, from_lerp, from_lane, would_unit);
 	}
 
 	if (from_ucode)
@@ -6870,7 +10370,10 @@ u32 RemixGSRender::albedo_unit_mask(bool* from_ucode, bool* from_narrow) const
 		*from_ucode = true;
 	}
 
-	return colour;
+	// ROUND 58: the resolved path gets the rules too. A program whose colour_mask discriminated
+	// can still be a two-texture lerp, and the containment test is what keeps this from touching
+	// the ones where it makes no difference.
+	return finish_albedo_mask(colour, from_lerp, from_lane, would_unit);
 }
 
 int RemixGSRender::albedo_texture_unit(u32 skip_below) const
@@ -9377,7 +12880,9 @@ void RemixGSRender::report_uv_range(u32 unit, u32 coord_output, u32 attribute, u
 		// RPCS3_REMIX_CLAMPALBEDO candidate with no pick required. Raw RSX enums, labelled as
 		// such, because the remix-mapped cache entry is not in scope at this call site.
 		"rsxwrap=%u/%u dims=%ux%u "
-		"u=[%.5g..%.5g] v=[%.5g..%.5g] tiles=%.2fx%.2f src=%s%s vtx=%u frame=%llu line=%u/%u",
+		// ROUND 58: which lane pair of its TEXn varying THIS unit is sampled with. A row reading
+		// 'lanes=zw' with tiles=10x10 is the macro-coordinate family stated twice over.
+		"u=[%.5g..%.5g] v=[%.5g..%.5g] tiles=%.2fx%.2f src=%s%s lanes=%s vtx=%u frame=%llu line=%u/%u",
 		m_current_vp_hash,
 		m_current_fp_hash,
 		unit,
@@ -9393,6 +12898,8 @@ void RemixGSRender::report_uv_range(u32 unit, u32 coord_output, u32 attribute, u
 		static_cast<f64>(hi[0] - lo[0]), static_cast<f64>(hi[1] - lo[1]),
 		uv_scale_source_name(source),
 		detail,
+		remix_rsx::fp_lanes_name(m_current_fp_fingerprint && unit < 16
+			? m_current_fp_fingerprint->coord_lanes[unit] : remix_rsx::s_fp_lanes_none),
 		vertex_count,
 		m_frame_counter,
 		m_uvrange_lines,
@@ -9468,7 +12975,13 @@ void RemixGSRender::report_no_material(bool had_unit)
 		// unit that does carry a colour format - reachable albedo the walk refused.
 		"shadowonly=%d colorunit=%d "
 		"sampled=0x%x clip=%ux%u surf=0x%x "
-		"target=%u depth_write=%d blend=%d frame=%llu line=%u/%u",
+		// ROUND 51. The two registers that say whether the guest could see this draw at all.
+		// cmask packs NV4097_SET_COLOR_MASK as r=0x1 g=0x2 b=0x4 a=0x8, so 0xf is a normal colour
+		// write and 0x0/0x8 is a draw whose RGB never reaches the colour buffer (occlusion proxy,
+		// stencil/depth-only pass, alpha-only feed for a later composite). Without this field a
+		// constant-white fragment program that the guest's own picture does not show as white can
+		// only be guessed at; with it the mechanism is read, not inferred.
+		"target=%u depth_write=%d blend=%d cmask=0x%x stencil=%d frame=%llu line=%u/%u",
 		m_current_vp_hash,
 		m_current_fp_hash,
 		had_unit ? 1 : 0,
@@ -9487,6 +13000,11 @@ void RemixGSRender::report_no_material(bool had_unit)
 		static_cast<u32>(rsx::method_registers.surface_color_target()),
 		rsx::method_registers.depth_write_enabled() ? 1 : 0,
 		rsx::method_registers.blend_enabled() ? 1 : 0,
+		(rsx::method_registers.color_mask_r(0) ? 0x1u : 0u)
+			| (rsx::method_registers.color_mask_g(0) ? 0x2u : 0u)
+			| (rsx::method_registers.color_mask_b(0) ? 0x4u : 0u)
+			| (rsx::method_registers.color_mask_a(0) ? 0x8u : 0u),
+		rsx::method_registers.stencil_test_enabled() ? 1 : 0,
 		m_frame_counter,
 		m_notex_lines,
 		s_max_notex_lines);
@@ -9562,6 +13080,66 @@ u64 RemixGSRender::main_clip_reference() const
 	}
 
 	return std::max(m_main_clip_area, m_max_clip_area);
+}
+
+// --- ROUND 52: the guest light's main-clip gate ------------------------------------------------
+// RPCS3_REMIX_GUESTLIGHTMAINCLIP. A guest light's position is the fixture's local AABB centre pushed
+// through THAT draw's world transform, and an aux-pass copy of the fixture is divided by the main
+// camera's inverse just the same - so it lands at a projectively wrong scale and place and mints a
+// light nowhere near the bulb. MEASURED on BLUS30267: the bulb program 30086232b02bc73a is the only
+// vp whose 'Remix notex:' rows read clip=128x128 target=1, and both dump runs carry bulb rows whose
+// extent is 2.2-4.1x the main-pass value for the same albedo (1.281 / 1.732 on run pid=29940 frame
+// 1258, 1.556 / 2.068 on run pid=20656 frame 2724, against 0.5 / 0.578 everywhere else).
+//
+// The rule is the candidate clip gate's own same/double/half test against the session main clip,
+// REPLICATED rather than shared: that block is camera code and is being edited elsewhere, and a
+// shared helper would couple two gates whose references are allowed to diverge. Reference selection
+// is the same three-step fallback - session max under MAINCLIPMAX, else the per-frame latched main
+// clip, else the active camera's own clip - and with none of the three latched every draw is
+// admitted, because a boot frame must not be light-less for having no history.
+bool RemixGSRender::guest_light_clip_ok() const
+{
+	u32 ref_width = 0;
+	u32 ref_height = 0;
+
+	if (remix_rsx::main_clip_max_enabled() && m_max_clip_area != 0
+		&& m_max_clip_area >= m_main_clip_area)
+	{
+		ref_width = m_max_clip_width;
+		ref_height = m_max_clip_height;
+	}
+	else if (m_main_clip_area != 0)
+	{
+		ref_width = m_main_clip_width;
+		ref_height = m_main_clip_height;
+	}
+	else if (m_active_camera.valid)
+	{
+		ref_width = m_active_camera.clip_width;
+		ref_height = m_active_camera.clip_height;
+	}
+
+	const u64 cw = rsx::method_registers.surface_clip_width();
+	const u64 ch = rsx::method_registers.surface_clip_height();
+
+	if (ref_width == 0 || ref_height == 0 || cw == 0 || ch == 0)
+	{
+		return true;
+	}
+
+	const auto compatible_with = [cw, ch](u32 w, u32 h)
+	{
+		return w != 0 && h != 0
+			&& ((cw == w && ch == h)
+				|| (cw == u64{w} * 2 && ch == u64{h} * 2)
+				|| (cw * 2 == w && ch * 2 == h));
+	};
+
+	// Against the session maximum AND against the per-frame latched main clip, for the reason the
+	// camera gate states: a single textured draw at an anomalous clip raises the session max
+	// permanently, and accepting either reference costs nothing because this is a refusal.
+	return compatible_with(ref_width, ref_height)
+		|| compatible_with(m_main_clip_width, m_main_clip_height);
 }
 
 // Round 8. The four programs the sca-xyz sweep named should each print exactly one of these, the
@@ -9775,7 +13353,13 @@ void RemixGSRender::store_refused_fp_ucode()
 		return;
 	}
 
-	if (m_current_fp_fingerprint->out_rgb_source != remix_rsx::fp_out_source::other)
+	// ROUND 52. A hash on RPCS3_REMIX_UCODESTOREFPHASH bypasses the classifier gate as well as the
+	// `!material` gate at the call site. The scope this function was written for - untextured
+	// programs the classifier could not name - is the right default and is useless when the program
+	// whose shape has to be read offline is a TEXTURED one, which every 2D UI fragment program is.
+	// Named hashes only, so nothing else is stored and the counter stays comparable.
+	if (!remix_rsx::ucode_store_fp_hash_matches(m_current_fp_hash)
+		&& m_current_fp_fingerprint->out_rgb_source != remix_rsx::fp_out_source::other)
 	{
 		return;
 	}
@@ -10289,6 +13873,125 @@ void RemixGSRender::report_wdiv_shadowed()
 	}
 }
 
+void RemixGSRender::report_vertex_attributes(u32 first_vertex, u32 vertex_count, bool chosen_accepted)
+{
+	// Bounded twice: 64 programs per run, 64 vertices per attribute. A program is scanned once and
+	// drawn thousands of times, so the per-program cap is what keeps this off the frame budget;
+	// the per-vertex cap is because the statistic is a distribution, not a sum.
+	if (m_vtxattr_lines >= s_max_vtxattr_lines)
+	{
+		return;
+	}
+
+	++m_vtxattr_lines;
+
+	const auto type_name = [](rsx::vertex_base_type type) -> const char*
+	{
+		switch (type)
+		{
+		case rsx::vertex_base_type::s1: return "s1";
+		case rsx::vertex_base_type::f: return "f";
+		case rsx::vertex_base_type::sf: return "sf";
+		case rsx::vertex_base_type::ub: return "ub";
+		case rsx::vertex_base_type::s32k: return "s32k";
+		case rsx::vertex_base_type::cmp: return "cmp";
+		case rsx::vertex_base_type::ub256: return "ub256";
+		default: return "?";
+		}
+	};
+
+	const u32 sample = std::min<u32>(vertex_count, 64);
+
+	std::string slots;
+
+	for (u32 index = 0; index < 16; ++index)
+	{
+		attribute_view view{};
+
+		if (map_attribute(index, first_vertex, vertex_count, view) != attribute_status::ok)
+		{
+			continue;
+		}
+
+		const u32 components = (view.type == rsx::vertex_base_type::cmp) ? 3u : view.size;
+
+		fmt::append(slots, " a%u=%s%u", index, type_name(view.type), view.size);
+
+		if (components < 3)
+		{
+			continue;
+		}
+
+		// Both readings, because which one is right depends on the packing and the packing is
+		// what this line exists to identify: 'len' takes the decoded components as signed, 'blen'
+		// re-biases them out of a positive range first (2x-1 for the UNORM decode, x/127.5-1 for
+		// the raw byte one). Whichever column reads ~1.00 names both the slot AND its convention.
+		const f32 bias_scale = (view.type == rsx::vertex_base_type::ub256) ? (1.f / 127.5f) : 2.f;
+
+		f64 sum = 0.0;
+		f64 bsum = 0.0;
+		f32 lo = 0.f;
+		f32 hi = 0.f;
+		u32 n = 0;
+
+		for (u32 i = 0; i < sample; ++i)
+		{
+			f32 v[4] = {};
+
+			if (!remix_rsx::decode_position(view.at(i), view.type, view.size, v))
+			{
+				continue;
+			}
+
+			const f32 length = std::sqrt((v[0] * v[0]) + (v[1] * v[1]) + (v[2] * v[2]));
+
+			f32 b[3] = {};
+			for (u32 k = 0; k < 3; ++k) b[k] = (v[k] * bias_scale) - 1.f;
+			const f32 blength = std::sqrt((b[0] * b[0]) + (b[1] * b[1]) + (b[2] * b[2]));
+
+			if (!std::isfinite(length) || !std::isfinite(blength))
+			{
+				continue;
+			}
+
+			if (n == 0 || length < lo) lo = length;
+			if (n == 0 || length > hi) hi = length;
+
+			sum += length;
+			bsum += blength;
+			++n;
+		}
+
+		if (n == 0)
+		{
+			continue;
+		}
+
+		fmt::append(slots, "[len=%.4g/%.4g/%.4g blen=%.4g n=%u]",
+			static_cast<f64>(lo), sum / n, static_cast<f64>(hi), bsum / n, n);
+	}
+
+	const std::string line = fmt::format(
+		"Remix vtxattr: vp=%016llx fp=%016llx normalattr=%u chosen=%s vtx=%u prim=%u frame=%llu line=%u/%u |%s",
+		m_current_vp_hash,
+		m_current_fp_hash,
+		remix_rsx::normal_attribute_index(),
+		chosen_accepted ? "applied" : "refused",
+		vertex_count,
+		static_cast<u32>(rsx::method_registers.current_draw_clause.primitive),
+		m_frame_counter,
+		m_vtxattr_lines,
+		s_max_vtxattr_lines,
+		slots);
+
+	rsx_log.notice("%s", line);
+
+	if (fs::file out{ fs::get_executable_dir() + "remix_dump.log", fs::write + fs::create + fs::append })
+	{
+		out.write(line + '\n');
+	}
+}
+
 void RemixGSRender::report_shadow_only()
 {
 	const u64 window = m_frame_counter / s_stats_interval_flips;
@@ -10549,6 +14252,84 @@ void RemixGSRender::report_light_candidate(u64 albedo_hash, f32 extent, const f3
 	{
 		out.write(line + '\n');
 	}
+}
+
+// --- ROUND 52: the refusals on the guest-light path, NAMED --------------------------------------
+// 'Remix guest-light:' as shipped printed pos and extent only, so an aux-pass mint, a held-camera
+// mint and a good mint were indistinguishable on disk - and the largest population on this path had
+// never been named at all: guest_light_toobig=22553 of guest_light_match=23518 (96%) on run
+// pid=29940 is a number with no rows behind it. Two hypotheses fit it and want opposite next steps
+// (aux-pass draws under a wrong divisor, or a larger mesh sharing the bulb texture), and the pair
+// that separates them is `lext` against `extent`: the LOCAL span is basis-independent, so a big
+// `extent` with a bulb-sized `lext` is a divisor fault and a big `lext` is a different mesh.
+//
+// One line per (reason, albedo, vp, clip) per stats window, the report_light_candidate shape.
+void RemixGSRender::report_guest_light_refused(const char* reason, u64 albedo_hash,
+	const f32 (&position)[3], f32 world_extent, const f32 (&local)[3], f32 lext)
+{
+	if (!remix_rsx::diag_lines_enabled())
+	{
+		return;
+	}
+
+	const u64 window = m_frame_counter / s_stats_interval_flips;
+
+	if (m_glrefused_window != window)
+	{
+		m_glrefused_window = window;
+		m_glrefused_seen.clear();
+		m_glrefused_lines = 0;
+	}
+
+	if (m_glrefused_lines >= s_max_glrefused_lines)
+	{
+		return;
+	}
+
+	const u32 clip_w = rsx::method_registers.surface_clip_width();
+	const u32 clip_h = rsx::method_registers.surface_clip_height();
+
+	// The CLIP is part of the key on purpose: separating the 128x128 rows from the 1280x720 rows is
+	// the entire point of the census, and an albedo-only key would print whichever came first and
+	// hide the other.
+	u64 key = rpcs3::hash64(0x474C524546555345ull, albedo_hash);
+	key = rpcs3::hash64(key, m_current_vp_hash);
+	key = rpcs3::hash64(key, (u64{clip_w} << 32) | clip_h);
+
+	for (const char* c = reason; *c; ++c)
+	{
+		key = rpcs3::hash64(key, static_cast<u8>(*c));
+	}
+
+	if (!m_glrefused_seen.insert(key).second)
+	{
+		return;
+	}
+
+	++m_glrefused_lines;
+
+	dump_line(fmt::format(
+		"Remix guest-light-refused: reason=%s albedo=%016llX vp=%016llx fp=%016llx "
+		"pos=[%.4g %.4g %.4g] extent=%.4g local=[%.4g %.4g %.4g] lext=%.4g "
+		"clip=%ux%u target=%u cam_age=%u cam_vp=%016llx latch=%llu vtx=%llu frame=%llu line=%u/%u",
+		reason,
+		albedo_hash,
+		m_current_vp_hash,
+		m_current_fp_hash,
+		static_cast<f64>(position[0]), static_cast<f64>(position[1]), static_cast<f64>(position[2]),
+		static_cast<f64>(world_extent),
+		static_cast<f64>(local[0]), static_cast<f64>(local[1]), static_cast<f64>(local[2]),
+		static_cast<f64>(lext),
+		clip_w,
+		clip_h,
+		static_cast<u32>(rsx::method_registers.surface_color_target()),
+		m_camera_age,
+		m_active_camera.vp_hash,
+		m_active_camera.latch_frame,
+		static_cast<u64>(m_scratch_vertices.size()),
+		m_frame_counter,
+		m_glrefused_lines,
+		s_max_glrefused_lines));
 }
 
 // Every (fragment program, albedo) that carries a per-pixel discard, named once - the artefact the
@@ -10848,9 +14629,13 @@ void RemixGSRender::report_skip_census(const char* gate, u64 albedo_hash, f32 ex
 	// returns false and would therefore be counted a second time by notex_refused_world). Counting
 	// either would silently inflate the denominator and make the grey fallback look better covered
 	// than it is.
+	// ROUND 51: 'cmask' and 'notarget' join them for the same reason - both are register-only gates
+	// sited immediately after 'skipvp', long before the albedo walk, and both pass a literal 0.
 	if (albedo_hash == 0
 		&& std::strcmp(gate, "skipvp") != 0
-		&& std::strcmp(gate, "viewmodelrefused") != 0)
+		&& std::strcmp(gate, "viewmodelrefused") != 0
+		&& std::strcmp(gate, "cmask") != 0
+		&& std::strcmp(gate, "notarget") != 0)
 	{
 		++m_stats.notex_refused_skip;
 	}
@@ -10999,15 +14784,19 @@ void RemixGSRender::report_uv_scale_fixed(u32 output, u32 attribute,
 
 	if (m_current_fingerprint && output < 8)
 	{
-		const u8 slot = m_current_fingerprint->texcoord_scale_slot[output];
+		// ROUND 52 (step 2a): u16. This used to read the u8 field and print 'slot=c254' for every
+		// Eat Lead program, which is the clamp, not the ucode.
+		const u16 slot = m_current_fingerprint->texcoord_scale_slot[output];
 
 		if (slot != remix_rsx::s_no_texcoord_scale)
 		{
 			f32 value[4]{};
 			const bool read = remix_rsx::read_slot(slot, value);
 
-			named = fmt::format("slot=c%u inputs=0x%04x value=[%.6g %.6g %.6g %.6g] read=%d",
-				u32{slot}, u32{m_current_fingerprint->texcoord_scale_inputs[output]},
+			named = fmt::format("slot=c%u.%c inputs=0x%04x value=[%.6g %.6g %.6g %.6g] read=%d",
+				u32{slot},
+				"xyzw"[u32{m_current_fingerprint->texcoord_scale_component[output]} & 3u],
+				u32{m_current_fingerprint->texcoord_scale_inputs[output]},
 				static_cast<f64>(value[0]), static_cast<f64>(value[1]),
 				static_cast<f64>(value[2]), static_cast<f64>(value[3]),
 				read ? 1 : 0);
@@ -11051,6 +14840,90 @@ void RemixGSRender::report_uv_scale_fixed(u32 output, u32 attribute,
 		m_frame_counter,
 		m_uvscale_fixed_lines,
 		s_max_uvscale_fixed_lines);
+
+	rsx_log.notice("%s", line);
+
+	if (fs::file out{ fs::get_executable_dir() + "remix_dump.log", fs::write + fs::create + fs::append })
+	{
+		out.write(line + '\n');
+	}
+}
+
+void RemixGSRender::report_albedo_elect(u32 unit_mask, int elected, int would, const char* rule)
+{
+	// ROUND 58. One line per (vertex program, fragment program) pair, on the first draw that pair
+	// submits. This is the instrument the whole round turns on: 'elected=0 would=1' with a greymap
+	// bound says the election is wrong AND that the new rules would fix it, on a run with nothing
+	// armed. Bounded and deduped exactly like report_uv_scale_fixed above.
+	if (!m_current_fp_fingerprint || m_albedo_elect_lines >= s_max_albedo_elect_lines)
+	{
+		return;
+	}
+
+	const u64 key = m_current_vp_hash ^ m_current_fp_hash;
+
+	if (!m_albedo_elect_seen.insert(key).second)
+	{
+		return;
+	}
+
+	++m_albedo_elect_lines;
+
+	const remix_rsx::fp_fingerprint& fp = *m_current_fp_fingerprint;
+
+	const bool fp32_outputs =
+		(rsx::method_registers.shader_control() & CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS) != 0;
+
+	// The name of the file this program is stored as under bin\remix_ucode\, so the census row and
+	// the disassembler agree without anyone re-deriving the xor.
+	const u64 raw_hash = m_current_fp_hash ^ (fp32_outputs ? 0x9e3779b97f4a7c15ull : 0ull);
+
+	std::string lerp = "none";
+
+	if (fp.lerp_valid)
+	{
+		lerp = fmt::format("%u>%u:%.3g", u32{fp.lerp_a}, u32{fp.lerp_b},
+			static_cast<f64>(fp.lerp_weight));
+	}
+	else
+	{
+		lerp = fmt::format("none:%s", fp.lerp_note ? fp.lerp_note : "?");
+	}
+
+	// The macro lane pair of the TEXn output the ELECTED unit reads. Per output, never per
+	// program: a unit sampled through TEX4 is judged by TEX4's forms.
+	const char* macro = "none";
+
+	if (m_current_fingerprint && elected >= 0 && elected < 16
+		&& !(fp.coord_ambiguous_mask & (1u << elected)))
+	{
+		const u32 coord = static_cast<u32>((fp.coord_inputs >> (elected * 4)) & 0xf);
+
+		if (coord < 8)
+		{
+			const u8 bits = m_current_fingerprint->texcoord_macro_lanes[coord];
+			macro = (bits == 1) ? "xy" : ((bits == 2) ? "zw" : "none");
+		}
+	}
+
+	const std::string line = fmt::format(
+		"Remix albedo-elect: vp=%016llx fp=%016llx fpraw=%016llX sampled=0x%x wide=0x%x mask=0x%x "
+		"lerp=%s lanes=%s macro=%s elected=%d would=%d rule=%s frame=%llu line=%u/%u",
+		m_current_vp_hash,
+		m_current_fp_hash,
+		raw_hash,
+		u32{fp.sampled_mask},
+		u32{fp.sampled_mask} & ~u32{fp.narrow_sample_mask},
+		unit_mask,
+		lerp,
+		describe_coord_lanes(fp.sampled_mask, pack_coord_lanes(fp)),
+		macro,
+		elected,
+		would,
+		rule ? rule : "none",
+		m_frame_counter,
+		m_albedo_elect_lines,
+		s_max_albedo_elect_lines);
 
 	rsx_log.notice("%s", line);
 
@@ -11159,20 +15032,63 @@ void RemixGSRender::apply_texcoords(u32 unit, const remix_rsx::texture_entry& en
 	// RPCS3_REMIX_UVAFFINEALL=0 skips it entirely and restores per-hash-only, which is the one
 	// relaunch that bisects any material this makes worse. Every program it refuses is named, with
 	// its reason, by the uvscale-fixed census below.
-	if (remix_rsx::uv_affine_all_enabled() && m_current_fingerprint && coord_output < 8
-		&& m_current_fingerprint->texcoord_affine[coord_output].resolved)
+	// ROUND 52 (step 2c). Counted BEFORE the resolved gate below, because the whole point of this
+	// exit is that the form did not resolve: the program multiplies its UV pair by two constants in
+	// series - 8D67DBFCC9DB7A96.vp does it as '5: MUL r0.xy <- v4, c464.x' then
+	// '11: MUL r0.xy <- r0, c463.x' - and uv_affine_form carries one scale slot, so taking either
+	// would be a guess. The draw keeps the scalar path, which after step 2a applies c464 alone (the
+	// dequant) instead of the fixed 4096; this counter is what says how large that population is.
+	// ROUND 58 (step 4c). WHICH lane pair's form this draw should replay. The vertex program may
+	// write the same UV into o[7+n].xy and .zw at different scales, and the fragment program's TEX
+	// swizzle says which of the two this unit samples - fp_fingerprint::coord_lanes. Applying the
+	// .xy divisor to a unit sampled through .zw is the ten-times-too-dense tiling on Eat Lead's
+	// macro maps. Default OFF: with RPCS3_REMIX_UVLANES=0 'lane_form' is always the .xy form and
+	// this whole block is the round-57 behaviour bit for bit.
+	const u8 unit_lanes = (m_current_fp_fingerprint && unit < 16)
+		? m_current_fp_fingerprint->coord_lanes[unit]
+		: remix_rsx::s_fp_lanes_none;
+
+	const bool use_zw_form = remix_rsx::uv_lanes_enabled() && m_current_fingerprint && coord_output < 8
+		&& unit_lanes == remix_rsx::s_fp_lanes_zw
+		&& m_current_fingerprint->texcoord_affine_zw[coord_output].resolved;
+
+	if (remix_rsx::uv_lanes_enabled() && unit_lanes == remix_rsx::s_fp_lanes_mixed)
 	{
-		const remix_rsx::uv_affine_form& form = m_current_fingerprint->texcoord_affine[coord_output];
+		// Two samples of one unit through different lane pairs. There is no single form to apply,
+		// so the draw keeps whatever it had - refused and counted, never averaged.
+		++m_stats.uv_lane_refused;
+	}
+
+	const remix_rsx::uv_affine_form* lane_form = (m_current_fingerprint && coord_output < 8)
+		? (use_zw_form
+			? &m_current_fingerprint->texcoord_affine_zw[coord_output]
+			: &m_current_fingerprint->texcoord_affine[coord_output])
+		: nullptr;
+
+	// ROUND 52 (step 2c) / ROUND 58 (step 4c): counted on the form actually CHOSEN, so a program
+	// whose .zw form resolves stops counting as two-scales for the units sampled through .zw.
+	if (lane_form && lane_form->two_scales)
+	{
+		++m_stats.uv_affine_two_scales;
+	}
+
+	if (remix_rsx::uv_affine_all_enabled() && lane_form && lane_form->resolved)
+	{
+		const remix_rsx::uv_affine_form& form = *lane_form;
 
 		attribute_view affine_attribute{};
-		f32 scale[4]{}, row[2][4]{}, bias[4]{}, bias2[4]{};
+		f32 scale[4]{}, scale2[4]{}, row[2][4]{}, bias[4]{}, bias2[4]{};
 
 		const bool have_bias = form.bias_slot != remix_rsx::s_no_uv_slot;
 		const bool have_bias2 = form.bias2_slot != remix_rsx::s_no_uv_slot;
+		// ROUND 58 (step 5). Only ever set when RPCS3_REMIX_UVSCALE2 resolved the two-scale family;
+		// s_no_uv_slot on every form that existed before, so those multiply by 'scale' alone.
+		const bool have_scale2 = form.scale2_slot != remix_rsx::s_no_uv_slot;
 
 		const bool read =
 			map_attribute(form.attribute, first_vertex, vertex_count, affine_attribute) == attribute_status::ok
 			&& remix_rsx::read_slot(form.scale_slot, scale)
+			&& (!have_scale2 || remix_rsx::read_slot(form.scale2_slot, scale2))
 			&& (!form.has_rows
 				|| (remix_rsx::read_slot(form.row_slot[0], row[0])
 					&& remix_rsx::read_slot(form.row_slot[1], row[1])))
@@ -11184,8 +15100,13 @@ void RemixGSRender::apply_texcoords(u32 unit, const remix_rsx::texture_entry& en
 			// One divisor per lane (no rows) or per row (with rows). On every program that already
 			// resolved before UVSCALELANES landed the two components are the same, so s[0]==s[1]
 			// and this is bit-for-bit what the single-scalar form computed.
-			const f32 s[2] = { scale[form.scale_component[0]], scale[form.scale_component[1]] };
-			const bool one_scale = (form.scale_component[0] == form.scale_component[1]);
+			// ROUND 58 (step 5): the second scale multiplies the first, per lane, in the order the
+			// ucode applies them. Both are read live; the finiteness guard below covers the product.
+			const f32 s[2] = {
+				scale[form.scale_component[0]] * (have_scale2 ? scale2[form.scale2_component[0]] : 1.f),
+				scale[form.scale_component[1]] * (have_scale2 ? scale2[form.scale2_component[1]] : 1.f) };
+			const bool one_scale = (form.scale_component[0] == form.scale_component[1])
+				&& (!have_scale2 || form.scale2_component[0] == form.scale2_component[1]);
 
 			if (!one_scale)
 			{
@@ -11277,6 +15198,27 @@ void RemixGSRender::apply_texcoords(u32 unit, const remix_rsx::texture_entry& en
 				++m_stats.uv_ucode;
 				++m_stats.uv_affine_general;
 
+				// ROUND 52 (step 2b). Counted here and only here: this is the 3D apply site, so the
+				// number reads directly against uv_scale_fixed from the run before it. The 2D
+				// compositor replays the same forms and deliberately does not add to it -
+				// ui_uv_ucode is that path's own counter.
+				if (form.hopped)
+				{
+					++m_stats.uv_affine_hop;
+				}
+
+				// ROUND 58, counted where uv_affine_hop is and for the same reason: these say what
+				// the two new UV rules actually DID, not what they were offered.
+				if (use_zw_form)
+				{
+					++m_stats.uv_lane_zw;
+				}
+
+				if (have_scale2)
+				{
+					++m_stats.uv_affine_scale2;
+				}
+
 				if (form.attribute != (8 + unit))
 				{
 					++m_stats.uv_fallback;
@@ -11309,6 +15251,71 @@ void RemixGSRender::apply_texcoords(u32 unit, const remix_rsx::texture_entry& en
 
 		report_uv_failure(best_status);
 		return;
+	}
+
+	// The two captured Demon’s Souls skinned programs write TEX6 as
+	// ATTR8.xy * c466.x + c120.xy. This route is intentionally not generalized because the
+	// affine decoder declines input * temporary + constant programs.
+	if (remix_rsx::demons_world_enabled() && coord_output == 6 && chosen == 8
+		&& (m_current_vp_hash == 0xfee26ebba7aa213aull || m_current_vp_hash == 0xc7b10dbe8ee3d37aull)
+		&& uvs.type == rsx::vertex_base_type::s32k && !(tex.format() & CELL_GCM_TEXTURE_UN))
+	{
+		f32 scale[4]{}, bias[4]{};
+		if (remix_rsx::read_slot(466, scale) && remix_rsx::read_slot(120, bias)
+			&& std::isfinite(scale[0]) && std::isfinite(bias[0]) && std::isfinite(bias[1]))
+		{
+			const bool flip_v = remix_rsx::texcoord_flip_v();
+
+			for (u32 i = 0; i < vertex_count; ++i)
+			{
+				f32 uv[4]{};
+				if (!remix_rsx::decode_position(uvs.at(i), uvs.type, uvs.size, uv))
+				{
+					++m_stats.uv_none;
+					return;
+				}
+
+				m_scratch_vertices[i].texcoord[0] = uv[0] * scale[0] + bias[0];
+				m_scratch_vertices[i].texcoord[1] = remix_rsx::apply_v_flip(uv[1] * scale[0] + bias[1], flip_v);
+			}
+
+			++m_stats.uv_applied;
+			++m_stats.uv_ucode;
+			++m_stats.uv_scale_ucode;
+			m_scratch_uv_applied = true;
+			record_uv_provenance(chosen, true, uv_scale_source::ucode, scale[0], vertex_count,
+				unit, coord_output, entry.content_hash);
+			return;
+		}
+	}
+
+	// Verified o13.xy = ATTR8.xy * c466.x + c120.xy; the generic scale slot is only 8 bits.
+	if (remix_rsx::demons_world_enabled() && m_current_vp_hash == 0x9754e61daeaa76c7ull
+		&& coord_output == 6 && chosen == 8 && uvs.type == rsx::vertex_base_type::s32k
+		&& !(tex.format() & CELL_GCM_TEXTURE_UN))
+	{
+		f32 scale[4]{}, bias[4]{};
+		if (remix_rsx::read_slot(466, scale) && remix_rsx::read_slot(120, bias)
+			&& std::isfinite(scale[0]) && std::isfinite(bias[0]) && std::isfinite(bias[1]))
+		{
+			for (u32 i = 0; i < vertex_count; ++i)
+			{
+				f32 uv[4]{};
+				if (!remix_rsx::decode_position(uvs.at(i), uvs.type, uvs.size, uv))
+				{
+					++m_stats.uv_none;
+					return;
+				}
+				m_scratch_vertices[i].texcoord[0] = uv[0] * scale[0] + bias[0];
+				m_scratch_vertices[i].texcoord[1] = remix_rsx::apply_v_flip(uv[1] * scale[0] + bias[1], remix_rsx::texcoord_flip_v());
+			}
+			++m_stats.uv_applied;
+			++m_stats.uv_ucode;
+			++m_stats.uv_scale_ucode;
+			m_scratch_uv_applied = true;
+			record_uv_provenance(chosen, true, uv_scale_source::ucode, scale[0], vertex_count, unit, coord_output, entry.content_hash);
+			return;
+		}
 	}
 
 	f32 uv_scale[2] = { 1.f, 1.f };
@@ -11348,20 +15355,30 @@ void RemixGSRender::apply_texcoords(u32 unit, const remix_rsx::texture_entry& en
 
 		if (remix_rsx::texcoord_scale_from_ucode() && m_current_fingerprint && coord_output < 8)
 		{
-			const u8 slot = m_current_fingerprint->texcoord_scale_slot[coord_output];
+			// ROUND 52 (step 2a): u16. Every slot above c254 used to arrive here clamped to c254,
+			// read [0 0 0 0] and fail the v[0] > 0 guard below - which is why Eat Lead, whose
+			// divisor is c463/c464 = 1/2048, took the fixed 4096 on every S32K draw.
+			const u16 slot = m_current_fingerprint->texcoord_scale_slot[coord_output];
 			const u16 scale_inputs = m_current_fingerprint->texcoord_scale_inputs[coord_output];
 
 			// Only when the scale belongs to the attribute actually being read: a program can
 			// scale one texcoord set and copy another straight through.
 			if (slot != remix_rsx::s_no_texcoord_scale && (scale_inputs & (1u << chosen)))
 			{
+				// ROUND 53: the COMPONENT the ucode named, not v[0]. This read was right only for
+				// a program whose scale is c[N].x; the MOV walk can forward any component, and
+				// Demon's Souls' world texcoords reach the multiply as c[466].x through a temp.
+				// Defaults to 0, so every program resolved before this field existed is unchanged.
+				const u32 uv_component =
+					u32{m_current_fingerprint->texcoord_scale_component[coord_output]} & 3u;
+
 				if (f32 v[4]{}; remix_rsx::read_slot(slot, v))
 				{
 					// The multiply is by a reciprocal, so the divisor is 1/c. Guard against a slot
 					// that is zero or not yet uploaded rather than producing an infinity.
-					if (std::isfinite(v[0]) && v[0] > 0.f)
+					if (std::isfinite(v[uv_component]) && v[uv_component] > 0.f)
 					{
-						ucode_divisor = 1.f / v[0];
+						ucode_divisor = 1.f / v[uv_component];
 					}
 				}
 			}
@@ -11391,6 +15408,9 @@ void RemixGSRender::apply_texcoords(u32 unit, const remix_rsx::texture_entry& en
 			case remix_rsx::texcoord_scale_refusal::third_operand: ++m_stats.uv_scale_third_operand; break;
 			case remix_rsx::texcoord_scale_refusal::two_attributes: ++m_stats.uv_scale_two_attributes; break;
 			case remix_rsx::texcoord_scale_refusal::no_attribute: ++m_stats.uv_scale_no_attribute; break;
+			// ROUND 52 (step 2a): its own counter rather than a sixth slot in uv_scale_refuse, so
+			// that five-field census keeps meaning what every previous run's logs say it means.
+			case remix_rsx::texcoord_scale_refusal::slot_out_of_range: ++m_stats.uv_scale_slot_refused; break;
 			case remix_rsx::texcoord_scale_refusal::resolved:
 			case remix_rsx::texcoord_scale_refusal::no_multiply:
 			default: ++m_stats.uv_scale_no_multiply; break;
@@ -11713,6 +15733,164 @@ void RemixGSRender::apply_vertex_colour(u32 first_vertex, u32 vertex_count, bool
 	if (!vcol_route_replayable())
 	{
 		++m_stats.vcol_route_blocked;
+
+		// --- the texcoord tint route -------------------------------------------------------
+		// Ahead of the alpha-only path below, because it is strictly better when it applies: it
+		// recovers the whole RGBA the guest computes, not just the alpha.
+		//
+		// vcol_route::none is not a failure here - it is the CORRECT reading of a vertex program
+		// that writes COL0 nowhere because the colour travels through a texcoord interpolator
+		// instead. Two hops, both already computed and neither invented:
+		//   fp_fingerprint::out_tint_texcoord   the TEXn the FRAGMENT program modulates by
+		//   vp_fingerprint::texcoord_input[n]   the ATTRIBUTE the VERTEX program writes into it
+		// This is the same pair composite_ui_draw() has consumed since round 52; the only new
+		// thing is that the WORLD path now consumes it too, so the two cannot disagree about
+		// where a title's colour lives.
+		if (remix_rsx::world_tint_texcoord_enabled() && m_current_fp_fingerprint
+			&& m_current_fingerprint
+			&& m_current_fp_fingerprint->out_tint_texcoord != 0xff)
+		{
+			const u32 named = m_current_fp_fingerprint->out_tint_texcoord;
+			const u8 attribute = (named < 8)
+				? m_current_fingerprint->texcoord_input[named]
+				: remix_rsx::s_no_texcoord_input;
+
+			attribute_view tint{};
+
+			if (attribute == remix_rsx::s_no_texcoord_input || attribute >= 16)
+			{
+				// The fragment program named a varying the vertex program's table has no attribute
+				// for - resolve_output_input refused that write. Refuse and count, exactly as the
+				// 2D path does; the draw falls through to the alpha-only path below.
+				++m_stats.vcol_tint_unmapped;
+			}
+			else if (map_attribute(attribute, first_vertex, vertex_count, tint)
+				== attribute_status::ok)
+			{
+				bool decoded = true;
+
+				for (u32 i = 0; i < vertex_count; ++i)
+				{
+					f32 rgba[4] = { 1.f, 1.f, 1.f, 1.f };
+
+					if (!remix_rsx::decode_position(tint.at(i), tint.type, tint.size, rgba)
+						|| !std::isfinite(rgba[0]) || !std::isfinite(rgba[1])
+						|| !std::isfinite(rgba[2]) || !std::isfinite(rgba[3]))
+					{
+						decoded = false;
+						break;
+					}
+
+					const auto channel = [](f32 v)
+					{
+						return static_cast<u32>(std::clamp(v, 0.f, 1.f) * 255.f + 0.5f);
+					};
+
+					const u32 red = channel(rgba[0]);
+					const u32 green = channel(rgba[1]);
+					const u32 blue = channel(rgba[2]);
+					// A texcoord carrying a colour need not carry four components; a 3-component
+					// varying leaves alpha at the decoder's 1.0, which is the opaque default the
+					// draw already had.
+					const u32 alpha = channel(tint.size >= 4 ? rgba[3] : 1.f);
+
+					m_scratch_vertices[i].color = remix_rsx::vertex_colour_bgra_enabled()
+						? (blue | (green << 8) | (red << 16) | (alpha << 24))
+						: (red | (green << 8) | (blue << 16) | (alpha << 24));
+				}
+
+				if (decoded)
+				{
+					++m_stats.vcol_tint_texcoord;
+					return;
+				}
+
+				// A partial write would leave half the mesh tinted and half white, which is worse
+				// than either. Put every vertex back the way the decode loop left it and let the
+				// alpha-only path have its turn.
+				for (u32 i = 0; i < vertex_count; ++i)
+				{
+					m_scratch_vertices[i].color = 0xFFFFFFFFu;
+				}
+
+				++m_stats.vcol_tint_unmapped;
+			}
+			else
+			{
+				++m_stats.vcol_tint_unmapped;
+			}
+		}
+
+		// The RGB route is unproven and stays refused - but the ALPHA of a blended draw is
+		// consumed by the blend equation, not by the colour output, so the fragment program does
+		// not have to prove anything about COL0.rgb for it to be right. Submitting it is what
+		// stops a raster fade arriving as an opaque slab. Narrow on purpose:
+		//   * blending must actually be on, or the alpha is decoration and changes nothing;
+		//   * ATTR3 must carry four components, so there IS an alpha lane to read;
+		//   * the alpha must VARY across the draw - a constant is either already opaque or is a
+		//     value the guest is not using as coverage, and replaying it could only delete
+		//     geometry for no gain;
+		//   * and the maximum must be non-zero, so a draw can never be erased by this path.
+		// RGB is left at white; only bits 24-31 are written, in the same packing the main path
+		// below uses (0xFF in every colour lane is byte-order independent).
+		attribute_view alpha_attr{};
+
+		// CORRECTION, and it is the load-bearing guard. vcol_route::none means the vertex program
+		// writes o1/COL0 NOWHERE - the enum's own comment says "COL0 is undefined and replaying
+		// anything into it is fabrication", and that applies to the alpha lane exactly as much as
+		// to the colour lanes. Where COL0 is never written, ATTR3's alpha is not the blend alpha;
+		// whatever fade the guest performs comes from the fragment stage instead. So this path is
+		// for the routes that DO write COL0 from ATTR3 and merely could not have their RGB scale
+		// resolved - there the alpha is genuinely the guest's and submitting it is recovery, not
+		// invention.
+		//
+		// This guard was missing on the first cut of this change, which was justified partly by
+		// reading `alpha_range=255..0` on a Remix kil: line as a vertex alpha gradient. It is not:
+		// that field is m_scratch_albedo_alpha_min/max, the ALBEDO TEXTURE's alpha range, and
+		// 255..0 is its reset value printed unchanged because the draw has no albedo at all.
+		if (!remix_rsx::vcol_alpha_only_enabled()
+			|| !m_current_fingerprint
+			|| m_current_fingerprint->vcol_route_kind == remix_rsx::vcol_route::none
+			|| !rsx::method_registers.blend_enabled()
+			|| map_attribute(3, first_vertex, vertex_count, alpha_attr) != attribute_status::ok
+			|| alpha_attr.size < 4)
+		{
+			return;
+		}
+
+		f32 lo = 3.4e38f;
+		f32 hi = -3.4e38f;
+
+		for (u32 i = 0; i < vertex_count; ++i)
+		{
+			f32 rgba[4]{};
+
+			if (!remix_rsx::decode_position(alpha_attr.at(i), alpha_attr.type, alpha_attr.size, rgba)
+				|| !std::isfinite(rgba[3]))
+			{
+				return;
+			}
+
+			lo = std::min(lo, rgba[3]);
+			hi = std::max(hi, rgba[3]);
+		}
+
+		if (hi <= lo || hi <= 0.f)
+		{
+			return;
+		}
+
+		for (u32 i = 0; i < vertex_count; ++i)
+		{
+			f32 rgba[4]{};
+			remix_rsx::decode_position(alpha_attr.at(i), alpha_attr.type, alpha_attr.size, rgba);
+
+			const u32 alpha = static_cast<u32>(
+				std::clamp(rgba[3], 0.f, 1.f) * 255.f + 0.5f);
+			m_scratch_vertices[i].color = 0x00FFFFFFu | (alpha << 24);
+		}
+
+		++m_stats.vcol_alpha_only;
 		return;
 	}
 
@@ -13401,6 +17579,9 @@ void RemixGSRender::draw_ui_probe()
 
 void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 {
+	const bool demons_ui_trace = remix_rsx::demons_menu_enabled() && Emu.GetTitleID() == "BLUS30443";
+	const u32 preview_target_address = demons_preview_target();
+	if (demons_ui_trace) ++m_demons_ui_frame.calls;
 	u32 width = 0;
 	u32 height = 0;
 
@@ -13505,6 +17686,34 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 	if (remix_rsx::mat4 prescale{}; fp.group_count && remix_rsx::build_prescale(fp, prescale))
 	{
 		clip = remix_rsx::mat4_multiply(prescale, clip);
+	}
+
+	const bool demons_menu = is_demons_menu_draw();
+	float demons_uv_scale = 1.f;
+	float demons_uv_bias = 0.f;
+	if (demons_menu)
+	{
+		f32 cx[4]{}, cy[4]{}, translation[4]{}, constants[4]{};
+		if (!remix_rsx::read_slot(0, cx) || !remix_rsx::read_slot(1, cy)
+			|| !remix_rsx::read_slot(3, translation) || !remix_rsx::read_slot(467, constants))
+		{
+			++m_stats.ui_skipped;
+			return;
+		}
+		// These menu shaders assemble HPOS from x/y columns, a translation,
+		// and a broadcast bias; F257 additionally scales its packed positions.
+		const bool packed = m_current_vp_hash == 0xf2577d351159c828ull;
+		const f32 scale = packed ? constants[0] : 1.f;
+		const f32 bias = constants[packed ? 1 : 0];
+		demons_uv_scale = packed ? constants[2] : 1.f;
+		demons_uv_bias = packed ? 0.f : constants[1];
+		for (u32 j = 0; j < 4; ++j)
+		{
+			clip.m[0][j] = cx[j] * scale;
+			clip.m[1][j] = cy[j] * scale;
+			clip.m[2][j] = 0.f;
+			clip.m[3][j] = translation[j] + bias;
+		}
 	}
 
 	if (!remix_rsx::mat4_is_finite(clip))
@@ -13690,8 +17899,11 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 		screen_lo_x <= fw * 0.05f && screen_hi_x >= fw * 0.95f
 		&& screen_lo_y <= fh * 0.05f && screen_hi_y >= fh * 0.95f;
 
-	if (!targets_display && !covers_frame)
+	// Demon’s Souls builds its menu on an intermediate surface; the final copy
+	// samples guest memory that the Remix backend does not rasterize into.
+	if (!targets_display && !covers_frame && !demons_menu && !preview_target_address)
 	{
+		if (demons_ui_trace) ++m_demons_ui_frame.target_refused;
 		++m_stats.ui_render_target;
 		return;
 	}
@@ -13703,6 +17915,10 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 	u32 ui_texture_address = 0;
 	u32 ui_texcoord_output = 0;
 	f32 uv_scale[2] = { 1.f, 1.f };
+	// ROUND 52: which ATTRIBUTE resolve_texcoord_attribute picked. The return value used to be
+	// thrown away here; the ucode UV replay below needs it, because a stated scale only applies to
+	// the attribute the ucode states it for.
+	u32 ui_uv_attribute = no_attribute;
 
 	const int ui_texture_unit = albedo_texture_unit();
 
@@ -13726,15 +17942,85 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 			}
 		}
 
+		if (demons_ui_trace)
+		{
+			auto source = m_demons_previews.find(ui_texture_address);
+			if (source != m_demons_previews.end() && source->second.raster.width == tex.width()
+				&& source->second.raster.height == tex.height())
+			{
+				auto& cached = source->second;
+				cached.texture.pixels.resize(cached.raster.pixels.size() * sizeof(u32));
+				std::memcpy(cached.texture.pixels.data(), cached.raster.pixels.data(), cached.texture.pixels.size());
+				entry = &cached.texture;
+				static u32 preview_copies = 0;
+				if (preview_copies < 32)
+				{
+					++preview_copies;
+					rsx_log.notice("Remix Demons preview blit: source=%08x target=%08x size=%ux%u box=%.4f,%.4f,%.4f,%.4f offscreen=%u frame=%llu",
+						ui_texture_address, rsx::method_registers.surface_offset(0), tex.width(), tex.height(),
+						screen_lo_x / fw, screen_lo_y / fh, screen_hi_x / fw, screen_hi_y / fh, preview_target_address ? 1u : 0u, m_frame_counter);
+				}
+			}
+		}
+
 		// A full-screen quad sampling something the RSX itself rendered into is a post-process
 		// pass (tone map, bloom, colour grade), not UI. Compositing it is wrong twice over:
 		// Remix already owns the final image, and with 'Write Color Buffers' off the guest copy
 		// of that surface holds stale bytes anyway. It is also what makes this path unusable -
 		// each one is a full compositor-buffer fill through the scalar rasterizer, ~20 ms at
 		// 1920x1083, and Haze issues three to seven of them per frame.
-		if (!remix_rsx::keep_render_target_blits() &&
-			m_surface_addresses.contains(ui_texture_address))
+		bool samples_render_surface = m_surface_addresses.contains(ui_texture_address);
+		if (!entry && !samples_render_surface && covers_frame && !remix_rsx::keep_render_target_blits()
+			&& m_current_fp_fingerprint)
 		{
+			for (u32 sampled_unit = 0; sampled_unit < rsx::limits::fragment_textures_count; ++sampled_unit)
+			{
+				if (!(m_current_fp_fingerprint->sampled_mask & (1u << sampled_unit))) continue;
+				const auto& sampled_texture = rsx::method_registers.fragment_textures[sampled_unit];
+				if (!sampled_texture.enabled()) continue;
+				const u32 sampled_address = rsx::get_address(sampled_texture.offset(), sampled_texture.location());
+				if (!m_surface_addresses.contains(sampled_address)) continue;
+				samples_render_surface = true;
+				static u32 secondary_surface_lines = 0;
+				if (secondary_surface_lines++ < 16)
+					rsx_log.notice("Remix UI secondary surface: vp=%016llx fp=%016llx albedo_unit=%u albedo_address=%08x sampled_unit=%u sampled_address=%08x frame=%llu",
+						m_current_vp_hash, m_current_fp_hash, unit, ui_texture_address, sampled_unit, sampled_address, m_frame_counter);
+				break;
+			}
+		}
+		if (!entry && !remix_rsx::keep_render_target_blits() && samples_render_surface)
+		{
+			if (demons_ui_trace) ++m_demons_ui_frame.copy_refused;
+			if (demons_ui_trace && tex.width() == 512 && tex.height() == 512)
+			{
+				static u32 preview_copy_lines = 0;
+				if (preview_copy_lines < 48 || ((m_frame_counter % 120) == 0 && preview_copy_lines < 96))
+				{
+					++preview_copy_lines;
+					attribute_view trace_uv{};
+					attribute_status trace_status = attribute_status::absent;
+					const u32 trace_attr = resolve_texcoord_attribute(ui_texcoord_output, first_vertex, vertex_count, trace_uv, trace_status);
+					f32 uv_lo[2] = { 3.4e38f, 3.4e38f }, uv_hi[2] = { -3.4e38f, -3.4e38f };
+					if (trace_attr != no_attribute)
+						for (u32 i = 0; i < vertex_count; ++i)
+						{
+							f32 value[4]{};
+							if (!remix_rsx::decode_position(trace_uv.at(i), trace_uv.type, trace_uv.size, value)) break;
+							for (u32 c = 0; c < 2; ++c)
+							{
+								uv_lo[c] = std::min(uv_lo[c], value[c]);
+								uv_hi[c] = std::max(uv_hi[c], value[c]);
+							}
+						}
+					rsx_log.notice("Remix Demons preview-copy: frame=%llu vp=%016llx fp=%016llx source=%08x offset=%08x location=%u target=%08x clip=%ux%u display=%u verts=%u box=%.5f,%.5f,%.5f,%.5f uvattr=%u uvraw=%.5f,%.5f,%.5f,%.5f uvdecode=%.5f,%.5f un=%u scissor=%u,%u,%u,%u viewport=%.5f,%.5f,%.5f,%.5f line=%u/96",
+						m_frame_counter, m_current_vp_hash, m_current_fp_hash, ui_texture_address, tex.offset(), tex.location(),
+						rsx::method_registers.surface_offset(0), u32{rsx::method_registers.surface_clip_width()}, u32{rsx::method_registers.surface_clip_height()}, targets_display ? 1u : 0u,
+						vertex_count, screen_lo_x / fw, screen_lo_y / fh, screen_hi_x / fw, screen_hi_y / fh, trace_attr,
+						uv_lo[0], uv_lo[1], uv_hi[0], uv_hi[1], demons_uv_scale, demons_uv_bias, (tex.format() & CELL_GCM_TEXTURE_UN) ? 1u : 0u,
+						u32{rsx::method_registers.scissor_origin_x()}, u32{rsx::method_registers.scissor_origin_y()}, u32{rsx::method_registers.scissor_width()}, u32{rsx::method_registers.scissor_height()},
+						rsx::method_registers.viewport_scale_x(), rsx::method_registers.viewport_scale_y(), rsx::method_registers.viewport_offset_x(), rsx::method_registers.viewport_offset_y(), preview_copy_lines);
+				}
+			}
 			++m_stats.ui_render_target;
 			return;
 		}
@@ -13742,7 +18028,7 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 		// refresh_pixels: this path rasterizes from the CPU copy, and a title that rewrites a
 		// font atlas under a stable descriptor otherwise keeps the page that was resident when
 		// the entry was created. Only the CPU copy is rebuilt, so no mesh key moves.
-		m_textures.bind(m_remix.api(), tex, m_frame_counter, &entry, true);
+		if (!entry) m_textures.bind(m_remix.api(), tex, m_frame_counter, &entry, true);
 
 		if (entry && entry->pixels.empty())
 		{
@@ -13759,14 +18045,165 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 			// over 3968 frames - the whole live-rendered main menu, refused.
 			attribute_status uv_status = attribute_status::absent;
 
-			have_uv = resolve_texcoord_attribute(ui_texcoord_output, first_vertex, vertex_count,
-				uvs, uv_status) != no_attribute;
+			ui_uv_attribute = resolve_texcoord_attribute(ui_texcoord_output, first_vertex, vertex_count,
+				uvs, uv_status);
+			have_uv = ui_uv_attribute != no_attribute;
 
 			if (tex.format() & CELL_GCM_TEXTURE_UN)
 			{
 				// Unnormalised coordinates are in texels.
 				uv_scale[0] = (entry->width != 0) ? (1.f / static_cast<f32>(entry->width)) : 1.f;
 				uv_scale[1] = (entry->height != 0) ? (1.f / static_cast<f32>(entry->height)) : 1.f;
+			}
+		}
+	}
+
+	// --- ROUND 52 (gap 2): the texcoord scale the PROGRAM states -----------------------------
+	//
+	// This path has always computed 'u = attribute * uv_scale' with uv_scale = 1 unless the texture
+	// is CELL_GCM_TEXTURE_UN. It has never applied the texcoord_scale_slot / texcoord_affine forms
+	// the 3D path replays for every textured draw (uv_ucode=678129 on the same runs), so a 2D
+	// program that scales its texcoords in the vertex shader sampled its atlas with the RAW
+	// attribute. Eat Lead's 2D program says so outright:
+	//
+	//     F2B6988E84056628.vp   0: VEC MUL o[7].xy <- v2.xyxx, c[466].xxxx
+	//
+	// i.e. TEX0 = ATTR2 * c[466].x. The affine form is preferred over the scalar slot for the same
+	// reason apply_texcoords prefers it: it is strictly more faithful - it carries a 2x2 and both
+	// biases the single divisor cannot express - and it names the attribute it belongs to, so it can
+	// be refused when the draw is reading a different one.
+	//
+	// Folded into u,v in the triangle loop BEFORE uv_scale, which is the order the hardware uses:
+	// the multiply happens in the vertex program and UN texel normalisation is a sampler property.
+	//
+	// RPCS3_REMIX_UIUVUCODE=0 restores today's arithmetic bit-exactly and is the one-relaunch bisect
+	// for any UI that changes size. Note the pre-registered reading: if the named slot holds 1.0
+	// this whole block is a measured no-op on this title, which is a result and not a failure - the
+	// 'Remix ui-route:' census prints uvval= so that is readable before any pixel moves.
+	f32 ui_uv_ucode_scale[2] = { 1.f, 1.f };
+	f32 ui_uv_ucode_matrix[2][2] = { { 1.f, 0.f }, { 0.f, 1.f } };
+	f32 ui_uv_ucode_offset[2] = { 0.f, 0.f };
+	u8 ui_uv_ucode_component[2] = { 0, 1 };
+	bool ui_uv_ucode_rows = false;
+	bool ui_uv_ucode_applied = false;
+
+	if (remix_rsx::ui_uv_ucode_enabled() && have_uv && entry && m_current_fingerprint
+		&& ui_texcoord_output < 8)
+	{
+		const remix_rsx::uv_affine_form& form = m_current_fingerprint->texcoord_affine[ui_texcoord_output];
+
+		if (form.resolved && form.attribute == ui_uv_attribute)
+		{
+			f32 scale[4]{}, row[2][4]{}, bias[4]{}, bias2[4]{};
+
+			const bool have_bias = form.bias_slot != remix_rsx::s_no_uv_slot;
+			const bool have_bias2 = form.bias2_slot != remix_rsx::s_no_uv_slot;
+
+			const bool read = remix_rsx::read_slot(form.scale_slot, scale)
+				&& (!form.has_rows
+					|| (remix_rsx::read_slot(form.row_slot[0], row[0])
+						&& remix_rsx::read_slot(form.row_slot[1], row[1])))
+				&& (!have_bias || remix_rsx::read_slot(form.bias_slot, bias))
+				&& (!have_bias2 || remix_rsx::read_slot(form.bias2_slot, bias2));
+
+			if (read)
+			{
+				const f32 s[2] = { scale[form.scale_component[0]], scale[form.scale_component[1]] };
+
+				f32 matrix[2][2] = { { 1.f, 0.f }, { 0.f, 1.f } };
+
+				if (form.has_rows)
+				{
+					for (u32 r = 0; r < 2; ++r)
+					{
+						for (u32 lane = 0; lane < 2; ++lane)
+						{
+							matrix[r][lane] = row[r][form.row_component[r][lane]];
+						}
+					}
+				}
+
+				f32 offset[2] = { 0.f, 0.f };
+
+				for (u32 lane = 0; lane < 2; ++lane)
+				{
+					if (have_bias)
+					{
+						offset[lane] += (form.bias_negate ? -1.f : 1.f) * bias[form.bias_component[lane]];
+					}
+
+					if (have_bias2)
+					{
+						offset[lane] += (form.bias2_negate ? -1.f : 1.f) * bias2[form.bias2_component[lane]];
+					}
+				}
+
+				// A slot that has not been uploaded yet reads as whatever the register file holds,
+				// so the whole form is checked before a single vertex is written - the same guard
+				// apply_texcoords applies, for the same reason.
+				const f32 coefficients[] = {
+					s[0], s[1], matrix[0][0], matrix[0][1], matrix[1][0], matrix[1][1],
+					offset[0], offset[1] };
+
+				if (std::all_of(std::begin(coefficients), std::end(coefficients),
+					[](f32 value) { return std::isfinite(value); }))
+				{
+					ui_uv_ucode_scale[0] = s[0];
+					ui_uv_ucode_scale[1] = s[1];
+					ui_uv_ucode_matrix[0][0] = matrix[0][0];
+					ui_uv_ucode_matrix[0][1] = matrix[0][1];
+					ui_uv_ucode_matrix[1][0] = matrix[1][0];
+					ui_uv_ucode_matrix[1][1] = matrix[1][1];
+					ui_uv_ucode_offset[0] = offset[0];
+					ui_uv_ucode_offset[1] = offset[1];
+					ui_uv_ucode_component[0] = form.attr_component[0];
+					ui_uv_ucode_component[1] = form.attr_component[1];
+					ui_uv_ucode_rows = form.has_rows;
+					ui_uv_ucode_applied = true;
+					++m_stats.ui_uv_ucode;
+				}
+				else
+				{
+					++m_stats.ui_uv_ucode_refused;
+				}
+			}
+			else
+			{
+				++m_stats.ui_uv_ucode_refused;
+			}
+		}
+		else if (!form.resolved)
+		{
+			// The scalar fallback, gated exactly as the 3D path gates it: the scale only applies
+			// when the ucode says it belongs to the attribute this draw is actually reading. A
+			// program can scale one texcoord set and copy another straight through.
+			// ROUND 52 (step 2a): u16, matching the 3D reader. This mattered here as well as
+			// there - the u8 store clamped every slot above c254 to c254, which reads
+			// [0 0 0 0], and this path has no v[0] > 0 guard, so a clamped program set the 2D
+			// scale to ZERO and collapsed the element onto one texel. The widened field removes
+			// that failure mode rather than adding a guard for it.
+			const u16 slot = m_current_fingerprint->texcoord_scale_slot[ui_texcoord_output];
+			const u16 scale_inputs = m_current_fingerprint->texcoord_scale_inputs[ui_texcoord_output];
+
+			if (slot != remix_rsx::s_no_texcoord_scale && ui_uv_attribute < 16
+				&& (scale_inputs & (1u << ui_uv_attribute)))
+			{
+				// ROUND 53: the component the ucode named, matching the 3D reader. Both paths took
+				// value[0] unconditionally, which silently substitutes c[N].x for c[N].z.
+				const u32 ui_uv_component =
+					u32{m_current_fingerprint->texcoord_scale_component[ui_texcoord_output]} & 3u;
+
+				if (f32 value[4]{}; remix_rsx::read_slot(slot, value) && std::isfinite(value[ui_uv_component]))
+				{
+					ui_uv_ucode_scale[0] = value[ui_uv_component];
+					ui_uv_ucode_scale[1] = value[ui_uv_component];
+					ui_uv_ucode_applied = true;
+					++m_stats.ui_uv_ucode;
+				}
+				else
+				{
+					++m_stats.ui_uv_ucode_refused;
+				}
 			}
 		}
 	}
@@ -13789,7 +18226,55 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 		return channel(rgba[2]) | (channel(rgba[1]) << 8) | (channel(rgba[0]) << 16) | (channel(rgba[3]) << 24);
 	};
 
-	if (map_attribute(3, first_vertex, vertex_count, colours) == attribute_status::ok)
+	// --- ROUND 52 (gap 1): the colour attribute the UCODE names ------------------------------
+	//
+	// ATTR3 is the RSX diffuse register and is the right default, but it is not where every title's
+	// 2D colour lives - and when it is not, this function filled every element with the white
+	// default AT ALPHA 1, which paints an opaque slab over everything behind it. That is exactly the
+	// wall Eat Lead's menu shows: 'Remix ui-biggest: ... inputs=0x7 unit=0 uv=1 tint=FFFFFFFF' on a
+	// title whose text is authored LIGHT GREY ('Remix vtxattr: vp=f2b6988e84056628 ...
+	// a0=ub4[len=1.221/1.221/1.221]', i.e. v0 ~ 0.705 per channel).
+	//
+	// The ucode says where it is, in two hops that already exist as fields:
+	//   fp_fingerprint::out_tint_texcoord   the TEXn the FRAGMENT program reads its colour from
+	//                                       (round 52's texcoord_pass / texcoord_modulate classes)
+	//   vp_fingerprint::texcoord_input[n]   the ATTRIBUTE the VERTEX program writes into that TEXn
+	// On Eat Lead that resolves to TEX1 <- ATTR0:
+	//   CDFE447F7B7DED21.fp  0: MOV R1.xyzw <- TEX1.xyzw     ... 8: MUL R0 <- R0, C{1,1,1,1} END
+	//   F2B6988E84056628.vp  5: VEC MOV o[8].xyzw <- v0.xyzw
+	//
+	// modulate() then reproduces both decoded programs exactly rather than approximately: for the
+	// B8 glyph sheet sample_bgra returns white rgb plus coverage in alpha, so
+	// modulate(sample, tint) = (TEXn.rgb, coverage * TEXn.a) - the fragment program's own
+	// 'rgb = TEX1.xyz, alpha = coverage * TEX1.w'. For the DXT45 draws it is
+	// (tex.rgb * TEXn.rgb, tex.a * TEXn.a), which is that program's line for line.
+	//
+	// RPCS3_REMIX_UITINTTEXCOORD=0 restores the ATTR3-only read; on every title whose fragment
+	// programs are not of the two texcoord_* shapes out_tint_texcoord stays 0xff and this block is
+	// skipped entirely, so the knob is a no-op there in both positions.
+	u32 colour_attribute = 3;
+	bool tint_from_texcoord = false;
+
+	if (remix_rsx::ui_tint_texcoord_enabled() && m_current_fp_fingerprint
+		&& m_current_fp_fingerprint->out_tint_texcoord != 0xff)
+	{
+		const u32 named = m_current_fp_fingerprint->out_tint_texcoord;
+		const u8 attribute = (named < 8) ? fp.texcoord_input[named] : remix_rsx::s_no_texcoord_input;
+
+		if (attribute != remix_rsx::s_no_texcoord_input && attribute < 16)
+		{
+			colour_attribute = attribute;
+			tint_from_texcoord = true;
+		}
+		else
+		{
+			// The fragment program named a varying the vertex program's table has no attribute
+			// for - resolve_output_input refused that write. Refuse-and-count: keep ATTR3.
+			++m_stats.ui_tint_texcoord_unmapped;
+		}
+	}
+
+	if (map_attribute(colour_attribute, first_vertex, vertex_count, colours) == attribute_status::ok)
 	{
 		f32 rgba[4] = { 1.f, 1.f, 1.f, 1.f };
 
@@ -13801,6 +18286,52 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 		}
 	}
 
+	// Only when it actually carried the draw: a named attribute the layout could not map falls back
+	// to a white tint like any other, and counting it here would claim a fix that did not happen.
+	const bool tint_texcoord_applied = tint_from_texcoord && have_colour;
+
+	if (tint_texcoord_applied)
+	{
+		++m_stats.ui_tint_texcoord;
+
+		// Where the replay is approximate rather than exact. texcoord_pass discards the sampled rgb
+		// ('rgb = TEXn.xyz'), and modulate() multiplies it in; on a B8 coverage sheet sample_bgra
+		// returns white so the two agree, on anything else they do not. Counted rather than
+		// special-cased - a special case here would need a second rasterizer path.
+		if (m_current_fp_fingerprint
+			&& m_current_fp_fingerprint->out_rgb_source == remix_rsx::fp_out_source::texcoord_pass
+			&& entry && !entry->b8_coverage)
+		{
+			++m_stats.ui_tint_pass_rgbdrop;
+		}
+	}
+
+	if (demons_ui_trace)
+	{
+		static std::vector<std::array<u64, 3>> logged_colours;
+		const std::array<u64, 3> key{ m_current_vp_hash, m_current_fp_hash, entry ? entry->content_hash : 0 };
+		if (logged_colours.size() < 32 && std::find(logged_colours.begin(), logged_colours.end(), key) == logged_colours.end())
+		{
+			logged_colours.push_back(key);
+			u32 format = 0, remap = 0, gamma = 0;
+			if (ui_texture_unit >= 0)
+			{
+				const auto& tex = rsx::method_registers.fragment_textures[static_cast<u32>(ui_texture_unit)];
+				format = tex.format();
+				remap = tex.remap();
+				gamma = tex.gamma();
+			}
+			rsx_log.notice("Remix Demons UI colour: vp=%016llx fp=%016llx albedo=%016llX unit=%d fmt=%02x remap=%08x gamma=%x dims=%ux%u attr3=%u/%u colour=%u tint=%08x uv=%u b8=%u",
+				m_current_vp_hash, m_current_fp_hash, key[2], ui_texture_unit, format, remap, gamma,
+				entry ? entry->width : 0, entry ? entry->height : 0, static_cast<u32>(colours.type), colours.size,
+				have_colour ? 1u : 0u, tint, have_uv ? 1u : 0u, entry && entry->b8_coverage ? 1u : 0u);
+			if (entry && !entry->pixels.empty())
+			{
+				const std::string name = fmt::format("demons_ui_%016llX_%ux%u.bmp", entry->content_hash, entry->width, entry->height);
+				write_bgra_bmp(fs::get_executable_dir() + name, entry->pixels.data(), entry->width, entry->height);
+			}
+		}
+	}
 	// Neither an albedo texture nor a vertex colour: the draw's colour lives somewhere this
 	// compositor cannot read (a vertex/fragment program constant). Filling it with the default
 	// white tint at alpha 1 paints an opaque slab over everything behind it, which is exactly
@@ -13855,7 +18386,20 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 	// Haze's full-screen framebuffer copies carry valid RGB but leave alpha at zero. The native
 	// presentation treats those copies as opaque; multiplying their undefined alpha in the CPU
 	// compositor made the complete menu disappear despite the captured 1280x720 RGB being valid.
-	const bool force_opaque = covers_frame && entry && entry->alpha_min == 0 && entry->alpha_max == 0;
+	//
+	// ROUND 52. Not when the tint's alpha came from an attribute the ucode named. The rule reads a
+	// constant-zero texture alpha as "undefined, so treat the draw as opaque", which is right when
+	// the texture is the only alpha the draw has - and wrong the moment the fade lives in the VERTEX
+	// data instead: slamming such a draw to alpha 255 after the tint was correctly resolved
+	// reinstates the opaque wall on the very population round 52 fixed. Counted, so the interaction
+	// is readable rather than inferred.
+	const bool force_opaque_shape = covers_frame && entry && entry->alpha_min == 0 && entry->alpha_max == 0;
+	const bool force_opaque = force_opaque_shape && !tint_texcoord_applied;
+
+	if (force_opaque_shape && tint_texcoord_applied)
+	{
+		++m_stats.ui_force_opaque_skipped;
+	}
 
 	// The RSX clips each UI draw before fragment shading. Ignoring that state lets glyphs and
 	// sprites outside a menu row spill into every neighbouring row; Haze uses 340x20/21-pixel
@@ -13886,6 +18430,105 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 
 	m_compositor.set_clip(clip_left, r2_menu_reflect_geometry ? fh - clip_bottom : clip_top,
 		clip_right, r2_menu_reflect_geometry ? fh - clip_top : clip_bottom);
+
+	// --- ROUND 52: the 2D half of the 'Remix ui-route:' census --------------------------------
+	// Everything this line reports is resolved by here: the space classification, the texture, the
+	// texcoord attribute and its stated scale, and the tint with the attribute it came from. The
+	// per-vertex tint range is only walked when a line can actually be emitted - the budget and the
+	// window are checked first, so a saturated census costs one comparison per draw.
+	if (m_uiroute_lines < s_max_uiroute_lines
+		|| m_uiroute_window != (m_frame_counter / s_stats_interval_flips))
+	{
+		ui_route_report row{};
+		row.route = "2d";
+		// ROUND 59. A UIREFUSEFP draw is described by this row and then dropped a few dozen lines
+		// below, so the row has to say so or the census would claim it was rasterised. The route
+		// string stays "2d" deliberately: report_ui_route's dedup key reads route[0], and changing
+		// it would split this program's window entry away from its unrefused history.
+		row.reason = remix_rsx::ui_refuse_fp_matches(m_current_fp_hash)
+			? "refusedfp"
+			: m_scratch_ui_route_reason;
+		row.albedo = entry ? entry->content_hash : 0;
+		row.tex_width = entry ? entry->width : 0;
+		row.tex_height = entry ? entry->height : 0;
+		row.tex_unit = ui_texture_unit;
+		row.tex_address = ui_texture_address;
+		row.have_box = true;
+		row.box[0] = screen_lo_x;
+		row.box[1] = screen_lo_y;
+		row.box[2] = screen_hi_x;
+		row.box[3] = screen_hi_y;
+		row.tint_attr = have_colour ? static_cast<s32>(colour_attribute) : -1;
+		row.tint_min = tint;
+		row.tint_max = tint;
+		row.uv_output = ui_texcoord_output;
+
+		if (ui_texture_unit >= 0)
+		{
+			row.tex_format = rsx::method_registers.fragment_textures[static_cast<u32>(ui_texture_unit)].format();
+			// ROUND 60: read from the SAME register bank and the SAME unit as the format on the
+			// line above, so 'fmt' and 'remap' on a ui-route row always describe one texture.
+			row.tex_remap = rsx::method_registers.fragment_textures[static_cast<u32>(ui_texture_unit)].remap();
+		}
+
+		if (m_current_fingerprint && ui_texcoord_output < 8)
+		{
+			row.uv_slot = m_current_fingerprint->texcoord_scale_slot[ui_texcoord_output];
+
+			// The affine form is what the replay above actually uses when it resolved, so print ITS
+			// slot in that case - a line that named the scalar slot while the affine one carried the
+			// draw would be describing a different mechanism from the one that ran.
+			// ROUND 52 (step 2a) widened the scalar slot to u16, so the '<= 0xff' cap this test
+			// used to carry - a leftover of the u8 field - would have hidden exactly the slots
+			// this round exists for (Eat Lead scales in c463/c464). The real "no slot" value is
+			// the affine sentinel, so test that instead.
+			if (const remix_rsx::uv_affine_form& form = m_current_fingerprint->texcoord_affine[ui_texcoord_output];
+				form.resolved && form.scale_slot != remix_rsx::s_no_uv_slot)
+			{
+				row.uv_slot = static_cast<u32>(form.scale_slot);
+			}
+
+			if (f32 slot_value[4]{}; row.uv_slot != remix_rsx::s_no_texcoord_scale
+				&& remix_rsx::read_slot(row.uv_slot, slot_value))
+			{
+				row.uv_value = slot_value[0];
+				row.uv_value_read = true;
+			}
+		}
+
+		// The tint RANGE, not vertex 0's tint: a draw whose elements fade independently carries the
+		// fade here and nowhere else, and "every vertex is FFFFFFFF" is the white-slab signature
+		// stated as a measurement instead of read off one vertex.
+		if (have_colour)
+		{
+			u32 lo_channels[4] = { 255, 255, 255, 255 };
+			u32 hi_channels[4] = { 0, 0, 0, 0 };
+
+			for (u32 i = 0; i < vertex_count; ++i)
+			{
+				f32 rgba[4] = { 1.f, 1.f, 1.f, 1.f };
+
+				if (!remix_rsx::decode_position(colours.at(i), colours.type, colours.size, rgba))
+				{
+					break;
+				}
+
+				const u32 packed = colour_bgra(rgba);
+
+				for (u32 c = 0; c < 4; ++c)
+				{
+					const u32 channel = (packed >> (c * 8)) & 0xFF;
+					lo_channels[c] = std::min(lo_channels[c], channel);
+					hi_channels[c] = std::max(hi_channels[c], channel);
+				}
+			}
+
+			row.tint_min = lo_channels[0] | (lo_channels[1] << 8) | (lo_channels[2] << 16) | (lo_channels[3] << 24);
+			row.tint_max = hi_channels[0] | (hi_channels[1] << 8) | (hi_channels[2] << 16) | (hi_channels[3] << 24);
+		}
+
+		report_ui_route(row);
+	}
 
 	// Round 7: accumulators for the 'Remix uiwrap:' census, filled inside the triangle loop below
 	// and consumed once after it. Sentinels chosen so the emit site can tell "no textured triangle
@@ -13946,6 +18589,21 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 		}
 	}
 
+	// --- ROUND 59: RPCS3_REMIX_UIREFUSEFP ---------------------------------------------------------
+	// A named fragment program is never UI: a full-frame background or wall the compositor could
+	// only paint OVER the finished Remix image. Refuse-and-count, placed HERE on purpose - after the
+	// census row and after the BMP dump, so a refused draw is still fully described, and before the
+	// triangle loop and before ++m_stats.ui_draws, so ui_draws keeps meaning "rasterised".
+	// m_compositor.set_clip() has already run above, hence the clear_clip() the normal exit does.
+	// Dropping a 2D draw is exactly what RPCS3_REMIX_NOUI=1 does to it today (skip_screen_space),
+	// so a listed program keeps today's picture rather than gaining a new one.
+	if (remix_rsx::ui_refuse_fp_matches(m_current_fp_hash))
+	{
+		++m_stats.ui_refused_fp;
+		m_compositor.clear_clip();
+		return;
+	}
+
 	for (usz t = 0; (t + 2) < m_scratch_indices.size(); t += 3)
 	{
 		const u32 i0 = m_scratch_indices[t + 0];
@@ -13983,6 +18641,56 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 				{
 					have_uv = false;
 					break;
+				}
+
+				// The title-specific scale/bias, read out of c467 by the is_demons_menu_draw()
+				// block above and verified against the replayed ucode:
+				//   f2577d351159c828  MUL o[7](TEX0).xy <- v8.xyxx, c[467].zzzz   (scale  = c467.z)
+				//   fc7a78150c4515d7  ADD o[7](TEX0).xy <- c[467].yyyy, v8.xyxx   (bias   = c467.y)
+				// which is exactly the 'packed ? constants[2] : 0' / 'packed ? 0 : constants[1]'
+				// pair those two lines produce.
+				bool demons_uv_here = false;
+
+				if (demons_menu)
+				{
+					uv[0] = uv[0] * demons_uv_scale + demons_uv_bias;
+					uv[1] = uv[1] * demons_uv_scale + demons_uv_bias;
+					demons_uv_here = demons_uv_scale != 1.f || demons_uv_bias != 0.f;
+				}
+
+				// ROUND 52 (gap 2). The program's own scale, applied BEFORE the UN texel
+				// normalisation - the multiply is in the vertex shader and UN is a sampler
+				// property, so that is the order the hardware uses. The 'one_scale' association
+				// and the rows/no-rows split are copied from apply_texcoords so the 2D and 3D
+				// paths cannot compute a different number from the same fingerprint.
+				// ...so when it fired, the general block below would apply the SAME c467 component a
+				// second time. MEASURED on Demon's Souls: ui_uv_ucode=351949 climbing on a run whose
+				// 2D route is entirely demonsmenu, and 'Remix uiwrap:' reporting a submitted span of
+				// u=[0.00003..0.00005] on a 1024x1024 atlas - a correct span times c467.z, i.e. one
+				// texel, which is why every inventory icon is a flat grey block. The sibling program
+				// is untouched because its texcoord write is an ADD: there is no MUL for the scale
+				// resolver to find, ui_uv_ucode_applied stays false, and it renders correctly - which
+				// is the falsifiable half of this diagnosis and it holds.
+				if (ui_uv_ucode_applied && demons_uv_here && remix_rsx::ui_uv_apply_once())
+				{
+					++m_stats.ui_uv_double_skipped;
+				}
+				else if (ui_uv_ucode_applied)
+				{
+					const f32 a0 = uv[ui_uv_ucode_component[0]];
+					const f32 a1 = uv[ui_uv_ucode_component[1]];
+					const bool one_scale = (ui_uv_ucode_scale[0] == ui_uv_ucode_scale[1]);
+
+					uv[0] = ui_uv_ucode_rows
+						? (one_scale
+							? ui_uv_ucode_scale[0] * (a0 * ui_uv_ucode_matrix[0][0] + a1 * ui_uv_ucode_matrix[1][0]) + ui_uv_ucode_offset[0]
+							: (ui_uv_ucode_scale[0] * a0 * ui_uv_ucode_matrix[0][0] + ui_uv_ucode_scale[1] * a1 * ui_uv_ucode_matrix[1][0]) + ui_uv_ucode_offset[0])
+						: ui_uv_ucode_scale[0] * a0 + ui_uv_ucode_offset[0];
+					uv[1] = ui_uv_ucode_rows
+						? (one_scale
+							? ui_uv_ucode_scale[0] * (a0 * ui_uv_ucode_matrix[0][1] + a1 * ui_uv_ucode_matrix[1][1]) + ui_uv_ucode_offset[1]
+							: (ui_uv_ucode_scale[0] * a0 * ui_uv_ucode_matrix[0][1] + ui_uv_ucode_scale[1] * a1 * ui_uv_ucode_matrix[1][1]) + ui_uv_ucode_offset[1])
+						: ui_uv_ucode_scale[1] * a1 + ui_uv_ucode_offset[1];
 				}
 
 				u[c] = uv[0] * uv_scale[0];
@@ -14333,7 +19041,38 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 				&& (std::max({ v[0], v[1], v[2] }) - std::min({ v[0], v[1], v[2] })) <= 1.f + 1e-3f;
 		}
 
-		m_compositor.draw_triangle(x, y, u, v, have_uv ? entry : nullptr, tints, force_clamp_uv, force_opaque);
+		if (preview_target_address)
+		{
+			auto* destination = prepare_demons_preview(preview_target_address, static_cast<u32>(clip_w), static_cast<u32>(clip_h));
+			if (destination)
+			{
+				std::array<remix_rsx::preview_raster::vertex, 3> triangle{};
+				for (u32 k = 0; k < 3; ++k)
+				{
+					triangle[k].clip[0] = x[k] * 2.f / fw - 1.f;
+					triangle[k].clip[1] = 1.f - y[k] * 2.f / fh;
+					triangle[k].clip[2] = .5f;
+					triangle[k].uv[0] = u[k]; triangle[k].uv[1] = v[k];
+					triangle[k].color = tints[k];
+				}
+				remix_rsx::preview_raster::viewport preview_view{};
+				preview_view.scale_x = clip_w * .5f; preview_view.scale_y = clip_h * -.5f;
+				preview_view.offset_x = clip_w * .5f; preview_view.offset_y = clip_h * .5f;
+				preview_view.clip_left = clip_left * clip_w / fw; preview_view.clip_top = clip_top * clip_h / fh;
+				preview_view.clip_right = clip_right * clip_w / fw; preview_view.clip_bottom = clip_bottom * clip_h / fh;
+				remix_rsx::preview_raster::texture_view preview_texture{};
+				if (entry && have_uv)
+				{
+					preview_texture.pixels = reinterpret_cast<const u32*>(entry->pixels.data());
+					preview_texture.width = entry->width; preview_texture.height = entry->height;
+					preview_texture.wrap_u = entry->wrap_u == 1; preview_texture.wrap_v = entry->wrap_v == 1;
+				}
+				preview_texture.force_opaque = force_opaque;
+				destination->raster.draw_triangle(triangle, preview_view, preview_texture, false, true, 0, false);
+			}
+		}
+		else
+			m_compositor.draw_triangle(x, y, u, v, have_uv ? entry : nullptr, tints, force_clamp_uv, force_opaque);
 	}
 
 	m_compositor.clear_clip();
@@ -14363,6 +19102,24 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 		observe_sun_sprite(entry->content_hash, lo, hi);
 	}
 
+	if (demons_ui_trace)
+	{
+		++m_demons_ui_frame.accepted;
+		if (covers_frame)
+		{
+			const bool textured = entry && have_uv;
+			m_demons_ui_frame.full_texture += textured ? 1u : 0u;
+			m_demons_ui_frame.full_flat += textured ? 0u : 1u;
+			if (textured)
+			{
+				m_demons_ui_frame.texture_address = ui_texture_address;
+				m_demons_ui_frame.texture_width = entry->width;
+				m_demons_ui_frame.texture_height = entry->height;
+				m_demons_ui_frame.target = rsx::method_registers.surface_offset(0);
+				m_demons_ui_frame.full_vp = m_current_vp_hash;
+			}
+		}
+	}
 	++m_stats.ui_draws;
 }
 
@@ -14662,6 +19419,103 @@ void RemixGSRender::report_ui_wrap(const remix_rsx::texture_entry& entry, f32 u_
 		s_max_uiwrap_lines));
 }
 
+// ROUND 52. The routing census. Design, the population it names and the three numbers it exists to
+// print are on the ui_route_report declaration in the header.
+void RemixGSRender::report_ui_route(const ui_route_report& info)
+{
+	const u64 window = m_frame_counter / s_stats_interval_flips;
+
+	if (m_uiroute_window != window)
+	{
+		m_uiroute_window = window;
+		m_uiroute_seen.clear();
+		m_uiroute_lines = 0;
+	}
+
+	if (m_uiroute_lines >= s_max_uiroute_lines)
+	{
+		return;
+	}
+
+	// depth_write and route are both in the key on purpose: the SAME program pair on this title
+	// takes both routes depending on a live register, and a key without them would print whichever
+	// side happened to draw first and hide the other - which is the exact question the line exists
+	// to answer.
+	const u64 key = rpcs3::hash64(
+		rpcs3::hash64(rpcs3::hash64(m_current_vp_hash, m_current_fp_hash), info.albedo),
+		(rsx::method_registers.depth_write_enabled() ? 2u : 0u)
+			| ((info.route && info.route[0] == '2') ? 1u : 0u));
+
+	if (!m_uiroute_seen.insert(key).second)
+	{
+		return;
+	}
+
+	++m_uiroute_lines;
+
+	// Built as strings so the format string keeps a fixed specifier count whether or not the route
+	// resolved a box or a scale slot - the same idiom report_uv_scale_fixed uses for 'named' and
+	// 'affine', and the one that keeps this line editable without re-counting arguments.
+	const std::string box = info.have_box
+		? fmt::format("[%.1f %.1f]..[%.1f %.1f]",
+			static_cast<f64>(info.box[0]), static_cast<f64>(info.box[1]),
+			static_cast<f64>(info.box[2]), static_cast<f64>(info.box[3]))
+		: std::string("none");
+
+	const std::string uvslot = (info.uv_slot == remix_rsx::s_no_texcoord_scale)
+		? std::string("none")
+		: fmt::format("c%u", info.uv_slot);
+
+	const std::string uvval = info.uv_value_read
+		? fmt::format("%.6g", static_cast<f64>(info.uv_value))
+		: std::string("unread");
+
+	dump_line(fmt::format(
+		"Remix ui-route: vp=%016llx fp=%016llx albedo=%016llX tex=%ux%u fmt=%02x unit=%d "
+		// ROUND 60, inserted immediately after 'fmt'/'unit' with its argument in the matching
+		// position. 'remap' is the register that decides what the sampled channel order actually
+		// is; without it a texture that decodes to a solid blue field cannot be told from one the
+		// guest asked to be read in a different order. 0xAAE4 = identity = the register is inert.
+		"remap=%04x "
+		"texaddr=0x%08x route=%s reason=%s dw=%d blend=%d sfac=%u dfac=%u eq=%u cmask=0x%x "
+		"target=%u world_before=%llu box=%s tint_attr=%d tint=[%08X..%08X] uvout=%u uvslot=%s "
+		"uvval=%s frame=%llu line=%u/%u",
+		m_current_vp_hash,
+		m_current_fp_hash,
+		info.albedo,
+		info.tex_width, info.tex_height,
+		info.tex_format,
+		info.tex_unit,
+		// ROUND 60, in the order of "remap=%04x" above.
+		info.tex_remap,
+		info.tex_address,
+		info.route ? info.route : "?",
+		info.reason ? info.reason : "?",
+		rsx::method_registers.depth_write_enabled() ? 1 : 0,
+		rsx::method_registers.blend_enabled() ? 1 : 0,
+		static_cast<u32>(rsx::method_registers.blend_func_sfactor_rgb()),
+		static_cast<u32>(rsx::method_registers.blend_func_dfactor_rgb()),
+		static_cast<u32>(rsx::method_registers.blend_equation_rgb()),
+		// The four write-mask bits in one nibble, RGBA from bit 3 down, so a masked-out draw is
+		// readable as 0x0 rather than four fields.
+		(rsx::method_registers.color_mask_r(0) ? 0x8u : 0u)
+			| (rsx::method_registers.color_mask_g(0) ? 0x4u : 0u)
+			| (rsx::method_registers.color_mask_b(0) ? 0x2u : 0u)
+			| (rsx::method_registers.color_mask_a(0) ? 0x1u : 0u),
+		static_cast<u32>(rsx::method_registers.surface_color_target()),
+		m_frame_world_draws,
+		box,
+		info.tint_attr,
+		info.tint_min,
+		info.tint_max,
+		info.uv_output,
+		uvslot,
+		uvval,
+		m_frame_counter,
+		m_uiroute_lines,
+		s_max_uiroute_lines));
+}
+
 const remix_rsx::texture_entry* RemixGSRender::overlay_image(const void* key, const u8* rgba, u32 width, u32 height)
 {
 	if (!key || !rgba || width == 0 || height == 0)
@@ -14708,10 +19562,16 @@ void RemixGSRender::composite_overlay_command(const rsx::overlays::compiled_reso
 	}
 
 	const auto channel = [](f32 v) { return static_cast<u32>(std::clamp(v, 0.f, 1.f) * 255.f + 0.5f); };
+	float alpha = config.color.a;
+	if (Emu.GetTitleID() == "BLUS30443" && remix_rsx::demons_menu_enabled() && config.pulse_glow)
+	{
+		// Match OverlayRenderFS.glsl; the OSK marks its selected key by this pulse.
+		alpha *= (std::sin(config.get_sinus_value()) + 1.f) * 0.5f;
+	}
 	const u32 tint = channel(config.color.b)
 		| (channel(config.color.g) << 8)
 		| (channel(config.color.r) << 16)
-		| (channel(config.color.a) << 24);
+		| (channel(alpha) << 24);
 
 	if (config.clip_region)
 	{
@@ -14943,12 +19803,95 @@ void RemixGSRender::composite_native_overlay()
 	}
 }
 
+void RemixGSRender::clear_surface(u32 arg)
+{
+	// Recorded, never executed. See the declaration for why the colour is worth keeping.
+	if ((arg & RSX_GCM_CLEAR_COLOR_RGB_MASK) != RSX_GCM_CLEAR_COLOR_RGB_MASK)
+	{
+		// Depth-only, stencil-only, or a partial channel mask. None of those is a background
+		// fill, and building one out of two channels would invent a colour the console never
+		// showed. Leave the frame's verdict exactly as it was.
+		return;
+	}
+
+	const rsx::surface_color_format format = rsx::method_registers.surface_color();
+
+	switch (format)
+	{
+	case rsx::surface_color_format::a8r8g8b8:
+	case rsx::surface_color_format::x8r8g8b8_z8r8g8b8:
+	case rsx::surface_color_format::x8r8g8b8_o8r8g8b8:
+		break;
+
+	default:
+	{
+		// b8, g8b8, r5g6b5 and the b8g8r8 family each re-read NV4097_SET_COLOR_CLEAR_VALUE through
+		// their own swizzle (VKGSRender::clear_surface spells the conversions out), and the float
+		// formats ignore it. Guessing wrong here does not produce a subtle artifact -- it paints
+		// the entire screen the wrong colour -- so refuse, once, by name.
+		if (!m_clear_fmt_logged)
+		{
+			m_clear_fmt_logged = true;
+			rsx_log.notice("Remix: colour clear on surface format 0x%x is not one this backend "
+				"decodes; 2D-only frames keep the runtime background",
+				static_cast<u32>(format));
+		}
+
+		return;
+	}
+	}
+
+	// clear_color_r/g/b already decode the register into logical channels, so nothing is swapped
+	// here beyond the pack into the compositor's 0xAARRGGBB word. Alpha is forced opaque: this is
+	// a background, and a background the guest cleared to alpha 0 still shows as its colour.
+	m_frame_clear_bgra = 0xFF000000u
+		| (u32{rsx::method_registers.clear_color_r()} << 16)
+		| (u32{rsx::method_registers.clear_color_g()} << 8)
+		| u32{rsx::method_registers.clear_color_b()};
+	m_frame_clear_valid = true;
+}
+
 void RemixGSRender::submit_compositor()
 {
 	if (!m_remix.fork_features() || remix_rsx::compositor_disabled())
 	{
 		m_compositor_open = false;
 		return;
+	}
+
+	// A frame that submitted no world geometry is a 2D frame: a splash, a loading screen, a
+	// full-screen menu. Its background came from a framebuffer clear, which this backend cannot
+	// express -- there is no surface to clear, and the runtime renders what was submitted, which
+	// on such a frame is nothing. Everything the 2D draws leave transparent therefore shows the
+	// empty scene. Painting the guest's own clear colour underneath is what the console shows.
+	//
+	// Decided here and not at begin_frame because m_frame_world_draws is only final once the
+	// frame's draws are done (flip() resets it after this call), which makes the test exact with
+	// no one-frame lag in either direction -- the first frame with geometry loses the background
+	// in the same frame the geometry arrives.
+	if (m_frame_clear_valid && m_frame_world_draws == 0 && remix_rsx::clear_background_enabled())
+	{
+		u32 width = 0;
+		u32 height = 0;
+
+		if (compositor_target(width, height))
+		{
+			if (!m_compositor_open)
+			{
+				m_compositor.begin_frame(width, height);
+				m_compositor_open = true;
+			}
+
+			m_compositor.underlay(m_frame_clear_bgra);
+
+			if (!m_clear_bg_logged || m_clear_bg_logged_bgra != m_frame_clear_bgra)
+			{
+				m_clear_bg_logged = true;
+				m_clear_bg_logged_bgra = m_frame_clear_bgra;
+				rsx_log.notice("Remix: 2D-only frame %llu, painting the guest clear colour 0x%08x under the overlay",
+					m_frame_counter, m_frame_clear_bgra);
+			}
+		}
 	}
 
 	if (!m_compositor.dirty())
@@ -15711,7 +20654,7 @@ void RemixGSRender::audit_vertex_extent(u32 first_vertex, u32 vertex_count, cons
 // rather than against a number. Sky is exempt: a dome legitimately spans the level, and gating it on
 // the scene median would delete the sky.
 //
-// Returns false when the draw is refused. RPCS3_REMIX_STREAKGATE=0 restores 81af315.
+// Returns false when the draw is refused. RPCS3_REMIX_STREAKGATE=0 retains the census but refuses none.
 bool RemixGSRender::audit_world_extent(const remixapi_Transform& transform, bool skinned, u32 vertex_count, bool exempt)
 {
 	m_streak_extent = 0.f;
@@ -15861,12 +20804,95 @@ bool RemixGSRender::audit_world_extent(const remixapi_Transform& transform, bool
 		}
 	}
 
+	// ROUND 55. audit_world_extent has always computed this draw's world-space AABB and then
+	// thrown it away, keeping only the largest span. The span answers "is this draw huge";
+	// the BOX answers "is this draw somewhere else", which is the question left standing after
+	// the drop partition measured every removal gate at zero and the geometry was still absent.
+	// Published, not acted on.
+	for (u32 r = 0; r < 3; ++r)
+	{
+		m_world_box_lo[r] = lo[r];
+		m_world_box_hi[r] = hi[r];
+	}
+	m_world_box_valid = true;
+
 	m_streak_extent = extent;
 	m_streak_raw_extent = raw_extent;
 	m_streak_measured = true;
 
-	if (exempt)
+	// These exact Demon’s Souls palette and physical particle programs were replayed against their ucode:
+	// their positions have no missing decode. Native-scale terrain and particle batches
+	// must not be rejected merely because props dominate the frame's median size.
+	// Compare distance metrics, not AABB widths: rotation changes the widest box axis.
+	// API transforms are column-packed; the authoritative palette uses row vectors.
+	const bool demons_native_scale = [&]()
 	{
+		const auto& fp = *m_current_fingerprint;
+		if (!remix_rsx::demons_world_enabled() || nonfinite != 0
+			|| !(raw_extent > 0.f) || !std::isfinite(raw_extent) || !std::isfinite(extent)
+			|| !(fp.demons_particle_depth || fp.palette_implicit_w)) return false;
+		// Some architectural batches select different rigid palettes per vertex. Their
+		// authored placement is already in the bones; only the remaining camera basis
+		// must preserve distances. This is not a weighted character-skin exemption.
+		const bool rigid_batch = skinned && fp.palette_implicit_w && !fp.skin_blended
+			&& m_scratch_bones_per_vertex == 1 && !m_scratch_bone_transforms.empty()
+			&& m_scratch_bone_indices.size() >= vertex_count && m_scratch_bone_weights.size() >= vertex_count;
+		if (skinned && !rigid_batch) return false;
+		if (rigid_batch)
+		{
+			for (u32 i = 0; i < vertex_count; ++i)
+				if (m_scratch_bone_weights[i] != 1.f || m_scratch_bone_indices[i] >= m_scratch_bone_transforms.size()) return false;
+			for (const auto& bone : m_scratch_bone_transforms)
+				for (const auto& row : bone.matrix)
+					for (const f32 value : row) if (!std::isfinite(value)) return false;
+		}
+		else if (!fp.demons_particle_depth && !m_indexed_world_valid) return false;
+		const bool identity_reference = fp.demons_particle_depth || rigid_batch;
+		f64 difference2 = 0., reference2 = 0.;
+		for (u32 i = 0; i < 3; ++i)
+			for (u32 j = 0; j < 3; ++j)
+			{
+				f64 actual = 0., expected = 0.;
+				for (u32 k = 0; k < 3; ++k)
+				{
+					actual += static_cast<f64>(transform.matrix[k][i]) * transform.matrix[k][j];
+					if (!identity_reference)
+						expected += static_cast<f64>(m_indexed_world.m[i][k]) * m_indexed_world.m[j][k];
+				}
+				if (identity_reference) expected = i == j ? 1. : 0.;
+				if (!std::isfinite(actual) || !std::isfinite(expected)) return false;
+				difference2 += (actual - expected) * (actual - expected);
+				reference2 += expected * expected;
+			}
+		return reference2 > 1e-24 && std::isfinite(difference2) && std::isfinite(reference2)
+			&& difference2 <= (0.02 * 0.02) * reference2;
+	}();
+	if (exempt || demons_native_scale)
+	{
+		if (demons_native_scale && skinned && (m_skip_census_albedo == 0x0AF16EA9FBB31DF3ull
+			|| m_skip_census_albedo == 0x54CC52E729C00C70ull || m_skip_census_albedo == 0x7D8EA635B4E4151Eull))
+		{
+			static std::unordered_set<u64> captured_batches;
+			if (captured_batches.insert(m_skip_census_albedo).second)
+			{
+				const std::string directory = fs::get_executable_dir() + "remix_ground_batch/";
+				fs::create_dir(directory);
+				std::string dump = fmt::format("rigid-batch vp=%016llX albedo=%016llX vertices=%u raw=%.9g extent=%.9g\n", m_current_vp_hash, m_skip_census_albedo, vertex_count, raw_extent, extent);
+				for (const auto& row : transform.matrix) dump += fmt::format("instance %.9g %.9g %.9g %.9g\n", row[0], row[1], row[2], row[3]);
+				for (const auto& bone : m_scratch_bone_transforms)
+					for (const auto& row : bone.matrix) dump += fmt::format("bone %.9g %.9g %.9g %.9g\n", row[0], row[1], row[2], row[3]);
+				for (u32 i = 0; i < vertex_count; ++i)
+				{
+					const auto& v = m_scratch_vertices[i];
+					dump += fmt::format("v %.9g %.9g %.9g bone=%u\n", v.position[0], v.position[1], v.position[2], m_scratch_bone_indices[i]);
+				}
+				for (usz i = 0; i + 2 < m_scratch_indices.size(); i += 3)
+					dump += fmt::format("f %u %u %u\n", m_scratch_indices[i], m_scratch_indices[i + 1], m_scratch_indices[i + 2]);
+				const std::string path = fmt::format("%s%016llX.txt", directory, m_skip_census_albedo);
+				if (fs::file output{ path, fs::write + fs::create + fs::trunc }) output.write(dump.data(), dump.size());
+				rsx_log.notice("Remix Demons rigid architecture accepted: vp=%016llX albedo=%016llX vertices=%u bones=%llu capture=%s", m_current_vp_hash, m_skip_census_albedo, vertex_count, static_cast<u64>(m_scratch_bone_transforms.size()), path);
+			}
+		}
 		++m_stats.wext_exempt;
 		return true;
 	}
@@ -16808,6 +21834,20 @@ bool RemixGSRender::build_skinning(u32 first_vertex, u32 vertex_count)
 void RemixGSRender::update_camera_candidate()
 {
 	const remix_rsx::vp_fingerprint& fp = *m_current_fingerprint;
+	if (fp.demons_particle_depth) return;
+	// The captured Demon’s Souls palettes produce world coordinates before one fused
+	// view-projection group. Keep their skinning archetype, but nominate the camera as
+	// fused so world submission divides by its reference before prepending the palette.
+	const bool demons_fused_camera = remix_rsx::demons_world_enabled()
+		&& fp.palette_implicit_w && fp.group_count == 1;
+	const auto camera_archetype = demons_fused_camera ? remix_rsx::vp_archetype::fused : fp.archetype;
+	// Depth-only shadow passes precede the display pass and can consume the entire
+	// decomposition budget. They cannot nominate the displayed scene's camera.
+	if (remix_rsx::demons_world_enabled()
+		&& static_cast<u32>(rsx::method_registers.surface_color_target()) == 0)
+	{
+		return;
+	}
 
 	if (!fp.has_outer())
 	{
@@ -16909,7 +21949,7 @@ void RemixGSRender::update_camera_candidate()
 			}
 
 			m_frame_viewmodel_candidate.valid = true;
-			m_frame_viewmodel_candidate.archetype = fp.archetype;
+			m_frame_viewmodel_candidate.archetype = camera_archetype;
 			m_frame_viewmodel_candidate.projection = folded;
 			m_frame_viewmodel_candidate.has_reference = true;
 			m_frame_viewmodel_candidate.reference_inverse = viewmodel_inverse;
@@ -16917,7 +21957,7 @@ void RemixGSRender::update_camera_candidate()
 		}
 	}
 
-	if (fp.is_layered())
+	if (fp.is_layered() && !demons_fused_camera)
 	{
 		// The title already split its own transform: the outermost group is the projection,
 		// the one below it is the view (identity when there are only two groups).
@@ -17065,6 +22105,25 @@ void RemixGSRender::update_camera_candidate()
 	if (!remix_rsx::split_view_projection(folded, split))
 	{
 		++m_stats.split_failed;
+		if (demons_fused_camera)
+		{
+			static u64 last_demons_split_dump = umax;
+			if (last_demons_split_dump == umax || m_frame_counter < last_demons_split_dump
+				|| m_frame_counter - last_demons_split_dump >= 120)
+			{
+				last_demons_split_dump = m_frame_counter;
+				rsx_log.notice("Remix Demons split-failed: frame=%llu vp=%016llx surf=%08x target=%u clip=%ux%u "
+					"zscale=%.9g zoffset=%.9g folded=[%.9g %.9g %.9g %.9g | %.9g %.9g %.9g %.9g | %.9g %.9g %.9g %.9g | %.9g %.9g %.9g %.9g]",
+					m_frame_counter, m_current_vp_hash, rsx::method_registers.surface_offset(0),
+					static_cast<u32>(rsx::method_registers.surface_color_target()),
+					static_cast<u32>(clip_w), static_cast<u32>(clip_h),
+					rsx::method_registers.viewport_scale_z(), rsx::method_registers.viewport_offset_z(),
+					folded.m[0][0], folded.m[0][1], folded.m[0][2], folded.m[0][3],
+					folded.m[1][0], folded.m[1][1], folded.m[1][2], folded.m[1][3],
+					folded.m[2][0], folded.m[2][1], folded.m[2][2], folded.m[2][3],
+					folded.m[3][0], folded.m[3][1], folded.m[3][2], folded.m[3][3]);
+			}
+		}
 
 		// Haze's gameplay matrices become numerically unsplittable near the vertical view. The
 		// configured camera programs still carry a valid fused matrix there, so recover only their
@@ -17083,7 +22142,7 @@ void RemixGSRender::update_camera_candidate()
 			|| static_cast<u32>(rsx::method_registers.surface_color_target()) != m_active_camera.color_target
 			|| static_cast<u32>(clip_w) != m_active_camera.clip_width
 			|| static_cast<u32>(clip_h) != m_active_camera.clip_height
-			|| fp.archetype != m_active_camera.archetype)
+			|| camera_archetype != m_active_camera.archetype)
 		{
 			return;
 		}
@@ -17200,7 +22259,7 @@ void RemixGSRender::update_camera_candidate()
 	candidate.color_target = static_cast<u32>(rsx::method_registers.surface_color_target());
 	candidate.clip_width = static_cast<u32>(clip_w);
 	candidate.clip_height = static_cast<u32>(clip_h);
-	candidate.archetype = fp.archetype;
+	candidate.archetype = camera_archetype;
 	candidate.view = split.view;
 	candidate.projection = split.projection;
 	candidate.has_reference = true;
@@ -17255,6 +22314,1140 @@ void RemixGSRender::update_camera_candidate()
 	consider_camera_candidate(candidate, reserved_camera_attempt);
 }
 
+// ROUND 52. "value is the active camera, one frame later" - the mid-frame relatch's own predicate,
+// lifted out of it verbatim so the relatch and the CAMSTICKY vote below cannot drift apart. The
+// identity keys are the ones the relatch already used: surface, colour target, clip, archetype, and
+// has_reference / group_count, which decide which branch of per_draw_transform a draw takes and so
+// must never change mid-frame. The projection tolerance stays at the relatch's 1e-2, which is what
+// lets a smooth lens sweep follow (Eat Lead's aim zoom moves the projection ~0.3% per frame) while
+// an abrupt lens change reads as a new identity.
+//
+// vp_hash is deliberately NOT a key. Without a lock, clusters merge across programs by matrix
+// (the clustering loop below only compares vp_hash when lock_vp != 0), so requiring the program to
+// match would make "own cluster" narrower than the cluster it is asked about.
+bool RemixGSRender::camera_own_cluster(const camera_candidate& value, f32 view_tolerance) const
+{
+	return m_active_camera.valid && value.valid
+		&& value.surface_offset == m_active_camera.surface_offset
+		&& value.color_target == m_active_camera.color_target
+		&& value.clip_width == m_active_camera.clip_width
+		&& value.clip_height == m_active_camera.clip_height
+		&& value.archetype == m_active_camera.archetype
+		&& value.has_reference == m_active_camera.has_reference
+		&& value.group_count == m_active_camera.group_count
+		// ROUND 53: RAW views on both sides. Under RPCS3_REMIX_CAMREBASE the active camera carries the
+		// accumulated bridge R while a fresh candidate does not, so comparing the submitted matrices
+		// would make every cluster look like a discontinuity for the rest of the session. raw_view_of
+		// is the identity function while the rebase is off, so this is bit-exact without it.
+		&& matrix_relative_delta(raw_view_of(value), raw_view_of(m_active_camera)) <= view_tolerance
+		&& matrix_relative_delta(value.projection, m_active_camera.projection) <= 1e-2f;
+}
+
+// --- round 53: witness tracking -----------------------------------------------------------------
+
+const remix_rsx::mat4& RemixGSRender::raw_view_of(const camera_candidate& value) const
+{
+	return value.rebased ? value.raw_view : value.view;
+}
+
+void RemixGSRender::rebase_camera(camera_candidate& value) const
+{
+	if (!m_camera_rebase_valid || !value.valid || value.rebased)
+	{
+		return;
+	}
+
+	value.raw_view = value.view;
+	value.view = remix_rsx::mat4_multiply(m_camera_rebase, value.raw_view);
+
+	// Row-vector convention throughout (camera_candidate's own comment: "both row-vector"), so a
+	// draw's world transform has to absorb R^-1 on its RIGHT:
+	//   world' = fused x ref_inv x R^-1  and  world' x (R x V) x P = fused x ref_inv x V x P = fused.
+	// The composite is exact - the invariant the whole backend rests on - and it is exact for the
+	// same reason whichever witness the reference came from.
+	value.reference_inverse = remix_rsx::mat4_multiply(value.reference_inverse, m_camera_rebase_inverse);
+
+	if (value.has_view_proj_inverse)
+	{
+		// inverse((R x V) x P) = inverse(P) x inverse(V) x inverse(R) = view_proj_inverse x R^-1.
+		value.view_proj_inverse = remix_rsx::mat4_multiply(value.view_proj_inverse, m_camera_rebase_inverse);
+	}
+
+	// Row 3 of the inverse view is the eye, the same expression update_camera_candidate uses.
+	remix_rsx::mat4 view_to_world{};
+
+	if (remix_rsx::mat4_invert(value.view, view_to_world))
+	{
+		value.position[0] = view_to_world.m[3][0];
+		value.position[1] = view_to_world.m[3][1];
+		value.position[2] = view_to_world.m[3][2];
+	}
+
+	value.rebased = true;
+}
+
+// ROUND 55, RPCS3_REMIX_CAMREFSYNTH. rebase_camera's algebra with R = rel^-1, applied to ONE frame
+// instead of to a whole session: build the candidate the incumbent I would have produced this frame
+// out of the witness J's cluster, which IS drawn.
+//
+//   rel = view_J x view_I^-1 = (M_J x V x P_v) x (M_I x V x P_v)^-1 = M_J x M_I^-1
+//
+// The true camera cancels, which is the only reason this can be measured from the outside at all. So
+// for this frame's camera, still row-vector throughout:
+//
+//   view_I            = rel^-1 x view_J
+//   reference_inverse_I = reference_inverse_J x rel
+//   view_proj_inverse_I = view_proj_inverse_J x rel
+//
+// and per_draw_transform then places a draw at
+//
+//   world = fused x (ref_inv_J x rel) = M_obj x M_J^-1 x M_J x M_I^-1 = M_obj x M_I^-1
+//
+// which is exactly what the incumbent's own cluster would have produced had it been drawn - the pose
+// in I's frame, with THIS frame's camera in it rather than a frozen one.
+//
+// Writes nothing outside `out` and `self_check`: no track state, no identity, no counter, no
+// m_active_camera. raw_view is left untouched and rebased is set false so the existing
+// rebase_camera(m_frame_candidate) at the end of update_camera_tracks still applies R on top under
+// CAMREBASE - the two mechanisms compose as R x rel^-1 x view_J.
+bool RemixGSRender::synthesize_camera_from_witness(const camera_track& incumbent,
+	const camera_track& witness, const camera_candidate& cluster, camera_candidate& out,
+	f32& self_check) const
+{
+	self_check = 0.f;
+
+	remix_rsx::mat4 relation_inverse{};
+
+	if (!remix_rsx::mat4_invert(witness.rel_last, relation_inverse))
+	{
+		return false;
+	}
+
+	// The bridge's own test (the CAMREBASE handover applies it to exactly the same quantity): re-derive
+	// the incumbent's view in the frame the relation was MEASURED in and compare it against what was
+	// actually observed there. Exact algebra makes the two sides equal, so a residual is conditioning
+	// on the two inversions and rigidity on the pair - it cannot pass on a relation that was never
+	// really rigid, and it cannot pass on a near-singular one.
+	self_check = matrix_relative_delta(
+		remix_rsx::mat4_multiply(relation_inverse, witness.rel_last_view),
+		witness.rel_last_incumbent_view);
+
+	if (!(self_check <= s_camera_pending_match_tolerance))
+	{
+		return false;
+	}
+
+	out = cluster;
+	out.view = remix_rsx::mat4_multiply(relation_inverse, cluster.view);
+	out.reference_inverse = remix_rsx::mat4_multiply(cluster.reference_inverse, witness.rel_last);
+
+	if (out.has_view_proj_inverse)
+	{
+		out.view_proj_inverse = remix_rsx::mat4_multiply(cluster.view_proj_inverse, witness.rel_last);
+	}
+
+	if (!remix_rsx::mat4_is_finite(out.view) || !remix_rsx::mat4_is_finite(out.reference_inverse))
+	{
+		return false;
+	}
+
+	// Row 3 of the inverse view is the eye, the expression update_camera_candidate and rebase_camera
+	// both use. A view that will not invert is refused outright rather than left at the origin, where
+	// it would match a distant track by sitting at 0,0,0.
+	remix_rsx::mat4 view_to_world{};
+
+	if (!remix_rsx::mat4_invert(out.view, view_to_world))
+	{
+		return false;
+	}
+
+	out.position[0] = view_to_world.m[3][0];
+	out.position[1] = view_to_world.m[3][1];
+	out.position[2] = view_to_world.m[3][2];
+
+	// The identity this candidate claims is the INCUMBENT's, not the witness's: the identity keys are
+	// already equal (the witness scan requires it) and vp_hash is the one remaining field that would
+	// otherwise say "a different program drew this". It is a preference and not a key everywhere it is
+	// read, but the flip's source-change test and the census both print it, and printing the witness's
+	// would misreport whose camera this is.
+	out.vp_hash = incumbent.vp_hash;
+	out.rebased = false;
+	out.valid = true;
+
+	return true;
+}
+
+void RemixGSRender::report_camera_track(const char* event, u32 incumbent_id, u64 incumbent_tenure,
+	u64 incumbent_vp, const f32 (&incumbent_position)[3], u32 elected_id, u64 elected_tenure,
+	u64 elected_vp, const f32 (&elected_position)[3], f32 distance, u32 elected_votes,
+	u32 max_votes, u32 live_tracks, bool bridged, f32 bridge_error, f32 rebase_determinant)
+{
+	// The window is rolled BEFORE the cap is tested, the order report_light_candidate and the
+	// guest-light drift census use. Testing the cap first looks equivalent and is not: once the first
+	// window fills, the reset is never reached again and the census goes silent for the session.
+	const u64 window = m_frame_counter / s_stats_interval_flips;
+
+	if (m_cam_track_window != window)
+	{
+		m_cam_track_window = window;
+		m_cam_track_lines = 0;
+	}
+
+	if (m_cam_track_lines >= s_max_cam_track_lines)
+	{
+		return;
+	}
+
+	++m_cam_track_lines;
+
+	dump_line(fmt::format(
+		"Remix cam-track: event=%s frame=%llu inc=%u tenure=%llu vp=%016llx pos=[%.4g %.4g %.4g] "
+		"new=%u ntenure=%llu nvp=%016llx npos=[%.4g %.4g %.4g] d=%.3g votes=%u/%u live=%u "
+		"bridged=%d bridge_err=%.3g rdet=%.6g line=%u/%u",
+		event,
+		m_frame_counter,
+		incumbent_id,
+		incumbent_tenure,
+		incumbent_vp,
+		static_cast<f64>(incumbent_position[0]), static_cast<f64>(incumbent_position[1]),
+		static_cast<f64>(incumbent_position[2]),
+		elected_id,
+		elected_tenure,
+		elected_vp,
+		static_cast<f64>(elected_position[0]), static_cast<f64>(elected_position[1]),
+		static_cast<f64>(elected_position[2]),
+		static_cast<f64>(distance),
+		elected_votes,
+		max_votes,
+		live_tracks,
+		bridged ? 1 : 0,
+		static_cast<f64>(bridge_error),
+		static_cast<f64>(rebase_determinant),
+		m_cam_track_lines,
+		s_max_cam_track_lines));
+}
+
+// ROUND 53, RPCS3_REMIX_CAMTRACK. Continuity of camera identity over TIME, which is the only lever
+// the data leaves. Read with a position-continuity tracker, run 13's 83,257 cluster rows say the
+// winner track changed 84 times in 4,761 gameplay frames and in 80 of the 84 the previous winner's
+// track was ABSENT from the frame - so no ranking rule can help, because there is nothing in the
+// frame to rank. Every cluster is split(M_obj x V x P), a placed object's basis; no track is present
+// in more than 30.8% of frames; there is no bare V x P to prefer. The choice is only ever WHICH
+// WITNESS, and the fault is that the witness is re-chosen whenever the current one is culled.
+//
+// The rule: once a witness is elected, keep it for as long as its track is on screen irrespective of
+// votes (votes are 1-3 and tie in 59.5% of frames - they carry no information about persistence);
+// while it is off screen for up to CAMTRACKMISS frames discard the frame's candidate and let the
+// existing latch hold; when it dies, hand over to the matched track with the greatest tenure.
+// Simulated at 16 handovers in 4,761 frames against 84.
+//
+// Expressed by REWRITING m_frame_candidate - the round-10 CAMFBRELATCH shape - so the source-change
+// test, the 12-frame confirm, the age, the hold and every counter below it still run. It reorders
+// nothing in consider_camera_candidate and cannot elect a cluster the frame's census did not
+// contain. The mid-frame relatch, CAMSTICKY, the lock path and the clip gate are untouched; under
+// CAMTRACK cam_sticky_kept / cam_sticky_lost describe THE VOTE, not the elected identity.
+void RemixGSRender::update_camera_tracks()
+{
+	// A title with a camera lock keeps its lock path: the lock already pins the identity, and the
+	// whole diagnosis behind tracking is a title that cannot use one.
+	if (remix_rsx::camera_track_mode() == 0 || remix_rsx::camera_lock_vp_hash() != 0)
+	{
+		return;
+	}
+
+	const u64 frame = m_frame_counter;
+	const f32 position_tolerance = remix_rsx::camera_track_position_tolerance();
+	const u32 miss_frames = remix_rsx::camera_track_miss_frames();
+	const bool rebase = remix_rsx::camera_rebase_mode() != 0;
+	// ROUND 55, RPCS3_REMIX_CAMREFSYNTH. The relation table below (rel_first / rel_last) was built for
+	// the CAMREBASE bridge, but the reference synthesis reads exactly the same quantity, so it is now
+	// maintained whenever EITHER is armed. Nothing else is un-gated: the `moving` verdict keeps its
+	// `rebase &&` because track.moving feeds the tenure election, and the whole claim of this round is
+	// that identity is bit-identical on the refsynth-only arm.
+	const u32 refsynth = remix_rsx::camera_ref_synth_mode();
+	const bool relations = rebase || refsynth != 0;
+
+	m_camera_track_handover_frame = false;
+
+	// ROUND 55, the same per-flip lifetime as the flag above. flip() clears this immediately before
+	// calling us as well, so a title without CAMTRACK - where this function returns at the top - still
+	// reads 0 ("fresh") rather than the previous flip's verdict.
+	m_camera_ref_state = 0;
+
+	// ROUND 54, the same per-flip lifetime as the line above and cleared beside it for the same
+	// reason: it is this flip's verdict, and a drift row that inherited the previous flip's would
+	// name M-witness on a frame where nothing was judged to be moving. STRUCTURALLY 0 WHILE
+	// CAMREBASE IS OFF - the block that sets it is inside `invertible = rebase && ...`.
+	m_camera_incumbent_moving_frame = false;
+
+	const auto eye_distance = [](const f32 (&lhs)[3], const f32 (&rhs)[3])
+	{
+		const f32 dx = lhs[0] - rhs[0];
+		const f32 dy = lhs[1] - rhs[1];
+		const f32 dz = lhs[2] - rhs[2];
+		return std::sqrt(dx * dx + dy * dy + dz * dz);
+	};
+
+	// --- match this frame's clusters to the live tracks --------------------------------------
+	std::array<bool, s_max_camera_candidates_per_frame> claimed{};
+	std::array<u32, s_max_camera_tracks> order{};
+	u32 order_used = 0;
+	u32 incumbent_slot = umax;
+
+	for (u32 i = 0; i < s_max_camera_tracks; ++i)
+	{
+		m_camera_tracks[i].matched_index = umax;
+
+		if (!m_camera_tracks[i].valid)
+		{
+			continue;
+		}
+
+		order[order_used++] = i;
+
+		if (m_camera_track_incumbent != umax && m_camera_tracks[i].id == m_camera_track_incumbent)
+		{
+			incumbent_slot = i;
+		}
+	}
+
+	// Descending tenure - the oldest first_frame - so the longest-lived witness gets first claim on
+	// a cluster two tracks could both accept.
+	std::stable_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(order_used),
+		[this](u32 lhs, u32 rhs) { return m_camera_tracks[lhs].first_frame < m_camera_tracks[rhs].first_frame; });
+
+	for (u32 oi = 0; oi < order_used; ++oi)
+	{
+		camera_track& track = m_camera_tracks[order[oi]];
+		u32 best = umax;
+		f32 best_distance = 0.f;
+		bool best_vp = false;
+
+		for (u32 c = 0; c < m_frame_camera_candidates_used; ++c)
+		{
+			const camera_candidate& cluster = m_frame_camera_candidates[c];
+
+			if (claimed[c] || !cluster.valid)
+			{
+				continue;
+			}
+
+			// The camera_own_cluster identity set. These decide which branch of per_draw_transform a
+			// draw takes and which world draws may follow the camera at all, so a track that changed
+			// any of them is a different witness however close its eye is.
+			if (cluster.surface_offset != track.surface_offset
+				|| cluster.color_target != track.color_target
+				|| cluster.clip_width != track.clip_width
+				|| cluster.clip_height != track.clip_height
+				|| cluster.archetype != track.archetype
+				|| cluster.has_reference != track.has_reference
+				|| cluster.group_count != track.group_count)
+			{
+				continue;
+			}
+
+			// The coarse matrix gate, so a candidate whose mat4_invert failed and left position at
+			// the origin cannot match a distant track just by sitting at 0,0,0.
+			if (matrix_relative_delta(raw_view_of(cluster), track.view) > s_camera_discontinuity_tolerance)
+			{
+				continue;
+			}
+
+			const f32 distance = eye_distance(cluster.position, track.position);
+
+			if (distance > position_tolerance)
+			{
+				continue;
+			}
+
+			// vp_hash is a PREFERENCE, never a key: one moving viewpoint's first-observed program
+			// alternates between frames (the cam-elect vp changes at 7811->7812 and 8279->8280 of the
+			// played session are 0.146 apart in position - cosmetic), so requiring it would break the
+			// track for a reason that is not about the object at all.
+			const bool vp_match = cluster.vp_hash == track.vp_hash;
+
+			if (best == umax
+				|| (vp_match && !best_vp)
+				|| (vp_match == best_vp && distance < best_distance))
+			{
+				best = c;
+				best_distance = distance;
+				best_vp = vp_match;
+			}
+		}
+
+		if (best == umax)
+		{
+			++track.missed;
+			continue;
+		}
+
+		claimed[best] = true;
+		track.matched_index = best;
+
+		const camera_candidate& cluster = m_frame_camera_candidates[best];
+		track.view = raw_view_of(cluster);
+		track.projection = cluster.projection;
+		track.position[0] = cluster.position[0];
+		track.position[1] = cluster.position[1];
+		track.position[2] = cluster.position[2];
+		track.vp_hash = cluster.vp_hash;
+		track.score = cluster.score;
+		track.votes += cluster.observations;
+		track.missed = 0;
+		track.last_frame = frame;
+	}
+
+	// --- ROUND 54: did the relatch and the tracker follow the same object? ---------------------
+	// Measurement only. Placed here, after the match loop and before the retire sweep, because this
+	// is the only point at which the incumbent's slot is still live AND its matched_index for THIS
+	// frame is filled in. Nothing below reads what this writes.
+	//
+	// The two mechanisms use different predicates on different quantities: the mid-frame relatch
+	// takes the first candidate within CAMRELATCHTOL (a relative delta on the raw view - a sibling
+	// 0.13-1.25 units away is 0.004-0.04 relative against a view norm of ~30, i.e. comfortably
+	// inside 0.1), while the tracker matches the incumbent by a 1.0-unit eye distance plus the
+	// identity keys. They can therefore pick different draws in the same frame, and run B has frames
+	// where they demonstrably did. This is the direct count of that.
+	//
+	// 0.05 units is a READING THRESHOLD, not a gate: it is s_camera_witness_tolerance's magnitude and
+	// about 3x the p50 per-frame eye step, so a pair further apart than this is two objects rather
+	// than one object measured twice. Nothing is refused, held or re-chosen on the strength of it.
+	if (m_frame_relatch_count != 0 && incumbent_slot != umax
+		&& m_camera_tracks[incumbent_slot].matched_index != umax)
+	{
+		const camera_candidate& matched =
+			m_frame_camera_candidates[m_camera_tracks[incumbent_slot].matched_index];
+		const f32 relatch_track_d = eye_distance(m_frame_relatch_position, matched.position);
+
+		if (relatch_track_d <= 0.05f)
+		{
+			++m_stats.cam_relatch_agree;
+		}
+		else
+		{
+			++m_stats.cam_relatch_disagree;
+
+			if (remix_rsx::camera_relatch_trace_mode() != 0)
+			{
+				// Shares cam-relatch's window and cap: the two rows are read together, so one
+				// budget is one thing to reason about. Window rolled before the cap is tested.
+				const u64 relatch_window = frame / s_stats_interval_flips;
+
+				if (m_cam_relatch_window != relatch_window)
+				{
+					m_cam_relatch_window = relatch_window;
+					m_cam_relatch_lines = 0;
+				}
+
+				if (m_cam_relatch_lines < s_max_cam_relatch_lines)
+				{
+					++m_cam_relatch_lines;
+
+					dump_line(fmt::format(
+						"Remix cam-relatch-disagree: frame=%llu relatch_vp=%016llx "
+						"relatch=[%.4g %.4g %.4g] track=%u track_vp=%016llx "
+						"match=[%.4g %.4g %.4g] d=%.3g line=%u/%u",
+						frame,
+						m_frame_relatch_vp,
+						static_cast<f64>(m_frame_relatch_position[0]),
+						static_cast<f64>(m_frame_relatch_position[1]),
+						static_cast<f64>(m_frame_relatch_position[2]),
+						m_camera_tracks[incumbent_slot].id,
+						matched.vp_hash,
+						static_cast<f64>(matched.position[0]),
+						static_cast<f64>(matched.position[1]),
+						static_cast<f64>(matched.position[2]),
+						static_cast<f64>(relatch_track_d),
+						m_cam_relatch_lines,
+						s_max_cam_relatch_lines));
+				}
+			}
+		}
+	}
+
+	// --- retire the tracks that ran out of miss window ----------------------------------------
+	// The incumbent is snapshotted before the sweep because the census line and the bridge both need
+	// the outgoing witness after its slot has been cleared and possibly reused this same frame.
+	camera_track outgoing{};
+	bool incumbent_died = false;
+
+	if (incumbent_slot != umax)
+	{
+		outgoing = m_camera_tracks[incumbent_slot];
+	}
+
+	for (u32 i = 0; i < s_max_camera_tracks; ++i)
+	{
+		camera_track& track = m_camera_tracks[i];
+
+		if (!track.valid || track.missed <= miss_frames)
+		{
+			continue;
+		}
+
+		if (i == incumbent_slot)
+		{
+			incumbent_died = true;
+			incumbent_slot = umax;
+		}
+
+		track = camera_track{};
+		++m_stats.cam_track_expired;
+	}
+
+	// --- every unclaimed cluster opens a track -------------------------------------------------
+	for (u32 c = 0; c < m_frame_camera_candidates_used; ++c)
+	{
+		const camera_candidate& cluster = m_frame_camera_candidates[c];
+
+		if (claimed[c] || !cluster.valid)
+		{
+			continue;
+		}
+
+		u32 slot = umax;
+
+		for (u32 i = 0; i < s_max_camera_tracks; ++i)
+		{
+			if (!m_camera_tracks[i].valid)
+			{
+				slot = i;
+				break;
+			}
+		}
+
+		if (slot == umax)
+		{
+			// Must read 0. A frame whose clusters do not all get a track has an incomplete census and
+			// the tenure election is deciding on a subset without saying so.
+			++m_stats.cam_track_overflow;
+			continue;
+		}
+
+		camera_track& track = m_camera_tracks[slot];
+		track = camera_track{};
+		track.valid = true;
+		track.id = m_camera_track_next_id++;
+		track.first_frame = frame;
+		track.last_frame = frame;
+		track.votes = cluster.observations;
+		track.vp_hash = cluster.vp_hash;
+		track.surface_offset = cluster.surface_offset;
+		track.color_target = cluster.color_target;
+		track.clip_width = cluster.clip_width;
+		track.clip_height = cluster.clip_height;
+		track.archetype = cluster.archetype;
+		track.has_reference = cluster.has_reference;
+		track.group_count = cluster.group_count;
+		track.view = raw_view_of(cluster);
+		track.projection = cluster.projection;
+		track.position[0] = cluster.position[0];
+		track.position[1] = cluster.position[1];
+		track.position[2] = cluster.position[2];
+		track.score = cluster.score;
+		track.matched_index = c;
+		claimed[c] = true;
+	}
+
+	u32 live_tracks = 0;
+	u32 max_votes = 0;
+
+	for (const camera_track& track : m_camera_tracks)
+	{
+		live_tracks += track.valid ? 1 : 0;
+	}
+
+	for (u32 c = 0; c < m_frame_camera_candidates_used; ++c)
+	{
+		max_votes = std::max(max_votes, m_frame_camera_candidates[c].observations);
+	}
+
+	// --- elect ---------------------------------------------------------------------------------
+	const bool had_incumbent = m_camera_track_incumbent != umax;
+	u32 elected_slot = umax;
+	bool handover = false;
+
+	if (incumbent_slot != umax && m_camera_tracks[incumbent_slot].matched_index != umax)
+	{
+		elected_slot = incumbent_slot;
+		++m_stats.cam_track_kept;
+
+		const camera_candidate& cluster =
+			m_frame_camera_candidates[m_camera_tracks[incumbent_slot].matched_index];
+
+		// The subset that says the rule is deciding rather than agreeing: the vote's winner was some
+		// other cluster and the incumbent's own is taken instead. Simulation says 55.7% of frames.
+		const bool vote_agrees = m_frame_candidate.valid
+			&& m_frame_candidate.vp_hash == cluster.vp_hash
+			&& matrix_relative_delta(raw_view_of(m_frame_candidate), raw_view_of(cluster)) <= 1e-6f;
+
+		if (!vote_agrees)
+		{
+			m_frame_candidate = cluster;
+			++m_stats.cam_track_override;
+		}
+	}
+	else if (incumbent_slot != umax)
+	{
+		// Alive but not drawn this frame. Discard the frame's candidate so the existing latch holds
+		// m_active_camera - cam_held counts the same frame - instead of handing the identity to
+		// whatever else happened to be on screen. This is the whole point: 80 of the baseline's 84
+		// identity changes are exactly this situation resolved the other way.
+		elected_slot = incumbent_slot;
+		++m_stats.cam_track_missed;
+
+		// --- ROUND 55, RPCS3_REMIX_CAMREFSYNTH: refresh the REFERENCE without touching IDENTITY ----
+		// The discard above freezes m_active_camera whole - identity AND matrices - and it is the
+		// matrices half that makes the world and the injected lights slide by the camera's own motion
+		// for the length of the hold. The identity decision is correct and is NOT revisited here:
+		// elected_slot is still the incumbent, track.missed / expiry / the tenure election below are
+		// untouched, and nothing in this block writes m_camera_track_incumbent or any track field.
+		//
+		// What it does write is m_frame_candidate, with the candidate the incumbent WOULD have produced
+		// had it been drawn, reconstructed from a co-present static witness J and the rigid relation the
+		// pair expressed while both were drawn: rel = M_J x M_I^-1, so view_I = rel^-1 x view_J. Since
+		// it goes in through the ordinary latch, latch_frame is stamped and the drift census's new_age
+		// can never reach 2 on a synthesised flip.
+		//
+		// A synthesis that cannot be made HOLDS EXACTLY AS TODAY and increments exactly one named
+		// reason counter - never a guessed matrix. The order of the tests below is what makes
+		// cam_ref_synth + nowitness + short + rigid + basis + badrel == cam_track_missed hold.
+		if (refsynth == 0)
+		{
+			m_frame_candidate = camera_candidate{};
+			m_camera_ref_state = 9;
+		}
+		else
+		{
+			const camera_track& incumbent = m_camera_tracks[incumbent_slot];
+
+			// 1. Is the active camera even in the incumbent's basis? If a confirm is pending on a new
+			//    witness, or the incumbent's own basis was never installed (run 54 frames 1809-1811),
+			//    then there is no "incumbent reference" being held to refresh, and synthesising one
+			//    would itself be the basis switch. Nothing to do; hold.
+			if (!m_active_camera.valid
+				|| matrix_relative_delta(raw_view_of(m_active_camera), incumbent.view)
+					> s_camera_discontinuity_tolerance)
+			{
+				m_frame_candidate = camera_candidate{};
+				m_camera_ref_state = 5;
+				++m_stats.cam_ref_synth_basis;
+			}
+			else
+			{
+				// 2. The witness scan. A witness must be drawn THIS frame, must be a different object,
+				//    must share the incumbent's camera_own_cluster identity keys (the tracker's own key
+				//    set - a witness on another surface or clip is not interchangeable with it), and
+				//    must carry a relation anchored against THIS incumbent. Longest co-presence first
+				//    (smallest rel_first_frame), ties to the greater vote count.
+				u32 witness_slot = umax;
+
+				for (u32 i = 0; i < s_max_camera_tracks; ++i)
+				{
+					const camera_track& track = m_camera_tracks[i];
+
+					if (i == incumbent_slot || !track.valid || track.matched_index == umax)
+					{
+						continue;
+					}
+
+					if (track.surface_offset != incumbent.surface_offset
+						|| track.color_target != incumbent.color_target
+						|| track.clip_width != incumbent.clip_width
+						|| track.clip_height != incumbent.clip_height
+						|| track.archetype != incumbent.archetype
+						|| track.has_reference != incumbent.has_reference
+						|| track.group_count != incumbent.group_count)
+					{
+						continue;
+					}
+
+					if (!track.rel_valid || track.rel_incumbent_id != incumbent.id
+						|| track.rel_first_frame == umax || track.rel_last_frame == umax)
+					{
+						continue;
+					}
+
+					if (witness_slot == umax)
+					{
+						witness_slot = i;
+						continue;
+					}
+
+					const camera_track& best = m_camera_tracks[witness_slot];
+
+					if (track.rel_first_frame != best.rel_first_frame)
+					{
+						if (track.rel_first_frame < best.rel_first_frame)
+						{
+							witness_slot = i;
+						}
+					}
+					else if (track.votes > best.votes)
+					{
+						witness_slot = i;
+					}
+				}
+
+				if (witness_slot == umax)
+				{
+					m_frame_candidate = camera_candidate{};
+					m_camera_ref_state = 2;
+					++m_stats.cam_ref_synth_nowitness;
+				}
+				else
+				{
+					const camera_track& witness = m_camera_tracks[witness_slot];
+					const f32 rigid = matrix_relative_delta(witness.rel_last, witness.rel_first);
+					camera_candidate synth{};
+					f32 self_check = 0.f;
+
+					// 3. One co-present frame means rel_last == rel_first by construction, so rigidity
+					//    cannot be tested AT ALL - a moving witness would pass a test it never took.
+					if (witness.rel_last_frame == witness.rel_first_frame)
+					{
+						m_frame_candidate = camera_candidate{};
+						m_camera_ref_state = 3;
+						++m_stats.cam_ref_synth_short;
+					}
+					// 4. The relation drifted: the "witness" is a character, a vehicle or a door, and
+					//    synthesising from it would drag the whole world along with it.
+					else if (rigid > s_camera_witness_tolerance)
+					{
+						m_frame_candidate = camera_candidate{};
+						m_camera_ref_state = 4;
+						++m_stats.cam_ref_synth_rigid;
+					}
+					// 5. The algebra itself refused (an inversion, the bridge's own self-check, or a
+					//    non-finite result).
+					else if (!synthesize_camera_from_witness(incumbent, witness,
+						m_frame_camera_candidates[witness.matched_index], synth, self_check))
+					{
+						m_frame_candidate = camera_candidate{};
+						m_camera_ref_state = 6;
+						++m_stats.cam_ref_synth_badrel;
+					}
+					else
+					{
+						m_frame_candidate = synth;
+						m_camera_ref_state = 1;
+						++m_stats.cam_ref_synth;
+
+						if (remix_rsx::camera_relatch_trace_mode() != 0)
+						{
+							// The window is rolled BEFORE the cap is tested, and the cap is shared with
+							// 'Remix cam-relatch:' on purpose: the two rows are read together and one
+							// flooding the other out would make the pairing unreadable.
+							const u64 synth_window = m_frame_counter / s_stats_interval_flips;
+
+							if (m_cam_relatch_window != synth_window)
+							{
+								m_cam_relatch_window = synth_window;
+								m_cam_relatch_lines = 0;
+							}
+
+							if (m_cam_relatch_lines < s_max_cam_relatch_lines)
+							{
+								++m_cam_relatch_lines;
+
+								dump_line(fmt::format(
+									"Remix cam-synth: frame=%llu inc=%u witness=%u wvp=%016llx "
+									"copresent=%llu rel_age=%llu missed=%u rigid=%.3g err=%.3g "
+									"step=%.3g pos=[%.4g %.4g %.4g] line=%u/%u",
+									frame,
+									incumbent.id,
+									witness.id,
+									witness.vp_hash,
+									witness.rel_last_frame - witness.rel_first_frame,
+									frame - witness.rel_last_frame,
+									incumbent.missed,
+									static_cast<f64>(rigid),
+									static_cast<f64>(self_check),
+									static_cast<f64>(eye_distance(synth.position, incumbent.position)),
+									static_cast<f64>(synth.position[0]),
+									static_cast<f64>(synth.position[1]),
+									static_cast<f64>(synth.position[2]),
+									m_cam_relatch_lines,
+									s_max_cam_relatch_lines));
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	else
+	{
+		// No incumbent: the boot frame, or the frame its track died. Greatest tenure wins; ties go to
+		// the track the vote already picked, then to cumulative votes, then to score - so a fresh
+		// scene reduces to today's election exactly. A witness known to be moving is skipped.
+		for (u32 i = 0; i < s_max_camera_tracks; ++i)
+		{
+			const camera_track& track = m_camera_tracks[i];
+
+			if (!track.valid || track.matched_index == umax || track.moving)
+			{
+				continue;
+			}
+
+			if (elected_slot == umax)
+			{
+				elected_slot = i;
+				continue;
+			}
+
+			const camera_track& best = m_camera_tracks[elected_slot];
+			const auto is_vote = [&](const camera_track& value)
+			{
+				return m_frame_candidate.valid
+					&& matrix_relative_delta(raw_view_of(m_frame_camera_candidates[value.matched_index]),
+						raw_view_of(m_frame_candidate)) <= 1e-6f;
+			};
+
+			bool better;
+
+			if (track.first_frame != best.first_frame)
+			{
+				better = track.first_frame < best.first_frame;
+			}
+			else if (is_vote(track) != is_vote(best))
+			{
+				better = is_vote(track);
+			}
+			else if (track.votes != best.votes)
+			{
+				better = track.votes > best.votes;
+			}
+			else
+			{
+				better = track.score > best.score;
+			}
+
+			if (better)
+			{
+				elected_slot = i;
+			}
+		}
+
+		if (elected_slot != umax)
+		{
+			m_frame_candidate = m_frame_camera_candidates[m_camera_tracks[elected_slot].matched_index];
+			handover = had_incumbent;
+			m_camera_track_handover_frame = handover;
+		}
+	}
+
+	// --- the bridge (RPCS3_REMIX_CAMREBASE) ----------------------------------------------------
+	bool bridged = false;
+	f32 bridge_error = 0.f;
+	bool copresent = false;
+
+	if (handover)
+	{
+		const camera_track& elected = m_camera_tracks[elected_slot];
+
+		// Bridgeable only if the incoming witness was drawn alongside the outgoing one inside the
+		// miss window - without that there is no frame in which the relation between the two could
+		// have been measured, and the handover is a real cut.
+		copresent = elected.copresent_frame != umax
+			&& frame >= elected.copresent_frame
+			&& (frame - elected.copresent_frame) <= u64{miss_frames} + 1;
+
+		++m_stats.cam_track_handover;
+
+		if (!copresent)
+		{
+			++m_stats.cam_track_reset;
+		}
+
+		if (rebase)
+		{
+			const remix_rsx::mat4 r_old = m_camera_rebase_valid ? m_camera_rebase : remix_rsx::mat4_identity();
+			remix_rsx::mat4 relation_inverse{};
+
+			if (copresent && elected.rel_valid
+				&& elected.rel_last_frame != umax
+				&& frame >= elected.rel_last_frame
+				&& (frame - elected.rel_last_frame) <= u64{miss_frames} + 1
+				&& remix_rsx::mat4_invert(elected.rel_last, relation_inverse))
+			{
+				// rel = J x I^-1, so I = rel^-1 x J and the basis the session has been submitting,
+				// R_old x I, is reproduced from the new witness as (R_old x rel^-1) x J. The true
+				// camera cancels in rel, which is why this can be measured at all.
+				remix_rsx::mat4 next = remix_rsx::mat4_multiply(r_old, relation_inverse);
+
+				// Self-check in the frame the relation was measured in. Exact algebra makes the two
+				// sides identical, so this is a conditioning test on the two inversions and a
+				// rigidity test on the pair: a cut across a real shot change is not rigid and fails.
+				bridge_error = matrix_relative_delta(
+					remix_rsx::mat4_multiply(next, elected.rel_last_view),
+					remix_rsx::mat4_multiply(r_old, elected.rel_last_incumbent_view));
+
+				if (remix_rsx::mat4_is_finite(next) && bridge_error <= s_camera_pending_match_tolerance)
+				{
+					// Gram-Schmidt on the rows of the 3x3. R is composed once per handover and split
+					// noise accumulates across a session; re-orthonormalising keeps it a rotation.
+					// A degenerate row is left alone rather than replaced by a zero one.
+					remix_rsx::mat4 orthonormal = next;
+					bool degenerate = false;
+
+					for (u32 i = 0; i < 3 && !degenerate; ++i)
+					{
+						for (u32 j = 0; j < i; ++j)
+						{
+							f32 dot = 0.f;
+
+							for (u32 k = 0; k < 3; ++k)
+							{
+								dot += orthonormal.m[i][k] * orthonormal.m[j][k];
+							}
+
+							for (u32 k = 0; k < 3; ++k)
+							{
+								orthonormal.m[i][k] -= dot * orthonormal.m[j][k];
+							}
+						}
+
+						f32 length = 0.f;
+
+						for (u32 k = 0; k < 3; ++k)
+						{
+							length += orthonormal.m[i][k] * orthonormal.m[i][k];
+						}
+
+						length = std::sqrt(length);
+
+						if (!(length > 1e-6f))
+						{
+							degenerate = true;
+							break;
+						}
+
+						for (u32 k = 0; k < 3; ++k)
+						{
+							orthonormal.m[i][k] /= length;
+						}
+					}
+
+					if (!degenerate)
+					{
+						next = orthonormal;
+					}
+
+					remix_rsx::mat4 next_inverse{};
+
+					if (remix_rsx::mat4_invert(next, next_inverse))
+					{
+						m_camera_rebase = next;
+						m_camera_rebase_inverse = next_inverse;
+						m_camera_rebase_valid = true;
+						// ROUND 54 tripwire, the first of the three -- and only three -- writers of R.
+						// See m_camera_rebase_generation: a drift row whose rgen moved with no
+						// 'Remix cam-track:' handover or reset row at any frame in between would mean R
+						// changed outside a handover, which is impossible by code. Frozen at 0 with
+						// CAMREBASE off, where the tripwire is inert and the field costs nothing.
+						++m_camera_rebase_generation;
+						bridged = true;
+						++m_stats.cam_rebase_applied;
+					}
+				}
+				else
+				{
+					++m_stats.cam_rebase_refused;
+				}
+			}
+
+			if (!bridged)
+			{
+				// Today's path exactly: no rebase, and the flip's 12-frame confirm sees the jump and
+				// handles it as it does now.
+				m_camera_rebase = remix_rsx::mat4_identity();
+				m_camera_rebase_inverse = remix_rsx::mat4_identity();
+				m_camera_rebase_valid = false;
+				// ROUND 54 tripwire, the second writer of R. A reset is a change of basis like
+				// any other, so it advances the generation too -- otherwise a light placed under
+				// a bridged R and re-placed after a reset would read rgen == rgen_old.
+				++m_camera_rebase_generation;
+				++m_stats.cam_rebase_reset;
+			}
+
+			// Every stored relation was expressed against the OUTGOING incumbent and means nothing
+			// against the new one.
+			for (camera_track& track : m_camera_tracks)
+			{
+				track.rel_valid = false;
+				track.rel_first_frame = umax;
+				track.rel_last_frame = umax;
+			}
+		}
+	}
+	else if (elected_slot != umax && !had_incumbent && rebase && m_camera_rebase_valid)
+	{
+		// A first election after the incumbent expired in a frame that had no clusters at all. There
+		// is no predecessor to bridge from, so the basis has to go back to the title's own.
+		m_camera_rebase = remix_rsx::mat4_identity();
+		m_camera_rebase_inverse = remix_rsx::mat4_identity();
+		m_camera_rebase_valid = false;
+		// ROUND 54 tripwire, the third and last writer of R.
+		++m_camera_rebase_generation;
+		++m_stats.cam_rebase_reset;
+	}
+
+	// --- census --------------------------------------------------------------------------------
+	const f32 rebase_determinant = m_camera_rebase_valid
+		? (m_camera_rebase.m[0][0] * (m_camera_rebase.m[1][1] * m_camera_rebase.m[2][2] - m_camera_rebase.m[1][2] * m_camera_rebase.m[2][1])
+			- m_camera_rebase.m[0][1] * (m_camera_rebase.m[1][0] * m_camera_rebase.m[2][2] - m_camera_rebase.m[1][2] * m_camera_rebase.m[2][0])
+			+ m_camera_rebase.m[0][2] * (m_camera_rebase.m[1][0] * m_camera_rebase.m[2][1] - m_camera_rebase.m[1][1] * m_camera_rebase.m[2][0]))
+		: 0.f;
+
+	if (handover)
+	{
+		const camera_track& elected = m_camera_tracks[elected_slot];
+
+		report_camera_track(copresent ? "handover" : "reset",
+			outgoing.valid ? outgoing.id : m_camera_track_incumbent,
+			outgoing.valid ? (outgoing.last_frame - outgoing.first_frame) : u64{0},
+			outgoing.vp_hash,
+			outgoing.position,
+			elected.id,
+			frame - elected.first_frame,
+			elected.vp_hash,
+			elected.position,
+			outgoing.valid ? eye_distance(elected.position, outgoing.position) : 0.f,
+			m_frame_candidate.observations,
+			max_votes,
+			live_tracks,
+			bridged,
+			bridge_error,
+			rebase_determinant);
+	}
+	else if (incumbent_died)
+	{
+		// The incumbent's track ran out of miss window in a frame with nothing to hand over to. The
+		// identity stays vacant and the next frame that draws a cluster elects; m_camera_track_incumbent
+		// is deliberately left pointing at the dead id so that election is counted as a handover.
+		report_camera_track("expire",
+			outgoing.id,
+			outgoing.last_frame - outgoing.first_frame,
+			outgoing.vp_hash,
+			outgoing.position,
+			static_cast<u32>(umax),
+			u64{0},
+			u64{0},
+			outgoing.position,
+			0.f,
+			0u,
+			max_votes,
+			live_tracks,
+			false,
+			0.f,
+			rebase_determinant);
+	}
+
+	if (elected_slot == umax)
+	{
+		return;
+	}
+
+	m_camera_track_incumbent = m_camera_tracks[elected_slot].id;
+
+	// --- co-presence and witness consistency ---------------------------------------------------
+	if (m_camera_tracks[elected_slot].matched_index != umax)
+	{
+		const camera_track incumbent = m_camera_tracks[elected_slot];
+		remix_rsx::mat4 incumbent_inverse{};
+		// ROUND 55: `relations` rather than `rebase` - the reference synthesis needs rel_first/rel_last
+		// on the CAMREBASE-off arm. Only the TABLE is un-gated; the drift verdict below keeps its
+		// `rebase &&` so track.moving, cam_track_witness_moving, cam_track_incumbent_moving and
+		// m_camera_incumbent_moving_frame stay structurally 0 here and the election is bit-exact.
+		const bool invertible = relations && remix_rsx::mat4_invert(incumbent.view, incumbent_inverse);
+
+		std::array<u32, s_max_camera_tracks> drifted{};
+		u32 drifted_used = 0;
+
+		for (u32 i = 0; i < s_max_camera_tracks; ++i)
+		{
+			camera_track& track = m_camera_tracks[i];
+
+			if (i == elected_slot || !track.valid || track.matched_index == umax)
+			{
+				continue;
+			}
+
+			// The stamp the handover reads. Maintained under CAMTRACK alone, where it is the only
+			// thing that separates a bridgeable handover from a real cut.
+			track.copresent_frame = frame;
+
+			if (!invertible)
+			{
+				continue;
+			}
+
+			// rel = J x I^-1 = M_J x M_I^-1: the true camera cancels, so this is constant for a pair
+			// of static objects and drifts only if one of them is moving.
+			const remix_rsx::mat4 relation = remix_rsx::mat4_multiply(track.view, incumbent_inverse);
+
+			if (!remix_rsx::mat4_is_finite(relation))
+			{
+				continue;
+			}
+
+			// ROUND 55: re-anchor when the relation belongs to a DIFFERENT incumbent. The CAMREBASE
+			// handover loop clears rel_valid on every track when the incumbent changes, but that loop
+			// runs only under `rebase`; on the refsynth arm the stamp is what stops a relation measured
+			// against a previous incumbent from being used against this one.
+			if (!track.rel_valid || track.rel_incumbent_id != incumbent.id)
+			{
+				track.rel_valid = true;
+				track.rel_first = relation;
+				track.rel_first_frame = frame;
+				track.rel_incumbent_id = incumbent.id;
+			}
+			else if (rebase && !track.moving
+				&& matrix_relative_delta(relation, track.rel_first) > s_camera_witness_tolerance)
+			{
+				track.moving = true;
+				++m_stats.cam_track_witness_moving;
+				drifted[drifted_used++] = i;
+			}
+
+			track.rel_last = relation;
+			track.rel_last_frame = frame;
+			track.rel_last_view = track.view;
+			track.rel_last_incumbent_view = incumbent.view;
+		}
+
+		if (drifted_used >= 2)
+		{
+			// Two or more witnesses drifted against the same incumbent in one frame. The common term
+			// is the incumbent, so it is the incumbent that is moving and the witnesses are innocent:
+			// clear their flags and re-anchor their relations so the measurement restarts rather than
+			// re-firing every frame. CAMREBASE mode 2 would hand over here; this round only counts.
+			++m_stats.cam_track_incumbent_moving;
+			// ROUND 54: the same verdict, held for the frame so the guest-light drift census - which
+			// runs mid-frame, long after this - can print it as inc_moving. Describes the LAST
+			// COMPLETED FLIP when read from a draw, which is what the row's field means.
+			m_camera_incumbent_moving_frame = true;
+
+			for (u32 k = 0; k < drifted_used; ++k)
+			{
+				camera_track& track = m_camera_tracks[drifted[k]];
+				track.moving = false;
+				track.rel_first = track.rel_last;
+				track.rel_first_frame = frame;
+			}
+		}
+	}
+
+	// Last, so a handover's freshly composed R is the one this frame's candidate is expressed in.
+	// A missed frame leaves m_frame_candidate invalid and this is a no-op there.
+	if (rebase)
+	{
+		rebase_camera(m_frame_candidate);
+	}
+}
+
 void RemixGSRender::consider_camera_candidate(const camera_candidate& candidate, bool reserved_attempt)
 {
 	// Apply an explicit camera lock before voting. A named fallback participates only until the
@@ -17288,10 +23481,20 @@ void RemixGSRender::consider_camera_candidate(const camera_candidate& candidate,
 	// per-frame latched main clip and then to the active camera's own clip. With none of the three
 	// available every candidate is admitted, because a boot frame must not be camera-less.
 	//
+	// ROUND 52: CAMCLIPGATE=2 LIFTS THAT SCOPING and runs the same ladder with no lock configured,
+	// because a title can be unable to use a lock and still need this gate. On Eat Lead
+	// (BLUS30267) no VP exceeds 60.6% frame presence and pinning one was measured live as
+	// cam_resolved=0 / 100% fallback / a black screen - yet its 128x128 fov=90 aspect=1.0
+	// near=0.01 cube-face pass (1b20d02263aa8ee4 / f5265372e9f61872) wins the vote outright: 14
+	// frames of run 13, including the FIRST camera of the run (frame 931, candidates=1, position
+	// 30 units off). score_perspective's square-aspect refusal cannot catch it - that test is fed
+	// the candidate's own clip aspect, 1.0 for a square pass - and neither can a target rule, since
+	// 155 of the 157 128x128 rows are on target 31, the same target as the main pass.
+	//
 	// Placed at the head, above the lock/fallback filter and therefore above everything downstream
 	// of it: the split-failure recovery path also runs inside candidate consideration, so it
 	// inherits this gate rather than routing around it.
-	if (lock_vp != 0 && remix_rsx::camera_clip_gate_enabled())
+	if ((lock_vp != 0 || remix_rsx::camera_clip_gate_mode() >= 2) && remix_rsx::camera_clip_gate_enabled())
 	{
 		u32 ref_width = 0;
 		u32 ref_height = 0;
@@ -17433,33 +23636,210 @@ void RemixGSRender::consider_camera_candidate(const camera_candidate& candidate,
 	// still own switches. The split_failed recovery path (:6562) only gets easier: it divides the
 	// incoming fused matrix by this same reference_inverse, and a fresher reference leaves a
 	// 'relative' that is closer to rigid, not further.
+	//
+	// ROUND 52 - IT WAS NOT NARROW ENOUGH, and this is the Eat Lead main-menu symptom ("the camera
+	// rides the player character's revolver and oscillates"). The identity keys and 0.8 admit any
+	// draw on the main pass whose view is merely near the active one, and this takes the FIRST such
+	// candidate of the frame. In every sampled menu frame of run 13 that was a ONE-vote animated
+	// part - one of four near-identical 633ba74c6b235af7 clusters drifting -2.3212 -> -2.3270 ->
+	// -2.3329 frame to frame - while the 9-vote winner 001e6e3d1495ee54 sat static at
+	// [-1.6456 2.4655 -0.5667], 0.40 away. submit_camera() submits m_active_camera AFTER this
+	// refresh, so the Remix camera followed the part: winner >= 0.05 from what was submitted on 727
+	// of 1,074 contested menu frames (68%), and 1,312 of 4,731 in gameplay (28%). "Same source and
+	// continuous" is not "the same camera one frame later"; camera_own_cluster at CAMRELATCHTOL is.
+	// The rasterised picture was never wrong (world = fused x ref^-1 is exact whichever cluster is
+	// the reference) - the world pose, the lighting anchor and the temporal history were.
+	//
+	// cam_relatch_refused is the population the tightening removes: candidates that pass today's
+	// 0.8 test and fail the configured one. Structurally 0 at CAMRELATCHTOL=0.8, which is the
+	// default, so an unarmed run is bit-exact and says so.
 	if (remix_rsx::camera_relatch_enabled()
-		&& m_active_camera.valid
-		&& candidate.valid
 		&& m_active_camera.latch_frame != m_frame_counter
-		&& candidate.surface_offset == m_active_camera.surface_offset
-		&& candidate.color_target == m_active_camera.color_target
-		&& candidate.clip_width == m_active_camera.clip_width
-		&& candidate.clip_height == m_active_camera.clip_height
-		&& candidate.archetype == m_active_camera.archetype
-		// has_reference and group_count decide which branch of per_draw_transform a draw takes.
-		// Refreshing across a change in either would move the frame's remaining draws onto a
-		// different transform model mid-frame, which is the one thing this must never do.
-		&& candidate.has_reference == m_active_camera.has_reference
-		&& candidate.group_count == m_active_camera.group_count
-		&& matrix_relative_delta(candidate.view, m_active_camera.view) <= s_camera_discontinuity_tolerance
-		&& matrix_relative_delta(candidate.projection, m_active_camera.projection) <= 1e-2f)
+		&& camera_own_cluster(candidate, s_camera_discontinuity_tolerance)
+		&& !camera_own_cluster(candidate, remix_rsx::camera_relatch_tolerance()))
 	{
-		m_active_camera.view = candidate.view;
-		m_active_camera.projection = candidate.projection;
-		m_active_camera.reference_inverse = candidate.reference_inverse;
-		m_active_camera.has_view_proj_inverse = candidate.has_view_proj_inverse;
-		m_active_camera.view_proj_inverse = candidate.view_proj_inverse;
-		m_active_camera.position[0] = candidate.position[0];
-		m_active_camera.position[1] = candidate.position[1];
-		m_active_camera.position[2] = candidate.position[2];
-		m_active_camera.latch_frame = m_frame_counter;
-		++m_stats.cam_relatch_midframe;
+		++m_stats.cam_relatch_refused;
+	}
+
+	if (remix_rsx::camera_relatch_enabled()
+		&& m_active_camera.latch_frame != m_frame_counter
+		&& camera_own_cluster(candidate, remix_rsx::camera_relatch_tolerance()))
+	{
+		// ROUND 53. The second of the two sites that install a candidate into m_active_camera, so it
+		// is the second that has to express it in the session's basis. rebase_camera is a no-op while
+		// RPCS3_REMIX_CAMREBASE is off or R is not live, which makes this bit-exact without it.
+		//
+		// The split-failure recovery candidate (recovered.view = relative x m_active_camera.view) is
+		// deliberately NOT routed through here: it comes out raw by construction, because `relative`
+		// is built from m_active_camera.reference_inverse, which carries R^-1, while
+		// m_active_camera.view carries R - the two cancel and the recovery re-enters candidate
+		// consideration as an ordinary raw cluster.
+		camera_candidate refreshed = candidate;
+		rebase_camera(refreshed);
+
+		// --- ROUND 54: RELATCH PROVENANCE, measurement only ------------------------------------
+		// Taken BEFORE the copy below, because the copy is what destroys the answer: after it,
+		// m_active_camera IS the refreshed candidate and "how far did the reference just move" is
+		// unanswerable from anything the build keeps.
+		//
+		// TWO DIFFERENT QUANTITIES, deliberately measured in two different bases:
+		//   step  - refreshed.position against m_active_camera.position, both SUBMITTED (rebase_camera
+		//           re-derives the eye from the rebased view, and m_active_camera is rebased too).
+		//           This is directly comparable with a drift row's d, which is also a submitted-basis
+		//           distance, and an S-order row's d should match it.
+		//   inc_d - candidate.position against the incumbent TRACK's position, both RAW. The tracker
+		//           stores raw cluster eyes on purpose, and mixing the two bases would make this read
+		//           |translation of R| on every row after the first bridge - the self-check is that
+		//           inc_d stays under 1.0 on the great majority of rows just after a bridged handover.
+		//
+		// The three counters partition cam_relatch_midframe exactly (incumbent + foreign + noinc ==
+		// cam_relatch on the live line, which is the acceptance) and accumulate whether or not
+		// CAMRELATCHTRACE is armed - the knob only decides whether the rows are printed.
+		const auto relatch_eye_distance = [](const f32 (&lhs)[3], const f32 (&rhs)[3])
+		{
+			const f32 dx = lhs[0] - rhs[0];
+			const f32 dy = lhs[1] - rhs[1];
+			const f32 dz = lhs[2] - rhs[2];
+			return std::sqrt(dx * dx + dy * dy + dz * dz);
+		};
+
+		const f32 relatch_step = relatch_eye_distance(refreshed.position, m_active_camera.position);
+		s32 relatch_inc = -1;
+		f32 relatch_inc_d = 0.f;
+
+		if (m_camera_track_incumbent != umax)
+		{
+			for (const camera_track& track : m_camera_tracks)
+			{
+				if (!track.valid || track.id != m_camera_track_incumbent)
+				{
+					continue;
+				}
+
+				relatch_inc_d = relatch_eye_distance(candidate.position, track.position);
+				relatch_inc = relatch_inc_d <= remix_rsx::camera_track_position_tolerance() ? 1 : 0;
+				break;
+			}
+		}
+
+		// --- ROUND 55, RPCS3_REMIX_CAMREFSYNTH: the relatch honours the tracker's identity --------
+		// The relatch never decides identity - it takes the FIRST candidate of the frame within
+		// CAMRELATCHTOL of whatever view is active - and that is fine while the flip latch has just
+		// installed the incumbent's own object. It stops being fine on a SYNTHESISED frame: the
+		// incumbent is by definition not drawn there, so every candidate near the synthesised view is
+		// a different object, and an unconstrained relatch would hand the basis to a sibling on
+		// precisely the frames this round exists to fix. That is the run-54 frame-1568 mechanism
+		// (inc_d=2.35 inc_ok=0: a sibling 2.3 units off took the reference).
+		//
+		// relatch_inc is the census the round-54 work already computes: 1 = this draw is within
+		// CAMTRACKPOS of the incumbent track, 0 = it is not, -1 = there is no live incumbent to ask.
+		// Only 0 is refused. -1 is NEVER refused - with no incumbent there is no identity to honour,
+		// and refusing there would change boot behaviour for no reason.
+		//
+		// A refused relatch touches nothing: not the incumbent/foreign/noinc partition (those count
+		// relatches that HAPPENED), not m_frame_relatch_*, not m_active_camera, not latch_frame - so a
+		// later draw of the incumbent's own object in the same frame can still relatch normally.
+		const bool foreign_refused = remix_rsx::camera_ref_synth_mode() != 0 && relatch_inc == 0;
+
+		if (foreign_refused)
+		{
+			++m_stats.cam_relatch_foreign_refused;
+		}
+		else if (relatch_inc == 1)
+		{
+			++m_stats.cam_relatch_incumbent;
+		}
+		else if (relatch_inc == 0)
+		{
+			++m_stats.cam_relatch_foreign;
+		}
+		else
+		{
+			// No live incumbent to compare against: the boot frames, or a frame after every track
+			// died. Not a foreign reference and not an incumbent one - a third outcome, so that the
+			// partition against cam_relatch stays exact instead of quietly folding into 'foreign'.
+			++m_stats.cam_relatch_noinc;
+		}
+
+		if (!foreign_refused)
+		{
+			m_frame_relatch_count = 1;
+			m_frame_relatch_step = relatch_step;
+			m_frame_relatch_inc = relatch_inc;
+			m_frame_relatch_inc_d = relatch_inc_d;
+			m_frame_relatch_ordinal = m_frame_world_draws;
+			m_frame_relatch_position[0] = candidate.position[0];
+			m_frame_relatch_position[1] = candidate.position[1];
+			m_frame_relatch_position[2] = candidate.position[2];
+			m_frame_relatch_vp = candidate.vp_hash;
+		}
+
+		if (remix_rsx::camera_relatch_trace_mode() != 0)
+		{
+			// The window is rolled BEFORE the cap is tested, the order report_camera_track and the
+			// drift census both use: testing the cap first looks equivalent and is not - once the
+			// first window fills, the reset is never reached again and the census goes silent for
+			// the rest of the session.
+			const u64 relatch_window = m_frame_counter / s_stats_interval_flips;
+
+			if (m_cam_relatch_window != relatch_window)
+			{
+				m_cam_relatch_window = relatch_window;
+				m_cam_relatch_lines = 0;
+			}
+
+			if (m_cam_relatch_lines < s_max_cam_relatch_lines)
+			{
+				++m_cam_relatch_lines;
+
+				dump_line(fmt::format(
+					"Remix cam-relatch: frame=%llu vp=%016llx pos=[%.4g %.4g %.4g] "
+					"active=[%.4g %.4g %.4g] step=%.3g inc=%u inc_d=%.3g inc_ok=%d ord=%llu "
+					"age=%u rgen=%u refused=%d line=%u/%u",
+					m_frame_counter,
+					candidate.vp_hash,
+					static_cast<f64>(candidate.position[0]), static_cast<f64>(candidate.position[1]),
+					static_cast<f64>(candidate.position[2]),
+					static_cast<f64>(m_active_camera.position[0]),
+					static_cast<f64>(m_active_camera.position[1]),
+					static_cast<f64>(m_active_camera.position[2]),
+					static_cast<f64>(relatch_step),
+					m_camera_track_incumbent == umax ? 0u : m_camera_track_incumbent,
+					static_cast<f64>(relatch_inc_d),
+					relatch_inc,
+					m_frame_relatch_ordinal,
+					m_camera_age,
+					m_camera_rebase_generation,
+					foreign_refused ? 1 : 0,
+					m_cam_relatch_lines,
+					s_max_cam_relatch_lines));
+			}
+		}
+
+		// ROUND 55: a refused relatch installs nothing. m_active_camera and latch_frame are left as the
+		// flip set them, so this frame's draws divide by the flip's reference (synthesised or held) and
+		// a later draw of the incumbent's OWN object can still relatch, exactly as it would have.
+		if (!foreign_refused)
+		{
+			m_active_camera.view = refreshed.view;
+			m_active_camera.projection = refreshed.projection;
+			m_active_camera.reference_inverse = refreshed.reference_inverse;
+			m_active_camera.has_view_proj_inverse = refreshed.has_view_proj_inverse;
+			m_active_camera.view_proj_inverse = refreshed.view_proj_inverse;
+			m_active_camera.position[0] = refreshed.position[0];
+			m_active_camera.position[1] = refreshed.position[1];
+			m_active_camera.position[2] = refreshed.position[2];
+			m_active_camera.raw_view = refreshed.raw_view;
+			m_active_camera.rebased = refreshed.rebased;
+			m_active_camera.latch_frame = m_frame_counter;
+			++m_stats.cam_relatch_midframe;
+
+			// ROUND 57. HERE, and after the increment: the frame's reference has just been installed,
+			// so every draw held for it can now be placed with the same arithmetic a post-relatch
+			// draw uses. Returns immediately unless RPCS3_REMIX_DEFERPRERELATCH armed the buffer -
+			// m_deferred_instances is empty on the control arm of this title.
+			flush_deferred_for_relatch();
+		}
 	}
 
 	camera_candidate* cluster = nullptr;
@@ -17553,9 +23933,37 @@ void RemixGSRender::consider_camera_candidate(const camera_candidate& candidate,
 	}
 	else if (lock_vp == 0)
 	{
+		// ROUND 52, RPCS3_REMIX_CAMSTICKY: the same rank-before-votes rule the lock path above
+		// applies, generalised to the path a title with no usable lock actually takes.
+		//
+		// Eat Lead flip-flops between same-lens clusters: 72 identity changes in 4,806 gameplay
+		// frames (15 per 1,000, winners 10-25 units apart - e.g. frames 4515 -> 4528 -> 4573 ->
+		// 4590), and in 54 of them a cluster CONTINUOUS WITH THE PREVIOUS WINNER was present in
+		// the frame and simply lost the vote by a mean margin of 2.3 observations; 42 had one
+		// within 0.1. The vote has no notion of who was elected last frame, so a prop that draws
+		// one more time than the camera takes the identity, and with it the gauge and the
+		// lighting anchor.
+		//
+		// The incumbent's own cluster therefore outranks any cluster that is not, regardless of
+		// votes; among equals the observation count then the score decide exactly as before; and
+		// a frame with NO own cluster - a real cut - elects by vote exactly as before and still
+		// goes through the existing 12-frame confirm at flip. Nothing here can elect a cluster
+		// that the vote could not already have elected; it only reorders.
+		//
+		// Armed only together with CAMRELATCHTOL below 0.8, and the tolerance used is that same
+		// knob: with the relatch still refreshing m_active_camera from props, "own cluster" would
+		// be measured against a prop and the hysteresis would lock onto it. Default 0.
+		const bool sticky = remix_rsx::camera_sticky_enabled();
+		const f32 own_tolerance = remix_rsx::camera_relatch_tolerance();
+		const bool cluster_own = sticky && camera_own_cluster(*cluster, own_tolerance);
+		const bool winner_own = sticky && camera_own_cluster(m_frame_candidate, own_tolerance);
+
 		if (!m_frame_candidate.valid
-			|| cluster->observations > m_frame_candidate.observations
-			|| (cluster->observations == m_frame_candidate.observations && cluster->score > m_frame_candidate.score))
+			|| (cluster_own && !winner_own)
+			|| (cluster_own == winner_own
+				&& (cluster->observations > m_frame_candidate.observations
+					|| (cluster->observations == m_frame_candidate.observations
+						&& cluster->score > m_frame_candidate.score))))
 		{
 			m_frame_candidate = *cluster;
 		}
@@ -17635,6 +24043,16 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 	// and a draw that did not take that branch must never inherit the previous draw's verdict - the
 	// flush would then re-cross a placement that was built by the plain division.
 	m_scratch_defer_projsplit = false;
+
+	// ROUND 57, same lifetime and the same reason again. The pick-fresh stash must describe THIS
+	// draw's divide or none at all: a draw refused before the world branch, or one that never
+	// matched the followed program, must not leave the previous draw's fused/reference armed for
+	// trace_pick_follow to promote.
+	m_scratch_pick_valid = false;
+
+	// ROUND 57, same lifetime. Only the DEFERPRERELATCH arm below sets it, and a draw held for a
+	// gauge ANCHOR must never be flushed by the relatch - it is waiting on a different event.
+	m_scratch_defer_relatch = false;
 
 	// ROUND 46, same lifetime. Written at the submit site by the viewmodel operator block, which is
 	// the only place that knows whether an operator ran; cleared here so a non-viewmodel draw can
@@ -17892,8 +24310,14 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 				return false;
 			}
 
+			remix_rsx::mat4 matrix = remix_rsx::slots_to_matrix(slots, fp.outer_shape());
+			if (fp.demons_particle_depth && !remix_rsx::read_group_matrix(fp, 0, matrix))
+			{
+				note_world_fail(5);
+				return false;
+			}
 			const remix_rsx::mat4 fused = remix_rsx::fold_viewport_z(
-				remix_rsx::slots_to_matrix(slots, fp.outer_shape()),
+				matrix,
 				rsx::method_registers.viewport_scale_z(),
 				rsx::method_registers.viewport_offset_z());
 
@@ -17965,6 +24389,11 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 			}
 
 			chain = remix_rsx::slots_to_matrix(slots, fp.outer_shape());
+			if (fp.demons_particle_depth && !remix_rsx::read_group_matrix(fp, 0, chain))
+			{
+				note_world_fail(9);
+				return false;
+			}
 		}
 
 		const remix_rsx::mat4 fused = remix_rsx::fold_viewport_z(
@@ -18180,7 +24609,34 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 				// DEFERPREANCHOR=0 makes the whole path dead - it is staged so that when the user
 				// re-tests DEFERPREANCHOR=1 the cheap third is already gone. Set DEFERPREVONLY=0 to
 				// reproduce round 31's deferral population exactly.
-				if (remix_rsx::defer_prev_only_enabled())
+				// --- ROUND 57: hold it for the RELATCH instead --------------------------------
+				//
+				// The branch above declines this draw because no gauge anchor exists for its render
+				// source in this frame or the last, and on this title that is EVERY world draw
+				// (defer_absent_declined=3087767, defer_buffered=0). But an anchor is not the only
+				// thing a draw can usefully wait for. If the frame's own CAMERA reference has not
+				// been installed yet - latch_frame != m_frame_counter, the same predicate
+				// world_ref_stale counts a few lines below - then this draw is about to be divided
+				// by the flip latch of frame N-1 and will land at OS x M x Q_N, displaced by the
+				// camera's own frame-to-frame motion. That is the measured cause of the props
+				// swimming (RPCS3_REMIX_PICKFRESH's doc block has the numbers), and holding the draw
+				// until the mid-frame relatch installs the frame's reference removes it EXACTLY,
+				// because the flush then does the identical arithmetic a post-relatch draw does.
+				//
+				// Ordered before the DEFERPREVONLY test so this arm is the one that decides, and so
+				// defer_relatch_armed + defer_absent_declined == gauge_anchor_absent stays a
+				// partition. Requires camera_relatch_enabled(): with the relatch off there is no
+				// mid-frame event to flush on and every held draw would simply reach flip.
+				if (remix_rsx::defer_pre_relatch_enabled()
+					&& remix_rsx::camera_relatch_enabled()
+					&& m_active_camera.valid
+					&& m_active_camera.latch_frame != m_frame_counter)
+				{
+					defer_candidate = true;
+					m_scratch_defer_relatch = true;
+					++m_stats.defer_relatch_armed;
+				}
+				else if (remix_rsx::defer_prev_only_enabled())
 				{
 					++m_stats.defer_absent_declined;
 				}
@@ -18539,6 +24995,34 @@ bool RemixGSRender::per_draw_transform(remixapi_Transform& out)
 			m_scratch_defer_clip_w = defer_clip_w;
 			m_scratch_defer_clip_h = defer_clip_h;
 			m_scratch_defer_pending = true;
+		}
+
+		// --- ROUND 57: the pick-fresh stash, same capture pattern, same reason ------------------
+		//
+		// The three operands this draw's placement was built from, so the flip can re-divide the
+		// SAME fused by the frame's OWN relatched reference and turn the followed object's pose
+		// error into a number. object_space is the composite obtained by running the very same
+		// prepend_object_space lambda on an identity, exactly as the deferral above does - there is
+		// no second copy of that composition to drift from the live one.
+		//
+		// *reference, not m_active_camera.reference_inverse: the branches above can point 'reference'
+		// at a gauge anchor's inverse or at the viewmodel camera, and the stash has to carry THE
+		// DIVISOR THIS DRAW USED or recheck (which re-divides by it and must reproduce the submitted
+		// origin exactly) would be measuring the wrong matrix.
+		//
+		// Pre-filtered to the followed program during the follow's own 180-frame window, so the cost
+		// is one lambda call on a handful of draws per frame and zero when nothing is being followed.
+		// trace_pick_follow applies the remaining identity tests before promoting this to the stash.
+		if (remix_rsx::pick_fresh_enabled()
+			&& m_pick_follow_generation != 0
+			&& m_frame_counter <= m_pick_follow_until_frame
+			&& m_current_vp_hash == m_pick_follow_vp)
+		{
+			m_scratch_pick_fused = fused;
+			m_scratch_pick_object_space = remix_rsx::mat4_identity();
+			prepend_object_space(m_scratch_pick_object_space);
+			m_scratch_pick_reference = *reference;
+			m_scratch_pick_valid = true;
 		}
 	}
 	else
@@ -19176,9 +25660,10 @@ void RemixGSRender::submit_subdraw()
 		return;
 	}
 
-	if (rsx::method_registers.restart_index_enabled())
+	const bool restart_enabled = rsx::method_registers.restart_index_enabled();
+	if (restart_enabled && !remix_rsx::primitive_restart_enabled())
 	{
-		// Restart sentinels would have to be split into separate meshes.
+		// Preserve the diagnostic opt-out for restart decoding.
 		++m_stats.skip_restart_index;
 		return;
 	}
@@ -19194,10 +25679,70 @@ void RemixGSRender::submit_subdraw()
 		return;
 	}
 
+	// --- ROUND 51: draws the guest itself could not see ---------------------------------------
+	// Two register-only refusals, so they belong here - before the decode they would otherwise pay
+	// for, and before update_camera_candidate(), which these draws currently contest
+	// (cam_contested=2351 over 3193 frames on the measured Eat Lead run).
+	//
+	// THE MEASUREMENT. Eat Lead (BLUS30267) submits ~218 draws/frame from one program pair,
+	// vp=dc76f9c50a96ccba fp=daf4787c7e54c2f7 - 21 of the 22 'no-unit' census rows, and
+	// tex_no_unit=696070 is 99.7% of tex_none=698200. The census rows read
+	//
+	//   had_unit=0 class=no-unit sampled=0x0 clip=1280x720 target=1 depth_write=0 blend=1
+	//   had_unit=0 class=no-unit sampled=0x0 clip=512x512  target=0 depth_write=1 blend=0
+	//
+	// and the fragment program is on disk as bin\remix_ucode\44C301C5011EBEE2.fp (the fp32-export
+	// name: store_refused_fp_ucode strips the 0x9e3779b97f4a7c15 term the log adds, and
+	// daf4787c7e54c2f7 ^ 9e3779b97f4a7c15 = 44C301C5011EBEE2). 48 bytes, three instructions:
+	//
+	//   1e7e7e00 c8001c9d ...   FENCB                (opcode 0x3e, no dest)
+	//   1e010100 00021c9c ...   MOV R0.xyzw, c.x     (opcode 0x01, mask xyzw, END=1)
+	//   00003f80 ...            inline constant {1.0, 0, 0, 0}
+	//
+	// It writes a constant 1.0 and samples nothing (sampled=0x0), so there is no albedo to walk to
+	// and any texture the walk found would be the wrong one. A constant-white opaque draw that the
+	// guest's own picture does not show as white can only be one whose colour writes are masked off
+	// or whose colour target is none - and neither is something the runtime will fix for us: the
+	// Remix API instance path reads only the ALPHA bit of writeMask
+	// (dxvk-remix\src\dxvk\rtx_render\rtx_instance_manager.cpp), so a masked draw becomes a fully
+	// visible grey surface the moment neutral_material is attached.
+	//
+	// Vertex colour is NOT the explanation and is not tried here: vcol_route_blocked=730909 is
+	// exactly tex_none (698200) + blend_astranded (32709) on the same snapshot, and all 32
+	// 'Remix vcolroute:' lines this title emitted read route=none - no vertex program writes
+	// o1/COL0 at all.
+	//
+	// WRONG-DIRECTION FAILURE, stated so it is recognisable: a title that DOES show a masked-RGB
+	// draw (something driven through the alpha channel into a later composite) would lose it. The
+	// tell is a missing object with skip_cmask non-zero, and RPCS3_REMIX_SKIPCMASK=0 restores it in
+	// one restart; RPCS3_REMIX_SKIPNOTARGET=0 does the same for the target=none half.
+	if (remix_rsx::skip_colour_mask_off_enabled()
+		&& !rsx::method_registers.color_mask_r(0)
+		&& !rsx::method_registers.color_mask_g(0)
+		&& !rsx::method_registers.color_mask_b(0))
+	{
+		++m_stats.skip_cmask;
+		// Pre-albedo, like skipvp: nothing has been resolved yet, so the census names the pair only.
+		report_skip_census("cmask", 0, -1.f, -1.f);
+		return;
+	}
+
+	if (remix_rsx::skip_no_colour_target_enabled()
+		&& rsx::method_registers.surface_color_target() == rsx::surface_target::none)
+	{
+		++m_stats.skip_notarget;
+		report_skip_census("notarget", 0, -1.f, -1.f);
+		return;
+	}
+
 	// --- screen-space classification ----------------------------------------------------
 	// When dumping, the skip is deferred until after the decode so that the 2D programs
 	// still get a dump line: their ATTR0 bounding box is the corroborating evidence.
 	bool screen_space = !remix_rsx::keep_ui_enabled() && is_screen_space_draw();
+
+	// ROUND 52. Per DRAW, not cumulative: the two counters below are run totals and cannot say
+	// whether THIS draw was rescued. The 'Remix ui-route:' census reads it a few lines further down.
+	bool ui_route_forced = false;
 
 	// --- round 23: RPCS3_REMIX_UIFORCEVP ------------------------------------------------------
 	// is_screen_space_draw() reads only the live outer constant block and depth_write_enabled(), so
@@ -19211,12 +25756,54 @@ void RemixGSRender::submit_subdraw()
 	//
 	// Deliberately NOT inside is_screen_space_draw(): that method is const and this needs a counter,
 	// and keeping the override at the call site leaves the classifier itself byte-identical.
+	//
+	// ROUND 52 adds the UIFORCEVPDW term and nothing else. With that knob at its default 0 the
+	// expression below is byte-identical to round 23's, so ui_forced stays comparable across every
+	// run that came before; with it at 1 a LISTED program may also be pulled in while writing
+	// depth, which is the only state Eat Lead's menu text is ever drawn in. The subset admitted by
+	// the relaxation alone is counted separately - a shared counter could not answer "did the
+	// depth-write relaxation do anything" independently of "did the list match", which is the same
+	// split round 36 had to make for the pair route.
+	//
+	// ROUND 59 adds the PRE-WORLD term, and only at UIFORCEVPDW=2. At modes 0 and 1 the expression
+	// below is the round-52 expression evaluated in a different order and nothing else, so every
+	// earlier run stays comparable. At mode 2 a listed, DEPTH-WRITING draw is admitted only once
+	// this frame has already submitted a world draw (m_frame_world_draws > 0). MEASURED on Eat Lead:
+	// the DXT1 backdrop fp=0bde04241aed1c6a reads world_before=0 on every census row ever printed
+	// (13/13 round 52, 8/8 on 2026-09-10) while the menu text and HUD read 12..473 - so the term
+	// separates a full-frame background from an overlay without a per-title FP list, and it LEAVES
+	// the refused draw on the world path rather than dropping it.
+	//
+	// Named ui_depth_write and not depth_write on purpose: submit_subdraw already declares a
+	// const bool depth_write in a nested block further down, and shadowing it would be a warning
+	// for no benefit.
+	const bool ui_depth_write = rsx::method_registers.depth_write_enabled();
+	const bool ui_dw_admitted = !ui_depth_write
+		|| (remix_rsx::ui_force_vp_depth_write_enabled()
+			&& (remix_rsx::ui_force_vp_depth_write_mode() != 2 || m_frame_world_draws > 0));
+
 	if (!screen_space && !remix_rsx::keep_ui_enabled()
 		&& remix_rsx::ui_force_vp_matches(m_current_vp_hash)
-		&& !rsx::method_registers.depth_write_enabled())
+		&& ui_dw_admitted)
 	{
 		screen_space = true;
+		ui_route_forced = true;
 		++m_stats.ui_forced;
+
+		if (ui_depth_write)
+		{
+			++m_stats.ui_forced_dw;
+		}
+	}
+	// Listed, depth-writing, would have been admitted at mode 1, refused because the frame has no
+	// world yet. Structurally 0 unless the mode is 2 and UIFORCEVP names a program. The draw still
+	// prints its 'route=world reason=ortho-dw' census row a few lines below, so world_before=0 on
+	// that row is the readable proof of WHY it was refused.
+	else if (!screen_space && !remix_rsx::keep_ui_enabled()
+		&& remix_rsx::ui_force_vp_matches(m_current_vp_hash)
+		&& ui_depth_write && remix_rsx::ui_force_vp_depth_write_enabled())
+	{
+		++m_stats.ui_forced_dw_preworld;
 	}
 
 	// --- round 36: the same override keyed on a (vp, fp) PAIR, for the helmet ------------------
@@ -19240,16 +25827,97 @@ void RemixGSRender::submit_subdraw()
 	// With those blank this expression is the round-36 one, so the counter stays comparable.
 	if (!screen_space && !remix_rsx::keep_ui_enabled()
 		&& remix_rsx::ui_force_pair_any_matches(m_current_vp_hash, m_current_fp_hash)
-		&& !rsx::method_registers.depth_write_enabled())
+		&& (remix_rsx::ui_force_vp_depth_write_enabled()
+			|| !rsx::method_registers.depth_write_enabled()))
 	{
 		screen_space = true;
+		ui_route_forced = true;
 		++m_stats.ui_forced_pair;
+
+		if (rsx::method_registers.depth_write_enabled())
+		{
+			++m_stats.ui_forced_dw;
+		}
+	}
+
+	// In allowlist-only mode an exact pair may already satisfy the ordinary screen-space
+	// classifier. Mark it as forced as well so it remains eligible for compositing below.
+	if (remix_rsx::ui_force_only_enabled() && screen_space && !ui_route_forced
+		&& !remix_rsx::keep_ui_enabled()
+		&& (remix_rsx::ui_force_vp_matches(m_current_vp_hash)
+			|| remix_rsx::ui_force_pair_any_matches(m_current_vp_hash, m_current_fp_hash))
+		&& (remix_rsx::ui_force_vp_depth_write_enabled()
+			|| !rsx::method_registers.depth_write_enabled()))
+	{
+		ui_route_forced = true;
+	}
+
+	// --- ROUND 52: the routing census, and the reason latch it needs ------------------------------
+	//
+	// Latched HERE, where the classifier's answer and both overrides are simultaneously visible.
+	// composite_ui_draw runs several hundred lines downstream and could only re-derive this, which
+	// would report 'ortho' or 'persp' for a draw that was actually FORCED - and "which programs did
+	// the force list have to rescue" is precisely what the step-4 conf list is built from.
+	const char* const route_reason = screen_space_reason();
+	m_scratch_ui_route_reason = ui_route_forced ? "forced" : route_reason;
+
+	// The refused-UI population, named for the first time: orthographic outer block, depth writes
+	// ON, therefore world path. Emitted here because it is the LAST point at which the routing
+	// decision is still in scope - everything after this either decodes the draw or returns.
+	//
+	// KNOWN GAP, stated rather than papered over: the albedo CONTENT HASH is not resolved yet on
+	// this path (the texture bind happens hundreds of lines later, and running it early would create
+	// materials from a diagnostic). The row therefore carries the texture's guest ADDRESS, unit,
+	// dimensions and GCM format instead, which identify it uniquely against 'Remix tex=' and against
+	// the 2D rows of this same census, where the hash IS resolved.
+	if (!screen_space && std::strcmp(route_reason, "ortho-dw") == 0)
+	{
+		ui_route_report refused{};
+		refused.route = "world";
+		refused.reason = route_reason;
+		refused.tex_unit = albedo_texture_unit();
+
+		if (refused.tex_unit >= 0)
+		{
+			const auto& tex = rsx::method_registers.fragment_textures[static_cast<u32>(refused.tex_unit)];
+			refused.tex_address = rsx::get_address(tex.offset(), tex.location());
+			refused.tex_width = tex.width();
+			refused.tex_height = tex.height();
+			refused.tex_format = tex.format();
+		}
+
+		if (m_current_fingerprint)
+		{
+			refused.uv_slot = m_current_fingerprint->texcoord_scale_slot[0];
+
+			if (f32 slot_value[4]{}; refused.uv_slot != remix_rsx::s_no_texcoord_scale
+				&& remix_rsx::read_slot(refused.uv_slot, slot_value))
+			{
+				refused.uv_value = slot_value[0];
+				refused.uv_value_read = true;
+			}
+		}
+
+		report_ui_route(refused);
+	}
+
+	// --- ROUND 52 (step 1b): the listed-hash ucode store ------------------------------------------
+	// Placed BEFORE the 2D/world split, and that placement is the whole point. The composited route
+	// returns a few dozen lines below without ever reaching store_refused_fp_ucode()'s call site,
+	// which sits on the world path behind an `if (!material)` - so a knob that only bypassed the
+	// gates inside that function would still store nothing for a textured 2D program. The function
+	// dedups on the raw hash and writes at most one file, so calling it from two places costs one
+	// set lookup per draw of a listed program and nothing at all otherwise.
+	if (remix_rsx::ucode_store_fp_hash_matches(m_current_fp_hash))
+	{
+		store_refused_fp_ucode();
 	}
 
 	// The title's 2D draws are no longer thrown away: they are rasterized into the overlay
 	// buffer, which needs their positions, so the pre-decode early-out only applies when the
 	// compositor is unavailable.
-	const bool compositing = m_remix.fork_features() && !remix_rsx::compositor_disabled();
+	const bool compositing = m_remix.fork_features() && !remix_rsx::compositor_disabled()
+		&& (!remix_rsx::ui_force_only_enabled() || ui_route_forced);
 
 	if (screen_space && !remix_rsx::dump_enabled() && !compositing)
 	{
@@ -19259,8 +25927,34 @@ void RemixGSRender::submit_subdraw()
 
 	if (!screen_space)
 	{
-		// Every 3D draw is a camera candidate, whether or not it survives the gates below.
-		update_camera_candidate();
+		if (remix_rsx::demons_menu_enabled() && Emu.GetTitleID() == "BLUS30443")
+			++m_demons_ui_frame.non_ui;
+		if (remix_rsx::demons_world_enabled()
+			&& static_cast<u32>(rsx::method_registers.surface_color_target()) == 0)
+		{
+			++m_stats.skip_camera_surface;
+			return;
+		}
+		// This captured horizontal pass writes only alpha/depth. Replaying it as an
+		// opaque Remix surface hides the visible floor behind a white plane.
+		if (remix_rsx::demons_world_enabled()
+			&& m_current_vp_hash == 0xed53cdf8176af8b7ull && m_current_fp_hash == 0x9c9c026440818182ull
+			&& static_cast<u32>(rsx::method_registers.surface_color_target()) == 1
+			&& !rsx::method_registers.color_mask_r(0) && !rsx::method_registers.color_mask_g(0)
+			&& !rsx::method_registers.color_mask_b(0))
+		{
+			++m_stats.skip_render_target;
+			static bool reported_demons_alpha_plane = false;
+			if (!reported_demons_alpha_plane)
+			{
+				reported_demons_alpha_plane = true;
+				rsx_log.notice("Remix Demons: omitted captured alpha/depth-only horizontal pass (RGB writes disabled)");
+			}
+			return;
+		}
+		// Captured offscreen palettes are rasterized into their own texture below.
+		if (!(demons_preview_target() && m_current_fingerprint->palette_implicit_w))
+			update_camera_candidate();
 	}
 
 	// --- locate the interleaved block that feeds ATTR0 ---------------------------------
@@ -19293,6 +25987,40 @@ void RemixGSRender::submit_subdraw()
 		const rsx::index_array_type type = rsx::method_registers.index_type();
 		const u32 type_size = get_index_type_size(type);
 		const u32 element_count = draw_call.get_elements_count();
+		if (restart_enabled)
+		{
+			// Decode exact guest indices before normalization can alias a custom
+			// restart marker with a legitimate maximum-width vertex index.
+			if (element_count < 3 || element_count > s_max_indices_per_mesh / 3)
+			{
+				++m_stats.skip_layout;
+				return;
+			}
+			m_scratch_indices_alt.resize(element_count);
+			if (type == rsx::index_array_type::u16)
+			{
+				const auto* src = reinterpret_cast<const be_t<u16>*>(indexed->raw_index_buffer.data());
+				for (u32 i = 0; i < element_count; ++i) m_scratch_indices_alt[i] = src[i];
+			}
+			else
+			{
+				const auto* src = reinterpret_cast<const be_t<u32>*>(indexed->raw_index_buffer.data());
+				for (u32 i = 0; i < element_count; ++i) m_scratch_indices_alt[i] = src[i];
+			}
+			remix_rsx::restart_to_list(m_scratch_indices_alt.data(), element_count,
+				rsx::method_registers.restart_index(), prim, m_scratch_indices);
+			if (m_scratch_indices.empty())
+			{
+				++m_stats.skip_layout;
+				return;
+			}
+			const auto bounds = std::minmax_element(m_scratch_indices.begin(), m_scratch_indices.end());
+			min_index = *bounds.first;
+			max_index = *bounds.second;
+			for (u32& index : m_scratch_indices) index -= min_index;
+		}
+		else
+		{
 		const bool expandable = remix_rsx::is_buffer_utils_expandable(prim);
 		const u32 index_capacity = expandable ? get_index_count(prim, element_count) : element_count;
 
@@ -19346,6 +26074,8 @@ void RemixGSRender::submit_subdraw()
 			m_scratch_indices_alt.clear();
 			remix_rsx::strip_to_list(m_scratch_indices.data(), ::size32(m_scratch_indices), m_scratch_indices_alt);
 			m_scratch_indices.swap(m_scratch_indices_alt);
+		}
+
 		}
 
 		index_base = rsx::method_registers.vertex_data_base_index();
@@ -19419,12 +26149,24 @@ void RemixGSRender::submit_subdraw()
 		return;
 	}
 
-	// --- decode ATTR0 positions ---------------------------------------------------------
+	// --- decode positions from the attribute the ucode actually reads --------------------
+	// Round 50. This was map_attribute(0, ...) - ATTR0, hard-coded, on the premise that ATTR0 is
+	// the one attribute this backend submits as a position. That is a fact about the BACKEND, and
+	// it was being used as a fact about the GUEST. Eat Lead's world programs feed HPOS from
+	// 'v2.xyz * c[465].x' and route a byte-quantised normal through ATTR0, so this site was
+	// handing Remix a [0..254]-unit normal cloud for the entire title.
+	//
+	// `position_input` is 0 for every program match_const_affine's widened MUL arm did not touch,
+	// so this reads exactly as it always did wherever the position really is ATTR0, and it is the
+	// ONE site that has to change: composite_ui_draw (the 2D route, called below) consumes the
+	// same m_scratch_vertices, so the compositor is fixed transitively.
 	const u32 first_vertex = index_base ? rsx::get_index_from_base(min_index, index_base) : min_index;
+
+	const u32 position_attribute = u32{m_current_fingerprint->position_input};
 
 	attribute_view positions{};
 
-	switch (map_attribute(0, first_vertex, vertex_count, positions))
+	switch (map_attribute(position_attribute, first_vertex, vertex_count, positions))
 	{
 	case attribute_status::ok:
 		break;
@@ -19456,6 +26198,40 @@ void RemixGSRender::submit_subdraw()
 			// asks is "is the fix on the draws in front of me", not "did the matcher like it".
 			++m_stats.wdiv_shadowed_draws;
 			report_wdiv_shadowed();
+		}
+	}
+
+	// Round 50: the position-input widening, counted on the DRAWS that used it, for the same
+	// reason wdiv_shadowed and madmix are - the play-test question is "is the fix on the geometry
+	// in front of me", not "did the matcher like the program". A program is scanned once and drawn
+	// thousands of times, so a program count alone cannot answer it.
+	//
+	// The census line carries scale_slot/comp because those are what build_prescale will fold, and
+	// the expected values are known in advance from the replayed ucode: f2b6988e84056628 must read
+	// input=1 slot=467 comp=0, and the world family input=2 slot=465. A line with the right input
+	// and the wrong slot means the walk found a different MUL than the one that decodes the
+	// position, which is the one way this widening can be right in shape and wrong in fact.
+	if (m_current_fingerprint->position_input != 0)
+	{
+		++m_stats.pos_input_draws;
+
+		if (m_posinput_seen.insert(m_current_vp_hash).second)
+		{
+			++m_stats.pos_input_programs;
+
+			dump_line(fmt::format(
+				"Remix posinput: vp=%016llx input=%u scale_slot=%u comp=%u arch=%s groups=%u "
+				"affine=%d areason=%s vtx=%llu frame=%llu",
+				m_current_vp_hash,
+				u32{m_current_fingerprint->position_input},
+				m_current_fingerprint->affine_scale_slot,
+				u32{m_current_fingerprint->affine_scale_component[0]},
+				remix_rsx::archetype_name(m_current_fingerprint->archetype),
+				m_current_fingerprint->group_count,
+				m_current_fingerprint->has_const_affine ? 1 : 0,
+				m_current_fingerprint->affine_reason ? m_current_fingerprint->affine_reason : "none",
+				static_cast<u64>(vertex_count),
+				m_frame_counter));
 		}
 	}
 
@@ -19549,6 +26325,48 @@ void RemixGSRender::submit_subdraw()
 		}
 	}
 
+	// --- decode the guest's own vertex normal --------------------------------------------
+	// Everything below this comment used to be the constant (0,0,1). Remix shades from the
+	// submitted normal, and for a skinned mesh dxvk-remix's skinning pass rotates it by the same
+	// blended bone matrix it rotates the position by (shaders/rtx/pass/skinning.h reads srcNormal,
+	// accumulates mul(bone, normal) * weight and renormalises), so an object-space normal is the
+	// right space to submit on BOTH paths and neither needs the world matrix applied here.
+	//
+	// The attribute is a knob, not a constant (see normal_attribute_index) and the decode is
+	// gated: a draw whose mean pre-normalisation length is not near 1 keeps the old constant.
+	// That gate is what makes a wrong attribute index safe - the failure mode is today's
+	// behaviour, never a mesh shaded from a texcoord.
+	const bool want_normals = remix_rsx::vertex_normals_enabled();
+
+	attribute_view normal_attr{};
+	bool normals_mapped = false;
+
+	if (want_normals)
+	{
+		const u32 index = remix_rsx::normal_attribute_index();
+
+		if (map_attribute(index, first_vertex, vertex_count, normal_attr) == attribute_status::ok
+			&& (normal_attr.type == rsx::vertex_base_type::cmp || normal_attr.size >= 3))
+		{
+			normals_mapped = true;
+		}
+		else
+		{
+			++m_stats.normal_absent;
+		}
+	}
+
+	// UNORM8 and raw-byte attributes store a normal biased into the positive range; every other
+	// type decode_position produces is already signed. s_scale has divided ub by 255 and left
+	// ub256 raw, hence the two different reconstructions.
+	const bool normal_biased = normals_mapped
+		&& (normal_attr.type == rsx::vertex_base_type::ub || normal_attr.type == rsx::vertex_base_type::ub256);
+	const f32 normal_bias_scale = (normals_mapped && normal_attr.type == rsx::vertex_base_type::ub256) ? (1.f / 127.5f) : 2.f;
+
+	f64 normal_length_sum = 0.0;
+	u32 normal_length_samples = 0;
+	u32 normal_degenerate_here = 0;
+
 	for (u32 i = 0; i < vertex_count; ++i)
 	{
 		f32 position[4] = {};
@@ -19581,9 +26399,84 @@ void RemixGSRender::submit_subdraw()
 		v.normal[0] = 0.f;
 		v.normal[1] = 0.f;
 		v.normal[2] = 1.f;
+
+		if (normals_mapped)
+		{
+			f32 n[4] = {};
+
+			if (remix_rsx::decode_position(normal_attr.at(i), normal_attr.type, normal_attr.size, n))
+			{
+				if (normal_biased)
+				{
+					for (u32 k = 0; k < 3; ++k) n[k] = (n[k] * normal_bias_scale) - 1.f;
+				}
+
+				const f32 length = std::sqrt((n[0] * n[0]) + (n[1] * n[1]) + (n[2] * n[2]));
+
+				if (std::isfinite(length) && length > 1e-6f)
+				{
+					normal_length_sum += length;
+					++normal_length_samples;
+
+					const f32 inv = 1.f / length;
+					v.normal[0] = n[0] * inv;
+					v.normal[1] = n[1] * inv;
+					v.normal[2] = n[2] * inv;
+				}
+				else
+				{
+					++normal_degenerate_here;
+				}
+			}
+			else
+			{
+				++normal_degenerate_here;
+			}
+		}
+
 		v.texcoord[0] = 0.f;
 		v.texcoord[1] = 0.f;
 		v.color = 0xFFFFFFFF;
+	}
+
+	// The unit-length gate, per draw and not per vertex: a texcoord normalised per vertex would
+	// still be unit-length and would still be wrong, so the thing that has to be tested is the
+	// length the guest STORED. A real normal stream measures ~1.0 whatever the packing.
+	if (normals_mapped)
+	{
+		const f64 mean = normal_length_samples ? (normal_length_sum / normal_length_samples) : 0.0;
+
+		if (normal_length_samples == 0 || mean < 0.7 || mean > 1.4)
+		{
+			for (u32 i = 0; i < vertex_count; ++i)
+			{
+				remixapi_HardcodedVertex& v = m_scratch_vertices[i];
+				v.normal[0] = 0.f;
+				v.normal[1] = 0.f;
+				v.normal[2] = 1.f;
+			}
+
+			++m_stats.normal_rejected;
+			normals_mapped = false;
+		}
+		else
+		{
+			++m_stats.normal_applied;
+			m_stats.normal_degenerate += normal_degenerate_here;
+
+			if (m_vtxattr_seen.find(m_current_vp_hash) == m_vtxattr_seen.end())
+			{
+				++m_stats.normal_programs;
+			}
+		}
+	}
+
+	// One line per program per run, emitted whatever the verdict was: the question it answers is
+	// "which slot holds the unit 3-vector", and a program whose chosen attribute was REFUSED is
+	// exactly the one whose answer matters.
+	if (remix_rsx::normal_census_enabled() && m_vtxattr_seen.insert(m_current_vp_hash).second)
+	{
+		report_vertex_attributes(first_vertex, vertex_count, normals_mapped);
 	}
 
 	// Bounds check the index list against what we actually decoded.
@@ -19783,7 +26676,14 @@ void RemixGSRender::submit_subdraw()
 		{
 			++m_skin_unrec_census_lines;
 
-			rsx_log.notice("Remix: skin-unrecognised vp=%016llx arch=%s arl=%u idx_reads=%u foreign=%u "
+			// ROUND 52: dump_line, not rsx_log.notice. This line only ever reached
+			// bin\log\RPCS3.log, which is held under an exclusive lock for the whole run - so the
+			// round-51 dump carried ZERO program names behind 117183 skinning refusals and the
+			// question "which rig is being dropped" was unanswerable while the game was on screen.
+			// dump_line writes the same notice AND appends to remix_dump.log; the text, the cap
+			// (s_max_skin_unrec_census_lines) and the once-per-program m_skin_unrec_seen guard are
+			// all unchanged.
+			dump_line(fmt::format("Remix: skin-unrecognised vp=%016llx arch=%s arl=%u idx_reads=%u foreign=%u "
 				"blended=%d bones=%u vtx=%u line=%u/%u | %s",
 				m_current_vp_hash,
 				remix_rsx::archetype_name(fp.archetype),
@@ -19795,7 +26695,7 @@ void RemixGSRender::submit_subdraw()
 				vertex_count,
 				m_skin_unrec_census_lines,
 				s_max_skin_unrec_census_lines,
-				fp.skin_note);
+				fp.skin_note));
 		}
 
 		return;
@@ -19855,6 +26755,14 @@ void RemixGSRender::submit_subdraw()
 		{
 			skinned = true;
 			++m_stats.indexed_world_skinned;
+
+			// Round 52, counted on the DRAWS that used the transposed-blend arm for the same reason
+			// pos_input and madmix are: a program is scanned once and drawn thousands of times, so
+			// a program count alone cannot answer "is the fix on the character in front of me".
+			if (fp.skin_vertex_blend)
+			{
+				++m_stats.skin_vertex_blend;
+			}
 
 			if (fp.palette_bias_forwarded)
 			{
@@ -19921,12 +26829,27 @@ void RemixGSRender::submit_subdraw()
 				blend += "]";
 			}
 
-			rsx_log.notice("Remix: indexed-world vp=%016llx base=c%u rows=%u stride=%u bias=%d fwdbias=%d attr=%u.%c abs=%d neg=%d rigid=%d vtx=%u%s",
+			// ROUND 52 adds form= and extra=, inserted immediately after rigid= with their two
+			// arguments in the matching position - adjacent, one specifier group, one argument
+			// group. form names WHICH blend matcher expressed the rig (the two are transposes of
+			// each other and everything downstream is identical, so nothing else distinguishes
+			// them); extra is how many indexed reads of the same palette the matched group does not
+			// itself explain. Expected on Eat Lead: form=vertexblend extra=36 on the six main
+			// character programs, extra=0 on the two colour-mask-skipped shadow ones.
+			const char* const form = fp.skin_vertex_blend
+				? "vertexblend"
+				: (fp.skin_blended ? "matrixblend" : "single");
+
+			// dump_line, not rsx_log.notice, for the reason the two refusal censuses above record:
+			// this is the line that says the rig was UNDERSTOOD, and reading it against them is the
+			// whole verification of this round - so it has to be readable while RPCS3.log is
+			// exclusively locked. Same text, same once-per-program m_indexed_world_seen guard.
+			dump_line(fmt::format("Remix: indexed-world vp=%016llx base=c%u rows=%u stride=%u bias=%d fwdbias=%d attr=%u.%c abs=%d neg=%d rigid=%d form=%s extra=%u vtx=%u%s",
 				m_current_vp_hash, fp.palette_base, fp.palette_rows, fp.palette_stride,
 				fp.palette_has_bias ? 1 : 0, fp.palette_bias_forwarded ? 1 : 0,
 				fp.bone_attribute, "xyzw"[fp.bone_component & 3],
 				fp.bone_index_abs ? 1 : 0, fp.bone_index_negate ? 1 : 0,
-				rigid ? 1 : 0, vertex_count, blend);
+				rigid ? 1 : 0, form, fp.indexed_reads_outside_chain, vertex_count, blend));
 		}
 	}
 	else if (fp.indexed_const && !remix_rsx::draw_indexed_const())
@@ -19975,7 +26898,12 @@ void RemixGSRender::submit_subdraw()
 		// never the reason this program could not be placed.
 		if (m_indexed_census_seen.insert(m_current_vp_hash).second)
 		{
-			rsx_log.notice("Remix: indexed-const refusal vp=%016llx vtx=%u idx=%llu arch=%s "
+			// ROUND 52: dump_line, not rsx_log.notice, for the reason the skin-unrecognised census
+			// above records - this is the OTHER blind census, and between them they are the only
+			// two lines that name the programs behind the 117183 refused draws. dump_line writes
+			// the same notice and appends to remix_dump.log; the text and the once-per-program
+			// m_indexed_census_seen guard are unchanged.
+			dump_line(fmt::format("Remix: indexed-const refusal vp=%016llx vtx=%u idx=%llu arch=%s "
 				"uniform=%d addr=c%u.%c abs=%d neg=%d base=[c%u..c%u] a=%d input=%d released=%d",
 				m_current_vp_hash, vertex_count, static_cast<u64>(m_scratch_indices.size()),
 				remix_rsx::archetype_name(fp.archetype),
@@ -19985,7 +26913,7 @@ void RemixGSRender::submit_subdraw()
 				fp.indexed_base_min, fp.indexed_base_max,
 				uniform_resolved ? uniform_offset : -1,
 				fp.inner_is_input ? 1 : 0,
-				released ? 1 : 0);
+				released ? 1 : 0));
 		}
 
 		// The program reads a constant palette through an address register and the recogniser
@@ -20038,11 +26966,87 @@ void RemixGSRender::submit_subdraw()
 	// whose sampled mask has no bit 0 at all. Six programs binding 107 different normal maps is a
 	// large share of the world, and with no diffuse map anywhere in the program there is nothing
 	// for albedo_texture_unit() to pick but the normal map.
-	if (m_current_fp_fingerprint && remix_rsx::pass_skip_enabled()
+	// ROUND 56. This pair IS the water surface - the replayed fragment program
+	// (bin/remix_ucode/613195379C52B18B.fp, read with docs/remix/fpdis.py) samples tex2 twice
+	// through tc7 and tc8, unpacks both with the classic 2x-1, and rebuilds z with
+	// DIVSQ(1 - dot(n.xy, n.xy)): two scrolling normal maps and no albedo at all. The level's own
+	// DrawParam preset names confirm it - m08 authors rows called water surface and waterway.
+	//
+	// The `== 1` colour-target term meant this gate NEVER FIRED: neither log contains the
+	// "captured water surface" notice nor its failure twin, so get_demons_water_material() was
+	// never once called. The draw therefore reached Remix with material=nullptr, no albedo and
+	// no colour route, and rendered as an opaque BLACK SHEET lying over the courtyard - which is
+	// the whole of the "missing ground" report. It was never missing and it is not ground.
+	//
+	// The program pair is the identity; the colour target is not, and keying on it was a guess
+	// that happened to be wrong. It is kept as a KNOB rather than deleted, because the term was
+	// presumably added to separate two uses of one program and this run cannot prove there is
+	// only one - and the observed target is now logged once, so the next run says what it is
+	// instead of leaving it to another guess.
+	const u32 demons_water_target = static_cast<u32>(rsx::method_registers.surface_color_target());
+	const bool demons_water_pair = remix_rsx::demons_world_enabled()
+		&& m_current_vp_hash == 0x0314c853c971ceaeull && m_current_fp_hash == 0x613195379c52b18bull;
+
+	if (demons_water_pair)
+	{
+		static u32 reported_target = ~0u;
+
+		if (reported_target != demons_water_target)
+		{
+			reported_target = demons_water_target;
+			rsx_log.notice("Remix Demons water: target=%u blend=%d depth_write=%d vtx=%u",
+				demons_water_target, rsx::method_registers.blend_enabled() ? 1 : 0,
+				rsx::method_registers.depth_write_enabled() ? 1 : 0, vertex_count);
+		}
+	}
+
+	const bool demons_water_surface = demons_water_pair
+		&& (remix_rsx::demons_water_any_target() || demons_water_target == 1);
+	if (!demons_water_surface && m_current_fp_fingerprint && remix_rsx::pass_skip_enabled()
 		&& m_current_fp_fingerprint->sampled_mask != 0
 		&& (m_current_fp_fingerprint->sampled_mask & 1u) == 0)
 	{
 		++m_stats.skip_lighting_pass;
+		if (remix_rsx::demons_world_enabled())
+		{
+			static std::unordered_set<u64> demons_pass_seen;
+			const u64 key = rpcs3::hash64(m_current_vp_hash, m_current_fp_hash);
+			if (demons_pass_seen.size() < 32 && demons_pass_seen.insert(key).second)
+			{
+				const f32 bound = std::numeric_limits<f32>::infinity();
+				f32 lo[3] = { bound, bound, bound }, hi[3] = { -bound, -bound, -bound };
+				for (u32 i = 0; i < vertex_count; ++i)
+					for (u32 c = 0; c < 3; ++c)
+					{
+						lo[c] = std::min(lo[c], m_scratch_vertices[i].position[c]);
+						hi[c] = std::max(hi[c], m_scratch_vertices[i].position[c]);
+					}
+				rsx_log.notice("Remix Demons pass-skip: vp=%016llX fp=%016llX sampled=%x vertices=%u indices=%llu clip=%ux%u rgb=%u%u%u depthwrite=%u blend=%u raw=[%.9g %.9g %.9g]..[%.9g %.9g %.9g]",
+					m_current_vp_hash, m_current_fp_hash, m_current_fp_fingerprint->sampled_mask, vertex_count, static_cast<u64>(m_scratch_indices.size()),
+					rsx::method_registers.surface_clip_width(), rsx::method_registers.surface_clip_height(),
+					rsx::method_registers.color_mask_r(0) ? 1u : 0u, rsx::method_registers.color_mask_g(0) ? 1u : 0u, rsx::method_registers.color_mask_b(0) ? 1u : 0u,
+					rsx::method_registers.depth_write_enabled() ? 1u : 0u, rsx::method_registers.blend_enabled() ? 1u : 0u,
+					lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]);
+				if (m_current_vp_hash == 0x0314c853c971ceaeull && m_current_fp_hash == 0x613195379c52b18bull)
+				{
+					const std::string directory = fs::get_executable_dir() + "remix_ucode/";
+					fs::create_dir(directory);
+					const void* code = current_fragment_program.get_data();
+					const u32 length = current_fragment_program.ucode_length;
+					if (code && length && length <= 65536)
+						if (fs::file output{ directory + "613195379C52B18B.fp", fs::write + fs::create + fs::trunc }) output.write(code, length);
+					for (u32 unit : { 1u, 2u, 8u })
+					{
+						const auto& texture = rsx::method_registers.fragment_textures[unit];
+						const remix_rsx::texture_entry* entry = nullptr;
+						m_textures.bind(m_remix.api(), texture, m_frame_counter, &entry, true);
+						rsx_log.notice("Remix Demons floor texture: unit=%u format=%x size=%ux%u offset=%08x decoded=%u hash=%016llX",
+							unit, texture.format(), texture.width(), texture.height(), texture.offset(), entry ? 1u : 0u, entry ? entry->content_hash : 0ull);
+						if (entry) dump_texture(*entry, texture, unit);
+					}
+				}
+			}
+		}
 		return;
 	}
 
@@ -20051,10 +27055,17 @@ void RemixGSRender::submit_subdraw()
 	// draws that share geometry but not their texture must not share a mesh handle.
 	const auto& api = m_remix.api();
 
-	remixapi_MaterialHandle material = nullptr;
+	remixapi_MaterialHandle material = demons_water_surface ? get_demons_water_material() : nullptr;
+	if (demons_water_surface && !material)
+	{
+		++m_stats.skip_albedo;
+		return;
+	}
 	u64 albedo_hash = 0;
 	bool had_albedo_unit = false;
 	s8 selected_albedo_unit = -1;
+	const remix_rsx::texture_entry* selected_albedo_entry = nullptr;
+	bool demons_fire_surface = false;
 
 	// Per draw, not per frame: the previous draw's texture says nothing about this one's.
 	m_scratch_albedo_alpha_min = 255;
@@ -20066,9 +27077,14 @@ void RemixGSRender::submit_subdraw()
 	// a draw that binds nothing would inherit the previous draw's dome flag.
 	m_scratch_albedo_peak_uv[0] = -1.f;
 	m_scratch_albedo_peak_uv[1] = -1.f;
+	// ROUND 58: same rule - a draw that binds nothing must not inherit the last one's verdict.
+	m_scratch_albedo_grey = false;
+	m_scratch_elect_rule = "none";
+	m_scratch_elect_would = -1;
 	// Round 23 defect fix: cleared per draw, set only where apply_texcoords writes real texcoords.
 	m_scratch_uv_applied = false;
 	m_scratch_vertex_alpha = false;
+	m_scratch_demons_particle_fade = false;
 	m_scratch_texkill = false;
 	m_scratch_kil_applied = false;
 	m_scratch_kil_ref = -1;
@@ -20113,7 +27129,7 @@ void RemixGSRender::submit_subdraw()
 	// The viewmodel verdict's own reset is at the TOP of this function, not here - see the comment
 	// there; the diagnostic path reaches it before this point.
 
-	if (m_remix.fork_features())
+	if (m_remix.fork_features() && !demons_water_surface)
 	{
 		// Walk the eligible 2D units in order and keep the first that yields a material.
 		// A refusal on the lowest unit is not a refusal for the draw: see albedo_texture_unit_in.
@@ -20122,12 +27138,48 @@ void RemixGSRender::submit_subdraw()
 		// partition one population and tex_albedo_narrow reads as a share of tex_albedo_ucode
 		// rather than of the draw count.
 		bool unit_from_narrow = false;
-		const u32 unit_mask = albedo_unit_mask(&unit_from_ucode, &unit_from_narrow);
+		// ROUND 58. Same place, same partition rationale as ROUND 43's pair above.
+		bool unit_from_lerp = false;
+		bool unit_from_lane = false;
+		int unit_would = -1;
+		const u32 unit_mask = albedo_unit_mask(&unit_from_ucode, &unit_from_narrow,
+			&unit_from_lerp, &unit_from_lane, &unit_would);
 
-		int unit = albedo_texture_unit_in(unit_mask, 0);
+		// ROUND 58. Which rule chose, in the order the rules are applied - the last one that
+		// actually moved the mask is the one that decided. Carried on scratch so the pick record,
+		// which is filled much later in this function, does not have to re-derive it.
+		m_scratch_elect_rule = unit_from_lane ? "lane"
+			: (unit_from_lerp ? "lerp"
+				: (unit_from_narrow ? "narrow" : (unit_from_ucode ? "ucode" : "lowest")));
+		m_scratch_elect_would = static_cast<s8>(unit_would);
+
+		const int normal_unit = albedo_texture_unit_in(unit_mask, 0);
+		int unit = normal_unit;
+		bool forced_pair = false;
+
+		// A deliberately narrow escape hatch for a measured program pair whose colour expression is
+		// outside the generic terminal walk. The requested unit still has to be eligible and bindable;
+		// a typo or an unsupported texture therefore falls back to the normal election.
+		const u32 forced_unit = remix_rsx::force_albedo_unit();
+		if (forced_unit < 16
+			&& m_current_vp_hash == remix_rsx::force_albedo_vp_hash()
+			&& m_current_fp_hash == remix_rsx::force_albedo_fp_hash()
+			&& (unit_mask & (1u << forced_unit))
+			&& albedo_texture_unit_in(1u << forced_unit, 0) == static_cast<int>(forced_unit))
+		{
+			unit = static_cast<int>(forced_unit);
+			forced_pair = unit != normal_unit;
+			m_scratch_elect_rule = "forced-pair";
+		}
+
 		const int first_unit = unit;
 		const bool had_unit = (unit >= 0);
 		had_albedo_unit = had_unit;
+
+		// ROUND 58. Bounded and deduped per (vp, fp), so this costs one hash lookup per draw and
+		// at most 128 lines per run. It is deliberately NOT gated on DUMP: the whole point is that
+		// a normal run can state whether its walls are on the wrong unit.
+		report_albedo_elect(unit_mask, first_unit, unit_would, m_scratch_elect_rule);
 
 		// Which exit the walk took, for the tex_none census. tex_none is the largest counter in a
 		// Haze run (7.8M against 5.2M bound) and until now it was one number covering five
@@ -20165,6 +27217,18 @@ void RemixGSRender::submit_subdraw()
 			{
 				++m_stats.tex_albedo_narrow;
 			}
+
+			// ROUND 58, counted beside it and for the same reason: each names the draws its own
+			// rule MOVED, so the number is the exact size of that rule's behavioural delta.
+			if (unit_from_lerp)
+			{
+				++m_stats.tex_albedo_lerp;
+			}
+
+			if (unit_from_lane)
+			{
+				++m_stats.tex_albedo_lane;
+			}
 		}
 
 		while (unit >= 0)
@@ -20186,7 +27250,49 @@ void RemixGSRender::submit_subdraw()
 			if (material && entry)
 			{
 				selected_albedo_unit = static_cast<s8>(unit);
+				selected_albedo_entry = entry;
+				demons_fire_surface = remix_rsx::demons_world_enabled()
+					&& m_current_vp_hash == 0x7f4d3587c70d02daull && m_current_fp_hash == 0x845ff76b3b14e33full
+					&& entry->content_hash == 0x7dfce5f8fcc02fbeull;
+				if (demons_fire_surface) material = get_demons_fire_material(*entry);
 				albedo_hash = entry->content_hash;
+				// Observe every matching pass before static geometry and per-frame deduplication.
+				if (remix_rsx::demons_world_enabled() && (albedo_hash == 0xbb8f60ef3064b33bull
+					|| albedo_hash == 0x1716bea1c9e692f8ull || albedo_hash == 0x5fb80fd23e0972a5ull))
+				{
+					static std::unordered_map<u64, std::pair<u32, u64>> sky_passes;
+					static u32 sky_pass_total = 0;
+					const u64 key = rpcs3::hash64(rpcs3::hash64(albedo_hash, m_current_vp_hash), m_current_fp_hash);
+					auto& seen = sky_passes[key];
+					if (sky_pass_total < 48 && (seen.first == 0 || (seen.second != m_frame_counter
+						&& (seen.first < 3 || m_frame_counter >= seen.second + 120))))
+					{
+						++sky_pass_total;
+						++seen.first;
+						seen.second = m_frame_counter;
+						const void* code = current_fragment_program.get_data();
+						const u32 length = current_fragment_program.ucode_length;
+						const bool valid_code = code && length && length <= 65536;
+						f32 export_multiplier = std::numeric_limits<f32>::quiet_NaN();
+						if (valid_code && m_current_fp_hash == 0x2aadcee9659f3dfcull && length >= 1568)
+						{
+							u32 raw = 0;
+							std::memcpy(&raw, static_cast<const u8*>(code) + 1552, sizeof(raw));
+							export_multiplier = std::bit_cast<f32>(((raw & 0x00ff00ffu) << 8) | ((raw & 0xff00ff00u) >> 8));
+						}
+						const std::string directory = fs::get_executable_dir() + "remix_sky_pass/";
+						fs::create_dir(directory);
+						const std::string path = fmt::format("%s%016llX_%016llX_%016llX_%llu.fp", directory, albedo_hash, m_current_vp_hash, m_current_fp_hash, m_frame_counter);
+						if (valid_code)
+							if (fs::file output{ path, fs::write + fs::create + fs::trunc }) output.write(code, length);
+						rsx_log.notice("Remix Demons sky early pass: albedo=%016llX vp=%016llX fp=%016llX frame=%llu vtx=%u blend=%u dw=%u rgb=%u%u%u export_multiplier=%.9g fp_bytes=%u path=%s",
+							albedo_hash, m_current_vp_hash, m_current_fp_hash, m_frame_counter, vertex_count,
+							rsx::method_registers.blend_enabled() ? 1u : 0u, rsx::method_registers.depth_write_enabled() ? 1u : 0u,
+							rsx::method_registers.color_mask_r(0) ? 1u : 0u, rsx::method_registers.color_mask_g(0) ? 1u : 0u,
+							rsx::method_registers.color_mask_b(0) ? 1u : 0u, export_multiplier, length, path);
+					}
+				}
+
 				m_scratch_albedo_alpha_min = entry->alpha_min;
 				m_scratch_albedo_alpha_max = entry->alpha_max;
 				m_scratch_albedo_mean_rgb[0] = entry->mean_rgb[0];
@@ -20195,6 +27301,26 @@ void RemixGSRender::submit_subdraw()
 				m_scratch_albedo_peak_uv[0] = entry->peak_uv[0];
 				m_scratch_albedo_peak_uv[1] = entry->peak_uv[1];
 				++m_stats.tex_bound;
+
+				// ROUND 58 (step 2b). Measurement only. 'grey_alt' is the half that makes the
+				// number readable: a greymap bound where the elected mask held no other wide
+				// colour unit is a different problem from one bound where an alternative was
+				// sitting right there, and only the second is what the lerp and lane rules move.
+				m_scratch_albedo_grey = entry->greymap();
+
+				if (m_scratch_albedo_grey)
+				{
+					++m_stats.tex_albedo_grey;
+
+					const u32 wide_units = m_current_fp_fingerprint
+						? (unit_mask & ~u32{m_current_fp_fingerprint->narrow_sample_mask})
+						: unit_mask;
+
+					if (std::popcount(wide_units) >= 2)
+					{
+						++m_stats.tex_albedo_grey_alt;
+					}
+				}
 
 				// The second cutout channel, read on the unit that actually won. RSX's per-texture
 				// alpha kill is NV4097_SET_TEXTURE_CONTROL0 bit 2
@@ -20240,6 +27366,15 @@ void RemixGSRender::submit_subdraw()
 			m_scratch_notex_width = tex.width();
 			m_scratch_notex_height = tex.height();
 			m_scratch_notex_reason = entry ? entry->refusal_reason : "";
+
+			// A pair override is a preference, not permission to lose the draw. If that exact unit has a
+			// transient or format refusal, retry the normal election once before the generic walk policy.
+			if (forced_pair && normal_unit >= 0)
+			{
+				unit = normal_unit;
+				forced_pair = false;
+				continue;
+			}
 
 			if (m_textures.over_budget())
 			{
@@ -20783,6 +27918,11 @@ void RemixGSRender::submit_subdraw()
 			++m_stats.blend_alpha_stranded;
 		}
 	}
+
+	m_scratch_demons_particle_fade = apply_demons_particle_fade(first_vertex, vertex_count, albedo_hash);
+	if (m_scratch_demons_particle_fade) m_scratch_vertex_alpha = false;
+
+	if (rasterize_demons_preview(vertex_count, selected_albedo_unit)) return;
 
 	// --- round 11: the atmospheric haze card's fade ---------------------------------------------
 	// Last of the three vertex-colour writers and deliberately so: it owns BOTH halves of the
@@ -21486,6 +28626,7 @@ void RemixGSRender::submit_subdraw()
 	// so this changes exactly one thing: what colour an untextured surface is, which is the whole
 	// intent. RPCS3_REMIX_NOTEXMAT=0 restores the material-less submit bit-exactly.
 	remixapi_MaterialHandle submit_material = material;
+	bool guest_light_fixture_overridden = false;
 
 	if (!material)
 	{
@@ -21520,6 +28661,22 @@ void RemixGSRender::submit_subdraw()
 				submit_material = grey;
 				++m_stats.notex_mat_applied;
 			}
+		}
+	}
+
+	if (remix_rsx::guest_light_fixture_material_enabled()
+		&& remix_rsx::guest_light_albedo_matches(albedo_hash)
+		&& selected_albedo_entry
+		&& (remix_rsx::guest_light_pair_vp_hash() == 0
+			|| remix_rsx::guest_light_pair_vp_hash() == m_current_vp_hash)
+		&& (remix_rsx::guest_light_pair_fp_hash() == 0
+			|| remix_rsx::guest_light_pair_fp_hash() == m_current_fp_hash)
+		&& (!remix_rsx::guest_light_main_clip_enabled() || guest_light_clip_ok()))
+	{
+		if (remixapi_MaterialHandle fixture = guest_light_fixture_material(api, *selected_albedo_entry))
+		{
+			submit_material = fixture;
+			guest_light_fixture_overridden = true;
 		}
 	}
 
@@ -21610,6 +28767,12 @@ void RemixGSRender::submit_subdraw()
 		vertex_hash = rpcs3::hash64(vertex_hash, words[i]);
 	}
 
+	if (guest_light_fixture_overridden)
+	{
+		vertex_hash = rpcs3::hash64(vertex_hash,
+			reinterpret_cast<std::uintptr_t>(submit_material));
+	}
+
 	// ROUND 32: 'hash' opens here and is stopped just before the m_meshes.find(hash) lookup below.
 	// It covers the static-index key build, the per-triangle union accumulation (a set lookup plus a
 	// try_emplace per vertex), the union re-hash (three floats and a colour per vertex plus one hash
@@ -21689,7 +28852,7 @@ void RemixGSRender::submit_subdraw()
 
 		static_key = rpcs3::hash64(static_key, m_current_vp_hash);
 		static_key = rpcs3::hash64(static_key, albedo_hash);
-		static_key = rpcs3::hash64(static_key, reinterpret_cast<usz>(material));
+		static_key = rpcs3::hash64(static_key, reinterpret_cast<usz>(submit_material));
 		static_entry = &m_static_indices[static_key];
 
 		if (static_entry->overflow)
@@ -21862,7 +29025,7 @@ void RemixGSRender::submit_subdraw()
 
 			union_hash = rpcs3::hash64(union_hash, m_current_vp_hash);
 			union_hash = rpcs3::hash64(union_hash, albedo_hash);
-			union_hash = rpcs3::hash64(union_hash, reinterpret_cast<usz>(material));
+			union_hash = rpcs3::hash64(union_hash, reinterpret_cast<usz>(submit_material));
 
 			if (union_hash == 0)
 			{
@@ -21909,14 +29072,11 @@ void RemixGSRender::submit_subdraw()
 				// entered at all, and the last-known-good union IS the current one. An in-game pause
 				// menu is exactly that state, which is why it reads as 'aligned' while paused.
 				//
-				// GEOMETRY ONLY. An earlier draft of this comment claimed the stale mesh could also
-				// carry an OLDER MATERIAL; that is structurally impossible and chasing it would waste
-				// a round. static_key at :19053-19055 folds in m_current_vp_hash, albedo_hash AND the
-				// material pointer, and the union hash at :19225-19227 folds in the same three - so a
-				// material change lands on a DIFFERENT static_index entry whose mesh_hash is 0, which
-				// makes active_valid false and sends the draw to the drop exit below, not here. A
-				// stale union therefore always has the same (program, albedo, material) as the draw
-				// falling back to it. What lags is the triangle set, never the shading.
+				// GEOMETRY ONLY. The static key and final union hash both fold the actual submitted
+				// material handle, not merely the guest material. A material override therefore lands
+				// on a different static-index entry whose mesh_hash starts at zero; active_valid is false
+				// and the draw takes the drop exit below. A stale union always has the same program,
+				// albedo and submitted material as the draw falling back to it. Only its triangle set lags.
 				hash = static_entry->mesh_hash;
 				++m_static_index_deferred;
 				++m_static_index_deferred_stale;
@@ -21949,6 +29109,9 @@ void RemixGSRender::submit_subdraw()
 			hash = rpcs3::hash64(hash, m_current_vp_hash);
 		}
 
+		if (demons_water_surface)
+			hash = rpcs3::hash64(hash, 0x44454d4f57415452ull);
+		if (demons_fire_surface) hash = rpcs3::hash64(hash, reinterpret_cast<usz>(material));
 		if (albedo_hash)
 		{
 			hash = rpcs3::hash64(hash, albedo_hash);
@@ -22189,9 +29352,19 @@ void RemixGSRender::submit_subdraw()
 		++m_stats.meshes_created;
 		++m_mesh_creates_by_vp[m_current_vp_hash];
 
+		// What this mesh cost the runtime, counted from the arrays actually submitted above rather
+		// than from the scratch buffers, so a skinned surface includes its blend tuples and an
+		// unskinned one does not.
+		const u64 mesh_bytes = u64{surface.vertices_count} * sizeof(remixapi_HardcodedVertex)
+			+ u64{surface.indices_count} * sizeof(u32)
+			+ (skinned
+				? u64{surface.skinning_value.blendWeights_count} * sizeof(f32)
+					+ u64{surface.skinning_value.blendIndices_count} * sizeof(u32)
+				: 0);
+
 		// Round 9: record what the mesh baked. 'surface.material' above is the handle the Remix
 		// mesh object now owns for its whole life - this is the only place it can be observed.
-		it = m_meshes.emplace(hash, mesh_entry{ handle, m_frame_counter, surface.material }).first;
+		it = m_meshes.emplace(hash, mesh_entry{ handle, m_frame_counter, surface.material, mesh_bytes }).first;
 	}
 
 	it->second.last_used_frame = m_frame_counter;
@@ -22886,6 +30059,32 @@ void RemixGSRender::submit_subdraw()
 		}
 	}
 
+	// --- ROUND 53: RPCS3_REMIX_SKYTAG=0 makes every rule above MEASURE-ONLY --------------------
+	// ONE gate at the point is_sky is CONSUMED, rather than a guard at each of the four sites that
+	// set it (the anchored chain, the learned ring, SKYBACKDROP=2 and SKYHASH=2), and deliberately
+	// placed AFTER the census. Everything above this line therefore runs byte for byte as it does
+	// today: each sub-rule's own counter still records what it would have done
+	// (sky_learned_ring / skyhash_tagged / sky_backdrop_hit), m_sky_dome_programs is still keyed on
+	// the would-have result so the learned-ring rule stays armed and its counter stays meaningful,
+	// and 'Remix sky-census:' still prints TAGGED. With skytag=0 on the banner, TAGGED means
+	// "would have been" - that is the one thing a reader of the census has to know, and the KNOBS
+	// row says so. Exactly two things change, and they are the only two consumers of is_sky: the
+	// SKY category bit at submission, and the world-extent exemption is_sky grants below.
+	//
+	// WHY: what a SKY-tagged API draw does is fork-dependent by construction. On the deployed
+	// aerial-descended runtime CameraType::Sky reaches DrawCallState and rtx_instance_manager sets
+	// m_isHidden, so the draw is DELETED; on numos3 toRtDrawState clamps Sky->Main and it is merely
+	// re-cameraed. Eat Lead's anchored rule fires on the untextured pass of its second dome program
+	// (vp=487557313fb93949, albedo=0, wext 3516-4176 past SKYEXTENT 2000), so that pass is deleted
+	// on one runtime in the family and kept on another. SKYEMISSIVE is what makes this title's dome
+	// visible and it needs no category at all, so the category is removed rather than relied on.
+	// Full derivation on sky_tag_enabled() in RemixTransforms.h.
+	if (is_sky && !remix_rsx::sky_tag_enabled())
+	{
+		is_sky = false;
+		++m_stats.sky_tag_suppressed;
+	}
+
 	// --- viewmodel, decided by the viewport depth range ---------------------------------------
 	// The first-person arms and weapon. Up to 81af315 nothing in this backend had any notion of
 	// one: REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL and REMIXAPI_CAMERA_TYPE_VIEW_MODEL were both
@@ -23160,6 +30359,176 @@ void RemixGSRender::submit_subdraw()
 	m_skip_census_dist = skip_census_dist;
 	m_skip_census_albedo = albedo_hash;
 
+	// Exact DS particle capture compares submitted geometry with its physical source projection.
+	if (remix_rsx::demons_world_enabled() && m_current_fingerprint
+		&& m_current_fingerprint->demons_particle_depth && world_resolved && m_active_camera.valid)
+	{
+		static std::unordered_map<u64, std::pair<u32, u64>> particle_captures;
+		static u32 particle_capture_total = 0;
+		auto& capture = particle_captures[albedo_hash];
+		if (particle_capture_total < 64 && (capture.first < 4 || m_frame_counter >= capture.second + 120))
+		{
+			++capture.first;
+			capture.second = m_frame_counter;
+			++particle_capture_total;
+			remix_rsx::mat4 source{};
+			if (remix_rsx::read_group_matrix(*m_current_fingerprint, 0, source))
+			{
+				source = remix_rsx::fold_viewport_z(source, rsx::method_registers.viewport_scale_z(), rsx::method_registers.viewport_offset_z());
+				const auto camera = remix_rsx::mat4_multiply(m_active_camera.view, m_active_camera.projection);
+				const std::string directory = fs::get_executable_dir() + "remix_particle/";
+				fs::create_dir(directory);
+				const std::string path = fmt::format("%s%016llX_%llu_%u.txt", directory, albedo_hash, m_frame_counter, particle_capture_total);
+				std::string dump = fmt::format("particle albedo=%016llX vp=%016llX fp=%016llX frame=%llu vertices=%u alpha=%u..%u blend=%u camera=[%.9g %.9g %.9g]\n",
+					albedo_hash, m_current_vp_hash, m_current_fp_hash, m_frame_counter, vertex_count,
+					m_scratch_albedo_alpha_min, m_scratch_albedo_alpha_max, rsx::method_registers.blend_enabled() ? 1u : 0u,
+					m_active_camera.position[0], m_active_camera.position[1], m_active_camera.position[2]);
+				for (const u32 slot : { 0u, 8u, 9u, 10u, 11u, 104u, 111u, 158u, 466u, 467u })
+				{
+					f32 value[4]{};
+					if (remix_rsx::read_slot(slot, value))
+						dump += fmt::format("constant %u %.9g %.9g %.9g %.9g\n", slot, value[0], value[1], value[2], value[3]);
+				}
+				for (u32 r = 0; r < 4; ++r)
+				{
+					dump += fmt::format("source %.9g %.9g %.9g %.9g\n", source.m[r][0], source.m[r][1], source.m[r][2], source.m[r][3]);
+					dump += fmt::format("camera %.9g %.9g %.9g %.9g\n", camera.m[r][0], camera.m[r][1], camera.m[r][2], camera.m[r][3]);
+				}
+				for (u32 r = 0; r < 3; ++r)
+					dump += fmt::format("transform %.9g %.9g %.9g %.9g\n", transform.matrix[r][0], transform.matrix[r][1], transform.matrix[r][2], transform.matrix[r][3]);
+				f64 max_ndc_error = 0.;
+				u32 compared = 0;
+				for (u32 i = 0; i < vertex_count; ++i)
+				{
+					const auto& v = m_scratch_vertices[i];
+					const f64 raw[4] = { v.position[0], v.position[1], v.position[2], 1. };
+					f64 world[4] = { 0., 0., 0., 1. }, expected[4]{}, actual[4]{};
+					for (u32 r = 0; r < 3; ++r)
+						for (u32 k = 0; k < 4; ++k) world[r] += transform.matrix[r][k] * raw[k];
+					for (u32 c = 0; c < 4; ++c)
+						for (u32 k = 0; k < 4; ++k)
+						{
+							expected[c] += raw[k] * source.m[k][c];
+							actual[c] += world[k] * camera.m[k][c];
+						}
+					if (std::isfinite(expected[3]) && std::isfinite(actual[3]) && std::abs(expected[3]) > 1e-8 && std::abs(actual[3]) > 1e-8)
+					{
+						++compared;
+						for (u32 c = 0; c < 3; ++c) max_ndc_error = std::max(max_ndc_error, std::abs(expected[c] / expected[3] - actual[c] / actual[3]));
+					}
+					dump += fmt::format("v %.9g %.9g %.9g uv %.9g %.9g color %08X world %.9g %.9g %.9g sourceclip %.9g %.9g %.9g %.9g actualclip %.9g %.9g %.9g %.9g\n",
+						raw[0], raw[1], raw[2], v.texcoord[0], v.texcoord[1], v.color, world[0], world[1], world[2],
+						expected[0], expected[1], expected[2], expected[3], actual[0], actual[1], actual[2], actual[3]);
+				}
+				if (fs::file output{ path, fs::write + fs::create + fs::trunc }) output.write(dump.data(), dump.size());
+				rsx_log.notice("Remix Demons particle capture: albedo=%016llX frame=%llu compared=%u max_ndc_error=%.9g path=%s", albedo_hash, m_frame_counter, compared, max_ndc_error, path);
+			}
+		}
+	}
+
+	// Synchronize verified dirt topology with the camera used by its submitted instance.
+	if (remix_rsx::demons_world_enabled() && !skinned && m_active_camera.valid
+		&& (albedo_hash == 0x293611049b65f2a3ull || albedo_hash == 0xc002b0014160cff1ull || albedo_hash == 0xa58cbcabdf5873b7ull)
+		&& rsx::method_registers.surface_clip_width() == 1280 && rsx::method_registers.surface_clip_height() == 720)
+	{
+		static std::unordered_map<u64, std::pair<u32, u64>> dirt_capture_frame;
+		static u32 dirt_capture_count = 0;
+		const auto previous = dirt_capture_frame.find(albedo_hash);
+		if (dirt_capture_count < 36 && (previous == dirt_capture_frame.end()
+			|| (previous->second.first < 12 && m_frame_counter >= previous->second.second + 120)))
+		{
+			auto& state = dirt_capture_frame[albedo_hash];
+			++state.first;
+			state.second = m_frame_counter;
+			++dirt_capture_count;
+			const std::string directory = fs::get_executable_dir() + "remix_dirt/";
+			fs::create_dir(directory);
+			const std::string path = fmt::format("%s%016llX_%llu.txt", directory, albedo_hash, m_frame_counter);
+			std::string dump = fmt::format("dirt albedo=%016llX vp=%016llX fp=%016llX frame=%llu vertices=%u indices=%llu clip=1280x720 alpha=%u blend=%u\n",
+				albedo_hash, m_current_vp_hash, m_current_fp_hash, m_frame_counter, vertex_count,
+				static_cast<u64>(m_scratch_indices.size()), rsx::method_registers.alpha_test_enabled() ? 1u : 0u, rsx::method_registers.blend_enabled() ? 1u : 0u);
+			for (u32 r = 0; r < 4; ++r)
+			{
+				dump += fmt::format("view %.9g %.9g %.9g %.9g\n", m_active_camera.view.m[r][0], m_active_camera.view.m[r][1], m_active_camera.view.m[r][2], m_active_camera.view.m[r][3]);
+				dump += fmt::format("projection %.9g %.9g %.9g %.9g\n", m_active_camera.projection.m[r][0], m_active_camera.projection.m[r][1], m_active_camera.projection.m[r][2], m_active_camera.projection.m[r][3]);
+			}
+			for (u32 r = 0; r < 3; ++r)
+				dump += fmt::format("instance %.9g %.9g %.9g %.9g\n", transform.matrix[r][0], transform.matrix[r][1], transform.matrix[r][2], transform.matrix[r][3]);
+			for (u32 i = 0; i < vertex_count; ++i)
+			{
+				const auto& v = m_scratch_vertices[i];
+				dump += fmt::format("v %.9g %.9g %.9g %.9g %.9g %08X\n", v.position[0], v.position[1], v.position[2], v.texcoord[0], v.texcoord[1], v.color);
+			}
+			for (usz i = 0; i + 2 < m_scratch_indices.size(); i += 3)
+				dump += fmt::format("f %u %u %u\n", m_scratch_indices[i], m_scratch_indices[i + 1], m_scratch_indices[i + 2]);
+			if (fs::file output{ path, fs::write + fs::create + fs::trunc })
+			{
+				output.write(dump.data(), dump.size());
+				rsx_log.notice("Remix Demons dirt synchronized capture: albedo=%016llX frame=%llu path=%s", albedo_hash, m_frame_counter, path);
+			}
+		}
+	}
+
+	// Bounded capture of rigid scene geometry to identify the missing floor material.
+	if (remix_rsx::demons_world_enabled() && !skinned
+		&& rsx::method_registers.surface_clip_width() == 1280 && rsx::method_registers.surface_clip_height() == 720)
+	{
+		static std::unordered_set<u64> demons_ground_seen;
+		static std::unordered_set<u64> demons_new_rigid_seen;
+		const bool new_rigid = m_current_vp_hash == 0x0b5b0e742213fc4aull || m_current_vp_hash == 0x8647d8b25077ae2cull
+			|| m_current_vp_hash == 0x687a882dc91d3fb2ull || m_current_vp_hash == 0x9f14eb86224cedb5ull;
+		if ((demons_ground_seen.size() < 128 || (new_rigid && demons_new_rigid_seen.size() < 16))
+			&& demons_ground_seen.insert(hash).second)
+		{
+			if (new_rigid) demons_new_rigid_seen.insert(hash);
+			const std::string directory = fs::get_executable_dir() + "remix_ground/";
+			fs::create_dir(directory);
+			const std::string path = fmt::format("%s%016llX_%016llX.txt", directory, albedo_hash, hash);
+			std::string dump = fmt::format("ground vp=%016llX fp=%016llX mesh=%016llX frame=%llu prim=%u restart=%u vertices=%u indices=%llu alpha_test=%u alpha_ref=%.9g blend=%u cull=%u\n",
+				m_current_vp_hash, m_current_fp_hash, hash, m_frame_counter, static_cast<u32>(prim), restart_enabled ? 1u : 0u,
+				vertex_count, static_cast<u64>(m_scratch_indices.size()), rsx::method_registers.alpha_test_enabled() ? 1u : 0u,
+				rsx::method_registers.alpha_ref(), rsx::method_registers.blend_enabled() ? 1u : 0u,
+				remix_rsx::cull_from_rsx() && rsx::method_registers.cull_face_enabled() ? 1u : 0u);
+			dump += fmt::format("color_mask %u %u %u %u depth_write=%u\n",
+				rsx::method_registers.color_mask_r(0) ? 1u : 0u, rsx::method_registers.color_mask_g(0) ? 1u : 0u,
+				rsx::method_registers.color_mask_b(0) ? 1u : 0u, rsx::method_registers.color_mask_a(0) ? 1u : 0u,
+				rsx::method_registers.depth_write_enabled() ? 1u : 0u);
+			for (u32 row = 0; row < 3; ++row)
+				dump += fmt::format("m %.9g %.9g %.9g %.9g\n", transform.matrix[row][0], transform.matrix[row][1], transform.matrix[row][2], transform.matrix[row][3]);
+			remix_rsx::mat4 captured_outer{};
+			if (remix_rsx::read_group_matrix(*m_current_fingerprint, 0, captured_outer))
+				for (u32 row = 0; row < 4; ++row)
+					dump += fmt::format("outer %.9g %.9g %.9g %.9g\n", captured_outer.m[row][0], captured_outer.m[row][1], captured_outer.m[row][2], captured_outer.m[row][3]);
+			if (m_indexed_world_valid)
+				for (u32 row = 0; row < 4; ++row)
+					dump += fmt::format("palette %.9g %.9g %.9g %.9g\n", m_indexed_world.m[row][0], m_indexed_world.m[row][1], m_indexed_world.m[row][2], m_indexed_world.m[row][3]);
+			dump += fmt::format("viewport_z %.9g %.9g\n", rsx::method_registers.viewport_scale_z(), rsx::method_registers.viewport_offset_z());
+			if (const auto* captured_indices = std::get_if<rsx::draw_indexed_array_command>(&command))
+			{
+				dump += fmt::format("indices_raw base=%u restart=%u count=%u\n", min_index, rsx::method_registers.restart_index(), draw_call.get_elements_count());
+				for (u32 i = 0; i < draw_call.get_elements_count(); ++i)
+				{
+					const u32 value = rsx::method_registers.index_type() == rsx::index_array_type::u16
+						? static_cast<u32>(reinterpret_cast<const be_t<u16>*>(captured_indices->raw_index_buffer.data())[i])
+						: static_cast<u32>(reinterpret_cast<const be_t<u32>*>(captured_indices->raw_index_buffer.data())[i]);
+					dump += fmt::format("r %u\n", value);
+				}
+			}
+			for (u32 i = 0; i < vertex_count; ++i)
+			{
+				const auto& v = m_scratch_vertices[i];
+				dump += fmt::format("v %.9g %.9g %.9g %.9g %.9g %08X\n", v.position[0], v.position[1], v.position[2], v.texcoord[0], v.texcoord[1], v.color);
+			}
+			for (usz i = 0; i + 2 < m_scratch_indices.size(); i += 3)
+				dump += fmt::format("f %u %u %u\n", m_scratch_indices[i], m_scratch_indices[i + 1], m_scratch_indices[i + 2]);
+			if (fs::file output{ path, fs::write + fs::create + fs::trunc })
+			{
+				output.write(dump.data(), dump.size());
+				rsx_log.notice("Remix Demons ground capture: %s", path);
+			}
+		}
+	}
+
 	// ROUND 32: same 'audit' accumulator as audit_vertex_extent - one field for the whole diagnostic
 	// family, so the timing line answers "what do the audits cost" in one number rather than two
 	// that have to be added.
@@ -23243,7 +30612,52 @@ void RemixGSRender::submit_subdraw()
 	{
 		scope_us audit_timer{ m_timing.audit };
 
-		if (!audit_world_extent(transform, skinned, vertex_count, is_sky || r2_visible_backdrop))
+		// --- ROUND 53: a declared sky texture is exempt from the world-extent refusal ------------
+		// THE MEASUREMENT THIS EXISTS FOR, from bin\remix_dump.log on Eat Lead (BLUS30267):
+		//   Remix skip-census: gate=wext vp=bdc0776911119029 fp=9747c2d02c8abf97
+		//     albedo=20703908CDA055F1 extent=1095.06 dist=4.76837e-07 clip=1280x720
+		// The game's sky dome is refused HERE, in essentially every frame it is drawn - extent 1095
+		// against a frame median of ~0.149 is a ratio of ~7330 into a STREAKGATE of 128, and
+		// wext_refused reaches 7896 on a single 'Remix live:' line of that dump. It slips through
+		// only in the handful of frames before a median exists, which is why the sky on screen has
+		// been the runtime's atmosphere and not the game's.
+		//
+		// The gate's question is "did this mesh arrive undecoded", answered by ratio to the frame's
+		// own median. That is precisely the wrong question to ask of a sky, which is the one draw in
+		// a scene whose extent is SUPPOSED to dwarf the median - and a hash the user typed into
+		// RPCS3_REMIX_SKYEMISSIVE is a declaration that it is not an undecoded mesh. The mechanism
+		// is already here: is_sky and R2's visible backdrop take the same early-out four lines down
+		// in audit_world_extent, and an exempt draw is left out of the median sample as well, so the
+		// dome cannot inflate the bar for everything else.
+		//
+		// sky_emissive_albedo_matches (list UNION promoted) and not sky_emissive_listed, so the
+		// exemption follows exactly the predicate that BUILDS the sky material and a hash that gets
+		// an emissive material can never then be refused on extent. albedo_hash is already in scope
+		// - the r2_visible_backdrop expression above reads it.
+		//
+		// The counter is MARGINAL on purpose: only draws this rule ALONE exempted, so it answers
+		// "what did SKYEMISSIVEWEXT change" instead of double-counting the two exemptions that
+		// already existed. Note is_sky may have just been cleared by the SKYTAG switch above, which
+		// is the intended interaction - a suppressed tag hands its exemption back to the gate, and
+		// only a declared sky texture keeps one.
+		const bool sky_emissive_wext = remix_rsx::sky_emissive_wext_exempt_enabled()
+			&& remix_rsx::sky_emissive_albedo_matches(albedo_hash);
+
+		if (sky_emissive_wext && !is_sky && !r2_visible_backdrop)
+		{
+			++m_stats.wext_exempt_sky;
+		}
+
+		const bool profiled_world_extent = remix_rsx::streak_allow_vp_hash() != 0
+			&& remix_rsx::streak_allow_fp_hash() != 0
+			&& m_current_vp_hash == remix_rsx::streak_allow_vp_hash()
+			&& m_current_fp_hash == remix_rsx::streak_allow_fp_hash()
+			&& m_main_clip_width != 0 && m_main_clip_height != 0
+			&& rsx::method_registers.surface_clip_width() == m_main_clip_width
+			&& rsx::method_registers.surface_clip_height() == m_main_clip_height;
+
+		if (!audit_world_extent(transform, skinned, vertex_count,
+			is_sky || r2_visible_backdrop || sky_emissive_wext || profiled_world_extent))
 		{
 			r2_candidate_probe("after-audit-fail");
 			audit_timer.stop();
@@ -23845,7 +31259,8 @@ void RemixGSRender::submit_subdraw()
 		//
 		// isVertexColorBakedLighting is cleared for the same reason as above: the guest's maths is
 		// a plain product, with no normalise-and-lerp-toward-white step.
-		if (m_scratch_haze_applied)
+		// The exact DS particle route also supplies a texture-times-vertex RGBA product.
+		if (m_scratch_haze_applied || m_scratch_demons_particle_fade)
 		{
 			blend_state.textureColorArg1Source = 1;  // RtTextureArgSource::Texture
 			blend_state.textureColorArg2Source = 2;  // RtTextureArgSource::VertexColor0
@@ -24232,6 +31647,14 @@ void RemixGSRender::submit_subdraw()
 		record.fp_vcol_replayed = remix_rsx::fp_vertex_colour_replay_enabled()
 			&& m_current_fp_fingerprint && m_current_fp_fingerprint->vcol_replayable();
 
+		// ROUND 58. Read from the same scratch the submit walk filled, so the pick line and the
+		// bind cannot disagree about which rule chose or what the bound texture measured.
+		record.elect_rule = m_scratch_elect_rule;
+		record.elect_would = m_scratch_elect_would;
+		record.albedo_grey = m_scratch_albedo_grey;
+		record.lanes_packed = m_current_fp_fingerprint
+			? pack_coord_lanes(*m_current_fp_fingerprint) : 0u;
+
 		// ROUND 43: from the same transform the loop below summarises, computed once above at the
 		// point it is handed to the runtime, so the pick line and the xform_mirrored counter can
 		// never disagree about a draw.
@@ -24244,6 +31667,12 @@ void RemixGSRender::submit_subdraw()
 				(transform.matrix[i][0] * transform.matrix[i][0]) +
 				(transform.matrix[i][1] * transform.matrix[i][1]) +
 				(transform.matrix[i][2] * transform.matrix[i][2]));
+			// ROUND 57. The same three entries basis[i] is the norm of, kept rather than summarised,
+			// so trace_pick_follow can divide by basis[i] and print a rotation delta. Costs nine f32
+			// stores on the picked draws only.
+			record.rot[i][0] = transform.matrix[i][0];
+			record.rot[i][1] = transform.matrix[i][1];
+			record.rot[i][2] = transform.matrix[i][2];
 			record.camera_position[i] = m_active_camera.position[i];
 			// ROUND 30. Seeded with the same value, then overwritten below if an anchor-frame eye is
 			// available - so a pick taken on a flip with no anchor eye reads camanchor == cam, which is
@@ -24475,6 +31904,12 @@ void RemixGSRender::submit_subdraw()
 			// re-testing it here would be a second, drifting copy of that decision.
 			held.used_projsplit = defer_projsplit_pending;
 
+			// ROUND 57. Which EVENT this draw is waiting for. Carried for the same reason as the flag
+			// above: the arming branch is where the decision is made, and re-deriving it in the flush
+			// would be a second copy of it that can drift. An anchor flush must skip these entries
+			// however well their render-source key matches - they are waiting on the relatch.
+			held.waits_relatch = m_scratch_defer_relatch;
+
 			// ROUND 46. Carried by value with everything else, for the same reason: the flush rebuilds
 			// the transform and would otherwise submit a viewmodel draw with the world placement and
 			// none of its rotation. False on every non-viewmodel draw, which is the whole population
@@ -24625,6 +32060,33 @@ void RemixGSRender::submit_subdraw()
 	// still submitted, and those two answers send the next round to opposite places.
 	note_watch("submitted", albedo_hash, m_streak_measured ? m_streak_extent : -1.f, m_skip_census_dist, true);
 
+	// ROUND 55. WHERE a submitted world draw landed, once per vertex program per run. The drop
+	// partition measured every removal gate at zero while ground and walls were still missing, so
+	// the remaining hypotheses are 'submitted somewhere else' and 'never drawn at all'. A box
+	// beside the camera position separates them: geometry that is present-but-elsewhere reads as
+	// an outlier here, and geometry that is genuinely absent never produces a line at all.
+	if (m_world_box_valid && m_worldbox_lines < s_max_worldbox_lines
+		&& m_worldbox_seen.insert(m_current_vp_hash).second)
+	{
+		++m_worldbox_lines;
+
+		dump_line(fmt::format(
+			"Remix worldbox: vp=%016llx fp=%016llx albedo=%016llX vtx=%u "
+			"lo=[%.6g %.6g %.6g] hi=[%.6g %.6g %.6g] cam=[%.6g %.6g %.6g] dist=%.6g frame=%llu line=%u/%u",
+			m_current_vp_hash, m_current_fp_hash, albedo_hash, vertex_count,
+			static_cast<f64>(m_world_box_lo[0]), static_cast<f64>(m_world_box_lo[1]),
+			static_cast<f64>(m_world_box_lo[2]),
+			static_cast<f64>(m_world_box_hi[0]), static_cast<f64>(m_world_box_hi[1]),
+			static_cast<f64>(m_world_box_hi[2]),
+			static_cast<f64>(m_active_camera.position[0]), static_cast<f64>(m_active_camera.position[1]),
+			static_cast<f64>(m_active_camera.position[2]),
+			static_cast<f64>(std::sqrt(
+				std::pow(0.5f * (m_world_box_lo[0] + m_world_box_hi[0]) - m_active_camera.position[0], 2.f)
+				+ std::pow(0.5f * (m_world_box_lo[1] + m_world_box_hi[1]) - m_active_camera.position[1], 2.f)
+				+ std::pow(0.5f * (m_world_box_lo[2] + m_world_box_hi[2]) - m_active_camera.position[2], 2.f))),
+			m_frame_counter, m_worldbox_lines, s_max_worldbox_lines));
+	}
+
 	// Only geometry that survived every refusal and reached Remix may seed a persistent guest
 	// light. This keeps rejected auxiliary passes from leaving phantom lamps in the scene.
 	// ROUND 48: is_viewmodel is the local computed for THIS draw earlier in this same function, so
@@ -24632,8 +32094,200 @@ void RemixGSRender::submit_subdraw()
 	// m_scratch_defer_is_viewmodel: that member is set inside the vm_op capture block and stays
 	// false at VIEWMODELCAM 0 and 1, which would make the gate silently inert at two reachable knob
 	// values - the exact defect shape rounds 46 and 47 both shipped.
-	maybe_inject_guest_light(m_current_vp_hash, m_current_fp_hash, albedo_hash, transform,
-		is_viewmodel);
+	// A deferred draw may be re-divided before it reaches Remix; its current transform is not the
+	// transform actually submitted. Do not mint a persistent light from coordinates we know are stale.
+	if (!deferred)
+	{
+		maybe_inject_guest_light(m_current_vp_hash, m_current_fp_hash, albedo_hash, transform,
+			is_viewmodel);
+	}
+	if (remix_rsx::demons_world_enabled() && m_current_vp_hash == 0x7f4d3587c70d02daull
+		&& m_current_fp_hash == 0x845ff76b3b14e33full && albedo_hash == 0xF93BC40E183C1F8Dull)
+	{
+		f32 direction[4]{}, extinction[4]{}, phase[4]{};
+		if (remix_rsx::read_slot(111, direction) && remix_rsx::read_slot(104, extinction)
+			&& remix_rsx::read_slot(107, phase))
+		{
+			const f32 length2 = direction[0] * direction[0] + direction[1] * direction[1] + direction[2] * direction[2];
+			const bool finite = std::all_of(std::begin(direction), std::end(direction), [](f32 v) { return std::isfinite(v); })
+				&& std::all_of(std::begin(extinction), std::end(extinction), [](f32 v) { return std::isfinite(v); });
+			const bool atmosphere = extinction[0] > 0.f && extinction[1] > 0.f && extinction[2] > 0.f
+				&& std::max({ extinction[0], extinction[1], extinction[2] }) < 1.f;
+			if (finite && atmosphere && length2 > 0.99f && length2 < 1.01f && direction[1] < 0.f)
+			{
+				const f32 inverse_length = 1.f / std::sqrt(length2);
+				for (u32 i = 0; i < 3; ++i) m_sun_track_travel[i] = direction[i] * inverse_length;
+				m_sun_track_have = true;
+
+				// Identify WHICH authored preset this is, by matching the scattering sun just
+				// recovered against the table generated from the game's own DrawParam banks. The key
+				// is exact to ~1e-6 when it matches at all, because the authored angles are whole
+				// degrees, so the tolerance only ever has to separate one preset from another.
+				if (remix_rsx::demons_lights_enabled())
+				{
+					const remix_rsx::demons_light_preset* best = nullptr;
+					const f32 tolerance = remix_rsx::demons_light_tolerance();
+					f32 best_err = tolerance;
+					u32 candidates = 0;
+
+					for (const auto& preset : remix_rsx::s_demons_light_presets)
+					{
+						f32 err = 0.f;
+						for (u32 k = 0; k < 3; ++k)
+						{
+							const f32 delta = preset.sun[k] - m_sun_track_travel[k];
+							err += delta * delta;
+						}
+
+						if (err >= tolerance)
+						{
+							continue;
+						}
+
+						++candidates;
+
+						// A preset that authors no key light cannot retarget the sun, so it is not a
+						// usable match however close its sky is.
+						const bool has_key = preset.rgb[0][0] > 0.f || preset.rgb[0][1] > 0.f
+							|| preset.rgb[0][2] > 0.f;
+
+						// STRICTLY less, and that is load-bearing. Presets can carry the IDENTICAL
+						// scattering sun - m08 rows 0 and 1 both key on the measured direction at
+						// err=0 exactly - so a '<=' hands the match to whichever row happens to come
+						// LAST. Row 1 there is named the level's unused waterway and its key light
+						// points about 90 degrees away in yaw from row 0's, so '<=' would have lit the
+						// whole level from a direction the game never uses. With '<' the first row to
+						// reach a given error keeps it, and the table is emitted in row order, so the
+						// base preset wins its own ties. A tie is genuinely undecidable from the
+						// scattering sun alone, which is what the census 'candidates' count reports.
+						if (has_key && err < best_err)
+						{
+							best_err = err;
+							best = &preset;
+						}
+					}
+
+					if (best != static_cast<const remix_rsx::demons_light_preset*>(m_demons_preset))
+					{
+						dump_line(fmt::format(
+							"Remix demons-preset: %s row=%u err=%.3g candidates=%u "
+							"sun=[%.5g %.5g %.5g] key=[%.5g %.5g %.5g] rgb=[%.4g %.4g %.4g] "
+							"hemi_up=[%.4g %.4g %.4g] frame=%llu",
+							best ? best->level : "none", best ? best->row : 0u,
+							static_cast<f64>(best ? best_err : -1.f), candidates,
+							static_cast<f64>(m_sun_track_travel[0]), static_cast<f64>(m_sun_track_travel[1]),
+							static_cast<f64>(m_sun_track_travel[2]),
+							static_cast<f64>(best ? best->dir[0][0] : 0.f),
+							static_cast<f64>(best ? best->dir[0][1] : 0.f),
+							static_cast<f64>(best ? best->dir[0][2] : 0.f),
+							static_cast<f64>(best ? best->rgb[0][0] : 0.f),
+							static_cast<f64>(best ? best->rgb[0][1] : 0.f),
+							static_cast<f64>(best ? best->rgb[0][2] : 0.f),
+							static_cast<f64>(best ? best->hemi_up[0] : 0.f),
+							static_cast<f64>(best ? best->hemi_up[1] : 0.f),
+							static_cast<f64>(best ? best->hemi_up[2] : 0.f),
+							m_frame_counter));
+					}
+
+					m_demons_preset = best;
+					m_demons_preset_frame = best ? m_frame_counter : umax;
+				}
+				m_sun_track_frame = m_frame_counter;
+				m_sun_track_score = std::numeric_limits<f32>::max();
+				m_sun_track_albedo = albedo_hash;
+				static u32 direction_logs = 0;
+				static u64 direction_log_frame = ~0ull;
+				if (direction_logs < 32 && (direction_logs == 0 || m_frame_counter >= direction_log_frame + 120))
+				{
+					++direction_logs;
+					direction_log_frame = m_frame_counter;
+					dump_line(fmt::format("Remix Demons authored sun: travel=[%.9g %.9g %.9g] c111w=%.9g c107=[%.9g %.9g %.9g %.9g] camera_forward=[%.9g %.9g %.9g] frame=%llu",
+						m_sun_track_travel[0], m_sun_track_travel[1], m_sun_track_travel[2], direction[3],
+						phase[0], phase[1], phase[2], phase[3], m_active_camera.view.m[0][2],
+						m_active_camera.view.m[1][2], m_active_camera.view.m[2][2], m_frame_counter));
+				}
+			}
+		}
+	}
+	// Capture the live inputs needed to replay COL0/TC8/TC9 and mutable fragment constants.
+	if (remix_rsx::demons_world_enabled() && albedo_hash == 0xbb8f60ef3064b33bull
+		&& m_current_vp_hash == 0x9754e61daeaa76c7ull && m_current_fp_hash == 0x2aadcee9659f3dfcull)
+	{
+		static u32 captures = 0;
+		static u64 last_frame = ~0ull;
+		if (captures < 12 && last_frame != m_frame_counter
+			&& (captures < 4 || m_frame_counter >= last_frame + 120))
+		{
+			++captures;
+			last_frame = m_frame_counter;
+			const std::string directory = fs::get_executable_dir() + "remix_sky/";
+			fs::create_dir(directory);
+			const std::string path = fmt::format("%sBB8F60EF3064B33B_%llu", directory, m_frame_counter);
+			std::string dump = fmt::format("sky vp=%016llX fp=%016llX frame=%llu vertices=%u samples=%u\n",
+				m_current_vp_hash, m_current_fp_hash, m_frame_counter, vertex_count, std::min(vertex_count, 8u));
+			for (u32 slot = 0; slot < 468; ++slot)
+			{
+				f32 value[4]{};
+				if (remix_rsx::read_slot(slot, value))
+					dump += fmt::format("constant %u %.9g %.9g %.9g %.9g\n", slot, value[0], value[1], value[2], value[3]);
+			}
+			for (u32 attr = 0; attr < 16; ++attr)
+			{
+				attribute_view input{};
+				if (map_attribute(attr, first_vertex, vertex_count, input) != attribute_status::ok)
+				{
+					dump += fmt::format("attribute_unmapped %u\n", attr);
+					continue;
+				}
+				dump += fmt::format("attribute_format %u type=%u size=%u\n", attr, static_cast<u32>(input.type), input.size);
+				for (u32 i = 0; i < std::min(vertex_count, 8u); ++i)
+				{
+					f32 value[4]{};
+					if (remix_rsx::decode_attribute_raw(input.at(i), input.type, input.size, value))
+						dump += fmt::format("attribute %u %u %.9g %.9g %.9g %.9g\n", i, attr, value[0], value[1], value[2], value[3]);
+				}
+			}
+			if (fs::file output{ path + ".txt", fs::write + fs::create + fs::trunc }) output.write(dump.data(), dump.size());
+			const void* code = current_fragment_program.get_data();
+			const u32 length = current_fragment_program.ucode_length;
+			if (code && length && length <= 65536)
+				if (fs::file output{ path + ".fp", fs::write + fs::create + fs::trunc }) output.write(code, length);
+			rsx_log.notice("Remix Demons sky input capture: frame=%llu fp_bytes=%u path=%s", m_frame_counter, length, path);
+		}
+	}
+
+	// Twelve synchronized frames for an evidence-based player-bone attachment.
+	if (remix_rsx::demons_world_enabled() && skinned && m_demons_attachment_start != ~0ull
+		&& m_frame_counter >= m_demons_attachment_start && m_frame_counter - m_demons_attachment_start < 12
+		&& !m_scratch_bone_transforms.empty() && m_scratch_bone_transforms.size() <= 128)
+	{
+		static u64 capture_frame = ~0ull;
+		static u32 capture_draw = 0;
+		if (capture_frame != m_frame_counter) { capture_frame = m_frame_counter; capture_draw = 0; }
+		if (capture_draw < 64)
+		{
+			const u32 ordinal = capture_draw++;
+			const std::string directory = fs::get_executable_dir() + "remix_attachment/";
+			fs::create_dir(directory);
+			const std::string path = fmt::format("%s%llu_%u_pose.txt", directory, m_frame_counter, ordinal);
+			std::string data = fmt::format("pose frame=%llu mesh=%016llX albedo=%016llX vp=%016llX fp=%016llX vertices=%u bones=%llu influences=%u\n",
+				m_frame_counter, hash, albedo_hash, m_current_vp_hash, m_current_fp_hash, vertex_count,
+				static_cast<u64>(m_scratch_bone_transforms.size()), m_scratch_bones_per_vertex);
+			for (u32 r = 0; r < 3; ++r)
+				data += fmt::format("instance %.9g %.9g %.9g %.9g\n", transform.matrix[r][0], transform.matrix[r][1], transform.matrix[r][2], transform.matrix[r][3]);
+			for (usz b = 0; b < m_scratch_bone_transforms.size(); ++b)
+				for (u32 r = 0; r < 3; ++r)
+				{
+					const auto& row = m_scratch_bone_transforms[b].matrix[r];
+					data += fmt::format("bone %llu %.9g %.9g %.9g %.9g\n", static_cast<u64>(b), row[0], row[1], row[2], row[3]);
+				}
+			if (fs::file output{ path, fs::write + fs::create + fs::trunc }) output.write(data.data(), data.size());
+			if (ordinal == 0) rsx_log.notice("Remix Demons attachment pose capture: frame=%llu path=%s", m_frame_counter, path);
+		}
+	}
+
+	place_demons_amulet_light(albedo_hash, transform, vertex_count);
+	track_demons_fire(demons_fire_surface, vertex_count);
 
 	if (static_entry && has_static_submit_signature)
 	{
@@ -24650,6 +32304,10 @@ void RemixGSRender::submit_subdraw()
 	}
 
 	++m_stats.draws_submitted;
+
+	// ROUND 52. The per-frame half of the same fact, for the 'Remix ui-route:' census: how much of
+	// the scene was already in when a given 2D draw arrived. Reset in flip(); see the declaration.
+	++m_frame_world_draws;
 
 	// The draw survived every gate and is now in the scene. If it was flagged as geometrically
 	// incoherent back at the decode, this is the counter that says the artifact is actually being
@@ -24767,6 +32425,16 @@ const remix_rsx::vp_fingerprint& RemixGSRender::fingerprint_for(u64 vp_hash)
 			{
 				++m_stats.vp_indexed_unmatched;
 			}
+		}
+
+		// Round 52, the program half of the transposed-blend arm - a strict subset of
+		// vp_indexed_matched. Counted here for the same reason the pair above is: the map is what
+		// makes it once per unique program. 8 is the expected value on Eat Lead (BLUS30267) and 0
+		// on every title that already rendered, which is the check that the new arm took nothing
+		// off an existing matcher.
+		if (it->second.skin_vertex_blend)
+		{
+			++m_stats.vp_vertex_blend;
 		}
 	}
 
@@ -24890,10 +32558,18 @@ const remix_rsx::fp_fingerprint& RemixGSRender::fp_fingerprint_for(u64 fp_hash)
 		{
 			const remix_rsx::fp_fingerprint& fp = it->second;
 
-			rsx_log.notice("Remix fpdump fp=%016llx sampled=0x%x colour=0x%x ref=0x%x instrs=%u fp32=%u alpha_only=%u flow=%u trunc=%u (%s)",
+			// ROUND 58 appends lerp= and lanes=. lerp=0>1:0.85 is the program stating outright that
+			// unit 0 is 15% of its colour and unit 1 is the rest; lerp=none:<reason> names the shape
+			// the detector refused, which is what a later extension is designed from.
+			const std::string lerp = fp.lerp_valid
+				? fmt::format("%u>%u:%.3g", u32{fp.lerp_a}, u32{fp.lerp_b}, static_cast<f64>(fp.lerp_weight))
+				: fmt::format("none:%s", fp.lerp_note ? fp.lerp_note : "?");
+
+			rsx_log.notice("Remix fpdump fp=%016llx sampled=0x%x colour=0x%x ref=0x%x instrs=%u fp32=%u alpha_only=%u flow=%u trunc=%u lerp=%s lanes=%s (%s)",
 				fp_hash, u32{fp.sampled_mask}, u32{fp.colour_mask},
 				u32{current_fp_metadata.referenced_textures_mask}, fp.instructions,
 				fp32_outputs ? 1 : 0, fp.alpha_only ? 1 : 0, fp.has_flow ? 1 : 0, fp.truncated ? 1 : 0,
+				lerp, describe_coord_lanes(fp.sampled_mask, pack_coord_lanes(fp)),
 				fp.note);
 		}
 	}
@@ -25684,7 +33360,11 @@ void RemixGSRender::dump_texture(const remix_rsx::texture_entry& entry, const rs
 		// 'acov' is the decoded alpha range. acov=255..255 on a texture bound to an
 		// alpha-blended draw means that draw is opaque no matter what the blend factors say,
 		// because the blend ext tells Remix to take surface alpha from this channel.
-		"Remix tex=%016llX fmt=%02x %ux%u unit=%u mips=%u swizzled=%d pitch=%u loc=%u offset=0x%x wrap=%u,%u alpha=%u/%u acov=%u..%u",
+		// ROUND 58: sat/lumsd are the greymap measurement (texture_entry::sat_mean / lum_sd, both
+		// 0..255). 'sat<4 lumsd>40' IS the black-and-white macro/grime map this title blends in at
+		// 5-15% and this backend was electing as the albedo; plain grey concrete reads sat 1.8 with
+		// lumsd 12, i.e. grey but FLAT, and is correctly not one.
+		"Remix tex=%016llX fmt=%02x %ux%u unit=%u mips=%u swizzled=%d pitch=%u loc=%u offset=0x%x wrap=%u,%u alpha=%u/%u acov=%u..%u sat=%.1f lumsd=%.1f",
 		entry.content_hash,
 		u32{tex.format()} & ~(CELL_GCM_TEXTURE_LN | CELL_GCM_TEXTURE_UN),
 		entry.width,
@@ -25700,7 +33380,9 @@ void RemixGSRender::dump_texture(const remix_rsx::texture_entry& entry, const rs
 		u32{entry.alpha_func},
 		u32{entry.alpha_ref},
 		u32{entry.alpha_min},
-		u32{entry.alpha_max});
+		u32{entry.alpha_max},
+		static_cast<f64>(entry.sat_mean),
+		static_cast<f64>(entry.lum_sd));
 
 	rsx_log.notice("%s", line);
 
@@ -25881,19 +33563,51 @@ void RemixGSRender::log_stats()
 
 	rsx_log.notice(
 		"Remix stats: frame=%llu draws=%llu submitted=%llu meshes_live=%llu created=%llu destroyed=%llu poisoned=%llu | "
-		"cam_resolved=%llu cam_fallback=%llu cam_held=%llu cam_clusters=%llu cam_contested=%llu cam_winner_votes=%llu cam_overflow=%llu cam_discontinuity_held=%llu cam_switch_confirmed=%llu split_attempted=%llu split_failed=%llu split_reserved=%llu cam_relatch=%llu arch=%s world_applied=%llu world_fallback=%llu world_refused=%llu world_layered_ref=%llu world_ref_fresh=%llu world_ref_stale=%llu gauge_used=%llu gauge_prev=%llu gauge_absent=%llu gauge_contested=%llu gauge_cam=%llu gauge_cam_failed=%llu gauge_slot_exhausted=%llu gauge_invert_failed=%llu gauge_prev_exact=%llu gauge_prev_dims=%llu gauge_cur_dims=%llu gauge_cur_avail=%llu gauge_prev_camfresh=%llu gauge_cam_prev=%llu gauge_cam_held=%llu gauge_zfold_mismatch=%llu skip_auxuntex=%llu world_div_f64=%llu kil_ucode=%llu kil_ctrl=%llu kil_disagree=%llu texkill_seen=%llu kil_applied=%llu kil_applied_texctl=%llu pick_clicks=%llu | "
-		"skip screen=%llu immediate=%llu inline=%llu volatile=%llu reg_attr0=%llu prim=%llu restart=%llu instanced=%llu layout=%llu mem=%llu decode=%llu poison=%llu vp=%llu albedo=%llu rt=%llu rt_kept=%llu camsurf=%llu notinput=%llu wdiv=%llu wdiv_shadowed=%llu posdecode_refused=%llu | "
+		"cam_resolved=%llu cam_fallback=%llu cam_held=%llu "
+		// ROUND 56: the three CAMXFLIP counters appended INSIDE the camera group immediately after
+		// cam_held, with their arguments in the matching position. On this title the pre-registered
+		// reading is cam_xmirror == cam_resolved on both arms (P[0][0] < 0 was measured on 100% of
+		// 17,314 resolved frames off score_perspective's -0.5 dock), cam_xflip == cam_xmirror with
+		// the knob armed and 0 without it, and cam_dropped == 0 - the drop path did not fire once
+		// after the first camera resolved in either frozen run.
+		"cam_xmirror=%llu cam_xflip=%llu cam_dropped=%llu "
+		"cam_clusters=%llu cam_contested=%llu cam_winner_votes=%llu cam_overflow=%llu cam_discontinuity_held=%llu cam_switch_confirmed=%llu split_attempted=%llu split_failed=%llu split_reserved=%llu cam_relatch=%llu arch=%s world_applied=%llu world_fallback=%llu world_refused=%llu world_layered_ref=%llu world_ref_fresh=%llu world_ref_stale=%llu gauge_used=%llu gauge_prev=%llu gauge_absent=%llu gauge_contested=%llu gauge_cam=%llu gauge_cam_failed=%llu gauge_slot_exhausted=%llu gauge_invert_failed=%llu gauge_prev_exact=%llu gauge_prev_dims=%llu gauge_cur_dims=%llu gauge_cur_avail=%llu gauge_prev_camfresh=%llu gauge_cam_prev=%llu gauge_cam_held=%llu gauge_zfold_mismatch=%llu skip_auxuntex=%llu world_div_f64=%llu kil_ucode=%llu kil_ctrl=%llu kil_disagree=%llu texkill_seen=%llu kil_applied=%llu kil_applied_texctl=%llu pick_clicks=%llu | "
+		// ROUND 51: cmask/notarget appended at the END of the group, not mid-line, because
+		// fmt::format does not check argument counts and a mid-line insertion shifts every
+		// following pair silently.
+		"skip screen=%llu immediate=%llu inline=%llu volatile=%llu reg_attr0=%llu prim=%llu restart=%llu instanced=%llu layout=%llu mem=%llu decode=%llu poison=%llu vp=%llu albedo=%llu rt=%llu rt_kept=%llu camsurf=%llu notinput=%llu wdiv=%llu wdiv_shadowed=%llu posdecode_refused=%llu cmask=%llu notarget=%llu | "
 		"vp_hpos_indirect=%llu vp_hpos_refused=%llu vp_hpos_indexed=%llu vp_wbuffer_z=%llu | "
 		"idxworld_rigid=%llu idxworld_skinned=%llu idxworld_refused=%llu vp_indexed_matched=%llu vp_indexed_unmatched=%llu bone_degenerate=%llu | "
 		"skin_submitted=%llu skin_skipped=%llu skin_unrecognised=%llu skin_bones_max=%llu "
-		"skin_unrec_arl=%llu skin_unrec_foreign=%llu skin_unrec_reads=%llu skin_unrec_indexed=%llu skin_unrec_census=%u | "
+		"skin_unrec_arl=%llu skin_unrec_foreign=%llu skin_unrec_reads=%llu skin_unrec_indexed=%llu skin_unrec_census=%u "
+		// ROUND 52, appended at the END of the skin group - never mid-group, because fmt::format
+		// does not check argument counts and an insertion shifts every following pair silently.
+		// draws / programs, same order as pos_input below. skin_vertexblend > 0 with
+		// skin_unrec_indexed at 0 is this round's acceptance; vp_vertexblend > 0 with
+		// skin_vertexblend at 0 says the programs matched and every draw of them was then refused
+		// downstream, and the skinblend_* group names which gate.
+		"skin_vertexblend=%llu vp_vertexblend=%llu | "
 		"idxuniform=%llu/%llu/%llu idxbias=%llu/%llu/%llu | "
 		"skinblend_submitted=%llu skinblend_idx=%llu skinblend_weight=%llu skinblend_bone=%llu skinblend_palette=%llu skinblend_scale=%llu skinblend_uniform=%llu skinblend_rescaled=%llu skin_reach_flagged=%llu vtx_spread=%llu vtx_zero_split=%llu vtx_spread_submitted=%llu vtx_spread_refused=%llu | "
-		"wext_examined=%llu wext_exempt=%llu wext_nonfinite=%llu wext_refused=%llu wext_flagged_drawn=%llu "
+		// ROUND 50. The same pair 'Remix live:' carries, mirrored here deliberately: this line goes
+		// only to bin\log\RPCS3.log, which is exclusively locked while the emulator runs, so the
+		// live copy is the one a play-test can read - but RPCS3.log is what survives the run.
+		// Inserted immediately BEFORE the wext group with its two arguments in the matching
+		// position, adjacent, so no unrelated pair can shift. programs/draws.
+		"pos_input=%llu/%llu | "
+		// The vertex-normal decode. Same five values, same order, as the 'normals=' group on the
+		// live line; present on both because 'Remix stats:' only reaches the exclusively locked
+		// RPCS3.log and anything a play-test has to judge must also be readable while it runs.
+		"normals=%llu/%llu/%llu/%llu/%llu normalattr=%u | "
+		"wext_examined=%llu wext_exempt=%llu wext_exempt_sky=%llu wext_nonfinite=%llu wext_refused=%llu wext_flagged_drawn=%llu "
 		"wext_median=%.6g wext_samples=%llu wext_max=%.6g wext_drawn=%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu | "
 		"skip_lighting_pass=%llu | "
 		"cat_sky=%llu sky_cand=%llu sky_noworld=%llu sky_extent=%llu sky_anchor=%llu sky_anchor_held=%llu sky_census=%u "
-		"sky_backdrop_hit=%llu sky_backdrop_dw=%llu sky_backdrop_mode=%u sky_learned_ring=%llu | "
+		"sky_backdrop_hit=%llu sky_backdrop_dw=%llu sky_backdrop_mode=%u sky_learned_ring=%llu "
+		// ROUND 53. Read against cat_sky two fields up: with skytag=0 on the banner, cat_sky must be
+		// 0 and this is where the tags went. Every rule's own counter above is untouched by the
+		// switch, so they still say WHICH rule would have tagged what.
+		"sky_tag_suppressed=%llu | "
 		"skyhash_considered=%llu skyhash_dome=%llu skyhash_matched=%llu skyhash_tagged=%llu "
 		"skyhash_rejected=%llu skyhash_tracked=%llu skyhash_census=%u skyhash_mode=%u | "
 		// ROUND 39. The dome classifier, mirroring the identical group on 'Remix live:'. Present on
@@ -25917,9 +33631,38 @@ void RemixGSRender::log_stats()
 		"cat_hidden=%llu cat_hidepair=%llu cat_particle=%llu cat_decal=%llu cat_smoothnormals=%llu | "
 		"blend_chained=%llu blend_translucent=%llu blend_unmapped=%llu blend_rtopaque=%llu "
 		"blend_arescued=%llu blend_astranded=%llu blend_pairs={%s} | "
-		"tex_bound=%llu tex_none=%llu tex_no_unit=%llu tex_unit_retry=%llu xform_measured=%llu xform_mirrored=%llu xform_degenerate=%llu tex_albedo_ucode=%llu tex_albedo_guess=%llu tex_albedo_narrow=%llu tex_retry_refused=%llu tex_unit_substituted=%llu uv_applied=%llu uv_none=%llu uv_absent=%llu uv_layout=%llu uv_memory=%llu uv_fallback=%llu uv_ucode=%llu uv_heuristic=%llu uv_nonfinite=%llu vcol_applied=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_tombstone=%llu tex_rehashed=%llu tex_refreshed=%llu mat_created=%llu tex_retry_unsupported=%llu mat_untested=%llu tex_tomb_transient=%llu tex_key_dup=%llu uv_scale_ucode=%llu uv_scale_fixed=%llu uv_scale_refuse=%llu/%llu/%llu/%llu/%llu uv_affine_general=%llu uv_affine_lanes=%llu uv_tiled=%llu | "
+		"tex_bound=%llu tex_none=%llu tex_no_unit=%llu tex_unit_retry=%llu xform_measured=%llu xform_mirrored=%llu xform_degenerate=%llu tex_albedo_ucode=%llu tex_albedo_guess=%llu tex_albedo_narrow=%llu tex_albedo_lerp=%llu tex_albedo_lane=%llu tex_albedo_grey=%llu tex_albedo_grey_alt=%llu tex_retry_refused=%llu tex_unit_substituted=%llu uv_applied=%llu uv_none=%llu uv_absent=%llu uv_layout=%llu uv_memory=%llu uv_fallback=%llu uv_ucode=%llu uv_heuristic=%llu uv_nonfinite=%llu vcol_applied=%llu tex_live=%llu tex_created=%llu tex_destroyed=%llu tex_hits=%llu tex_deferred=%llu tex_unreadable=%llu tex_unsupported=%llu tex_tombstone=%llu tex_rehashed=%llu tex_refreshed=%llu mat_created=%llu tex_retry_unsupported=%llu mat_untested=%llu tex_tomb_transient=%llu tex_key_dup=%llu uv_scale_ucode=%llu uv_scale_fixed=%llu uv_scale_refuse=%llu/%llu/%llu/%llu/%llu uv_affine_general=%llu uv_affine_lanes=%llu "
+		// ROUND 60, appended at the END of the tex/uv group with its two arguments in the matching
+		// position immediately after uv_affine_lanes' - one specifier pair, one argument pair,
+		// adjacent, the only shape of edit to this line that cannot shift an unrelated pair.
+		// tex_remap_seen counts every decoded texture whose NV4097_SET_TEXTURE_CONTROL1 is not the
+		// identity 0xAAE4 and is counted with the knob OFF too, so it answers "does this title use
+		// the register" without a rebuild; tex_remap_applied is the subset this build rewrote, so
+		// seen>0 with applied=0 reads as "RPCS3_REMIX_TEXREMAP is off", not "nothing to fix".
+		"tex_remap_seen=%llu tex_remap_applied=%llu "
+		// ROUND 52 (steps 2a/2b/2c), inserted between uv_affine_lanes and uv_tiled with its three
+		// arguments in the matching position below - one specifier, one argument, adjacent, the
+		// only shape of edit to this line that cannot shift an unrelated pair. Deliberately NOT a
+		// sixth field of uv_scale_refuse, so that census keeps meaning what every earlier run's
+		// logs say it means.
+		"uv_scale_slot_refused=%llu uv_affine_hop=%llu uv_affine_two_scales=%llu "
+		// ROUND 58, appended at the end of the same group - three specifiers and three
+		// arguments, adjacent, the only shape of edit here that cannot shift a pair.
+		"uv_lane_zw=%llu uv_lane_refused=%llu uv_affine_scale2=%llu "
+		"uv_tiled=%llu | "
 		"ui_draws=%llu ui_skipped=%llu ui_no_colour=%llu ui_rt=%llu ui_prims=%llu ui_frames=%llu ui_ndc=%llu ui_unit=%llu ui_pixel=%llu ui_nospace=%llu ui_ortho2d=%llu "
-		"ui_vpydown=%llu ui_vpyup=%llu ui_vpfallback=%llu ui_vflip_ndc=%llu/%llu ui_vflip_pixel=%llu/%llu ui_vflip_abstain=%llu | "
+		"ui_vpydown=%llu ui_vpyup=%llu ui_vpfallback=%llu ui_vflip_ndc=%llu/%llu ui_vflip_pixel=%llu/%llu ui_vflip_abstain=%llu "
+		// ROUND 52, appended at the END of the ui group - after ui_vflip_abstain and before the
+		// group separator - with its seven arguments in the matching position below and nowhere
+		// else. Every one is structurally 0 at the shipped defaults on every title measured before
+		// Eat Lead, so a non-zero reading is proof the route is armed. Field notes on the
+		// declarations in RemixGSRender.h.
+		"ui_tint_tc=%llu/%llu ui_tint_rgbdrop=%llu ui_opaque_skipped=%llu ui_uv_ucode=%llu/%llu ui_uv_double_skipped=%llu "
+		// ROUND 59, appended at the END of the ui group - after ui_forced_dw and before the group
+		// separator - with its two arguments in the matching position below and nowhere else. Both
+		// are structurally 0 at the shipped defaults, so a non-zero reading is proof the knob is
+		// armed. Field notes on the declarations in RemixGSRender.h.
+		"ui_forced_dw=%llu ui_forced_dw_preworld=%llu ui_refused_fp=%llu | "
 		"ui_forced=%llu uiforce_vps=%u "
 		// Round 36 inserts ui_forced_pair IMMEDIATELY AFTER uiforce_vps, and its argument goes in
 		// the matching position below. Adjacent on purpose: the pair route only makes sense read
@@ -25942,6 +33685,11 @@ void RemixGSRender::log_stats()
 		m_stats.cam_resolved,
 		m_stats.cam_fallback,
 		m_stats.cam_held,
+		// ROUND 56, the three in the matching position for
+		// "cam_xmirror=%llu cam_xflip=%llu cam_dropped=%llu" appended after "cam_held=%llu" above.
+		m_stats.cam_xmirror,
+		m_stats.cam_xflip,
+		m_stats.cam_dropped,
 		m_stats.cam_clusters,
 		m_stats.cam_contested,
 		m_stats.cam_winner_votes,
@@ -26007,6 +33755,8 @@ void RemixGSRender::log_stats()
 		m_stats.wdiv_draws,
 		m_stats.wdiv_shadowed_draws,
 		m_stats.pos_decode_refused,
+		m_stats.skip_cmask,
+		m_stats.skip_notarget,
 		m_stats.vp_hpos_indirect,
 		m_stats.vp_hpos_refused,
 		m_stats.vp_hpos_indexed,
@@ -26026,6 +33776,10 @@ void RemixGSRender::log_stats()
 		m_stats.skin_unrec_reads,
 		m_stats.skin_unrec_indexed,
 		m_skin_unrec_census_lines,
+		// ROUND 52, in the matching position for the "skin_vertexblend=%llu vp_vertexblend=%llu"
+		// appended after "skin_unrec_census=%u" above.
+		m_stats.skin_vertex_blend,
+		m_stats.vp_vertex_blend,
 		m_stats.idxuniform_considered,
 		m_stats.idxuniform_resolved,
 		m_stats.idxuniform_refused,
@@ -26045,8 +33799,22 @@ void RemixGSRender::log_stats()
 		m_stats.vtx_zero_split,
 		m_stats.vtx_spread_submitted,
 		m_stats.vtx_spread_refused,
+		// ROUND 50, the pair for the 'pos_input=%llu/%llu' inserted immediately before the wext
+		// group above. ROUND 51 SWAPS THEM: the field is draws/programs everywhere it is
+		// documented (KNOBS.md, every plan and report), and round 50 shipped it printing
+		// programs/draws - so 'pos_input=33/674496' was being read as 33 draws. Format untouched.
+		m_stats.pos_input_draws,
+		m_stats.pos_input_programs,
+		// programs/applied/rejected/absent/degenerate, then the slot they were read from.
+		m_stats.normal_programs,
+		m_stats.normal_applied,
+		m_stats.normal_rejected,
+		m_stats.normal_absent,
+		m_stats.normal_degenerate,
+		remix_rsx::normal_attribute_index(),
 		m_stats.wext_examined,
 		m_stats.wext_exempt,
+		m_stats.wext_exempt_sky,
 		m_stats.wext_nonfinite,
 		m_stats.wext_refused,
 		m_stats.wext_flagged_drawn,
@@ -26073,6 +33841,7 @@ void RemixGSRender::log_stats()
 		m_stats.sky_backdrop_dw,
 		remix_rsx::sky_backdrop_mode(),
 		m_stats.sky_learned_ring,
+		m_stats.sky_tag_suppressed,
 		m_stats.sky_hash_considered,
 		m_stats.sky_hash_dome,
 		m_stats.sky_hash_matched,
@@ -26142,6 +33911,12 @@ void RemixGSRender::log_stats()
 		m_stats.tex_albedo_ucode,
 		m_stats.tex_albedo_guess,
 		m_stats.tex_albedo_narrow,
+		// ROUND 58, in the order of "tex_albedo_lerp tex_albedo_lane tex_albedo_grey
+		// tex_albedo_grey_alt" above.
+		m_stats.tex_albedo_lerp,
+		m_stats.tex_albedo_lane,
+		m_stats.tex_albedo_grey,
+		m_stats.tex_albedo_grey_alt,
 		m_stats.tex_retry_refused,
 		m_stats.tex_unit_substituted,
 		m_stats.uv_applied,
@@ -26178,6 +33953,19 @@ void RemixGSRender::log_stats()
 		m_stats.uv_scale_no_attribute,
 		m_stats.uv_affine_general,
 		m_stats.uv_affine_lanes,
+		// ROUND 60, in the order of "tex_remap_seen=%llu tex_remap_applied=%llu" above. These live
+		// on the texture cache's own stats, not m_stats - 'tex' is the reference taken above.
+		tex.remap_seen,
+		tex.remap_applied,
+		// ROUND 52, in the order of
+		// "uv_scale_slot_refused=%llu uv_affine_hop=%llu uv_affine_two_scales=%llu" above.
+		m_stats.uv_scale_slot_refused,
+		m_stats.uv_affine_hop,
+		m_stats.uv_affine_two_scales,
+		// ROUND 58, in the order of "uv_lane_zw uv_lane_refused uv_affine_scale2" above.
+		m_stats.uv_lane_zw,
+		m_stats.uv_lane_refused,
+		m_stats.uv_affine_scale2,
 		m_stats.uv_tiled,
 		m_stats.ui_draws,
 		m_stats.ui_skipped,
@@ -26203,6 +33991,21 @@ void RemixGSRender::log_stats()
 		m_stats.ui_vflip_pixel_ok,
 		m_stats.ui_vflip_pixel_bad,
 		m_stats.ui_vflip_abstain,
+		// ROUND 52, in the order of
+		// "ui_tint_tc=%llu/%llu ui_tint_rgbdrop=%llu ui_opaque_skipped=%llu ui_uv_ucode=%llu/%llu
+		//  ui_forced_dw=%llu" above. The paired fields read <applied>/<refused>.
+		m_stats.ui_tint_texcoord,
+		m_stats.ui_tint_texcoord_unmapped,
+		m_stats.ui_tint_pass_rgbdrop,
+		m_stats.ui_force_opaque_skipped,
+		m_stats.ui_uv_ucode,
+		m_stats.ui_uv_ucode_refused,
+		m_stats.ui_uv_double_skipped,
+		m_stats.ui_forced_dw,
+		// ROUND 59, in the order of
+		// "ui_forced_dw_preworld=%llu ui_refused_fp=%llu" above.
+		m_stats.ui_forced_dw_preworld,
+		m_stats.ui_refused_fp,
 		// Round 23. ui_forced is the RPCS3_REMIX_UIFORCEVP subset of skip_screen_space; vm_pair_far
 		// is the RPCS3_REMIX_VMPAIRMAXDIST refusal count; the sun_sky trio is the per-level sun.
 		// Every one of them is structurally 0 at the shipped code defaults, so a non-zero value is
@@ -26298,6 +34101,42 @@ void RemixGSRender::log_stats()
 			m_timing.mesh_create_buckets[2],
 			m_timing.mesh_create_buckets[3],
 			m_timing.mesh_create_buckets[4]);
+
+		// --- ROUND 58: what the backend is HOLDING, beside what it is spending ---------------------
+		//
+		// The counts this backend already printed (meshes_live, tex_live, mat_created) say how many
+		// objects exist but not what they weigh, and that is the difference between reading a leak
+		// and guessing at one. On RC1 'meshes_live=148,696' sat beside a 5.4 GB process and the
+		// attribution took a chain of inference; one line of bytes would have said it outright.
+		//
+		// How to read it: after a scene has settled, every one of these should be FLAT. A total
+		// that keeps climbing while the picture does not change is something being retained that
+		// should not be - and the three are separated because they fail for different reasons.
+		// Meshes climb when the cache holds one-shot geometry (see MESHIDLE); textures climb when
+		// the same content is being re-uploaded under changing hashes (see TEXREHASH); materials
+		// climbing while textures do not means materials are outliving the entries that made them.
+		//
+		// mesh bytes are what was handed to CreateMesh, not what the runtime built from it: a BLAS
+		// is larger than its source geometry, so this is a floor on the real cost, and it is the
+		// only half this backend can honestly measure.
+		{
+			u64 mesh_bytes = 0;
+
+			for (const auto& [key, entry] : m_meshes)
+			{
+				mesh_bytes += entry.bytes;
+			}
+
+			const auto mib = [](u64 bytes) { return static_cast<f64>(bytes) / (1024.0 * 1024.0); };
+
+			rsx_log.notice("Remix memory: meshes=%llu/%.1fMiB textures=%llu/%.1fMiB materials=%llu | "
+				"mesh_avg=%.0fB tex_avg=%.0fKiB",
+				static_cast<u64>(m_meshes.size()), mib(mesh_bytes),
+				static_cast<u64>(m_textures.live()), mib(m_textures.live_bytes()),
+				static_cast<u64>(m_textures.live_materials()),
+				m_meshes.empty() ? 0.0 : static_cast<f64>(mesh_bytes) / static_cast<f64>(m_meshes.size()),
+				m_textures.live() == 0 ? 0.0 : static_cast<f64>(m_textures.live_bytes()) / static_cast<f64>(m_textures.live()) / 1024.0);
+		}
 
 		// --- ROUND 46: the cost numbers, in the log that SURVIVES ---------------------------------
 		//
@@ -26560,11 +34399,29 @@ void RemixGSRender::log_stats()
 			// uv_affine_lanes: draws whose form gives u and v different divisor components, i.e.
 			// the ones UVSCALELANES newly resolves. uv_tiled: draws whose submitted UVs leave the
 			// unit square at all, which is the size of the population the uvrange census names.
-			"uv_affine_lanes=%llu uv_tiled=%llu | "
+			"uv_affine_lanes=%llu "
+			// ROUND 60, inserted immediately after uv_affine_lanes with its two arguments in the
+			// matching position - the same edit as 'Remix stats:', for the same reason: RPCS3.log
+			// is exclusively locked while the game runs, so the pair that says whether
+			// RPCS3_REMIX_TEXREMAP did anything has to be readable from remix_dump.log too.
+			"tex_remap_seen=%llu tex_remap_applied=%llu "
+			// ROUND 52 (steps 2a/2b/2c), inserted between uv_affine_lanes and uv_tiled with its
+			// three arguments in the matching position below. On the LIVE line because these are
+			// the numbers the play-test reads while standing in front of the wall the fix is for:
+			// uv_affine_hop climbing while uv_scale_fixed collapses IS the fix firing, and
+			// uv_scale_slot_refused is the one that should stay 0 on every title.
+			"uv_scale_slot_refused=%llu uv_affine_hop=%llu uv_affine_two_scales=%llu "
+			// ROUND 58, at the end of the same group with its three arguments below.
+			"uv_lane_zw=%llu uv_lane_refused=%llu uv_affine_scale2=%llu "
+			"uv_tiled=%llu | "
 			// ROUND 43: the albedo-election split, on the LIVE line as well as the stats line.
 			// It is the readout for the killed colour walk and the stats line only reaches
 			// RPCS3.log, which is exclusively locked while the emulator runs.
 			"tex_bound=%llu tex_none=%llu tex_albedo_ucode=%llu tex_albedo_guess=%llu tex_albedo_narrow=%llu "
+			// ROUND 58, appended at the END of this group with its four arguments in the
+			// matching positions. lerp/lane are what the two new rules MOVED; grey/grey_alt
+			// are the measurement that says how large the population is either way.
+			"tex_albedo_lerp=%llu tex_albedo_lane=%llu tex_albedo_grey=%llu tex_albedo_grey_alt=%llu "
 			"xform_mirrored=%llu/%llu/%llu | "
 			// Round 9: the texture cache's own residency, mirrored where it can be read while the
 			// thing it describes is on screen. These printed only into RPCS3.log, which is held
@@ -26592,15 +34449,80 @@ void RemixGSRender::log_stats()
 			// Round 17: the Selva tree tops. programs/draws. Zero with madlanemap=1 on the banner
 			// means the arm is armed but the canopy programs never reached the matcher this run.
 			"madlanemap=%llu/%llu | "
-			"world_refused=%llu wext_refused=%llu | "
+			// ROUND 50 inserts pos_input IMMEDIATELY BEFORE world_refused and its two arguments go
+			// in the matching position below - adjacent, one specifier group, one argument group,
+			// which is the only shape of edit to this line that cannot shift an unrelated pair
+			// (the bug rounds 18/19 shipped by appending). programs/draws, same order as madmix.
+			// Reading: non-zero on Eat Lead is the widened MUL arm firing; non-zero on a title
+			// that already rendered is the regression this round has to be checked for.
+			"pos_input=%llu/%llu "
+			// The vertex-normal decode, inserted immediately before world_refused with its five
+			// arguments in the matching position, adjacent, so no unrelated pair can shift.
+			// Reading: applied is the fix firing; rejected climbing while applied stays at 0 says
+			// NORMALATTR names a slot that is not a unit 3-vector and 'Remix vtxattr:' says which
+			// slot is; absent says the layout does not feed that attribute at all.
+			"normals=%llu/%llu/%llu/%llu/%llu "
+			"world_refused=%llu wext_refused=%llu "
+			// ROUND 53, mirrored from 'Remix stats:' and here for the reason the drop partition below
+			// is here: 'Remix stats:' lands only in bin\log\RPCS3.log, which is held under an
+			// exclusive lock while the emulator runs, so a play-test standing in front of the sky
+			// could not read either of these. wext_exempt_sky is the number that says the dome
+			// reached the runtime at all (it should climb one or two per frame with the sky on
+			// screen while wext_refused stays flat); sky_tag_suppressed is where the SKY tags went
+			// with skytag=0. Inserted as an adjacent PAIR immediately after wext_refused with their
+			// two arguments in the matching position, so no unrelated pair can shift.
+			"wext_exempt_sky=%llu sky_tag_suppressed=%llu | "
+			// The drop partition, mirrored VERBATIM from 'Remix stats:' - same names, same order.
+			// It is the answer to "where did the other two thirds of the draws go", and until now it
+			// existed ONLY on the stats line, which lands in bin\log\RPCS3.log and is held under an
+			// exclusive lock while the emulator runs. So a play-test standing in front of a hole in a
+			// wall could read seen= and submitted= and could not read the difference between them,
+			// which is the only number that says WHICH gate removed the geometry. Cumulative like
+			// everything else on this line: difference two consecutive lines to get the rate at a
+			// place, and compare a spot where the wall is missing against one where it is not.
+			"skip screen=%llu immediate=%llu inline=%llu volatile=%llu reg_attr0=%llu prim=%llu "
+			"restart=%llu instanced=%llu layout=%llu mem=%llu decode=%llu poison=%llu vp=%llu "
+			"albedo=%llu rt=%llu rt_kept=%llu camsurf=%llu notinput=%llu posdecode_refused=%llu | "
 			// ROUND 49: cam_insane appended here; the arg list is edited at the same position.
 			// At the shipped CAMSANITY=0 an insane camera is COUNTED AND STILL SUBMITTED, so a
 			// non-zero value diagnoses without having changed anything.
-			"cam_resolved=%llu cam_fallback=%llu cam_held=%llu world_refused_nocam=%llu cam_insane=%llu | "
+			"cam_resolved=%llu cam_fallback=%llu cam_held=%llu world_refused_nocam=%llu cam_insane=%llu "
+			// ROUND 56: the three CAMXFLIP counters appended at the END of this camera group, after
+			// cam_insane, with their arguments in the matching position. This is the one line a
+			// play-test can read while the game runs, and the three numbers it needs are:
+			// cam_xmirror == cam_resolved (the split's left-handed cross-product assumption fired on
+			// every frame - MEASURED on 17,314 frames before the field existed, off
+			// score_perspective's -0.5 dock for m[0][0] < 0); cam_xflip == cam_xmirror with
+			// RPCS3_REMIX_CAMXFLIP=1 and 0 without it; and cam_dropped, which retires the "the camera
+			// dropped and nothing was submitted" reading of the dev menu's MAIN-block flicker. It is
+			// expected to be 0 - in both frozen runs cam_fallback climbed only while cam_resolved was
+			// 0 and then froze for all of gameplay, so a non-zero cam_dropped here is new information.
+			"cam_xmirror=%llu cam_xflip=%llu cam_dropped=%llu | "
 			// The wobble fix, stated as a ratio. Fresh >> stale is the success reading; stale
 			// dominant says the relatch could not reach most of the scene and deferred submission
 			// is the next step. relatch counts how often it fired at all.
-			"world_ref_fresh=%llu world_ref_stale=%llu cam_relatch=%llu | "
+			// ROUND 52 appends cam_relatch_refused INSIDE this group with its argument in the
+			// matching position immediately after cam_relatch's: the candidates the shipped 0.8
+			// tolerance would have relatched from and RPCS3_REMIX_CAMRELATCHTOL does not - the Eat
+			// Lead animated parts. Structurally 0 at the default tolerance.
+			"world_ref_fresh=%llu world_ref_stale=%llu cam_relatch=%llu cam_relatch_refused=%llu "
+			// ROUND 54, appended INSIDE the camera group with the five arguments in the matching
+			// position below. incumbent + foreign + noinc MUST equal cam_relatch - that is the
+			// acceptance that says the relatch provenance is measured and not guessed - and
+			// agree + disagree is the subset of frames that had both a relatch and a matched
+			// incumbent. foreign or disagree climbing is the X-relatch finding: the reference is
+			// being refreshed from an object the witness tracker is not following.
+			"cam_relatch_incumbent=%llu cam_relatch_foreign=%llu cam_relatch_noinc=%llu "
+			"cam_relatch_agree=%llu cam_relatch_disagree=%llu "
+			// ROUND 55. foreign_refused is NOT part of the partition above - it counts relatches that did
+			// NOT happen, because CAMREFSYNTH refused a candidate outside CAMTRACKPOS of a live incumbent,
+			// so on the armed arm cam_relatch_foreign should read 0 and this one carries that population
+			// instead. basis_switch is the named count of the visible teleport: a flip that installed a
+			// submitted view more than 0.5 from the outgoing one. discontinuity_held and switch_confirmed
+			// are COPIED from 'Remix stats:' (which goes to RPCS3.log, absent from bin) so the
+			// confirm-window share is readable inside a dump-only run; they are not moved.
+			"cam_relatch_foreign_refused=%llu cam_basis_switch=%llu cam_discontinuity_held=%llu "
+			"cam_switch_confirmed=%llu | "
 			// The gauge-anchor split, which is what this round is judged on. used >> absent means
 			// the scene is being divided by its own pass's view x projection; prev dominant means
 			// the identity draws arrive late in the frame and deferred submission is next.
@@ -26669,6 +34591,22 @@ void RemixGSRender::log_stats()
 			"guest_light_moving=%llu guest_light_budget=%llu guest_light_createfail=%llu "
 			"guest_lights_created=%llu guest_light_reached=%llu "
 			"guest_light_autobig=%llu guest_light_notrigger=%llu guest_light_movingrepeat=%llu "
+			// ROUND 52, appended at the END of the guest group, immediately before mat_emissive -
+			// the five arguments go in the matching position below and nowhere else. drift and
+			// drift_stale accumulate on BOTH arms (GUESTLIGHTTRACK=0 measures what TRACK=1 would
+			// have corrected); replaced and track_conflict are TRACK-only; auxclip is
+			// GUESTLIGHTMAINCLIP's refusal count.
+			"guest_light_drift=%llu guest_light_drift_stale=%llu guest_light_replaced=%llu "
+			"guest_light_track_conflict=%llu guest_light_auxclip=%llu "
+			// ROUND 54, appended INSIDE the guest group with the twelve arguments in the matching
+			// position below and nowhere else. gl_tracked is the denominator every drift rate is
+			// quoted against from now on; gl_step0..4 is the threshold histogram (branch d) and must
+			// sum to gl_tracked; gl_drift_ff/fs/sf/ss classify the drift rows by the freshness
+			// transition; gl_mat_unavailable and gl_drift_noold are the two refusals, and
+			// gl_drift_noold must read 0.
+			"gl_tracked=%llu gl_step0=%llu gl_step1=%llu gl_step2=%llu gl_step3=%llu gl_step4=%llu "
+			"gl_drift_ff=%llu gl_drift_fs=%llu gl_drift_sf=%llu gl_drift_ss=%llu "
+			"gl_mat_unavailable=%llu gl_drift_noold=%llu "
 			"mat_emissive=%llu | "
 			// Alpha to coverage: the two detection bits and the replay. ctrl/reg both 0 across a
 			// run is the negative verdict on the cutout theory, with bytes behind it.
@@ -26702,6 +34640,15 @@ void RemixGSRender::log_stats()
 			// held == 0 with DEFERVIEWMODEL=1 and DEFERPREANCHOR=1 both armed means a THIRD gate
 			// exists downstream of this one, exactly as round 46's zero did.
 			"defer_projsplit=%llu/%llu/%llu "
+			// ROUND 57, appended at the END of the defer group with its three arguments in the
+			// matching position. armed is the world_ref_stale population this arm holds (MEASURED
+			// 207,124 of 3,087,767 world draws, ~12.5 a frame); flushed is what the mid-frame relatch
+			// actually re-divided; the gap reached flip on frames that never relatched and went out
+			// with the transform they carried, which is today's behaviour one flush later. vmop is
+			// structurally 0. Partitions:
+			//   defer_relatch_armed + defer_absent_declined == gauge_anchor_absent
+			//   defer_buffered == defer_fresh + defer_relatch_flushed + defer_flip
+			"defer_relatch_armed=%llu defer_relatch_flushed=%llu defer_relatch_vmop=%llu "
 			"nectar_published=%llu | "
 			// Round 6, primary 1 - the untextured 41 per cent. shadowonly vs colorunit IS the verdict:
 			// colorunit ~0 means these draws sample nothing but depth buffers and should not be
@@ -26730,6 +34677,11 @@ void RemixGSRender::log_stats()
 			// much the ones that did fire actually ate.
 			"skipg_pair=%llu skipg_alb=%llu skipg_untexvp=%llu skipg_untexfp=%llu "
 			"skipg_chardepth=%llu skipg_unbound=%llu skipg_vp=%llu skipg_extent=%llu "
+			// ROUND 51, appended at the END of the skip-gate group (never mid-line - fmt::format
+			// does not check argument counts). skip_cmask: RGB colour mask all off. skip_notarget:
+			// surface colour target none. Both fire before decode, so they do NOT feed
+			// notex_refused_skip and are NOT part of the skipg_* == skip_albedo identity above.
+			"skip_cmask=%llu skip_notarget=%llu "
 			// Round 8: tex_stale_detected is cache hits whose guest bytes had moved under a stable
 			// descriptor key - the "stale pool slot" arm of the bark-textured-soldier bug. Non-zero
 			// with 'Remix texstale:' lines naming the keys is the arm confirmed; zero across a
@@ -26754,7 +34706,16 @@ void RemixGSRender::log_stats()
 			// actually corrected (0 while HUD text is on screen means it is not reaching the
 			// glyphs); declined is how many matched the hash and the span guard but were refused
 			// by the axis-aligned-quad test rather than torn.
-			"ui_ortho2d=%llu ui_uv=%llu/%llu/%llu/%llu/%llu/%llu ui_rect=%llu/%llu | "
+			"ui_ortho2d=%llu ui_uv=%llu/%llu/%llu/%llu/%llu/%llu ui_rect=%llu/%llu "
+			// ROUND 52, appended at the END of the ui group on this line too - the same seven
+			// counters, in the same order, with their arguments in the matching position below.
+			// This is the copy that can be read WHILE the menu is on screen; the 'Remix stats:'
+			// copy lands in the exclusively locked RPCS3.log.
+			"ui_tint_tc=%llu/%llu ui_tint_rgbdrop=%llu ui_opaque_skipped=%llu ui_uv_ucode=%llu/%llu ui_uv_double_skipped=%llu "
+			// ROUND 59, appended at the END of the ui group on this line too - the same two
+			// counters, in the same order, with their arguments in the matching position below.
+			// This is the copy that can be read WHILE the menu is on screen.
+			"ui_forced_dw=%llu ui_forced_dw_preworld=%llu ui_refused_fp=%llu | "
 			// Round 6, primary 2 - the missing world geometry. rescued_cur + rescued_aged is how
 			// much of the fail=tail population a re-division against the pass's own anchor put
 			// back; rescue_failed is the residue no anchor that exists can place, which is the
@@ -26785,7 +34746,25 @@ void RemixGSRender::log_stats()
 			"wdiv=%llu wdiv_shadowed=%llu | "
 			// Clicks seen by the renderer against clicks that named an object. 0/0 is "nobody
 			// clicked", which round 1 could not distinguish from a dead instrument.
-			"pick_clicks=%llu pick_resolved=%llu | "
+			"pick_clicks=%llu pick_resolved=%llu "
+			// ROUND 57, appended at the END of this group with the arguments in matching positions.
+			// The 0.05-0.25 band the user sees as static props swimming, as a census: pf_step1 is the
+			// props' own gl_step1, and pf_stale / pf_fresh is the reference-age partition that
+			// explains it (MEASURED 298/298 stale on the two props that swim). pf_err0..4 is the POSE
+			// ERROR rather than its per-frame change, which is the quantity the eye actually reads.
+			// Three partitions hold by construction and are the acceptance check for the instrument:
+			//   pf_stale + pf_fresh == pf_rows
+			//   pf_first + pf_step0..4 == pf_rows
+			//   pf_norelatch + pf_place_refused + pf_err0..4 == pf_fresh_rows
+			"pf_rows=%llu pf_first=%llu pf_stale=%llu pf_fresh=%llu "
+			"pf_step0=%llu pf_step1=%llu pf_step2=%llu pf_step3=%llu pf_step4=%llu "
+			"pf_age_unknown=%llu pf_rot_degenerate=%llu "
+			"pf_fresh_rows=%llu pf_norelatch=%llu pf_recheck_fail=%llu pf_place_refused=%llu "
+			"pf_err0=%llu pf_err1=%llu pf_err2=%llu pf_err3=%llu pf_err4=%llu "
+			// ROUND 57 step 8. Rows where the transform DEFERPRERELATCH's flush rebuilt disagreed
+			// with the origin_fresh this instrument computed independently at flip. Must be 0 on the
+			// fix arm and is structurally 0 on the control arm, where nothing is deferred.
+			"pf_deferred_mismatch=%llu | "
 			"vm_tagged=%llu vm_tagged_hash=%llu vm_hash_anchor_refused=%llu vmcam_applied=%llu vmcam_refused=%llu | "
 			// Round 10, the whole round on one segment.
 			//   cam_clipgate_refused climbing whenever the shadow pass draws IS the portal fix
@@ -26799,7 +34778,36 @@ void RemixGSRender::log_stats()
 			//     self-lit pulse, vm_tagged_albedo the visor route, vmcam_twin the camera that makes
 			//     the VIEW_MODEL tag mean anything at all, and madaccum the flower.
 			//   vm_anchor_unmeasured must stay 0: non-zero says VMANCHORGEO is partly inert.
-			"cam_clipgate_refused=%llu cam_fb_relatch=%llu "
+			// ROUND 52 appends cam_sticky_kept / cam_sticky_lost immediately after cam_fb_relatch
+			// with their two arguments in the matching position, adjacent and in order.
+			//   cam_sticky_kept climbing IS the flip-flop fix firing: the frame elected the
+			//     incumbent's own cluster over one with strictly more votes.
+			//   cam_sticky_lost is the frames that had clusters and no own cluster - real cuts, or
+			//     the one-frame gaps a sticky HOLD would cover. It sizes the next round; it is not
+			//     a failure by itself.
+			"cam_clipgate_refused=%llu cam_fb_relatch=%llu cam_sticky_kept=%llu cam_sticky_lost=%llu "
+			// ROUND 53 appends the thirteen CAMTRACK / CAMREBASE counters immediately after
+			// cam_sticky_lost with their arguments in the matching position, adjacent and in order.
+			//   cam_track_kept + cam_track_missed + cam_track_handover should account for the
+			//     gameplay frames; cam_track_override is the share the rule DECIDED (simulation
+			//     55.7%; below 5% means it is not deciding - check the banner and camlock).
+			//   cam_track_handover is the number the round is about: baseline 84 identity changes in
+			//     4,761 frames, target at most 6 per 1,000.
+			//   cam_track_overflow must read 0, and under CAMREBASE cam_rebase_bypassed must too -
+			//     it is a tripwire on the gauge path, not a mechanism.
+			//   cam_witness_moving / cam_incumbent_moving are pure measurement this round; a non-zero
+			//     incumbent count is what would justify CAMREBASE mode 2.
+			"cam_track_kept=%llu cam_track_override=%llu cam_track_missed=%llu cam_track_handover=%llu "
+			"cam_track_reset=%llu cam_track_expired=%llu cam_track_overflow=%llu cam_rebase_applied=%llu "
+			"cam_rebase_refused=%llu cam_rebase_reset=%llu cam_rebase_bypassed=%llu cam_witness_moving=%llu "
+			"cam_incumbent_moving=%llu "
+			// ROUND 55, RPCS3_REMIX_CAMREFSYNTH. The first six PARTITION cam_track_missed exactly while the
+			// knob is non-zero and are all 0 while it is 0, so the partition is the acceptance and an
+			// off-arm run says so on its own line. install counts mode-2 confirm bypasses and is not part
+			// of the partition.
+			"cam_ref_synth=%llu cam_ref_synth_nowitness=%llu cam_ref_synth_short=%llu "
+			"cam_ref_synth_rigid=%llu cam_ref_synth_basis=%llu cam_ref_synth_badrel=%llu "
+			"cam_ref_synth_install=%llu "
 			"anchor_parked=%llu anchor_recap=%llu anchor_promoted=%llu "
 			// ROUND 44b. offside is pure measurement (nothing reads it). upgrade_avail is counted
 			// whether or not GAUGEDONORBEST is armed, so an unarmed run sizes the route; upgraded
@@ -26831,7 +34839,8 @@ void RemixGSRender::log_stats()
 			// rather than by accident of refusal; vcol_route_blocked is the partition term against
 			// fpvcol_applied (a drop there of exactly this size is the route gate working);
 			// vcol_fold_applied is the constant fold; ucode_fp_stored is the offline capture.
-			"hazefade=%llu fpvcol_skygate=%llu vcol_route_blocked=%llu vcol_fold=%llu "
+			"hazefade=%llu fpvcol_skygate=%llu vcol_route_blocked=%llu vcol_alpha_only=%llu "
+			"vcol_tint=%llu/%llu vcol_fold=%llu "
 			"ucode_fp=%llu/%llu | "
 			// Round 12. vcol_const is the flat-constant COL0 replay ('MOV o1, c[K]'), the second
 			// mechanism that was sending the HUD gauges to a wrong colour. It can only climb on
@@ -26887,8 +34896,17 @@ void RemixGSRender::log_stats()
 			// result. The UV knobs had no such echo, so a run cannot be told from its own log -
 			// which is exactly what blocked the MAD A/B.
 			"knobs: affinetol=%.4g uvucode=%d uvtemp=%d uvmad=%d skycam=%d "
-			"camrelatch=%d gaugeanchor=%d gaugetrace=%u uvaffineall=%d uvscalelanes=%d "
-			"uvrangecensus=%d notexcensus=%d vmanchor=%.4g vmlist=%u "
+			// ROUND 52 appends camrelatchtol immediately after camrelatch, argument in the
+			// matching position, same reason the banner carries it: the relatch is what
+			// submit_camera() submits, and 0.8 here means the narrowing was never armed.
+			// ROUND 52 (step 2b) appends uvscalehop immediately after uvscalelanes, argument in the
+			// matching position, for the reason the run-start banner carries it: it defaults to 1
+			// and it changes the UV divisor on most of this title's world draws.
+			// ROUND 58 appends fplerpunit/uvlanes/uvscale2 immediately after uvscalehop, arguments
+			// in the matching positions, adjacent, for the reason the run-start banner carries
+			// them: each changes which texture a surface is drawn with.
+			"camrelatch=%d camrelatchtol=%.3g gaugeanchor=%d gaugetrace=%u uvaffineall=%d uvscalelanes=%d "
+			"uvscalehop=%d fplerpunit=%d uvlanes=%d uvscale2=%d uvrangecensus=%d notexcensus=%d vmanchor=%.4g vmlist=%u "
 			"gaugeslots=%u gaugeprevdims=%d gaugecurdims=%d gaugecamhold=%u anchorgaugecensus=%u camanchoreye=%d skipauxuntex=%d watchlist=%u "
 			"fpkil=%d fpkilref=%u gaugef64=%d "
 			// Round 5's knobs. Every one of these changes what a counter above means, and the
@@ -26900,7 +34918,12 @@ void RemixGSRender::log_stats()
 			// Round 6's knobs. Every one of these changes what a counter above means, and every
 			// one of them is a bisect step in the play-test card - so a run has to be able to
 			// state what it was launched with without anyone reading the launcher.
-			"notexmat=%d skipshadowonly=%d walksampled=%d tailrescue=%d tailrescueage=%u "
+			"notexmat=%d skipshadowonly=%d "
+			// ROUND 51, same pair as the run-start banner: both knobs default ON and both delete
+			// draws, so the dump has to carry their state too (RPCS3.log is exclusively locked
+			// while the game runs).
+			"skipcmask=%d skipnotarget=%d "
+			"walksampled=%d tailrescue=%d tailrescueage=%u "
 			"gllum=%.4g glmaxext=%.4g glauto=%d "
 			// Round 7's knobs. uiclamp is the UI seam fix (per-sample, CPU compositor);
 			// clampalbedos is the per-texture lever that closes the GPU route; mainclipmax is what
@@ -26909,6 +34932,21 @@ void RemixGSRender::log_stats()
 			"uiclamp=%u clampalbedos=%u mainclipmax=%d "
 			// Round 25. The HUD-font lever, stated where every other UI knob is stated.
 			"uirectshrink=%u uirectshrinkpct=%u "
+			// ROUND 52, appended at the END of the UI group with its four arguments in the matching
+			// position immediately after uirectshrinkpct's - same edit as the run-start banner, for
+			// the same reason: RPCS3.log is exclusively locked while the game runs, so a run's UI
+			// knob state has to be readable from remix_dump.log too.
+			"uitinttexcoord=%d uiuvucode=%d uiforcevpdw=%d ucodestorefphashes=%u "
+			// ROUND 59, appended at the END of the same knob group on this line too, with its one
+			// argument in the matching position - the same edit as the run-start banner, for the
+			// same reason: RPCS3.log is exclusively locked while the game runs, so a run's UI knob
+			// state has to be readable from remix_dump.log too. uiforcevpdw prints the MODE here.
+			"uirefusefps=%u "
+			// ROUND 60, appended at the END of the same knob group on this line too, with its one
+			// argument in the matching position - the same edit as the run-start banner, for the
+			// same reason: RPCS3.log is exclusively locked while the game runs, so a run's texture
+			// knob state has to be readable from remix_dump.log too.
+			"texremap=%d "
 			// Round 8. wdivwalk=0 on a run that still shows correctly-sized characters means the
 			// binary is stale, not that the fix was unnecessary. texverify is the cadence in
 			// frames behind tex_stale_detected; 0 means that whole census was off.
@@ -26928,9 +34966,43 @@ void RemixGSRender::log_stats()
 			// Round 10. Every one of these is a bisect step on the play-test card, so a run has to
 			// be able to state what it was launched with without anyone reading the launcher -
 			// which is the rule that caught round 6's silently-inert AFFINETOL run.
-			"camclipgate=%d camfbrelatch=%d anchorsticky=%d gaugedonorbest=%u "
+			// ROUND 52, same two edits as the run-start banner: camclipgate prints the MODE (2 is
+			// the gate with no lock configured, which as a bool was indistinguishable from 1), and
+			// camsticky is appended immediately after camfbrelatch with its argument in the
+			// matching position.
+			// ROUND 53, the same edit as the run-start banner: the four CAMTRACK / CAMREBASE knobs
+			// appended immediately after camsticky with their arguments in the matching position, so
+			// a play-test can read which arm is armed off the one line the game prints while running.
+			"camclipgate=%u camfbrelatch=%d camsticky=%u camtrack=%u camtrackpos=%.3g camtrackmiss=%u "
+			// ROUND 54: the same edit as the run-start banner, so a play-test can read whether
+			// the two measurement knobs are armed off the one line the game prints while running.
+			"camrebase=%u gldriftmat=%u camrelatchtrace=%u camrefsynth=%u "
+			// ROUND 56, the same edit as the run-start banner and for a stronger reason: CAMXFLIP is
+			// the first camera knob of this series that CHANGES OUTPUT rather than measuring it, so
+			// "the free camera still strafes the wrong way" has to be separable from "the launcher
+			// never armed it" on the one line a play-test can read while the game is running.
+			"camxflip=%u "
+			// ROUND 57, the same edit as the run-start banner: a play-test that clicked and saw no
+			// 'Remix pick-fresh:' rows can read here whether the instrument was armed at all.
+			// ROUND 57 step 8, beside pickfresh and for the round-56 reason: DEFERPRERELATCH
+			// CHANGES OUTPUT (it moves ~12 instances a frame from their draw ordinal to the relatch
+			// ordinal), so "the props still swim" has to be separable from "the launcher never armed
+			// the fix". It ships commented out in the conf, so this is how a run says which arm.
+			"pickfresh=%u deferprerelatch=%u "
+			"anchorsticky=%d gaugedonorbest=%u "
 			"vcolbgra=%d fpvcolalphagate=%d fpvcolemissive=%.4g fpvcoladditive=%d "
-			"vmalbedos=%u vmanchorgeo=%d vmalbedocam=%d madaccumwalk=%d "
+			// ROUND 50, appended with its argument in the matching position immediately after
+			// madaccumwalk's, same reason the banner carries it: posinput defaults to 1, so
+			// "the fix fired and did not work" and "the launcher turned it off" have to be
+			// distinguishable on the one line a play-test can actually read while the game runs.
+			"vmalbedos=%u vmanchorgeo=%d vmalbedocam=%d madaccumwalk=%d posinput=%d vertexblend=%d "
+			// The vertex-normal decode and its slot, plus the two Demon's Souls profile knobs,
+			// which were readable ONLY in bin\BLUS30443.conf until now: a run that shows the old
+			// flat shading with vtxnormal=1 is a fix that fired and did not work, and one with
+			// vtxnormal=0 is a launcher that turned it off.
+			"vtxnormal=%d normalattr=%u demonsmenu=%d demonsworld=%d "
+			"uvscalemov=%d uiuvonce=%d "
+			"demonslights=%d demonssunsrc=%u demonslightscale=%.4gdemonshemi=%d "
 			// Round 11, same rule: every one of these is a bisect step on the play-test card.
 			"fpvcolroute=%d vcolfold=%d fpvcolskygate=%d hazefade=%d fxrefprobe=%d ucodestorefp=%d "
 			// Round 18: projsplit is the second-projection reference (0 = pre-round-18 drop),
@@ -26983,6 +35055,13 @@ void RemixGSRender::log_stats()
 			// mat_skyemissive/mat_skyunordered above is 0 for that reason rather than for a
 			// failure. skyemissiveblend=0 is the "keep the glow, keep the occlusion" A/B.
 			"skyemissive=%u skyemissiveint=%.4g skyemissiveblend=%d "
+			// ROUND 53, and both belong in the first ten lines for the same reason skyemissive= does:
+			// each has a counter whose 0 reading is ambiguous without the knob beside it.
+			// skytag=0 means every sky rule is measure-only, so cat_sky=0 is a SETTING and not a
+			// rule that found nothing; skyemissivewext=1 means a declared sky texture is exempt from
+			// the world-extent refusal, so wext_exempt_sky=0 means the dome was never drawn rather
+			// than that the exemption failed.
+			"skytag=%d skyemissivewext=%d "
 			// ROUND 39. The dome classifier's six knobs plus the live size of the learned set, all
 			// printing the CLAMPED value so a SKYCLASSIFY=9 that is silently running as mode 3 is
 			// visible here rather than nowhere. skyclassifyset= is not a knob - it is how many hashes
@@ -27056,7 +35135,38 @@ void RemixGSRender::log_stats()
 			// it is NOT armed because the arms are currently REFUSED at the world gate rather than
 			// mis-tagged - vm_tagged read 1 out of 13,631,618 considered in the round-26 run.
 			"vmtriple=%u/%u/%u "
-			"mainclip=%ux%u maxclip=%ux%u",
+			"mainclip=%ux%u maxclip=%ux%u"
+			// ROUND 52, appended at the VERY END of both the format and the argument list - the one
+			// shape of edit to this line that cannot shift an unrelated pair (rounds 18/19 each
+			// shipped an ordering bug by appending text without appending its arguments in the same
+			// place). draws/programs, same order as madmix and pos_input. It is on the live line
+			// because 'Remix stats:' reaches only bin\log\RPCS3.log, which is exclusively locked
+			// while the game runs, and this is the counter a play-test standing in front of a
+			// character has to be able to read: climbing means the transposed-blend arm is on the
+			// draws in front of them.
+			" | skinvb=%llu/%llu"
+			// ROUND 52, appended after skinvb at the VERY END of both the format and the argument
+			// list, for the same reason skinvb itself was: it is the one shape of edit to this line
+			// that cannot shift an unrelated pair. Seven specifiers, seven arguments, in this order.
+			//
+			// loaded/placed are set ONCE at load and are constants for the run; the other five
+			// accumulate. Reading them, in the order a step-2 run reads them:
+			//   loaded=0 placed=0        -> the file never loaded. Read `Remix authored-lights:`
+			//                               (or its absence, which the banner's authoredlevel=
+			//                               explains) before anything else on this line.
+			//   submitted climbing, nothing new lit -> the lights ARE reaching the runtime and are
+			//                               landing somewhere the player is not. That is the
+			//                               placement transform, which is unproven, and NOT the
+			//                               plumbing.
+			//   createfail non-zero      -> the runtime refused them, or M is so far from rigid that
+			//                               a rect basis would not orthonormalise. A different
+			//                               problem entirely and it must be read before `submitted`.
+			//   culled_dist + capped     -> how much of the level never left the CPU.
+			//   glsuppressed             -> AUTHOREDLIGHTS=1 turning the derived path off. It is
+			//                               structurally 0 at modes 0 and 2, so a non-zero value
+			//                               here with mode 2 on the banner is a contradiction.
+			" | authored=%llu/%llu submitted=%llu culled=%llu capped=%llu createfail=%llu "
+			"glsuppressed=%llu",
 			m_stats.draws_seen,
 			m_stats.draws_submitted,
 			m_stats.uv_applied,
@@ -27069,12 +35179,31 @@ void RemixGSRender::log_stats()
 			m_stats.uv_scale_no_attribute,
 			m_stats.uv_affine_general,
 			m_stats.uv_affine_lanes,
+			// ROUND 60, in the order of "tex_remap_seen=%llu tex_remap_applied=%llu" above. This
+			// line has no 'tex' local, so the texture cache's stats are named in full here.
+			m_textures.stats().remap_seen,
+			m_textures.stats().remap_applied,
+			// ROUND 52, in the order of
+			// "uv_scale_slot_refused=%llu uv_affine_hop=%llu uv_affine_two_scales=%llu" above.
+			m_stats.uv_scale_slot_refused,
+			m_stats.uv_affine_hop,
+			m_stats.uv_affine_two_scales,
+			// ROUND 58, in the order of "uv_lane_zw uv_lane_refused uv_affine_scale2" above.
+			m_stats.uv_lane_zw,
+			m_stats.uv_lane_refused,
+			m_stats.uv_affine_scale2,
 			m_stats.uv_tiled,
 			m_stats.tex_bound,
 			m_stats.tex_none,
 			m_stats.tex_albedo_ucode,
 			m_stats.tex_albedo_guess,
 			m_stats.tex_albedo_narrow,
+			// ROUND 58, in the order of "tex_albedo_lerp tex_albedo_lane tex_albedo_grey
+			// tex_albedo_grey_alt" above.
+			m_stats.tex_albedo_lerp,
+			m_stats.tex_albedo_lane,
+			m_stats.tex_albedo_grey,
+			m_stats.tex_albedo_grey_alt,
 			// mirrored/degenerate/measured, in that order: the two faults first so a healthy run
 			// reads "0/0/<big>" at a glance.
 			m_stats.xform_mirrored,
@@ -27102,16 +35231,69 @@ void RemixGSRender::log_stats()
 			m_stats.madmix_draws,
 			m_stats.madlanemap_resolved,
 			m_stats.madlanemap_draws,
+			// ROUND 50, the pair for the 'pos_input=%llu/%llu' inserted immediately before
+			// world_refused. ROUND 51 SWAPS THEM to draws/programs, matching the documented
+			// reading and the 'Remix stats:' site. Format untouched.
+			m_stats.pos_input_draws,
+			m_stats.pos_input_programs,
+			// programs/applied/rejected/absent/degenerate, matching 'normals=' above.
+			m_stats.normal_programs,
+			m_stats.normal_applied,
+			m_stats.normal_rejected,
+			m_stats.normal_absent,
+			m_stats.normal_degenerate,
 			m_stats.world_refused,
 			m_stats.wext_refused,
+			// ROUND 53. Two arguments for the adjacent pair above, same order.
+			m_stats.wext_exempt_sky,
+			m_stats.sky_tag_suppressed,
+			// In the matching position for the "skip ..." group above, same order as the stats line.
+			m_stats.skip_screen_space,
+			m_stats.skip_immediate,
+			m_stats.skip_inline_array,
+			m_stats.skip_volatile,
+			m_stats.skip_register_attr0,
+			m_stats.skip_primitive,
+			m_stats.skip_restart_index,
+			m_stats.skip_instanced,
+			m_stats.skip_layout,
+			m_stats.skip_memory,
+			m_stats.skip_decode,
+			m_stats.skip_poisoned,
+			m_stats.skip_vp,
+			m_stats.skip_albedo,
+			m_stats.skip_render_target,
+			m_stats.rt_feedback_kept,
+			m_stats.skip_camera_surface,
+			m_stats.skip_not_input,
+			m_stats.pos_decode_refused,
 			m_stats.cam_resolved,
 			m_stats.cam_fallback,
 			m_stats.cam_held,
 			m_stats.world_refused_nocam,
 			m_stats.cam_insane,
+			// ROUND 56, the three in the matching position for
+			// "cam_xmirror=%llu cam_xflip=%llu cam_dropped=%llu" appended after "cam_insane=%llu".
+			m_stats.cam_xmirror,
+			m_stats.cam_xflip,
+			m_stats.cam_dropped,
 			m_stats.world_ref_fresh,
 			m_stats.world_ref_stale,
 			m_stats.cam_relatch_midframe,
+			// ROUND 52, in the matching position for the "cam_relatch_refused=%llu" appended
+			// after "cam_relatch=%llu" above.
+			m_stats.cam_relatch_refused,
+			// ROUND 54, the five in the order of the names appended to this group above.
+			m_stats.cam_relatch_incumbent,
+			m_stats.cam_relatch_foreign,
+			m_stats.cam_relatch_noinc,
+			m_stats.cam_relatch_agree,
+			m_stats.cam_relatch_disagree,
+			// ROUND 55, the four in the matching position for the strings appended above.
+			m_stats.cam_relatch_foreign_refused,
+			m_stats.cam_basis_switch,
+			m_stats.cam_discontinuity_held,
+			m_stats.cam_switch_confirmed,
 			m_stats.gauge_anchor_used,
 			m_stats.gauge_anchor_prev,
 			m_stats.gauge_anchor_absent,
@@ -27162,6 +35344,25 @@ void RemixGSRender::log_stats()
 			m_stats.guest_light_autobig,
 			m_stats.guest_light_notrigger,
 			m_stats.guest_light_movingrepeat,
+			// ROUND 52, in the order of the five names appended to the guest group above.
+			m_stats.guest_light_drift,
+			m_stats.guest_light_drift_stale,
+			m_stats.guest_light_replaced,
+			m_stats.guest_light_track_conflict,
+			m_stats.guest_light_auxclip,
+			// ROUND 54, in the order of the twelve names appended to the guest group above.
+			m_stats.gl_tracked,
+			m_stats.gl_step0,
+			m_stats.gl_step1,
+			m_stats.gl_step2,
+			m_stats.gl_step3,
+			m_stats.gl_step4,
+			m_stats.gl_drift_ff,
+			m_stats.gl_drift_fs,
+			m_stats.gl_drift_sf,
+			m_stats.gl_drift_ss,
+			m_stats.gl_mat_unavailable,
+			m_stats.gl_drift_noold,
 			m_textures.stats().materials_emissive,
 			m_stats.a2c_ctrl,
 			m_stats.a2c_reg,
@@ -27184,6 +35385,11 @@ void RemixGSRender::log_stats()
 			m_stats.defer_projsplit,
 			m_stats.defer_projsplit_fresh,
 			m_stats.defer_projsplit_kept,
+			// ROUND 57, the three in the matching position for "defer_relatch_armed=%llu
+			// defer_relatch_flushed=%llu defer_relatch_vmop=%llu" appended after defer_projsplit.
+			m_stats.defer_relatch_armed,
+			m_stats.defer_relatch_flushed,
+			m_stats.defer_relatch_vmop,
 			m_stats.nectar_published,
 			m_stats.tex_none_shadowonly,
 			m_stats.tex_none_colorunit,
@@ -27205,6 +35411,10 @@ void RemixGSRender::log_stats()
 			m_stats.skip_gate_unbound,
 			m_stats.skip_gate_vp,
 			m_stats.skip_gate_extent,
+			// ROUND 51, the pair for 'skip_cmask=%llu skip_notarget=%llu' appended immediately
+			// after skipg_extent in the same edit.
+			m_stats.skip_cmask,
+			m_stats.skip_notarget,
 			m_textures.stats().wrap_forced,
 			m_textures.stats().stale_detected,
 			m_textures.stats().stale_evicted,
@@ -27223,6 +35433,21 @@ void RemixGSRender::log_stats()
 			m_compositor.uv_counters().clamp,
 			m_compositor.uv_counters().rect_shrunk,
 			m_compositor.uv_counters().rect_declined,
+			// ROUND 52, in the order of
+			// "ui_tint_tc=%llu/%llu ui_tint_rgbdrop=%llu ui_opaque_skipped=%llu ui_uv_ucode=%llu/%llu
+			//  ui_forced_dw=%llu" above.
+			m_stats.ui_tint_texcoord,
+			m_stats.ui_tint_texcoord_unmapped,
+			m_stats.ui_tint_pass_rgbdrop,
+			m_stats.ui_force_opaque_skipped,
+			m_stats.ui_uv_ucode,
+			m_stats.ui_uv_ucode_refused,
+			m_stats.ui_uv_double_skipped,
+			m_stats.ui_forced_dw,
+			// ROUND 59, in the order of
+			// "ui_forced_dw_preworld=%llu ui_refused_fp=%llu" above.
+			m_stats.ui_forced_dw_preworld,
+			m_stats.ui_refused_fp,
 			m_stats.tail_rescued_cur,
 			m_stats.tail_rescued_aged,
 			m_stats.tail_rescue_failed,
@@ -27237,6 +35462,29 @@ void RemixGSRender::log_stats()
 			m_stats.wdiv_shadowed_draws,
 			m_stats.pick_clicks,
 			m_pick_state->resolved.load(std::memory_order_acquire),
+			// ROUND 57, the twenty in the matching position for the pf_* group appended after
+			// "pick_resolved=%llu" above.
+			m_stats.pf_rows,
+			m_stats.pf_first,
+			m_stats.pf_stale,
+			m_stats.pf_fresh,
+			m_stats.pf_step0,
+			m_stats.pf_step1,
+			m_stats.pf_step2,
+			m_stats.pf_step3,
+			m_stats.pf_step4,
+			m_stats.pf_age_unknown,
+			m_stats.pf_rot_degenerate,
+			m_stats.pf_fresh_rows,
+			m_stats.pf_norelatch,
+			m_stats.pf_recheck_fail,
+			m_stats.pf_place_refused,
+			m_stats.pf_err0,
+			m_stats.pf_err1,
+			m_stats.pf_err2,
+			m_stats.pf_err3,
+			m_stats.pf_err4,
+			m_stats.pf_deferred_mismatch,
 			m_stats.viewmodel_tagged,
 			m_stats.viewmodel_tagged_hash,
 			m_stats.viewmodel_hash_anchor_refused,
@@ -27244,6 +35492,33 @@ void RemixGSRender::log_stats()
 			m_stats.viewmodel_cam_refused,
 			m_stats.cam_clipgate_refused,
 			m_stats.cam_fallback_relatch,
+			// ROUND 52, the pair for "cam_sticky_kept=%llu cam_sticky_lost=%llu" appended after
+			// cam_fb_relatch above.
+			m_stats.cam_sticky_kept,
+			m_stats.cam_sticky_lost,
+			// ROUND 53, the thirteen in the matching position for the CAMTRACK / CAMREBASE
+			// specifiers appended after cam_sticky_lost above, adjacent and in order.
+			m_stats.cam_track_kept,
+			m_stats.cam_track_override,
+			m_stats.cam_track_missed,
+			m_stats.cam_track_handover,
+			m_stats.cam_track_reset,
+			m_stats.cam_track_expired,
+			m_stats.cam_track_overflow,
+			m_stats.cam_rebase_applied,
+			m_stats.cam_rebase_refused,
+			m_stats.cam_rebase_reset,
+			m_stats.cam_rebase_bypassed,
+			m_stats.cam_track_witness_moving,
+			m_stats.cam_track_incumbent_moving,
+			// ROUND 55, the seven in the matching position for the strings appended above.
+			m_stats.cam_ref_synth,
+			m_stats.cam_ref_synth_nowitness,
+			m_stats.cam_ref_synth_short,
+			m_stats.cam_ref_synth_rigid,
+			m_stats.cam_ref_synth_basis,
+			m_stats.cam_ref_synth_badrel,
+			m_stats.cam_ref_synth_install,
 			m_stats.gauge_anchor_parked,
 			m_stats.gauge_anchor_recaptured,
 			m_stats.gauge_anchor_promoted,
@@ -27265,6 +35540,9 @@ void RemixGSRender::log_stats()
 			m_stats.hazefade_applied,
 			m_stats.fpvcol_skygate,
 			m_stats.vcol_route_blocked,
+			m_stats.vcol_alpha_only,
+			m_stats.vcol_tint_texcoord,
+			m_stats.vcol_tint_unmapped,
 			m_stats.vcol_fold_applied,
 			m_stats.ucode_fp_stored,
 			m_stats.ucode_fp_store_failed,
@@ -27303,10 +35581,20 @@ void RemixGSRender::log_stats()
 			remix_rsx::texcoord_scale_mad_form() ? 1 : 0,
 			remix_rsx::sky_camera_enabled() ? 1 : 0,
 			remix_rsx::camera_relatch_enabled() ? 1 : 0,
+			// ROUND 52, in the matching position for the "camrelatchtol=%.3g" appended after
+			// "camrelatch=%d" above.
+			static_cast<f64>(remix_rsx::camera_relatch_tolerance()),
 			remix_rsx::gauge_anchor_enabled() ? 1 : 0,
 			remix_rsx::gauge_trace_frames(),
 			remix_rsx::uv_affine_all_enabled() ? 1 : 0,
 			remix_rsx::uv_scale_lanes_enabled() ? 1 : 0,
+			// ROUND 52 (step 2b), in the matching position for the "uvscalehop=%d" appended after
+			// "uvscalelanes=%d" above.
+			remix_rsx::uv_scale_hop_enabled() ? 1 : 0,
+			// ROUND 58, in the matching positions for "fplerpunit=%d uvlanes=%d uvscale2=%d".
+			remix_rsx::fp_lerp_unit_enabled() ? 1 : 0,
+			remix_rsx::uv_lanes_enabled() ? 1 : 0,
+			remix_rsx::uv_scale2_enabled() ? 1 : 0,
 			remix_rsx::uv_range_census_enabled() ? 1 : 0,
 			remix_rsx::notex_census_enabled() ? 1 : 0,
 			static_cast<f64>(remix_rsx::viewmodel_anchor_limit()),
@@ -27341,6 +35629,10 @@ void RemixGSRender::log_stats()
 			remix_rsx::light_pass_census_enabled() ? 1 : 0,
 			remix_rsx::notex_material_enabled() ? 1 : 0,
 			remix_rsx::skip_shadow_only_enabled() ? 1 : 0,
+			// ROUND 51, the pair for 'skipcmask=%d skipnotarget=%d' inserted at the matching
+			// position immediately after skipshadowonly in the same edit.
+			remix_rsx::skip_colour_mask_off_enabled() ? 1 : 0,
+			remix_rsx::skip_no_colour_target_enabled() ? 1 : 0,
 			remix_rsx::walk_sampled_enabled() ? 1 : 0,
 			remix_rsx::tail_rescue_enabled() ? 1 : 0,
 			remix_rsx::tail_rescue_age(),
@@ -27352,6 +35644,17 @@ void RemixGSRender::log_stats()
 			remix_rsx::main_clip_max_enabled() ? 1 : 0,
 			remix_rsx::ui_rect_shrink_count(),
 			remix_rsx::ui_rect_shrink_percent(),
+			// ROUND 52, in the order of
+			// "uitinttexcoord=%d uiuvucode=%d uiforcevpdw=%d ucodestorefphashes=%u" above.
+			remix_rsx::ui_tint_texcoord_enabled() ? 1 : 0,
+			remix_rsx::ui_uv_ucode_enabled() ? 1 : 0,
+			// ROUND 59: the MODE, not the flag. Prints 0/1/2 and is unchanged at 0 and 1.
+			static_cast<int>(remix_rsx::ui_force_vp_depth_write_mode()),
+			remix_rsx::ucode_store_fp_hash_count(),
+			// ROUND 59, in the order of "uirefusefps=%u" above.
+			remix_rsx::ui_refuse_fp_count(),
+			// ROUND 60, in the order of "texremap=%d" above.
+			remix_rsx::texture_remap_enabled() ? 1 : 0,
 			remix_rsx::wdivide_walk_enabled() ? 1 : 0,
 			remix_rsx::texture_verify_frames(),
 			remix_rsx::fp_vertex_colour_replay_enabled() ? 1 : 0,
@@ -27363,8 +35666,30 @@ void RemixGSRender::log_stats()
 			remix_rsx::texture_reap_safe() ? 1 : 0,
 			remix_rsx::ucode_store_enabled() ? 1 : 0,
 			remix_rsx::texture_idle_frames(),
-			remix_rsx::camera_clip_gate_enabled() ? 1 : 0,
+			// ROUND 52: the MODE for "camclipgate=%u", and camsticky in the matching position for
+			// the "camsticky=%u" appended after "camfbrelatch=%d" above.
+			remix_rsx::camera_clip_gate_mode(),
 			remix_rsx::camera_fallback_relatch_enabled() ? 1 : 0,
+			remix_rsx::camera_sticky_enabled() ? 1u : 0u,
+			// ROUND 53, the four in the matching position for the "camtrack=%u camtrackpos=%.3g
+			// camtrackmiss=%u camrebase=%u" appended after "camsticky=%u" above.
+			remix_rsx::camera_track_mode(),
+			static_cast<f64>(remix_rsx::camera_track_position_tolerance()),
+			remix_rsx::camera_track_miss_frames(),
+			remix_rsx::camera_rebase_mode(),
+			// ROUND 54, the two in the matching position for "gldriftmat=%u camrelatchtrace=%u"
+			// appended after "camrebase=%u" above.
+			remix_rsx::guest_light_drift_matrices(),
+			remix_rsx::camera_relatch_trace_mode(),
+			// ROUND 55, in the matching position for "camrefsynth=%u" appended after
+			// "camrelatchtrace=%u" above. The banner is how a run states which arm it was.
+			remix_rsx::camera_ref_synth_mode(),
+			// ROUND 56, in the matching position for "camxflip=%u" appended after "camrefsynth=%u".
+			remix_rsx::camera_xflip_enabled() ? 1u : 0u,
+			// ROUND 57, in the matching position for "pickfresh=%u deferprerelatch=%u" appended
+			// after "camxflip=%u".
+			remix_rsx::pick_fresh_enabled() ? 1u : 0u,
+			remix_rsx::defer_pre_relatch_enabled() ? 1u : 0u,
 			remix_rsx::gauge_anchor_sticky_enabled() ? 1 : 0,
 			remix_rsx::gauge_donor_best(),
 			remix_rsx::vertex_colour_bgra_enabled() ? 1 : 0,
@@ -27375,6 +35700,26 @@ void RemixGSRender::log_stats()
 			remix_rsx::viewmodel_anchor_geometry_enabled() ? 1 : 0,
 			remix_rsx::viewmodel_albedo_camera_enabled() ? 1 : 0,
 			remix_rsx::mad_accumulate_walk_enabled() ? 1 : 0,
+			// ROUND 50, in the matching position for the "posinput=%d" appended after
+			// "madaccumwalk=%d" above.
+			remix_rsx::position_input_enabled() ? 1 : 0,
+			// ROUND 52, in the matching position for the "vertexblend=%d" appended after
+			// "posinput=%d" above. Defaults to 1, which is exactly why it is on the banner: an Eat
+			// Lead run with no characters and vertexblend=1 is an arm that fired and did not work,
+			// and one with vertexblend=0 is a launcher that turned it off.
+			remix_rsx::vertex_blend_enabled() ? 1 : 0,
+			// In the matching position for "vtxnormal=%d normalattr=%u demonsmenu=%d
+			// demonsworld=%d" appended after "posinput=%d" above.
+			remix_rsx::vertex_normals_enabled() ? 1 : 0,
+			remix_rsx::normal_attribute_index(),
+			remix_rsx::demons_menu_enabled() ? 1 : 0,
+			remix_rsx::demons_world_enabled() ? 1 : 0,
+			remix_rsx::texcoord_scale_mov_walk() ? 1 : 0,
+			remix_rsx::ui_uv_apply_once() ? 1 : 0,
+			remix_rsx::demons_lights_enabled() ? 1 : 0,
+			remix_rsx::demons_sun_source(),
+			static_cast<f64>(remix_rsx::demons_light_scale()),
+			remix_rsx::demons_hemisphere_enabled() ? 1 : 0,
 			remix_rsx::fp_vcol_route_enabled() ? 1 : 0,
 			remix_rsx::vcol_fold_enabled() ? 1 : 0,
 			remix_rsx::fp_vcol_sky_gate_enabled() ? 1 : 0,
@@ -27421,6 +35766,9 @@ void RemixGSRender::log_stats()
 			remix_rsx::sky_emissive_albedo_count(),
 			static_cast<f64>(remix_rsx::sky_emissive_intensity()),
 			remix_rsx::sky_emissive_blend_enabled() ? 1 : 0,
+			// ROUND 53. Two arguments for the two specifiers above, same order: skytag, skyemissivewext.
+			remix_rsx::sky_tag_enabled() ? 1 : 0,
+			remix_rsx::sky_emissive_wext_exempt_enabled() ? 1 : 0,
 			// ROUND 39. Eight arguments for the eight specifiers above, same order: mode, maxext,
 			// minvtx, maxvtx, upv, min, settle, set.
 			remix_rsx::sky_classify_mode(),
@@ -27480,7 +35828,20 @@ void RemixGSRender::log_stats()
 			m_main_clip_width,
 			m_main_clip_height,
 			m_max_clip_width,
-			m_max_clip_height);
+			m_max_clip_height,
+			// ROUND 52, in the matching position for the "skinvb=%llu/%llu" appended at the end of
+			// the format above.
+			m_stats.skin_vertex_blend,
+			m_stats.vp_vertex_blend,
+			// ROUND 52, in the matching position for the seven authored-light specifiers appended
+			// after skinvb at the end of the format above, in the same order and nowhere else.
+			m_stats.authored_loaded,
+			m_stats.authored_placed,
+			m_stats.authored_submitted,
+			m_stats.authored_culled_dist,
+			m_stats.authored_capped,
+			m_stats.authored_createfail,
+			m_stats.guest_light_suppressed);
 
 		std::string bones = fmt::format(
 			"Remix bone-fail: max=%.6g <0.05=%llu <0.2=%llu <1=%llu <10=%llu >=10=%llu |",

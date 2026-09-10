@@ -227,6 +227,12 @@ struct cfg_root : cfg::node
 
 			// Camera
 			cfg::uint<0, 100000> camera_hold{ this, "Camera Hold Frames", 300, true };      // RPCS3_REMIX_CAMHOLD, 0 = drop instantly
+			// Continuity of identity over TIME rather than a ranking rule. Round 53 measured why the
+			// ranking version (CAMSTICKY) cannot help: over 4,761 gameplay frames the winner track
+			// changed 84 times and in 80 of those the previous winner's track was ABSENT from the
+			// frame, so no rank can save it. Tenure election with a 3-frame miss bridge simulated
+			// 16 handovers against 84. Off by default; 0 restores the plain vote bit for bit.
+			cfg::_bool camera_track{ this, "Camera Identity Tracking", false, true };       // RPCS3_REMIX_CAMTRACK
 
 			// Geometry classification
 			cfg::_bool no_w_divide{ this, "Disable Vertex W Divide", false };               // RPCS3_REMIX_NOWDIV
@@ -236,10 +242,20 @@ struct cfg_root : cfg::node
 			cfg::_bool no_vertex_colour{ this, "Ignore Vertex Colours", false };            // RPCS3_REMIX_NOVCOL
 			cfg::_bool no_alpha_test{ this, "Ignore Alpha Test", false };                   // RPCS3_REMIX_NOALPHA
 			cfg::_bool smooth_normals{ this, "Generate Smooth Normals", false, true };      // RPCS3_REMIX_SMOOTHNORMALS
+			// Recover a matrix row that reached its HPOS lane through a MOV or a MAD rather than
+			// landing there as a DP4. Hooked last in the chain walk, so turning it off restores the
+			// previous classification of every program exactly.
+			cfg::_bool split_rows{ this, "Recover Split Matrix Rows", true };               // RPCS3_REMIX_SPLITROWS
 			cfg::uint<0, 65536> render_target_verts{ this, "Post-process Quad Vertex Limit", 32 }; // RPCS3_REMIX_RTVERTS
 			cfg::_float<0, 1000000> sky_extent{ this, "Sky Detection Extent", 2000, true }; // RPCS3_REMIX_SKYEXTENT
 			cfg::uint<0, 1000000> mesh_cap{ this, "Live Mesh Cap", 0 };                     // RPCS3_REMIX_MESHCAP, 0 = uncapped
 			cfg::uint<30, 1000000> mesh_idle{ this, "Mesh Idle Frames", 300, true };        // RPCS3_REMIX_MESHIDLE, ~5 s at 60 fps
+
+			// Sky. The SKY category is not the tool for a dome on a runtime that HIDES what it
+			// tags - these make the dome self-lit instead, and need no category at all.
+			cfg::string sky_emissive{ this, "Sky Emissive Textures", "", true };            // RPCS3_REMIX_SKYEMISSIVE
+			cfg::_float<0, 10000> sky_emissive_intensity{ this, "Sky Emissive Intensity", 2, true }; // RPCS3_REMIX_SKYEMISSIVEINT
+			cfg::_bool sky_emissive_blend{ this, "Sky Emissive Keeps Blending", true, true };// RPCS3_REMIX_SKYEMISSIVEBLEND
 
 			// Instance categories. Comma-separated 16-hex-digit albedo content hashes.
 			// Remix's own rtx.*Textures conf lists cannot categorise API-submitted draws.
@@ -251,6 +267,14 @@ struct cfg_root : cfg::node
 			// 2D compositor
 			cfg::_bool no_ui{ this, "Disable Game UI Compositor", false };                  // RPCS3_REMIX_NOUI
 			cfg::uint<0, 7680> ui_width{ this, "UI Compositor Width", 1920 };               // RPCS3_REMIX_UIWIDTH, 0 = window size
+			// A title that composes its HUD into an offscreen render target and blits the result
+			// loses the HUD entirely without this, because render-target-targeted draws are skipped.
+			// Costs a full-screen fill per such draw, which is why it is not on by default.
+			cfg::_bool keep_render_targets{ this, "Composite Render Target Draws", false }; // RPCS3_REMIX_KEEPRT
+			// On a frame that submits no world geometry - a splash, a loading screen, a full-screen
+			// menu - paint the title's own framebuffer clear colour under the overlay. Without it
+			// such a frame shows the runtime's empty scene wherever the 2D draws are transparent.
+			cfg::_bool clear_background{ this, "Paint Clear Colour On 2D Frames", true };   // RPCS3_REMIX_CLEARBG
 
 			// Diagnostics
 			cfg::_bool dump{ this, "Log Draw Diagnostics", false };                         // RPCS3_REMIX_DUMP

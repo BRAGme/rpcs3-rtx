@@ -245,10 +245,43 @@ namespace remix_rsx
 			return false;
 		}
 
+		// Snapshot the window's proc across Startup(). The runtime subclasses the HWND it is
+		// given, and that hook has to come back off at shutdown or the next boot crashes in it --
+		// see unhook_window_proc(). Read through the charset-matched entry point, the same way
+		// dxvk-remix's HookWindowProc does, because Windows keeps A and W procs in different
+		// representations and mixing the two hands back a thunk rather than the real pointer.
+		const bool hwnd_unicode = hwnd && IsWindowUnicode(hwnd);
+		const WNDPROC proc_before = hwnd
+			? reinterpret_cast<WNDPROC>(hwnd_unicode
+				? GetWindowLongPtrW(hwnd, GWLP_WNDPROC)
+				: GetWindowLongPtrA(hwnd, GWLP_WNDPROC))
+			: nullptr;
+
 		const u32 startup_status = guarded_startup(m_storage.api.Startup, &startup_info);
+
+		// Recorded before the status is even looked at: a Startup that hooked the window and then
+		// failed leaves exactly the same dangling proc behind as a successful one.
+		if (hwnd)
+		{
+			const WNDPROC proc_after = reinterpret_cast<WNDPROC>(hwnd_unicode
+				? GetWindowLongPtrW(hwnd, GWLP_WNDPROC)
+				: GetWindowLongPtrA(hwnd, GWLP_WNDPROC));
+
+			if (proc_after != proc_before)
+			{
+				m_hwnd = hwnd;
+				m_original_wndproc = proc_before;
+				m_remix_wndproc = proc_after;
+
+				rsx_log.notice("Remix: runtime subclassed HWND 0x%x (proc 0x%x -> 0x%x); it will be restored at shutdown",
+					reinterpret_cast<u64>(hwnd), reinterpret_cast<u64>(proc_before), reinterpret_cast<u64>(proc_after));
+			}
+		}
+
 		if (startup_status != REMIXAPI_ERROR_CODE_SUCCESS)
 		{
 			rsx_log.error("Remix: Startup failed (%s)", error_name(startup_status));
+			unhook_window_proc();
 			remixapi_lib_shutdownAndUnloadRemixDll(&m_storage.api, m_dll);
 			m_storage = {};
 			m_dll = nullptr;
@@ -410,8 +443,59 @@ namespace remix_rsx
 				  "IS settable at runtime from this client");
 	}
 
+	void runtime::unhook_window_proc()
+	{
+		const HWND hwnd = m_hwnd;
+		const WNDPROC original = m_original_wndproc;
+		const WNDPROC hooked = m_remix_wndproc;
+
+		// Cleared unconditionally: whatever happens below, this runtime instance has no further
+		// claim on that window, and a stale snapshot must never be written back on a later call.
+		m_hwnd = nullptr;
+		m_original_wndproc = nullptr;
+		m_remix_wndproc = nullptr;
+
+		if (!hwnd || !original || !hooked || !IsWindow(hwnd))
+		{
+			return;
+		}
+
+		const bool hwnd_unicode = IsWindowUnicode(hwnd);
+		const WNDPROC current = reinterpret_cast<WNDPROC>(hwnd_unicode
+			? GetWindowLongPtrW(hwnd, GWLP_WNDPROC)
+			: GetWindowLongPtrA(hwnd, GWLP_WNDPROC));
+
+		if (current != hooked)
+		{
+			// Either the runtime took its own hook off (dxvk-remix's ResetWindowProc does this
+			// on paths that run), or something subclassed on top of it. Writing the snapshot
+			// back in either case would drop somebody else's proc out of the chain.
+			rsx_log.notice("Remix: HWND 0x%x no longer carries the runtime's window proc (0x%x), leaving it alone",
+				reinterpret_cast<u64>(hwnd), reinterpret_cast<u64>(current));
+			return;
+		}
+
+		if (hwnd_unicode)
+		{
+			SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(original));
+		}
+		else
+		{
+			SetWindowLongPtrA(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(original));
+		}
+
+		rsx_log.notice("Remix: restored the original window proc on HWND 0x%x", reinterpret_cast<u64>(hwnd));
+	}
+
 	void runtime::shutdown()
 	{
+		// Ahead of Shutdown(), not after it. The window lives on the main thread and this runs on
+		// the RSX thread, so any message dispatched while the runtime is tearing itself down would
+		// otherwise still be routed into a swapchain that is in the middle of being destroyed.
+		// dxvk-remix's own ResetWindowProc tolerates finding a foreign proc in place -- it only
+		// restores when the proc is still its own, and erases its map entry either way.
+		unhook_window_proc();
+
 		if (!m_dll)
 		{
 			m_storage = {};

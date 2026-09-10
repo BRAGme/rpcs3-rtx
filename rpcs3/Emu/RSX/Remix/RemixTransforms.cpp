@@ -5,7 +5,9 @@
 
 #include "Emu/RSX/Program/RSXFragmentProgram.h"
 #include "Emu/RSX/Program/RSXVertexProgram.h"
+#include "Emu/RSX/Program/ProgramStateCache.h"
 #include "Emu/RSX/rsx_methods.h"
+#include "Emu/System.h"
 #include "Emu/system_config.h"
 
 #include <algorithm>
@@ -228,6 +230,14 @@ namespace remix_rsx
 			// HPOS.z was recovered from a w-buffer premultiply (repair_wbuffer_z).
 			bool wbuffer_z = false;
 
+			// One or more rows were recovered through repair_split_rows: the lane the matcher
+			// watches was written by a MOV or a MAD, and the DP4 that actually computed the row
+			// sat one hop behind it. 'split_shear_const' names the constant slot supplying the
+			// MAD's factor when there was one, and umax otherwise - see repair_split_rows for
+			// why that term is dropped and when dropping it is free.
+			bool split_rows = false;
+			u32 split_shear_const = umax;
+
 			// The group is read once per bone and the reads summed: a weighted blend
 			// (match_blend_palette). 'indexed' is set too - it is still one palette through one
 			// address register - but every read goes through its own component of that register,
@@ -237,6 +247,15 @@ namespace remix_rsx
 			u32 blend_weight_attribute = 0;
 			u8 blend_weight_component[max_blend_bones] = {};
 			u8 blend_addr_swz[max_blend_bones] = {};
+
+			// Round 52. The blend is the TRANSPOSE of match_blend_palette's: the ucode transforms
+			// the point by each bone and sums the four transformed POINTS, instead of summing the
+			// matrix rows and applying the sum once (match_vertex_blend). Same palette, same
+			// output contract, mathematically the same result - but the group is assembled out of
+			// four indexed MAD column chains rather than out of DP4 rows, so the two matchers are
+			// structurally disjoint. Carried so the audit rule below can be scoped to this family
+			// and so the census can tell the two populations apart.
+			bool vertex_blend = false;
 		};
 
 		// What the chain walk carries across its hops, including back out to the caller.
@@ -1600,6 +1619,51 @@ namespace remix_rsx
 			return out;
 		}
 
+		// Round 52. How many of the program's indexed reads address slots inside [base, base+rows)
+		// through the matched address register and one of the matched components - i.e. how many of
+		// them are reads of the MATCHED PALETTE'S OWN ROWS.
+		//
+		// It exists because the exact 'rows x bones' count audit_indexing feeds cannot express the
+		// vertex-blend family. Eat Lead's six main character programs read the palette 52 times: 16
+		// on the position path (4 rows x 4 bones) and 36 more rotating the normal (v0), tangent
+		// (v5) and binormal (v3) by the same palette's 256..258 columns into TEX1..TEX6. Those 36
+		// never touch HPOS. Holding them to the exact count would move the refusal from
+		// skin_unrec_indexed to skin_unrec_reads and leave the characters just as invisible.
+		//
+		// The range rule is what keeps this from being a loosening. The blend walk resolved every
+		// operand feeding HPOS to its actual last writer - the position decode, the four weights and
+		// the one ARL - so a read somewhere else in the program cannot move the position; what it
+		// COULD do is name a second table, and a read outside [base, base+rows) is exactly that.
+		// arl_count and foreign_reads stay whole-program and unchanged.
+		u32 count_palette_range_reads(const program_walker& prog, u32 addr_reg, u32 swz_mask, u32 base, u32 rows)
+		{
+			u32 count = 0;
+
+			for (u32 i = 0; i < static_cast<u32>(prog.size()); ++i)
+			{
+				const decoded_instr& in = prog[i];
+
+				if (!in.d3.index_const || !reads_constant(in))
+				{
+					continue;
+				}
+
+				if (u32{in.d0.addr_reg_sel_1} != addr_reg || !(swz_mask & (1u << (u32{in.d0.addr_swz} & 3))))
+				{
+					continue;
+				}
+
+				const u32 slot = u32{in.d1.const_src};
+
+				if (slot >= base && slot < (base + rows))
+				{
+					++count;
+				}
+			}
+
+			return count;
+		}
+
 		// Reduce one component of a temp to 'factor * attr[a][c]', where 'factor' is an integer the
 		// ucode built by repeated addition rather than by multiplying a constant slot. ADD and MOV
 		// only, and both operands of an ADD have to bottom out on the *same* attribute component -
@@ -2088,6 +2152,12 @@ namespace remix_rsx
 			u32 scale_slot = 0;
 			u8 scale_component[3] = { 0, 1, 2 };
 			u32 bias_slot = 0;
+			// Round 50. Which vertex attribute the decoded position was read from. 0 - ATTR0 - for
+			// every shape this matcher accepted before the round, which is why it can be carried
+			// onto the fingerprint and used as the decode index unconditionally: a program the
+			// widened MUL arm did not touch still names attribute 0 and nothing moves. Only the
+			// MUL arm sets it; the MAD arm and the ADD terminal still refuse a non-ATTR0 input.
+			u32 input = 0;
 			// The scale was written as RCP(c[K].<c>) in a scalar slot, so the factor is 1/value
 			// rather than the value. Still a transform constant and still evaluable per draw.
 			bool scale_is_reciprocal = false;
@@ -2675,10 +2745,51 @@ namespace remix_rsx
 						return refuse("mul-src");
 					}
 
-					// ATTR0 only, and read straight: it is the one attribute this backend submits
-					// as a position, so a decode on any other input describes a vector we never
-					// send. The same rule match_wdivide states.
-					if (u32{in.d1.input_src} != 0)
+					// --- round 50: the position is not always ATTR0 -----------------------------
+					// This used to be "ATTR0 only, and read straight: it is the one attribute this
+					// backend submits as a position, so a decode on any other input describes a
+					// vector we never send" - the same rule match_wdivide states. That premise is
+					// true of the BACKEND, not of the GUEST, and Eat Lead (BLUS30267) is a title
+					// where it is false for every world program. Replayed from bin\remix_ucode:
+					//
+					//   f2b6988e84056628, the sprite/compositor program
+					//     1: VEC MUL r0.xyz  <- v1.xyzx, c[467].xxxx
+					//     2: VEC MUL r1.xyzw <- r0.yyyy, c[257].xyzw
+					//     3: VEC MAD r1.xyzw <- r0.xxxx, c[256].xyzw, r1.xyzw
+					//     4: VEC MAD r0.xyzw <- r0.zzzz, c[258].xyzw, r1.xyzw
+					//     6: VEC ADD HPOS.xyzw <- r0.xyzw, c[259].xyzw  END
+					//
+					//   1b20d02263aa8ee4, one of the world programs
+					//     0: VEC MUL r4.xyz  <- v2.xyzx, c[465].xxxx
+					//    10: VEC MUL r0.xyzw <- r4.yyyy, c[261].xyzw
+					//    11: VEC MAD r0.xyzw <- r4.xxxx, c[260].xyzw, r0.xyzw
+					//    12: VEC MAD r0.xyzw <- r4.zzzz, c[262].xyzw, r0.xyzw
+					//
+					// In both, the temp that feeds the matrix rows is a scaled read of v1/v2, and
+					// ATTR0 is a byte-quantised normal the program routes to a texcoord output.
+					// Refusing here meant the backend kept submitting ATTR0 as the position, so the
+					// whole title reached Remix as a [0..254]-unit normal cloud. Three independent
+					// measurements said so before this arm was touched: `Remix sky-census:` `raw=`
+					// boxes are integer 0..254 on 42 of 62 rows; the `gate=wext` skip-census extents
+					// are median 250.7 over n=80 (the diagonal of a 0..254 box); and every
+					// `Remix world-refused:` row for an Eat Lead world program carries
+					// `areason=mul-not-attr0`. Thousands of overlapping 254-unit slabs around the
+					// camera is the white screen.
+					//
+					// So the input index is RECORDED instead of refused, and travels on the
+					// fingerprint as `position_input` for the one decode site that fills
+					// m_scratch_vertices. Nothing else about the shape is relaxed: identity xyz
+					// swizzle, a constant factor, and the `mul-twice` !has_scale guard above all
+					// still apply, so `build_prescale` folds c[465].x / c[467].x per draw exactly
+					// as it already does for the ATTR0 case.
+					//
+					// The MAD arm ('mad-not-attr0', below) and the ADD terminal ('add-not-attr0')
+					// KEEP REFUSING. Eat Lead's programs only ever spell the decode as this MUL, so
+					// there is no replayed ucode justifying either widening, and `match_wdivide`'s
+					// same-rule refusal is likewise untouched (these programs have has_wdivide=0).
+					//
+					// RPCS3_REMIX_POSINPUT=0 restores the refusal verbatim.
+					if (u32{in.d1.input_src} != 0 && !remix_rsx::position_input_enabled())
 					{
 						return refuse("mul-not-attr0");
 					}
@@ -2695,6 +2806,9 @@ namespace remix_rsx
 					out.scale_component[0] = static_cast<u8>(factor.swz_x);
 					out.scale_component[1] = static_cast<u8>(factor.swz_y);
 					out.scale_component[2] = static_cast<u8>(factor.swz_z);
+					// 0 for every program that would have matched before this round, so a
+					// fingerprint that never met the widened arm reads exactly as it always did.
+					out.input = u32{in.d1.input_src};
 					out.found = true;
 					return true;
 				}
@@ -3097,7 +3211,20 @@ namespace remix_rsx
 		// the position (ef8f10966ce1500b writes 'DP4>o7.y(I0.xyzw,C0.xyzw,...)c2i0' - attribute 0,
 		// which is the position, not a texcoord), a swizzle that is not the identity, an indexed
 		// constant, a scalar-half write, or two writers that disagree.
-		bool resolve_output_input(const program_walker& prog, u32 output, u32& out_attribute)
+		//
+		// ROUND 52 adds 'allow_attr0'. The refusal below rests on "attribute 0 is the position",
+		// which is the very premise round 50 RETRACTED at the position decode: match_const_affine's
+		// MUL arm now records which attribute a program actually feeds HPOS from, and Eat Lead's
+		// programs feed it from v1/v2 (pos_input=1523303/57) while parking the VERTEX COLOUR on v0.
+		// When the position is PROVABLY somewhere else, ATTR0 is free to be whatever the ucode says
+		// it is, and refusing it here is what left texcoord_input[1] at 0xff on
+		//     F2B6988E84056628.vp   5: VEC MOV o[8].xyzw <- v0.xyzw
+		// i.e. on the one write that names where this title's UI colour lives. The caller passes
+		// 'result.position_input != 0 && position_input_enabled()', so on every title whose position
+		// really is ATTR0 (Haze, R2, Demon's Souls - all position_input == 0) the call is
+		// bit-identical to the pre-round-52 one.
+		bool resolve_output_input(const program_walker& prog, u32 output, u32& out_attribute,
+			bool allow_attr0)
 		{
 			bool found = false;
 			u32 attribute = 0;
@@ -3167,10 +3294,11 @@ namespace remix_rsx
 				attribute = index;
 			}
 
-			// Attribute 0 is the position. A program that texture-maps from it is doing texgen,
-			// which this backend does not evaluate; the heuristic scan is a better answer than a
-			// stream of vertex positions handed to a sampler.
-			if (!found || attribute == 0 || attribute > 15)
+			// Attribute 0 is the position - unless the caller has proof that it is not (round 52;
+			// see the block comment above). A program that texture-maps from its real position is
+			// doing texgen, which this backend does not evaluate, and the heuristic scan is a better
+			// answer than a stream of vertex positions handed to a sampler.
+			if (!found || (!allow_attr0 && attribute == 0) || attribute > 15)
 			{
 				return false;
 			}
@@ -3543,9 +3671,12 @@ namespace remix_rsx
 		// Refuses on ambiguity rather than guessing: two MULs naming different slots, or naming
 		// different attributes, and the caller keeps the old fixed divisor.
 		bool resolve_texcoord_scale_slot(const program_walker& prog, u32 output, u16& out_attributes, u32& out_slot,
-			texcoord_scale_refusal& refusal)
+			texcoord_scale_refusal& refusal, u8& out_component)
 		{
 			refusal = texcoord_scale_refusal::no_multiply;
+			// Component 0 is the historical behaviour of every reader of this slot, so it stays the
+			// default: a program whose scale really is c[N].x is byte-identical to before.
+			out_component = 0;
 			u32 consts = 0;
 			u32 instructions = 0;
 			bool indexed = false;
@@ -3572,6 +3703,13 @@ namespace remix_rsx
 			// register. Kept separate from the direct form and only consulted when the direct form
 			// finds nothing, so a program that states the scale outright is never second-guessed.
 			bool temp_found = false;
+			// ROUND 53: the MOV-forwarded scale. Kept in its own trio so it can only be consulted
+			// after both direct forms have found nothing, and so the census can tell the three apart.
+			bool mov_found = false;
+			u32 mov_slot = 0;
+			u8 mov_component = 0;
+			u16 mov_attributes = 0;
+			bool mov_ambiguous = false;
 			u32 temp_slot = 0;
 			bool temp_slot_ambiguous = false;
 			bool temp_operand_ambiguous = false;
@@ -3659,6 +3797,68 @@ namespace remix_rsx
 
 				if (const_slot == umax)
 				{
+					// ROUND 53. No constant OPERAND - but the scale may be a constant this program
+					// MOVed into a temp one instruction earlier. Walk exactly one hop, with round
+					// 10's guards (MADACCUM arm A): the definition live at this point, a MOV, of a
+					// non-indexed constant, unnegated, no abs, no saturate, unconditional, and read
+					// through a broadcast swizzle. Anything else keeps the fixed divisor.
+					u32 scale_operand = umax;
+
+					if (texcoord_scale_mov_walk() && input_slot != umax)
+					{
+						for (u32 s = 0; s < scan; ++s)
+						{
+							if ((sources & (1u << s)) && s != input_slot
+								&& in.src[s].reg_type == RSX_VP_REGISTER_TYPE_TEMP && !in.src[s].neg)
+							{
+								scale_operand = s;
+								break;
+							}
+						}
+					}
+
+					u32 factor_component = 0;
+
+					if (scale_operand != umax && is_broadcast_swizzle(in.src[scale_operand], factor_component))
+					{
+						bool from_sca = false;
+						const u32 def = prog.last_component_writer(
+							u32{in.src[scale_operand].tmp_src}, factor_component, i, from_sca);
+
+						if (def != umax && !from_sca)
+						{
+							const decoded_instr& mov = prog[def];
+
+							if (mov.d1.vec_opcode == RSX_VEC_OPCODE_MOV
+								&& mov.src[0].reg_type == RSX_VP_REGISTER_TYPE_CONSTANT
+								&& !mov.d3.index_const
+								&& !mov.src[0].neg
+								&& !mov.d0.src0_abs
+								&& !mov.d0.staturate
+								&& !is_conditional(mov))
+							{
+								const u32 index = u32{in.d1.input_src};
+
+								if (index != 0 && index <= 15)
+								{
+									const u32 slot_here = u32{mov.d1.const_src};
+									const u8 comp_here =
+										static_cast<u8>(swizzle_component(mov.src[0], factor_component));
+
+									if (mov_found && (mov_slot != slot_here || mov_component != comp_here))
+									{
+										mov_ambiguous = true;
+									}
+
+									mov_found = true;
+									mov_slot = slot_here;
+									mov_component = comp_here;
+									mov_attributes |= static_cast<u16>(1u << index);
+								}
+							}
+						}
+					}
+
 					continue;
 				}
 
@@ -3721,6 +3921,24 @@ namespace remix_rsx
 				// slot across the slice's MULs, nothing multiplied by a third operand kind, and
 				// exactly one attribute read anywhere in the slice. Any ambiguity keeps the fixed
 				// divisor, which is the old behaviour and a known-safe answer.
+				// ROUND 53, ahead of the temp form's own refusals and behind the direct form: a
+				// program that states the scale outright is still never second-guessed, and this
+				// only ever runs where the old code was about to return the fixed divisor.
+				if (mov_found && !mov_ambiguous)
+				{
+					out_attributes = mov_attributes;
+					out_slot = mov_slot;
+					out_component = mov_component;
+					refusal = texcoord_scale_refusal::resolved;
+					return true;
+				}
+
+				if (mov_ambiguous)
+				{
+					refusal = texcoord_scale_refusal::two_constants;
+					return false;
+				}
+
 				if (!texcoord_scale_temp_form() || !temp_found)
 				{
 					return false;
@@ -3933,6 +4151,171 @@ namespace remix_rsx
 			return false;
 		}
 
+		// ROUND 52 (step 2b/2c). One lane of a temp reduced back to the ATTRIBUTE it was MOVed from,
+		// through any number of MOV hops. reduce_scaled_attribute above stops at a
+		// 'MUL(attribute, constant)' because in the 2x2 family the scale lives inside the row; here
+		// the scale has already been consumed by the caller's MUL, so the only thing left to find is
+		// a straight move of the attribute into a register - which is the shape Eat Lead's world
+		// programs use and the one the affine walk used to refuse outright.
+		//
+		// Replayed from bin\remix_ucode\70931FA705186608.vp (the 9,964-vertex world mesh; the prop
+		// family 1B20D02263AA8EE4.vp is the same slice with r2 for r3 and c464 for c463):
+		//
+		//     4: VEC MOV r3.zw <- v5.xxxy
+		//     5: VEC MOV r3.xy <- v4.xyxx
+		//     6: VEC MUL o7.xyzw <- r3.xyzw, c463.xxxx
+		//
+		// The .xy pair is fed by v4 ALONE - instruction 4 only touches .zw, which is a second UV set
+		// this walk never looks at. That is exactly why the scalar matcher refuses these programs
+		// with two_attributes (595,023 of Eat Lead's 807,360 fixed-divisor draws): its slice of o7 is
+		// lane-blind and sees both v4 and v5. find_lane_writer is not, so instruction 4 is skipped
+		// here by construction rather than by a rule.
+		//
+		// A hop that lands on a second MUL(attribute, constant) is NOT this shape - it is the
+		// two-scale family, 8D67DBFCC9DB7A96.vp:
+		//
+		//     5: VEC MUL r0.xy <- v4.xyxx, c464.xxxx
+		//    11: VEC MUL r0.xy <- r0.xyxx, c463.xxxx
+		//    12: VEC MOV o7.xy <- r0.xyxx
+		//
+		// i.e. the dequant AND a second multiplier. uv_affine_form carries one scale slot, so taking
+		// either of the two would be a guess; it is refused by name ("affine:mul-two-scales") and
+		// counted, and the scalar path - which after step 2a applies c464 alone, the dequant - keeps
+		// that draw. The census row names the program so c463's live value can be read from
+		// 'tc0consts:' before deciding whether a second scale slot is worth carrying.
+		bool reduce_moved_attribute(const program_walker& prog, u32 tmp, u32 component, u32 bound,
+			u8& out_attribute, u8& out_attr_component, bool& out_two_scales,
+			u16& out_scale2_slot, u8& out_scale2_component, const char*& reason)
+		{
+			u32 reg = tmp;
+			u32 lane = component;
+			u32 limit = bound;
+
+			for (u32 hop = 0; hop < 8; ++hop)
+			{
+				u32 index = 0;
+
+				if (!find_lane_writer(prog, false, reg, 1u << lane, limit, index))
+				{
+					reason = "affine:hop-no-writer";
+					return false;
+				}
+
+				const decoded_instr& in = prog[index];
+
+				if (in.d3.index_const)
+				{
+					reason = "affine:hop-indexed";
+					return false;
+				}
+
+				if (in.d1.vec_opcode == RSX_VEC_OPCODE_MUL)
+				{
+					// The two-scale family above, separated from the generic "not a MOV" refusal so
+					// it can be counted on its own - it is a known, decoded shape, not an unknown.
+					u32 input_slot = umax;
+					u32 const_slot = umax;
+
+					for (u32 s = 0; s < 2; ++s)
+					{
+						if (in.src[s].reg_type == RSX_VP_REGISTER_TYPE_INPUT)
+						{
+							input_slot = s;
+						}
+						else if (in.src[s].reg_type == RSX_VP_REGISTER_TYPE_CONSTANT)
+						{
+							const_slot = s;
+						}
+					}
+
+					// Flagged as well as named: the apply site counts this population and cannot
+					// compare 'reason' by pointer across translation units.
+					out_two_scales = input_slot != umax && const_slot != umax;
+
+					// ROUND 58 (step 5). RESOLVE it instead of refusing: the second scale is right
+					// here, and uv_affine_form now carries a slot for it. Both operands must be
+					// unmodified and the attribute a real one, exactly as the MOV arm below
+					// demands - a negated or indexed operand is still refused by name.
+					if (out_two_scales && uv_scale2_enabled())
+					{
+						const u32 attribute = u32{in.d1.input_src};
+
+						if (attribute == 0 || attribute > 15)
+						{
+							reason = "affine:hop-attr0";
+							return false;
+						}
+
+						if (in.src[input_slot].neg || in.src[const_slot].neg)
+						{
+							reason = "affine:two-scales-negated";
+							return false;
+						}
+
+						out_attribute = static_cast<u8>(attribute);
+						out_attr_component = static_cast<u8>(src_component(in.src[input_slot], lane));
+						out_scale2_slot = static_cast<u16>(u32{in.d1.const_src});
+						out_scale2_component = static_cast<u8>(src_component(in.src[const_slot], lane));
+						reason = "affine:resolved-two-scales";
+						return true;
+					}
+
+					reason = out_two_scales ? "affine:mul-two-scales" : "affine:hop-not-mov";
+					return false;
+				}
+
+				if (in.d1.vec_opcode != RSX_VEC_OPCODE_MOV)
+				{
+					reason = "affine:hop-not-mov";
+					return false;
+				}
+
+				const SRC& src = in.src[0];
+
+				if (src.neg)
+				{
+					reason = "affine:hop-negated";
+					return false;
+				}
+
+				if (src.reg_type == RSX_VP_REGISTER_TYPE_TEMP)
+				{
+					lane = src_component(src, lane);
+					reg = u32{src.tmp_src};
+					limit = index;
+					continue;
+				}
+
+				if (src.reg_type != RSX_VP_REGISTER_TYPE_INPUT)
+				{
+					reason = "affine:hop-source";
+					return false;
+				}
+
+				const u32 attribute = u32{in.d1.input_src};
+
+				// Attribute 0 is the position; a texcoord built from it is texgen, which this
+				// backend does not evaluate. Same rule the rest of this file applies.
+				if (attribute == 0 || attribute > 15)
+				{
+					reason = "affine:hop-attr0";
+					return false;
+				}
+
+				out_attribute = static_cast<u8>(attribute);
+
+				// The swizzle is FOLLOWED, not required to be the identity: uv_affine_form carries
+				// attr_component per lane precisely so a permuting move is expressible rather than
+				// refused. On the two decoded programs above it happens to be the identity in the
+				// written lanes (v4.xyxx -> lane 0 = x, lane 1 = y), so this records {0,1} there.
+				out_attr_component = static_cast<u8>(src_component(src, lane));
+				return true;
+			}
+
+			reason = "affine:hop-too-deep";
+			return false;
+		}
+
 		// One row of the 2x2: 'pair = scaled_attribute_component * cRow', where the temp operand
 		// broadcasts a single component into both lanes and the constant supplies one component
 		// per lane.
@@ -4020,14 +4403,19 @@ namespace remix_rsx
 			return true;
 		}
 
-		bool resolve_texcoord_affine(const program_walker& prog, u32 output, uv_affine_form& out)
+		// ROUND 58 (step 4a). 'lane_pair' selects which half of the output register is walked:
+		// 0 = .xy (the only pair this ever looked at), 1 = .zw. A vertex program may write the same
+		// UV into both at different scales - see vp_fingerprint::texcoord_affine_zw for the ucode -
+		// and the fragment program then chooses between them with its TEX swizzle.
+		bool resolve_texcoord_affine(const program_walker& prog, u32 output, u32 lane_pair,
+			uv_affine_form& out)
 		{
 			out = uv_affine_form{};
 			out.reason = "affine:no-writer";
 
 			bool is_output = true;
 			u32 reg = output;
-			u32 lanes[2] = { 0, 1 };
+			u32 lanes[2] = { lane_pair ? 2u : 0u, lane_pair ? 3u : 1u };
 			u32 bound = static_cast<u32>(prog.size());
 			u32 biases = 0;
 
@@ -4215,6 +4603,96 @@ namespace remix_rsx
 						out.has_rows = false;
 						out.resolved = true;
 						out.reason = "affine:resolved";
+						return true;
+					}
+
+					// ROUND 52 (step 2b). 'pair = temp * constant' with no attribute in the MUL. The
+					// scale is right here and unambiguous; the only thing missing is which attribute
+					// the temp holds, and reduce_moved_attribute walks the MOV chain back to it -
+					// per lane, so a program that assembles (u, v) from two different registers or
+					// two different attributes is refused rather than averaged.
+					//
+					// Exactly one temp operand: 'temp * temp' has no constant and never reaches
+					// here, and a MUL naming two temps AND a constant is not this shape.
+					// RPCS3_REMIX_UVSCALEHOP=0 restores the "affine:mul-temp-pair" refusal below.
+					if (uv_scale_hop_enabled() && temp_slot != umax && other_temp_slot == umax)
+					{
+						if (in.src[temp_slot].neg)
+						{
+							out.reason = "affine:mul-negated";
+							return false;
+						}
+
+						const u32 scale[2] = {
+							src_component(in.src[const_slot], lanes[0]),
+							src_component(in.src[const_slot], lanes[1]) };
+
+						// Same reading as the terminal form directly above: with no 2x2 the pair IS
+						// the output, so two components of one constant are u's divisor and v's.
+						if (scale[0] != scale[1] && !uv_scale_lanes_enabled())
+						{
+							out.reason = "affine:mul-two-components";
+							return false;
+						}
+
+						const u32 temp = u32{in.src[temp_slot].tmp_src};
+						const u32 next[2] = {
+							src_component(in.src[temp_slot], lanes[0]),
+							src_component(in.src[temp_slot], lanes[1]) };
+
+						u8 attribute[2] = { 0xff, 0xff };
+						u8 attr_component[2] = { 0, 1 };
+						// ROUND 58 (step 5). Filled only when the hop landed on a second
+						// MUL(attribute, constant) and RPCS3_REMIX_UVSCALE2 is on; s_no_uv_slot
+						// otherwise, which is the pre-round behaviour bit for bit.
+						u16 scale2_slot[2] = { s_no_uv_slot, s_no_uv_slot };
+						u8 scale2_component[2] = { 0, 0 };
+						const char* reason = "affine:hop";
+
+						for (u32 lane = 0; lane < 2; ++lane)
+						{
+							if (!reduce_moved_attribute(prog, temp, next[lane], index,
+								attribute[lane], attr_component[lane], out.two_scales,
+								scale2_slot[lane], scale2_component[lane], reason))
+							{
+								out.reason = reason;
+								return false;
+							}
+						}
+
+						// uv_affine_form carries ONE attribute. u from v4 and v from v5 is a legal
+						// program this form cannot express, so it is named rather than half-applied.
+						if (attribute[0] != attribute[1])
+						{
+							out.reason = "affine:hop-two-attrs";
+							return false;
+						}
+
+						// ...and ONE second scale slot, for the same reason. Two lanes that reached
+						// two different constants are refused rather than reduced to one of them.
+						if (scale2_slot[0] != scale2_slot[1])
+						{
+							out.reason = "affine:hop-two-scale2";
+							return false;
+						}
+
+						out.attribute = attribute[0];
+						out.scale_slot = static_cast<u16>(u32{in.d1.const_src});
+						out.scale_component[0] = static_cast<u8>(scale[0]);
+						out.scale_component[1] = static_cast<u8>(scale[1]);
+						out.attr_component[0] = attr_component[0];
+						out.attr_component[1] = attr_component[1];
+						out.scale2_slot = scale2_slot[0];
+						out.scale2_component[0] = scale2_component[0];
+						out.scale2_component[1] = scale2_component[1];
+						out.has_rows = false;
+						out.hopped = true;
+						out.resolved = true;
+						// two_scales stays SET when the second scale was resolved, so the existing
+						// uv_affine_two_scales census keeps naming the same population; the apply
+						// site distinguishes resolved from refused by scale2_slot, not by this flag.
+						out.reason = out.scale2_slot != s_no_uv_slot
+							? "affine:resolved-two-scales" : "affine:resolved-hop";
 						return true;
 					}
 
@@ -5653,6 +6131,329 @@ namespace remix_rsx
 			return true;
 		}
 
+		// --- round 52: the TRANSPOSE of the shape above ---------------------------------------
+		//
+		// match_blend_palette blends the matrix ROWS and applies the sum once. This family
+		// transforms the POINT by each bone and blends the four transformed points. The two are
+		// mathematically identical and structurally disjoint, and the second one had no matcher at
+		// all: Eat Lead (BLUS30267) took 117183 draws into skin_unrec_indexed with skin_submitted=0
+		// and no character on screen, over eight programs, every one of them this shape.
+		//
+		// Replayed from bin\remix_ucode\001E9E3D5495EE54.vp (92 instructions, numbers as stored):
+		//
+		//    1: MUL r0.xyz  = v4.xyzx, c465.xxxx           position decode: ATTR4 (s32k) * a scale
+		//    4: FLR r2.xyzw = v1.wzxy                      bone indices: ATTR1 (ub256), PERMUTED
+		//    7: MUL r2.xyzw = r2.xyzw, c463.xxxx           times the palette stride (4 slots/bone)
+		//    8: ARL a0.xyzw = r2.xyzw                      one ARL, all four components
+		//   25: MUL r1.xyz  = r0.yyyy, c[a0.x+257].xyzx  \
+		//   28: MAD r1.xyz  = r0.xxxx, c[a0.x+256], r1    |  bone via a0.x: an indexed MAD COLUMN
+		//   57: MAD r1.xyz  = r0.zzzz, c[a0.x+258], r1    |  chain, then the indexed translation
+		//   59: ADD r1.xyz  = r1.xyzx, c[a0.x+259]       /
+		//   26,27,58,60: the same via a0.y, into r16 then r0   (accumulator HOPS register at 58)
+		//   24,29,56,61: the same via a0.z, into r2
+		//   23,30,55,62: the same via a0.w, into r3
+		//   69: MUL r3.xyz  = v2.yyyy, r3.xyzx           \
+		//   76: MAD r2.xyz  = v2.xxxx, r2.xyzx, r3.xyzx   |  the weighted sum of the four
+		//   77: MAD r0.xyz  = v2.zzzz, r0.xyzx, r2.xyzx   |  transformed points; weights are
+		//   78: MAD r0.xyz  = r1.xyzx, v2.wwww, r0.xyzx  /   broadcast lanes of ATTR2, EITHER
+		//                                                    operand order (78 puts the weight in
+		//                                                    src1, the other three in src0)
+		//   87..89, 91: r0 through the fused view-projection c452..c455 into HPOS
+		//   11-22, 31-54, 63-75: the SAME palette's 256..258 columns applied to v0/v5/v3 (normal,
+		//        tangent, binormal) into TEX1..TEX3 - 36 more indexed reads that never touch HPOS.
+		//
+		// Pairing read off the ucode, index lane == weight lane as a real rig must:
+		//   a0.x <- v1.w / v2.w    a0.y <- v1.z / v2.z    a0.z <- v1.x / v2.x    a0.w <- v1.y / v2.y
+		//
+		// The family, all eight replayed instruction by instruction:
+		//   001E9E3D5495EE54 001E6E3D1495EE54  pos v4*c465.x  idx v1*c463.x  w v2  52 indexed reads
+		//   031CE5A041C06209 031CB5A001C06209  pos v4*c464.x  idx v1*c462.x  w v2  52
+		//   A97036B5F4B84F25 A97006B5B4B84F25  pos v4*c464.x  idx v1*c462.x  w v2  52
+		//   349BACAA433E003C                   pos v2*c467.x  idx v0*c465.x  w v1  16 (cmask pass)
+		//   645FC1A8EDC0D28D                   pos v2*c467.x  idx v0*c466.x  w v1  16 (cmask pass)
+		//
+		// Why every existing arm refuses it, traced through find_chain and then confirmed live by
+		// the 'Remix: indexed-const refusal ... arch=fused ... input=0' rows in bin\log\RPCS3.log.
+		// The outer c452..c455 group matches (that is the arch=fused), the walk then targets r0 as
+		// read at 87-89, last written at 78, and:
+		//   match_dp4_chain        the program contains no DP4 at all.
+		//   match_mad_chain strict no 0xf writer of r0 exists - every write is .xyz.
+		//   ... relaxed/indexed    terminal 78 is 'MAD r0 = r1 * v2.w + r0', which has NO constant
+		//                          operand, so const_slot stays umax and the pass refuses.
+		//   ... mixed lanes        same terminal selection (relaxed=false wants 0xf), same refusal.
+		//   match_indexed_affine   wants single-component indexed DP4 rows.
+		//   match_blend_palette    classify_blend_level sees 78 - a MAD reading a temp and an input
+		//                          - which is none of its three roles (DP4 row / MOV .w / ADD
+		//                          translation), so the level is 'a term this cannot express'.
+		//   repair_wbuffer_z       target is a temp, not HPOS.
+		//   resolve_writers        only resolves MOV-from-temp; 78 is a MAD.
+		// So the walk exhausts with reached_input=false and the draw lands in skin_unrec_indexed.
+		//
+		// The per-bone group is delegated to match_mad_chain_pass(relaxed) rather than re-matched
+		// here: it already accepts an indexed .xyz group at a stride recovered from the data (the
+		// Haze relaxation) and it already follows the accumulator across a register hop, which bone
+		// a0.y needs - its addend at 58 is r16, written at 27 and 26. Nothing this arm hands on is
+		// new either: resolve_bone_index already expresses FLR -> MUL c[k].x -> ARL with a permuted
+		// source, evaluate_palette_slot adds the ARL offset to palette_base, build_palette_matrix's
+		// 'mad' branch lays rows 0..2 as columns and row 3 as the translation under xyz_only, and
+		// build_blend_skinning composes the position decode in front of every bone.
+		//
+		// Ordering: hooked LAST in find_chain, so it only ever runs on a group every existing
+		// matcher already refused and no program that matches today can change matcher or slots.
+		// RPCS3_REMIX_VERTEXBLEND=0 restores the refusal exactly.
+		bool match_vertex_blend(const program_walker& prog, const walk_target& target, const std::vector<writer_ref>& writers, chain_result& out)
+		{
+			if (target.is_output || writers.empty())
+			{
+				// The blend accumulates in a temp that the outer group reads back, and an output
+				// register is never read by a vertex program.
+				return false;
+			}
+
+			// (a) The terminal: the last writer of this temp that produces a whole position. Same
+			// selection match_mad_chain_pass makes, including the relaxed .xyz form - every write
+			// on this family is .xyz, which is why the strict pass finds no terminal at all.
+			u32 cursor = umax;
+			u32 terminal_mask = 0;
+
+			for (auto it = writers.rbegin(); it != writers.rend(); ++it)
+			{
+				const u32 mask = vec_writemask(prog[it->instr]);
+
+				if (it->mask != mask)
+				{
+					continue;
+				}
+
+				if (mask == 0xf || mask == 0x7)
+				{
+					cursor = it->instr;
+					terminal_mask = mask;
+					break;
+				}
+			}
+
+			if (cursor == umax)
+			{
+				return false;
+			}
+
+			// (b) The blend walk, backwards: three MADs then the MUL that opens the sum. Exactly
+			// four bones, because a set of weights that does not cover all four lanes is not a
+			// blend this can prove it has seen whole - the same rule match_blend_row applies.
+			u32 bone_temp[max_blend_bones] = {};
+			u32 bone_before[max_blend_bones] = {};
+			u8 weight_component[max_blend_bones] = {};
+			u32 weight_attribute = umax;
+
+			for (u32 step = 0; step < max_blend_bones; ++step)
+			{
+				const decoded_instr& in = prog[cursor];
+				const u32 opcode = in.d1.vec_opcode;
+				const u32 wanted = (step + 1 == max_blend_bones) ? RSX_VEC_OPCODE_MUL : RSX_VEC_OPCODE_MAD;
+
+				if (opcode != wanted || vec_writemask(in) != terminal_mask || in.d3.index_const
+					|| is_conditional(in) || in.d0.staturate
+					|| in.src[0].neg || in.src[1].neg || in.src[2].neg
+					|| in.d0.src0_abs || in.d0.src1_abs || in.d0.src2_abs)
+				{
+					return false;
+				}
+
+				// One operand is the weight - a broadcast component of a vertex attribute - and the
+				// other is the transformed point, read straight. Either order: instruction 78 puts
+				// the weight in src1 and the other three put it in src0.
+				u32 weight_slot = umax;
+				u32 point_slot = umax;
+
+				for (u32 s = 0; s < 2; ++s)
+				{
+					if (in.src[s].reg_type == RSX_VP_REGISTER_TYPE_INPUT)
+					{
+						weight_slot = (weight_slot == umax) ? s : umax;
+					}
+					else if (in.src[s].reg_type == RSX_VP_REGISTER_TYPE_TEMP)
+					{
+						point_slot = (point_slot == umax) ? s : umax;
+					}
+					else
+					{
+						return false;
+					}
+				}
+
+				if (weight_slot == umax || point_slot == umax)
+				{
+					return false;
+				}
+
+				u32 component = 0;
+
+				if (!is_broadcast_swizzle(in.src[weight_slot], component)
+					|| !is_identity_xyz_swizzle(in.src[point_slot]))
+				{
+					// A swizzled point read would permute the transformed position, and a weight
+					// that is not one lane splatted is not a scalar weight.
+					return false;
+				}
+
+				// All four weights are four components of one blend-weight vector. Four different
+				// attributes would mean this is not the shape it is being matched as.
+				if (weight_attribute == umax)
+				{
+					weight_attribute = u32{in.d1.input_src};
+				}
+				else if (weight_attribute != u32{in.d1.input_src})
+				{
+					return false;
+				}
+
+				weight_component[step] = static_cast<u8>(component);
+				bone_temp[step] = u32{in.src[point_slot].tmp_src};
+				bone_before[step] = cursor;
+
+				if (opcode == RSX_VEC_OPCODE_MUL)
+				{
+					break;
+				}
+
+				// Follow the accumulator into the previous step, read straight.
+				if (in.src[2].reg_type != RSX_VP_REGISTER_TYPE_TEMP || !is_identity_xyz_swizzle(in.src[2]))
+				{
+					return false;
+				}
+
+				const u32 prev = prog.last_temp_writer(u32{in.src[2].tmp_src}, cursor);
+
+				if (prev == umax)
+				{
+					return false;
+				}
+
+				cursor = prev;
+			}
+
+			// Two weights on the same lane are one bone counted twice, and the weights would not
+			// sum to one.
+			u32 weight_seen = 0;
+
+			for (u32 k = 0; k < max_blend_bones; ++k)
+			{
+				weight_seen |= 1u << (weight_component[k] & 3);
+			}
+
+			if (weight_seen != 0xf)
+			{
+				return false;
+			}
+
+			// (c) One indexed MAD column chain per bone, each proven by the existing relaxed pass.
+			chain_result bone_chain[max_blend_bones]{};
+			std::vector<u32> bone_writers;
+			std::vector<writer_ref> bone_refs;
+
+			for (u32 k = 0; k < max_blend_bones; ++k)
+			{
+				prog.collect_vec_writers(walk_target{ false, bone_temp[k] }, bone_writers, bone_before[k]);
+
+				bone_refs.clear();
+				bone_refs.reserve(bone_writers.size());
+
+				for (const u32 i : bone_writers)
+				{
+					bone_refs.push_back(writer_ref{ i, vec_writemask(prog[i]) });
+				}
+
+				bone_chain[k] = chain_result{};
+
+				if (!match_mad_chain_pass(prog, bone_refs, bone_chain[k], /*allow_indexed*/ true, /*relaxed*/ true)
+					|| !bone_chain[k].found
+					|| !bone_chain[k].indexed
+					|| bone_chain[k].shape != chain_shape::mad)
+				{
+					return false;
+				}
+			}
+
+			// Every bone has to be the SAME palette read through its own address component, applied
+			// to the SAME position. Four groups that merely happen to be indexed are four unrelated
+			// transforms, and blending those is what tears a character apart.
+			u32 swz_seen = 0;
+			u32 first_instruction = bone_chain[0].first_instruction;
+
+			for (u32 k = 0; k < max_blend_bones; ++k)
+			{
+				if (bone_chain[k].base != bone_chain[0].base
+					|| bone_chain[k].rows != bone_chain[0].rows
+					|| bone_chain[k].stride != bone_chain[0].stride
+					|| bone_chain[k].xyz_only != bone_chain[0].xyz_only
+					|| bone_chain[k].addr_reg != bone_chain[0].addr_reg
+					|| !(bone_chain[k].source == bone_chain[0].source))
+				{
+					return false;
+				}
+
+				swz_seen |= 1u << (bone_chain[k].addr_swz & 3);
+				first_instruction = std::min(first_instruction, bone_chain[k].first_instruction);
+			}
+
+			if (swz_seen != 0xf)
+			{
+				return false;
+			}
+
+			if ((bone_chain[0].base + bone_chain[0].rows) > s_legal_constant_slots)
+			{
+				return false;
+			}
+
+			// (d) The pairing, built exactly the way match_blend_palette builds it: the weight lane
+			// the instruction read names the address component the same instruction's bone came
+			// from. Assuming 'weight .x goes with a0.x' would read a different bone than the
+			// hardware - the ARL here permutes a0 through v1.wzxy.
+			u8 pairing[max_blend_bones] = {};
+
+			for (u32 k = 0; k < max_blend_bones; ++k)
+			{
+				pairing[weight_component[k] & 3] = static_cast<u8>(bone_chain[k].addr_swz & 3);
+			}
+
+			out.found = true;
+			out.shape = chain_shape::mad;
+			out.base = bone_chain[0].base;
+			out.source = bone_chain[0].source;
+			out.instructions = (bone_chain[0].rows * max_blend_bones) + max_blend_bones;
+			// The earliest instruction of the matched group, and the bound resolve_bone_index
+			// searches for the ARL under - 23 on 001E9E3D5495EE54, which is above the ARL at 8.
+			out.first_instruction = first_instruction;
+			out.indexed = true;
+			out.addr_reg = bone_chain[0].addr_reg;
+			// The single-bone fields describe bone 0, so the indexing audit and the diagnostics see
+			// a coherent palette rather than a default.
+			out.addr_swz = pairing[0];
+			out.rows = bone_chain[0].rows;
+			out.stride = bone_chain[0].stride;
+			out.xyz_only = bone_chain[0].xyz_only;
+			// The translation is row 3 of the indexed group, not a constant added after the matrix.
+			out.has_bias = false;
+			// s_no_palette_w. A four-row group needs no homogeneous w and build_palette_matrix never
+			// reads it; a three-row one would be REFUSED there rather than built against a w nobody
+			// proved, which is the right answer for a shape no replayed ucode presents.
+			out.w_slot = umax;
+			out.blended = true;
+			out.blend_bones = max_blend_bones;
+			out.blend_weight_attribute = weight_attribute;
+			out.vertex_blend = true;
+
+			for (u32 k = 0; k < max_blend_bones; ++k)
+			{
+				out.blend_weight_component[k] = static_cast<u8>(k);
+				out.blend_addr_swz[k] = pairing[k];
+			}
+
+			return true;
+		}
+
 
 		// Depth written as a w-buffer: 'o0.z = (c[k] . pos) * (c[w] . pos)', i.e. the clip z
 		// premultiplied by the clip w so that the perspective divide leaves the *linear* eye-space
@@ -5776,6 +6577,162 @@ namespace remix_rsx
 			return true;
 		}
 
+		// ROUND 57. The rows are all there; two of them just do not arrive in the register the
+		// matcher watches.
+		//
+		// Ratchet & Clank Collection (BCUS98282, RC1) writes its clip position like this - replayed
+		// with docs/remix/vpdis.py from the dumped 646DEC336DEBA29A.vp:
+		//
+		//     8: DP4 r1.z <- r0, c[2]
+		//     9: DP4 r1.x <- r0, c[0]
+		//    10: DP4 r1.y <- r0, c[1]
+		//    11: DP4 r0.x <- r0, c[3]                      ; the W row, into a DIFFERENT temp lane
+		//    14: MOV o[10](TEX3)=r1.w <- r0.xxxx           ; and into r1.w by a dual-write MOV
+		//    15: MAD r1.x <- r0.wwww, c[17].xxxx, r1.xxxx  ; the X row, then sheared
+		//    20: MOV o[0](HPOS).xyzw <- r1.xyzw
+		//
+		// c[0..3] is the view-projection and c[4..7] the object matrix, so the chain behind it is a
+		// perfectly ordinary two-group one. But match_dp4_chain is handed a MOV on w and a MAD on x,
+		// counts two rows instead of four, and the program comes back arch=unknown / 'no matrix
+		// chain into HPOS'. MEASURED on RC1: that is EVERY world draw - world_refused = 5,967,184 =
+		// world_fallback, cam_resolved=0, submitted=0, meshes_live=0, and a black screen behind a
+		// runtime that is otherwise healthy at 59 FPS with textures loading.
+		//
+		// Same shape as repair_wbuffer_z, and for the same reason: rewrite the writer list so each
+		// lane names the DP4 that actually computed it, then let the UNCHANGED matcher read the
+		// group. Exactly two forms are accepted:
+		//
+		//     MOV dst.c <- rN.<broadcast>                with rN.<comp> defined by a plain DP4/DPH
+		//     MAD dst.c <- a, b, rN.<broadcast>          with ONE of a/b a constant, rN.<comp> ditto
+		//
+		// The MAD form takes the ADDEND as the row and requires the product to carry a constant
+		// factor. That is the only reading under which the recovered matrix is the one the program
+		// multiplies: 'row + correction'. On RC1 the correction is (w - c[17].y) * c[17].x, a
+		// depth-proportional horizontal shear - stereo separation or a screen offset - and this
+		// repair DROPS it. That is free exactly when c[17].x is 0, and is a small x-shear otherwise;
+		// the slot is recorded in split_shear_const so a run can say which constant to read before
+		// deciding whether the omission matters.
+		//
+		// Returns true only when a lane actually moved, so the caller re-runs the matcher only when
+		// there is something new to see. A lane this cannot repair is left exactly as it was and the
+		// group is then refused exactly as it is today - which is what makes hooking this last,
+		// after every existing matcher, a strict widening: no program that matches now can move.
+		bool repair_split_rows(const program_walker& prog, std::vector<writer_ref>& refs, u32& out_shear_const)
+		{
+			bool repaired_any = false;
+
+			for (writer_ref& ref : refs)
+			{
+				u32 component = 0;
+
+				if (!single_component(ref.mask, component))
+				{
+					continue;
+				}
+
+				const decoded_instr& in = prog[ref.instr];
+
+				if (in.d1.vec_opcode == RSX_VEC_OPCODE_DP4 || in.d1.vec_opcode == RSX_VEC_OPCODE_DPH)
+				{
+					continue;
+				}
+
+				if (in.d3.index_const || is_conditional(in) || in.d0.staturate
+					|| in.d0.src0_abs || in.d0.src1_abs || in.d0.src2_abs)
+				{
+					continue;
+				}
+
+				u32 row_operand = umax;
+				u32 shear_const = umax;
+
+				if (in.d1.vec_opcode == RSX_VEC_OPCODE_MOV)
+				{
+					// A component-3 MOV that reads a CONSTANT is the homogeneous w that
+					// match_dp4_chain already accepts in place of a fourth row. Not this shape, and
+					// taking it here would replace a working reading with a guess.
+					if (in.src[0].reg_type != RSX_VP_REGISTER_TYPE_TEMP)
+					{
+						continue;
+					}
+
+					row_operand = 0;
+				}
+				else if (in.d1.vec_opcode == RSX_VEC_OPCODE_MAD)
+				{
+					// Exactly one constant among the two multiplied operands: that is the shear
+					// factor. Two constants, or none, is some other arithmetic and is left alone.
+					u32 const_slots = 0;
+
+					for (u32 s = 0; s < 2; ++s)
+					{
+						if (in.src[s].reg_type == RSX_VP_REGISTER_TYPE_CONSTANT)
+						{
+							++const_slots;
+							shear_const = in.d1.const_src;
+						}
+					}
+
+					if (const_slots != 1)
+					{
+						continue;
+					}
+
+					row_operand = 2;
+				}
+				else
+				{
+					continue;
+				}
+
+				const SRC& src = in.src[row_operand];
+
+				u32 src_component = 0;
+
+				if (src.reg_type != RSX_VP_REGISTER_TYPE_TEMP || src.neg
+					|| !is_broadcast_swizzle(src, src_component))
+				{
+					continue;
+				}
+
+				bool from_sca = false;
+				const u32 def = prog.last_component_writer(u32{src.tmp_src}, src_component, ref.instr, from_sca);
+
+				if (def == umax || from_sca)
+				{
+					continue;
+				}
+
+				const decoded_instr& row = prog[def];
+
+				if ((row.d1.vec_opcode != RSX_VEC_OPCODE_DP4 && row.d1.vec_opcode != RSX_VEC_OPCODE_DPH)
+					|| row.d3.index_const || is_conditional(row) || row.d0.staturate)
+				{
+					continue;
+				}
+
+				// A row is one component wide on its own instruction as well as on the target.
+				// Checking it here keeps match_dp4_chain's own test doing exactly what it does now
+				// rather than meeting a substitution it was never handed before.
+				if (u32 row_component = 0; !single_component(vec_writemask(row), row_component))
+				{
+					continue;
+				}
+
+				ref.instr = def;
+				repaired_any = true;
+
+				// First one wins: the shear is a property of the program, and every lane that
+				// carries one on the programs this was built from carries the same slot.
+				if (shear_const != umax && out_shear_const == umax)
+				{
+					out_shear_const = shear_const;
+				}
+			}
+
+			return repaired_any;
+		}
+
 		chain_result find_chain(const program_walker& prog, const walk_target& target, u32 before, chain_context& ctx, u32 depth = 0)
 		{
 			chain_result result{};
@@ -5836,6 +6793,21 @@ namespace remix_rsx
 				return result;
 			}
 
+			result = chain_result{};
+
+			// ...and the transpose of that: the same palette applied to the POINT once per bone and
+			// the four transformed points summed. Tried after match_blend_palette for the same
+			// reason match_blend_palette is tried after match_indexed_affine - the shapes are
+			// disjoint, but ordering them makes that a property of this code rather than of the
+			// ucode, and it is what guarantees no program matching today changes matcher or slots.
+			// See the header on match_vertex_blend for the replayed ucode and for which test in
+			// each arm above refuses this family.
+			if (ctx.allow_indexed && indexed_world_enabled() && bone_blend_enabled() && vertex_blend_enabled()
+				&& match_vertex_blend(prog, target, refs, result))
+			{
+				return result;
+			}
+
 			// ...and, last of the direct forms, the w-buffer depth encoding.
 			if (target.is_output && wbuffer_z_enabled())
 			{
@@ -5846,6 +6818,24 @@ namespace remix_rsx
 				if (repair_wbuffer_z(prog, repaired) && match_dp4_chain(prog, repaired, result))
 				{
 					result.wbuffer_z = true;
+					return result;
+				}
+			}
+
+			// ...and, last of the direct forms, rows that reached the target lane through a MOV or
+			// a MAD. Hooked after every matcher above so a group that already matches one keeps
+			// matching it, and after the w-buffer repair for the same reason.
+			if (split_rows_enabled())
+			{
+				result = chain_result{};
+
+				std::vector<writer_ref> repaired = refs;
+				u32 shear_const = umax;
+
+				if (repair_split_rows(prog, repaired, shear_const) && match_dp4_chain(prog, repaired, result))
+				{
+					result.split_rows = true;
+					result.split_shear_const = shear_const;
 					return result;
 				}
 			}
@@ -5886,6 +6876,26 @@ namespace remix_rsx
 						{
 							result.indirect = true;
 							result.wbuffer_z = true;
+							return result;
+						}
+					}
+
+					// The split rows are reached the same way. This is the arm RC1 actually lands
+					// on: its HPOS has ONE writer, 'MOV o[0].xyzw <- r1.xyzw', so the lanes only
+					// become visible after resolve_writers has taken the last writer of each
+					// component of r1 - which is where the MOV on w and the MAD on x turn up.
+					if (split_rows_enabled())
+					{
+						result = chain_result{};
+
+						std::vector<writer_ref> repaired = resolved;
+						u32 shear_const = umax;
+
+						if (repair_split_rows(prog, repaired, shear_const) && match_dp4_chain(prog, repaired, result))
+						{
+							result.indirect = true;
+							result.split_rows = true;
+							result.split_shear_const = shear_const;
 							return result;
 						}
 					}
@@ -6887,6 +7897,9 @@ namespace remix_rsx
 						result.affine_scale_reciprocal = decode.scale_is_reciprocal;
 						result.affine_bias_before_scale = decode.bias_before_scale;
 						result.affine_accum_walk = decode.used_accum_walk;
+						// Round 50. Only on the success path: a refused match leaves `input` at its
+						// default and recording it would claim an attribute the matcher never read.
+						result.position_input = static_cast<u8>(decode.input);
 					}
 				}
 			}
@@ -6901,9 +7914,15 @@ namespace remix_rsx
 		// Read the texcoord attributes out of the ucode before any early return: a screen_space or
 		// unknown program still draws through composite_ui_draw, which resolves texcoords the same
 		// way. Once per program, not per draw - the fingerprint is cached by program hash.
+		// ROUND 52: ATTR0 is admissible as a texcoord source exactly when this program's position was
+		// proven to come from somewhere else. result.position_input is written above, on the success
+		// path of the MUL arm only, so a refused position decode leaves it 0 and this stays false -
+		// the conservative direction. Latched once here rather than per unit.
+		const bool texcoord_allow_attr0 = result.position_input != 0 && position_input_enabled();
+
 		for (u32 unit = 0; unit < 8; ++unit)
 		{
-			if (u32 attribute = 0; resolve_output_input(prog, 7 + unit, attribute))
+			if (u32 attribute = 0; resolve_output_input(prog, 7 + unit, attribute, texcoord_allow_attr0))
 			{
 				result.texcoord_input[unit] = static_cast<u8>(attribute);
 			}
@@ -6913,11 +7932,35 @@ namespace remix_rsx
 			texcoord_scale_refusal refusal = texcoord_scale_refusal::no_multiply;
 			u32 slot = 0;
 			u16 attributes = 0;
+			u8 component = 0;
 
-			if (resolve_texcoord_scale_slot(prog, 7 + unit, attributes, slot, refusal))
+			if (resolve_texcoord_scale_slot(prog, 7 + unit, attributes, slot, refusal, component))
 			{
-				result.texcoord_scale_slot[unit] = static_cast<u8>(std::min<u32>(slot, 0xfeu));
-				result.texcoord_scale_inputs[unit] = attributes;
+				// ROUND 52 (step 2a). This used to be
+				//     result.texcoord_scale_slot[unit] = static_cast<u8>(std::min<u32>(slot, 0xfeu));
+				// which is a GUESS that happens to read zero: the field was u8, so every slot the
+				// matcher resolved above c254 was clamped to c254 - a slot no observed title writes -
+				// and the apply site then read [0 0 0 0], failed its v[0] > 0 guard and silently took
+				// the fixed UVINTSCALE divisor. Eat Lead (BLUS30267) keeps its UV dequant in
+				// c463/c464, so its ENTIRE scalar population went that way:
+				//   Remix uvscale-fixed: vp=8d67dbfcc9db7a96 unit=0 attr=4 refusal=resolved
+				//                        slot=c254 inputs=0x0010 value=[0 0 0 0] read=1 fixed=4096
+				// against bin\remix_ucode\8D67DBFCC9DB7A96.vp instruction 5, which reads
+				//   5: VEC MUL r0.xy <- v4.xyxx, c464.xxxx
+				// i.e. the matcher had c464 and the store threw it away. The field is u16 now, and a
+				// slot the constant file cannot hold is REFUSED and named rather than folded into a
+				// neighbouring one - "refuse and count, never guess". No knob: the "off" state of
+				// this change is a silent wrong read and must not be reproducible.
+				if (slot >= s_legal_constant_slots)
+				{
+					refusal = texcoord_scale_refusal::slot_out_of_range;
+				}
+				else
+				{
+					result.texcoord_scale_slot[unit] = static_cast<u16>(slot);
+					result.texcoord_scale_inputs[unit] = attributes;
+					result.texcoord_scale_component[unit] = static_cast<u8>(component & 3);
+				}
 			}
 
 			result.texcoord_scale_refused[unit] = refusal;
@@ -6925,10 +7968,149 @@ namespace remix_rsx
 			// The full form, resolved independently of both passes above: a program can state a
 			// scale the scalar pass finds and still carry a 2x2 and two biases it cannot express,
 			// which is the whole c151 population. Refusals leave 'reason' set for the census.
-			resolve_texcoord_affine(prog, 7 + unit, result.texcoord_affine[unit]);
+			resolve_texcoord_affine(prog, 7 + unit, 0, result.texcoord_affine[unit]);
+
+			// ROUND 58 (step 4a). The SECOND lane pair of the same output, and the macro verdict
+			// that follows from comparing the two SCALE forms. Once per unique program, not per
+			// draw. A pair is 'macro' when its form carries a second scale (resolved or refused)
+			// while the other pair resolved with one - which is exactly the shape
+			// 7565B4CBD93682D9.vp writes and the reason its .zw pair tiles ten times denser.
+			resolve_texcoord_affine(prog, 7 + unit, 1, result.texcoord_affine_zw[unit]);
+
+			{
+				const uv_affine_form& xy = result.texcoord_affine[unit];
+				const uv_affine_form& zw = result.texcoord_affine_zw[unit];
+
+				const bool xy_one = xy.resolved && xy.scale2_slot == s_no_uv_slot && !xy.two_scales;
+				const bool zw_one = zw.resolved && zw.scale2_slot == s_no_uv_slot && !zw.two_scales;
+				const bool xy_two = xy.two_scales || xy.scale2_slot != s_no_uv_slot;
+				const bool zw_two = zw.two_scales || zw.scale2_slot != s_no_uv_slot;
+
+				u8 macro = 0;
+
+				if (xy_two && zw_one)
+				{
+					macro |= 1;
+				}
+				else if (zw_two && xy_one)
+				{
+					macro |= 2;
+				}
+
+				result.texcoord_macro_lanes[unit] = macro;
+			}
 		}
 
 		slice_position(prog, 0, result.distinct_consts, result.chain_instructions, result.indexed_const);
+
+		if (demons_world_enabled())
+		{
+			// These captured programs scatter the three world coordinates across temporary
+			// registers before the c0..c3 MAD chain. The generic matcher requires one source
+			// register and cannot express that allocation. Replay only these verified binaries:
+			// world[row] = DPH(ATTR0.xyz, c[8 + trunc(ATTR7.x*c467.x) + row]),
+			// or its four-matrix blend with ATTR1 / sum(ATTR1). DPH supplies homogeneous 1.
+			const u64 hash = program_hash_util::vertex_program_utils::get_vertex_program_ucode_hash(vp);
+			if (hash == 0x7f4d3587c70d02daull)
+			{
+				result.archetype = vp_archetype::fused;
+				result.group_count = 1;
+				result.group_base[0] = 8;
+				result.group_shape[0] = chain_shape::mad;
+				result.group_rows[0] = 4;
+				result.inner_is_input = true;
+				result.has_basis_affine = false;
+				result.has_const_affine = false;
+				result.has_prescale = false;
+				result.demons_particle_depth = true;
+				result.note = "Demon's Souls particle physical depth; soft-depth displacement omitted";
+				return result;
+			}
+			bool known = true;
+			bool blended = false;
+			switch (hash)
+			{
+			case 0x1efbebaa832c5929ull:
+			case 0xc7b10dbe8ee3d37aull:
+			case 0xb3c9db2b1b285204ull:
+			case 0xe47fe00d9c636603ull:
+			case 0xfee26ebba7aa213aull:
+			case 0xc9d9acb780048576ull:
+			case 0x14f25071cb2c399full:
+			case 0x7fac43cedf8ec689ull:
+				blended = true;
+				break;
+			case 0xad2b85d2797f3da4ull:
+			case 0xe1b62419e7d43ff2ull:
+			case 0xed53cdf8176af8b7ull:
+			case 0xb32aa200ce7064fcull:
+			case 0x9754e61daeaa76c7ull:
+			case 0x2f0ddbd2f0c0e918ull:
+			case 0x2601e7953839e2a1ull:
+			case 0x0105776d61552055ull:
+			case 0x9a5f070ef1e0ebe7ull:
+			case 0xdf33548770fb53d7ull:
+			case 0x68e563f0d92ac9dbull:
+			case 0x0314c853c971ceaeull:
+			case 0xea7234e21647f836ull:
+			case 0x0b5b0e742213fc4aull:
+			case 0x8647d8b25077ae2cull:
+			case 0x687a882dc91d3fb2ull:
+			case 0x9f14eb86224cedb5ull:
+				break;
+			default:
+				known = false;
+				break;
+			}
+
+			if (known)
+			{
+				result.archetype = vp_archetype::skinned_layered;
+				result.group_count = 1;
+				result.group_base[0] = 0;
+				result.group_shape[0] = chain_shape::mad;
+				result.group_rows[0] = 4;
+				result.inner_is_input = true;
+				result.has_basis_affine = false;
+				result.has_const_affine = false;
+				result.skinned = true;
+				result.palette_base = 8;
+				result.palette_shape = chain_shape::dp4;
+				result.palette_rows = 3;
+				result.palette_stride = 1;
+				result.palette_implicit_w = true;
+				result.bone_attribute = 7;
+				result.bone_component = 0;
+				result.bone_resolved = true;
+				result.bone_op_count = 1;
+				result.bone_ops[0].op = bone_index_op::kind::scale;
+				result.bone_ops[0].mul_slot = 467;
+				result.bone_ops[0].mul_component = 0;
+				result.skin_blended = blended;
+				result.blend_bones = blended ? 4 : 0;
+				result.blend_weight_attribute = 1;
+				for (u32 k = 0; blended && k < 4; ++k)
+				{
+					result.blend_weight_component[k] = static_cast<u8>(k);
+					constexpr u8 swizzled_address[4] = { 2, 3, 1, 0 };
+					result.blend_addr_swz[k] = hash == 0x14f25071cb2c399full
+						? static_cast<u8>(k) : swizzled_address[k];
+					auto& bone = result.blend_bone[k];
+					bone.resolved = true;
+					bone.attribute = 7;
+					bone.component = k;
+					bone.op_count = 1;
+					bone.ops[0] = result.bone_ops[0];
+				}
+				const index_audit audit = audit_indexing(prog, 0, blended ? 0xf : 1);
+				result.arl_count = audit.arl_count;
+				result.indexed_reads = audit.indexed_reads;
+				result.foreign_indexed_reads = audit.foreign_reads;
+				result.affine_reason = "demons captured palette";
+				result.note = "Demon's Souls indexed world transform";
+				return result;
+			}
+		}
 
 		if (result.indexed_const)
 		{
@@ -6980,6 +8162,12 @@ namespace remix_rsx
 
 			result.hpos_indirect |= chain.indirect;
 			result.hpos_wbuffer_z |= chain.wbuffer_z;
+			result.hpos_split_rows |= chain.split_rows;
+
+			if (chain.split_shear_const != umax && result.hpos_split_shear_const == umax)
+			{
+				result.hpos_split_shear_const = chain.split_shear_const;
+			}
 
 			if (chain.indexed)
 			{
@@ -7000,6 +8188,9 @@ namespace remix_rsx
 				result.palette_bias_forwarded = chain.bias_forwarded;
 
 				result.skin_blended = chain.blended;
+				// Round 52: which of the two blend shapes matched. Read by the read audit below,
+				// by the counters and by the 'form=' field of the indexed-world census.
+				result.skin_vertex_blend = chain.vertex_blend;
 				result.blend_bones = chain.blend_bones;
 				result.blend_weight_attribute = chain.blend_weight_attribute;
 
@@ -7042,15 +8233,49 @@ namespace remix_rsx
 					// term this has not accounted for.
 					const u32 expected_reads = chain.blended ? (chain.rows * chain.blend_bones) : 0;
 
-					if (audit.arl_count > 1 || audit.foreign_reads != 0
-						|| (chain.blended && audit.indexed_reads != expected_reads))
+					// --- round 52: the vertex-blend family reads the palette off the HPOS path ---
+					// Eat Lead's six main character programs read the matched palette 52 times: 16
+					// on the position path and 36 more rotating the normal, tangent and binormal by
+					// the same palette's own 256..258 columns into TEX1..TEX6. The exact count would
+					// move all 117183 of them from skin_unrec_indexed to skin_unrec_reads and leave
+					// the characters exactly as invisible.
+					//
+					// The RANGE rule replaces it for this family only: every indexed read in the
+					// program has to address a row of the MATCHED palette through a matched address
+					// component. It is not a loosening - the arm's backward walk resolved every
+					// operand feeding HPOS to its actual last writer, so a read elsewhere cannot
+					// move the position; what it could do is name a SECOND table, and the range rule
+					// is what refuses that. arl_count and foreign_reads stay whole-program, and
+					// non-vertex-blend chains keep the exact count untouched.
+					//
+					// Deliberately NOT scoped with slice_position instead: that is a conservative
+					// slice (every earlier writer of a read register), and the dead r1/r2/r3 writes
+					// at 79-86 pull the whole normal path back into it anyway.
+					const u32 in_range_reads = chain.vertex_blend
+						? count_palette_range_reads(prog, chain.addr_reg, swz_mask, chain.base, chain.rows)
+						: 0;
+
+					// Measurement, on the success path: how many indexed reads the matched group
+					// does not itself explain. 36 on the six Eat Lead main programs, 0 on the two
+					// colour-mask-skipped shadow ones.
+					result.indexed_reads_outside_chain = chain.vertex_blend
+						? (audit.indexed_reads - std::min(audit.indexed_reads, expected_reads))
+						: 0;
+
+					const bool read_count_bad = chain.vertex_blend
+						? (audit.indexed_reads != in_range_reads)
+						: (chain.blended && audit.indexed_reads != expected_reads);
+
+					if (audit.arl_count > 1 || audit.foreign_reads != 0 || read_count_bad)
 					{
 						result.skin_unrecognised = true;
 						result.skin_note = (audit.arl_count > 1)
 							? "more than one ARL: address register is reloaded, so the rig blends"
 							: (audit.foreign_reads != 0
 								? "palette read through an address register component the match does not cover"
-								: "the program indexes the palette more times than the matched group explains");
+								: (chain.vertex_blend
+									? "vertex-blend program indexes a slot outside the matched palette"
+									: "the program indexes the palette more times than the matched group explains"));
 						result.note = "skinned rig not provably understood";
 						return result;
 					}
@@ -7140,6 +8365,9 @@ namespace remix_rsx
 				result.affine_bias_before_scale = affine.bias_before_scale;
 							result.affine_scale_reciprocal = affine.scale_is_reciprocal;
 							result.affine_bias_before_scale = affine.bias_before_scale;
+							// Round 50, on the success path only - see the identical assignment at
+							// the basis fold site above.
+							result.position_input = static_cast<u8>(affine.input);
 							reached_input = true;
 						}
 					}
@@ -7255,6 +8483,10 @@ namespace remix_rsx
 				result.affine_scale_component[2] = affine.scale_component[2];
 				result.affine_bias_slot = affine.bias_slot;
 				result.affine_accum_walk = affine.used_accum_walk;
+				// Round 50, on the success path only. This is the fold site Eat Lead's programs
+				// reach: the HPOS chain walks back to the temp r4/r0 that the widened MUL arm
+				// resolves to 'v2.xyz * c[465].x' / 'v1.xyz * c[467].x'.
+				result.position_input = static_cast<u8>(affine.input);
 				reached_input = true;
 				break;
 			}
@@ -7644,7 +8876,7 @@ namespace remix_rsx
 		// Three rows only carry a point when the operand's fourth coordinate is one. The ucode
 		// moves that in from a constant, so it is a live value like everything else here - and a
 		// program whose w is a scale factor is a different transform wearing the same instructions.
-		if (fp.palette_rows < 4)
+		if (fp.palette_rows < 4 && !fp.palette_implicit_w)
 		{
 			if (fp.palette_w_slot == s_no_palette_w)
 			{
@@ -7931,6 +9163,349 @@ namespace remix_rsx
 		// The RSX fragment pipeline allows 4096 slots; no shipped PS3 program comes near this, and a
 		// program that does gets 'truncated' rather than a wrong answer.
 		constexpr u32 s_max_fp_instructions = 512;
+
+		// --- ROUND 58 (step 3): the two-texture lerp detector -----------------------------------
+		// Helpers below are deliberately tiny and total: every refusal returns a static reason
+		// string that lands on the 'Remix albedo-elect:' census, so a program shape this does not
+		// cover is NAMED rather than approximated. See scan_fragment_program for the four decoded
+		// programs this is designed from and for the two controls that must stay refused.
+
+		// Why a backward walk stopped. An enum rather than a string so the caller can prefix it
+		// ("a-", "b-", "col0-") from one table instead of sniffing characters.
+		enum class fp_walk_fail : u8
+		{
+			none = 0,
+			no_writer,
+			partial_write,
+			narrow_tex,
+			not_tex,
+			hop_budget,
+		};
+
+		const char* fp_walk_fail_name(fp_walk_fail fail)
+		{
+			switch (fail)
+			{
+			case fp_walk_fail::none:          return "ok";
+			case fp_walk_fail::no_writer:     return "no-writer";
+			case fp_walk_fail::partial_write: return "partial-write";
+			case fp_walk_fail::narrow_tex:    return "narrow-tex";
+			case fp_walk_fail::not_tex:       return "not-tex";
+			case fp_walk_fail::hop_budget:    return "hop-budget";
+			}
+
+			return "?";
+		}
+
+		// Index of the last instruction before 'bound' that writes ALL THREE of reg.xyz. A writer
+		// that covers only part of .xyz means the value at the use site is a mix of two
+		// instructions, which is refused rather than followed.
+		u32 fp_last_rgb_writer(const std::vector<fp_instr>& code, u32 reg, u32 bound, fp_walk_fail& fail)
+		{
+			for (u32 i = bound; i-- > 0;)
+			{
+				const fp_instr& in = code[i];
+
+				if (!in.writes || in.dest != reg || !(in.write_mask & 0x7))
+				{
+					continue;
+				}
+
+				if ((in.write_mask & 0x7) != 0x7)
+				{
+					fail = fp_walk_fail::partial_write;
+					return umax;
+				}
+
+				return i;
+			}
+
+			fail = fp_walk_fail::no_writer;
+			return umax;
+		}
+
+		// 'temp * constant' with exactly one TEMP and one CONSTANT operand and no modifier on the
+		// temp - a per-material tint. Returns the temp's register id, or umax.
+		u32 fp_mul_tint_temp(const fp_instr& in)
+		{
+			if (in.opcode != RSX_FP_OPCODE_MUL || !in.has_constant)
+			{
+				return umax;
+			}
+
+			u32 temp_slot = umax;
+			u32 const_slot = umax;
+
+			for (u32 s = 0; s < 2; ++s)
+			{
+				if (in.src_type[s] == RSX_FP_REGISTER_TYPE_TEMP)
+				{
+					if (temp_slot != umax)
+					{
+						return umax;
+					}
+
+					temp_slot = s;
+				}
+				else if (in.src_type[s] == RSX_FP_REGISTER_TYPE_CONSTANT)
+				{
+					if (const_slot != umax)
+					{
+						return umax;
+					}
+
+					const_slot = s;
+				}
+			}
+
+			if (temp_slot == umax || const_slot == umax)
+			{
+				return umax;
+			}
+
+			if ((in.src_neg & (1u << temp_slot)) || (in.src_abs & (1u << temp_slot)))
+			{
+				return umax;
+			}
+
+			return in.src_reg[temp_slot];
+		}
+
+		// Walk back from reg.xyz to the TEX that produced it, through at most 'hops' tint MULs.
+		// Returns the texture unit, or 0xff with 'reason' set.
+		u8 fp_resolve_tex_unit(const std::vector<fp_instr>& code, u32 reg, u32 bound, u32 hops,
+			fp_walk_fail& fail)
+		{
+			for (u32 hop = 0; hop <= hops; ++hop)
+			{
+				const u32 index = fp_last_rgb_writer(code, reg, bound, fail);
+
+				if (index == umax)
+				{
+					return 0xff;
+				}
+
+				const fp_instr& in = code[index];
+
+				if (in.sample)
+				{
+					if (std::popcount(static_cast<u32>(in.write_mask & 0xf)) < 3)
+					{
+						// A sample that writes fewer than three channels cannot be the RGB term of
+						// a colour lerp - the same structural reading narrow_sample_mask makes.
+						fail = fp_walk_fail::narrow_tex;
+						return 0xff;
+					}
+
+					return in.tex_num;
+				}
+
+				const u32 temp = fp_mul_tint_temp(in);
+
+				if (temp == umax)
+				{
+					fail = fp_walk_fail::not_tex;
+					return 0xff;
+				}
+
+				reg = temp;
+				bound = index;
+			}
+
+			fail = fp_walk_fail::hop_budget;
+			return 0xff;
+		}
+
+		// "a-not-tex", "col0-partial-write" ... built once into a static buffer per program. The
+		// note is a const char* on the fingerprint and the fingerprint outlives the scan, so the
+		// string has to have static storage - hence the fixed table rather than a format call.
+		const char* fp_lerp_fail_name(char stage, fp_walk_fail fail)
+		{
+			struct row { char stage; fp_walk_fail fail; const char* text; };
+
+			// 'c' the COL0 terminal, 'd' the difference temp, 'a'/'b' the two texture ends.
+			static constexpr row rows[] =
+			{
+				{ 'c', fp_walk_fail::no_writer,     "col0-no-writer" },
+				{ 'c', fp_walk_fail::partial_write, "col0-partial-write" },
+				{ 'd', fp_walk_fail::no_writer,     "diff-no-writer" },
+				{ 'd', fp_walk_fail::partial_write, "diff-partial-write" },
+				{ 'a', fp_walk_fail::no_writer,     "a-no-writer" },
+				{ 'a', fp_walk_fail::partial_write, "a-partial-write" },
+				{ 'a', fp_walk_fail::narrow_tex,    "a-narrow-tex" },
+				{ 'a', fp_walk_fail::not_tex,       "a-not-tex" },
+				{ 'a', fp_walk_fail::hop_budget,    "a-hop-budget" },
+				{ 'b', fp_walk_fail::no_writer,     "b-no-writer" },
+				{ 'b', fp_walk_fail::partial_write, "b-partial-write" },
+				{ 'b', fp_walk_fail::narrow_tex,    "b-narrow-tex" },
+				{ 'b', fp_walk_fail::not_tex,       "b-not-tex" },
+				{ 'b', fp_walk_fail::hop_budget,    "b-hop-budget" },
+			};
+
+			for (const row& r : rows)
+			{
+				if (r.fail == fail && r.stage == stage)
+				{
+					return r.text;
+				}
+			}
+
+			return fp_walk_fail_name(fail);
+		}
+
+		// Returns a static reason string; "ok" means out_a/out_b/out_weight were filled.
+		const char* detect_fp_lerp(const std::vector<fp_instr>& code, u32 col0,
+			u8& out_a, u8& out_b, f32& out_weight)
+		{
+			out_a = 0xff;
+			out_b = 0xff;
+			out_weight = 0.f;
+
+			fp_walk_fail why = fp_walk_fail::none;
+
+			// The terminal COL0 writer, plus at most two colour-preserving unary hops: a program
+			// may scale or copy the finished lerp before exporting it (89137D5E0D4DFD18.fp ends
+			// '34: MUL R0.xyz <- R0, c[0.619608]'), and a constant scale cannot change WHICH unit
+			// dominates the colour, which is the only question being asked here.
+			u32 reg = col0;
+			u32 bound = static_cast<u32>(code.size());
+			u32 mad_index = umax;
+
+			for (u32 hop = 0; hop < 3; ++hop)
+			{
+				const u32 index = fp_last_rgb_writer(code, reg, bound, why);
+
+				if (index == umax)
+				{
+					return fp_lerp_fail_name('c', why);
+				}
+
+				const fp_instr& in = code[index];
+
+				if (in.opcode == RSX_FP_OPCODE_MAD)
+				{
+					mad_index = index;
+					bound = index;
+					break;
+				}
+
+				if (hop == 2)
+				{
+					return "terminal-deep";
+				}
+
+				if (in.opcode == RSX_FP_OPCODE_MOV
+					&& in.src_type[0] == RSX_FP_REGISTER_TYPE_TEMP
+					&& !(in.src_neg & 1) && !(in.src_abs & 1))
+				{
+					reg = in.src_reg[0];
+					bound = index;
+					continue;
+				}
+
+				const u32 temp = fp_mul_tint_temp(in);
+
+				if (temp == umax)
+				{
+					return "terminal-other";
+				}
+
+				reg = temp;
+				bound = index;
+			}
+
+			if (mad_index == umax)
+			{
+				return "terminal-not-mad";
+			}
+
+			const fp_instr& mad = code[mad_index];
+
+			// MAD dst = src0 * src1 + src2, with src0 the difference temp, src1 the blend weight
+			// and src2 the base the difference is added back to.
+			if (mad.src_type[0] != RSX_FP_REGISTER_TYPE_TEMP || (mad.src_neg & 1) || (mad.src_abs & 1))
+			{
+				return "mad-src0";
+			}
+
+			if (mad.src_type[1] != RSX_FP_REGISTER_TYPE_CONSTANT || !mad.has_constant)
+			{
+				return "mad-src1";
+			}
+
+			if (mad.src_type[2] != RSX_FP_REGISTER_TYPE_TEMP || (mad.src_neg & 4) || (mad.src_abs & 4))
+			{
+				return "mad-src2";
+			}
+
+			const f32 weight = mad.constant[mad.src_swizzle[1] & 3];
+			const u32 difference = mad.src_reg[0];
+			const u32 base = mad.src_reg[2];
+
+			const u32 add_index = fp_last_rgb_writer(code, difference, mad_index, why);
+
+			if (add_index == umax)
+			{
+				return fp_lerp_fail_name('d', why);
+			}
+
+			const fp_instr& add = code[add_index];
+
+			// RSX fragment ADD reads src0 + src1, so 'src0 non-negated, src1 negated' IS
+			// 'major - minor'. The mirrored operand order is deliberately NOT matched: refusing it
+			// can only ever leave a program on today's election, which is the safe direction.
+			if (add.opcode != RSX_FP_OPCODE_ADD)
+			{
+				return "diff-not-add";
+			}
+
+			if (add.src_type[0] != RSX_FP_REGISTER_TYPE_TEMP || (add.src_neg & 1) || (add.src_abs & 1))
+			{
+				return "add-src0";
+			}
+
+			if (add.src_type[1] != RSX_FP_REGISTER_TYPE_TEMP || !(add.src_neg & 2) || (add.src_abs & 2))
+			{
+				return "add-src1";
+			}
+
+			const u32 major = add.src_reg[0];
+			const u32 minor = add.src_reg[1];
+
+			// The base is read TWICE - once negated by the ADD and once by the MAD - so the two
+			// reads have to be the same register, or the arithmetic is not a lerp at all.
+			if (base != minor)
+			{
+				return "base-mismatch";
+			}
+
+			// No hop allowed on the base for the same reason: anything between the two reads would
+			// make them different values. One tint MUL is allowed on the major side
+			// (5410780A71852F83.fp's '16: MUL R0.xyz <- R2(tex1), c[0 0.835 0.843]').
+			const u8 unit_a = fp_resolve_tex_unit(code, minor, add_index, 0, why);
+
+			if (unit_a == 0xff)
+			{
+				return fp_lerp_fail_name('a', why);
+			}
+
+			const u8 unit_b = fp_resolve_tex_unit(code, major, add_index, 1, why);
+
+			if (unit_b == 0xff)
+			{
+				return fp_lerp_fail_name('b', why);
+			}
+
+			if (unit_a == unit_b)
+			{
+				return "same-unit";
+			}
+
+			out_a = unit_a;
+			out_b = unit_b;
+			out_weight = weight;
+			return "ok";
+		}
 	}
 
 	// --- ROUND 41 ------------------------------------------------------------------------------
@@ -7978,6 +9553,9 @@ namespace remix_rsx
 
 		bool saw_end = false;
 
+		// ROUND 58 (step 2c). Bit per unit: coord_lanes[unit] has been written at least once.
+		u16 lanes_seen_mask = 0;
+
 		for (u32 slot = 0; slot < slots; ++slot)
 		{
 			const u32 d0_raw = words[slot * 4 + 0];
@@ -8020,6 +9598,49 @@ namespace remix_rsx
 				// come from SRC0. Direct varying reads use d0.src_attr_reg_num, whose 4..13
 				// range is TEX0..TEX9. Do not guess through a temporary here; 0xf keeps the
 				// caller on its measured fallback for programs that transform coordinates.
+				// ROUND 58 (step 2c). Which two lanes of that varying the sample reads. Filled from
+				// the SAME condition as coord_inputs below, because a coordinate that did not come
+				// straight out of a varying has no lane pair to name. .xy is swizzle (x=0, y=1),
+				// .zw is (x=2, y=3); anything else, or two samples of one unit that disagree, is
+				// 'mixed' and the apply site refuses it and counts uv_lane_refused.
+				if (d0.tex_num < std::size(result.coord_lanes))
+				{
+					u8 lanes = s_fp_lanes_none;
+
+					if (s0.reg_type == RSX_FP_REGISTER_TYPE_INPUT && !s2.use_index_reg &&
+						d0.src_attr_reg_num >= 4 && d0.src_attr_reg_num <= 13)
+					{
+						if (s0.swizzle_x == 0 && s0.swizzle_y == 1)
+						{
+							lanes = s_fp_lanes_xy;
+						}
+						else if (s0.swizzle_x == 2 && s0.swizzle_y == 3)
+						{
+							lanes = s_fp_lanes_zw;
+						}
+						else
+						{
+							lanes = s_fp_lanes_mixed;
+						}
+					}
+
+					// 'first sample of this unit' is tracked in its own mask, not inferred from the
+					// field's initial value: s_fp_lanes_none is a real answer (the coordinate came
+					// from a temp), so a unit read once that way and once from .xy must land on
+					// 'mixed' rather than silently adopting the second reading.
+					u8& slot = result.coord_lanes[d0.tex_num];
+
+					if (!(lanes_seen_mask & unit_bit))
+					{
+						lanes_seen_mask |= unit_bit;
+						slot = lanes;
+					}
+					else if (slot != lanes)
+					{
+						slot = s_fp_lanes_mixed;
+					}
+				}
+
 				if (s0.reg_type == RSX_FP_REGISTER_TYPE_INPUT && !s2.use_index_reg &&
 					d0.src_attr_reg_num >= 4 && d0.src_attr_reg_num <= 13)
 				{
@@ -8258,6 +9879,57 @@ namespace remix_rsx
 			}
 
 			result.narrow_sample_mask = static_cast<u16>(result.sampled_mask & ~wide);
+		}
+
+		// --- ROUND 58 (step 3): the colour target is a TWO-TEXTURE LERP -------------------------
+		// See fp_fingerprint::lerp_valid. The programs that draw Eat Lead's interior compute
+		//     colour = tex0 + w * (tex1 - tex0)
+		// with w measured at 0.85 / 0.89 / 0.95 / 1.15, i.e. tex0 is a 5-15% grime term and tex1
+		// is the paint - while this backend elects the LOWEST sampled unit, which is tex0. Reading
+		// w out of the ucode is the exact statement of which unit the program itself considers the
+		// surface colour. Quoted slices, in program order, decoded with the corrected third operand
+		// (docs\remix\fpdis.py, fixed this round - it used to print SRC2 one bit low):
+		//
+		//   bin\remix_ucode\B3EFF9C2B4AE9F66.fp   (fp 2dd8807bcbe4e373, albedo 27D6FC610B1D8589)
+		//     12: TEX R2.xyz <- f[4](tc0).zwzz [tex0]
+		//     10: TEX R0.xyz <- f[4](tc0).xyzw [tex1]
+		//     13: ADD R0.xyz <- R0.xyzw, -R2.xyzw
+		//     16: MAD R0.xyz <- R0.xyzw, c[].xxxx, R2.xyzw   c=[0.85 0 0 0]
+		//   bin\remix_ucode\4D454157A816F756.fp   (d37238eed75c8b43, 06C0DE253F644772)
+		//      6/4/7/13, c=[0.95 ...]
+		//   bin\remix_ucode\89137D5E0D4DFD18.fp   (172404e77207810d, 6E6636E1AE1EBEC2)
+		//      6/4/7/10, c=[0.89 ...], then a per-material tint '34: MUL R0.xyz <- R0, c[0.6196]'
+		//      sitting ON TOP of the lerp - which is why the terminal walk below hops through
+		//      MUL(temp, constant) instead of demanding that the MAD be the last COL0 writer.
+		//   bin\remix_ucode\5410780A71852F83.fp   (ca2701b30ecf5396, E9999467C4497210)
+		//     16: MUL R0.xyz <- R2.xyzw(tex1), c[].yyzz   c=[0 0.835294 0.843137 0]
+		//     21: ADD R0.xyz <- R0.xyzw, -R1.xyzw(tex0)
+		//     22: MAD R0.xyz <- R0.xyzw, c[].xxxx, R1.xyzw  c=[1.15 0 0 0]     (extrapolated)
+		//
+		// CONTROLS that must keep reading unit 0, and do:
+		//   bin\remix_ucode\0B7312EE9A170A62.fp   (95446b57e55d7677) same shape, c=[0.35 ...] ->
+		//     tex0 is 65% of the colour, so w <= 0.5 leaves the mask untouched at the apply site.
+		//   bin\remix_ucode\EEDE93C214E686AF.fp   (70e9ea7b6bacfaba) lerps by a TEXTURE
+		//     ('31: MAD R0 <- R1(tex2), R4, R0'), refused here: src1 is not a constant.
+		//   bin\remix_ucode\633644D3E78A46A4.fp   (fd013d6a98c03ab1) writes R0 = tex0 outright,
+		//     refused: the terminal COL0 writer is a TEX.
+		//
+		// MEASURED over all 726 .fp files in bin\remix_ucode\ with the python mirror of this
+		// detector (docs\remix\fpelect.py, whose self-test is these thirteen programs): 31 match
+		// the shape, 23 of them would change the election and every one of those moves 0 -> 1.
+		// No program in the corpus moves to a unit above 1, and the weight distribution is
+		// bimodal - 0.20..0.49 unmoved, 0.60..1.20 moved - so nothing sits on the 0.5 boundary.
+		//
+		// Nothing here elects anything: albedo_unit_mask() consults these fields only under
+		// RPCS3_REMIX_FPLERPUNIT, and only through the same containment test the narrow rule uses.
+		if (!result.has_flow && !result.truncated)
+		{
+			result.lerp_note = detect_fp_lerp(code, col0, result.lerp_a, result.lerp_b, result.lerp_weight);
+			result.lerp_valid = result.lerp_a != 0xff;
+		}
+		else
+		{
+			result.lerp_note = result.has_flow ? "flow" : "truncated";
 		}
 
 		if (result.colour_mask == 0)
@@ -8521,13 +10193,172 @@ namespace remix_rsx
 
 			rgb_index = hop_copies(rgb_index, 0x7);
 
-			// One instruction, classified. 'index' is its position so the modulate arm can walk
-			// backwards from it for the sampled temp.
-			const auto classify = [&](s32 index) -> std::pair<fp_out_source, u8>
+			// --- ROUND 52: one more operation that is provably the identity function ---------------
+			// 'MUL dst, <src>, K' where the inline literal K is exactly 1.0 on every lane the caller
+			// is about to read. x * 1.0f == x for every finite float, both infinities and both zeros
+			// in IEEE-754 single, and a NaN operand was already a NaN colour - so stepping through
+			// one cannot change what the program computes. That is the SAME safety argument
+			// is_identity_copy makes, and the same step round 42's col0_chain_scale already walks.
+			//
+			// It exists because BOTH of Eat Lead's UI fragment programs end in one:
+			//   CDFE447F7B7DED21  8: MUL R0.xyzw <- R0.xyzw, C{1,1,1,1}.xyzw  END
+			//   B8E4FC5C9DDDD4E4  1: MUL R1.xyz  <- R1.xyzw, C{1,1,1,1}.xyzw
+			// so a walk that only hops identity MOVs stops on a multiply-by-one and reports 'other'.
+			//
+			// Returns the source slot the value came IN on, or -1 when this is not a unit scale.
+			const auto unit_scale_source = [&](const fp_instr& in, u8 mask) -> s32
+			{
+				if (in.opcode != RSX_FP_OPCODE_MUL || !in.writes || !in.has_constant)
+				{
+					return -1;
+				}
+
+				// Unconditional only, exactly as classify() and the KIL walk require: a predicated
+				// write's last-writer reading is not sound.
+				if (!(in.exec_lt && in.exec_eq && in.exec_gr))
+				{
+					return -1;
+				}
+
+				u32 kslot = 2;
+
+				for (u32 s = 0; s < 2; ++s)
+				{
+					if (in.src_type[s] == RSX_FP_REGISTER_TYPE_CONSTANT)
+					{
+						kslot = s;
+						break;
+					}
+				}
+
+				if (kslot > 1 || (in.src_neg & (1u << kslot)) || (in.src_abs & (1u << kslot)))
+				{
+					return -1;
+				}
+
+				// Per LANE, through the literal's own swizzle - a broadcast is not required, only
+				// that every lane being read is multiplied by one.
+				for (u32 lane = 0; lane < 4; ++lane)
+				{
+					if (!(mask & (1u << lane)))
+					{
+						continue;
+					}
+
+					const u32 component = (u32{in.src_swizzle[kslot]} >> (lane * 2)) & 3u;
+
+					if (in.constant[component] != 1.f)
+					{
+						return -1;
+					}
+				}
+
+				const u32 other = 1u - kslot;
+
+				if (in.src_swizzle[other] != identity_swizzle
+					|| (in.src_neg & (1u << other))
+					|| (in.src_abs & (1u << other)))
+				{
+					return -1;
+				}
+
+				return static_cast<s32>(other);
+			};
+
+			// ROUND 52. hop_copies widened by exactly the one step above, for the texcoord arms only.
+			// Kept separate rather than folded into hop_copies for two reasons: hop_copies feeds the
+			// EXISTING vcol classification and its round-41 'Remix fpother:' census, both of which
+			// must stay byte-identical; and it writes through to 'hops_used', which this must not
+			// perturb. Stops ON the instruction that reads a varying rather than trying to hop it.
+			const auto hop_tint = [&](s32 index, u8 mask) -> s32
+			{
+				const u32 budget = 8;
+
+				for (u32 h = 0; h < budget && index >= 0; ++h)
+				{
+					const fp_instr& in = code[index];
+					s32 slot = -1;
+
+					if (is_identity_copy(in))
+					{
+						slot = 0;
+					}
+					else if (const s32 scaled = unit_scale_source(in, mask); scaled >= 0)
+					{
+						slot = scaled;
+					}
+					else
+					{
+						break;
+					}
+
+					// A varying is where this walk is trying to arrive; a constant or anything else
+					// is not something to step through.
+					if (in.src_type[slot] != RSX_FP_REGISTER_TYPE_TEMP)
+					{
+						break;
+					}
+
+					// Strictly earlier than 'index' by last_writer's own contract, so this
+					// terminates even without the budget.
+					const s32 next = last_writer(in.src_reg[slot], mask, static_cast<u32>(index));
+
+					if (next < 0)
+					{
+						break;
+					}
+
+					index = next;
+				}
+
+				return index;
+			};
+
+			// ROUND 52. The instruction is a straight, unconditional MOV of ONE TEXn varying, and n
+			// is what comes back (0..7); 0xff otherwise. attr_reg is per INSTRUCTION in RSX fragment
+			// programs (OPDEST::src_attr_reg_num) and 4..13 is TEX0..TEX9, the same window the
+			// coord_inputs walk uses; capped at 11 so n indexes vp_fingerprint::texcoord_input[8].
+			const auto texcoord_mov = [&](s32 index) -> u8
 			{
 				if (index < 0)
 				{
-					return { fp_out_source::other, 0 };
+					return 0xff;
+				}
+
+				const fp_instr& in = code[index];
+
+				if (in.opcode != RSX_FP_OPCODE_MOV || !in.writes
+					|| !(in.exec_lt && in.exec_eq && in.exec_gr)
+					|| in.src_type[0] != RSX_FP_REGISTER_TYPE_INPUT
+					|| in.attr_reg < 4 || in.attr_reg > 11
+					|| in.src_swizzle[0] != identity_swizzle
+					|| (in.src_neg & 1u) || (in.src_abs & 1u))
+				{
+					return 0xff;
+				}
+
+				return static_cast<u8>(in.attr_reg - 4);
+			};
+
+			// ROUND 52. Three-field result so the texcoord index can be carried out WITHOUT going
+			// through out_vcol_attr, which must stay 0 on the new classes - vcol_replayable() reads
+			// it and the 3D blend-extension replay has to stay exactly where it was.
+			struct terminal_class
+			{
+				fp_out_source source = fp_out_source::other;
+				u8 attr = 0;
+				u8 texcoord = 0xff;
+			};
+
+			// One instruction, classified. 'index' is its position so the modulate arm can walk
+			// backwards from it for the sampled temp. 'mask' is the destination lane mask the caller
+			// resolved this terminal against (0x7 rgb, 0x8 alpha); round 52's arms need it to walk
+			// unit scales per lane.
+			const auto classify = [&](s32 index, u8 mask) -> terminal_class
+			{
+				if (index < 0)
+				{
+					return {};
 				}
 
 				const fp_instr& out = code[index];
@@ -8586,16 +10417,105 @@ namespace remix_rsx
 					}
 				}
 
+				// --- ROUND 52: the same two shapes with the colour on a TEXCOORD varying -----------
+				// Runs only after both vcol arms declined, so nothing this backend already classifies
+				// can move - and the two windows are disjoint anyway (is_vcol wants attr_reg 1 or 2,
+				// a texcoord is 4..11). Gated on RPCS3_REMIX_UITINTTEXCOORD so 0 restores the
+				// pre-round-52 classification bit-exactly, including the round-41 'Remix fpother:'
+				// srckind census, which is populated from the 'other' arm and would otherwise lose
+				// exactly the programs this names. Both listings are quoted on fp_out_source.
+				if (ui_tint_texcoord_enabled())
+				{
+					const s32 tint_index = hop_tint(index, mask);
+
+					if (tint_index >= 0)
+					{
+						const fp_instr& term = code[tint_index];
+
+						// 'rgb = TEXn', reached through nothing but identity copies and unit scales.
+						// CDFE447F7B7DED21 is 8 -> 5 -> 0 by that walk.
+						if (const u8 n = texcoord_mov(tint_index); n != 0xff)
+						{
+							return { fp_out_source::texcoord_pass, 0, n };
+						}
+
+						// 'rgb = sample * TEXn'. B8E4FC5C9DDDD4E4's terminal 3 is exactly this, with
+						// the varying one unit-scale behind its temp (1 -> 0).
+						//
+						// DELIBERATELY NOT WIDENED to a varying read DIRECTLY by the multiply
+						// ('MUL out, sample, TEXn'): no decoded program on this title has that shape,
+						// and this project's own record on widening a matcher until something matches
+						// is RETRYUNSUP. Such a program stays 'other' and is named by the fpother
+						// census, which is where the next widening would be designed from.
+						if (term.opcode == RSX_FP_OPCODE_MUL
+							&& term.exec_lt && term.exec_eq && term.exec_gr)
+						{
+							const auto clean_temp = [&](u32 s)
+							{
+								return term.src_type[s] == RSX_FP_REGISTER_TYPE_TEMP
+									&& term.src_swizzle[s] == identity_swizzle
+									&& !(term.src_neg & (1u << s))
+									&& !(term.src_abs & (1u << s));
+							};
+
+							const auto producer = [&](u32 s) -> s32
+							{
+								return hop_tint(
+									last_writer(term.src_reg[s], 0x7, static_cast<u32>(tint_index)), 0x7);
+							};
+
+							const auto sampled_operand = [&](u32 s) -> bool
+							{
+								if (!clean_temp(s))
+								{
+									return false;
+								}
+
+								const s32 w = producer(s);
+								return w >= 0 && code[w].sample;
+							};
+
+							const auto texcoord_operand = [&](u32 s) -> u8
+							{
+								return clean_temp(s) ? texcoord_mov(producer(s)) : u8{0xff};
+							};
+
+							for (u32 s = 0; s < 2; ++s)
+							{
+								if (!sampled_operand(s))
+								{
+									continue;
+								}
+
+								if (const u8 n = texcoord_operand(1u - s); n != 0xff)
+								{
+									return { fp_out_source::texcoord_modulate, 0, n };
+								}
+							}
+						}
+					}
+				}
+
 				return { fp_out_source::other, 0 };
 			};
 
-			const auto [rgb_class, rgb_attr] = classify(rgb_index);
+			const terminal_class rgb_term = classify(rgb_index, 0x7);
+			const fp_out_source rgb_class = rgb_term.source;
+			const u8 rgb_attr = rgb_term.attr;
 			result.out_rgb_source = rgb_class;
 
 			const s32 alpha_index = hop_copies(
 				last_writer(out_reg, 0x8, static_cast<u32>(code.size())), 0x8);
-			const auto [alpha_class, alpha_attr] = classify(alpha_index);
+			const terminal_class alpha_term = classify(alpha_index, 0x8);
+			const fp_out_source alpha_class = alpha_term.source;
+			const u8 alpha_attr = alpha_term.attr;
 			result.out_alpha_source = alpha_class;
+
+			// ROUND 52. Same precedence out_vcol_attr uses below and for the same reason: the two
+			// halves can only disagree when different instructions wrote them, and rgb is the half
+			// that decides the tint. 0xff on both leaves the field at its "no texcoord tint"
+			// default, which is every program on every other title measured.
+			result.out_tint_texcoord = (rgb_term.texcoord != 0xff) ? rgb_term.texcoord : alpha_term.texcoord;
 
 			// --- ROUND 41: record WHY, when the answer is 'other' --------------------------------
 			// Populated only on the failing arm so a classified program costs nothing. This is the
@@ -8912,6 +10832,9 @@ namespace remix_rsx
 		{
 		case fp_out_source::vcol_pass: return "vcol_pass";
 		case fp_out_source::vcol_modulate: return "vcol_modulate";
+		// ROUND 52.
+		case fp_out_source::texcoord_pass: return "texcoord_pass";
+		case fp_out_source::texcoord_modulate: return "texcoord_modulate";
 		default: return "other";
 		}
 	}
@@ -9148,6 +11071,19 @@ namespace remix_rsx
 		}
 
 		out = slots_to_matrix(slots, fp.group_shape[group]);
+		if (fp.demons_particle_depth)
+		{
+			// The shader reads only XY/W from c8..c11. With its per-particle depth
+			// displacement removed, Z = (c0.z / c0.y) * W - c0.x / c0.y.
+			f32 depth[4]{};
+			if (!read_slot(0, depth) || !std::isfinite(depth[0]) || !std::isfinite(depth[1])
+				|| !std::isfinite(depth[2]) || std::abs(depth[1]) < 1e-12f) return false;
+			const f32 a = depth[2] / depth[1];
+			const f32 b = depth[0] / depth[1];
+			for (u32 row = 0; row < 4; ++row) out.m[row][2] = a * out.m[row][3];
+			out.m[3][2] -= b;
+			return mat4_is_finite(out);
+		}
 		return true;
 	}
 
@@ -9693,6 +11629,60 @@ namespace remix_rsx
 		return value;
 	}
 
+	bool position_input_enabled()
+	{
+		// env_u32 rather than env_flag, the reason texcoord_from_ucode gives: this defaults ON, so
+		// the useful setting is the off one and env_flag cannot tell "set to 0" from "not set".
+		static const u32 value = env_u32(L"RPCS3_REMIX_POSINPUT", 1);
+		return value != 0;
+	}
+
+	// --- ROUND 52: the three 2D-compositor knobs. Full derivations on the declarations. ------------
+	//
+	// ROUND 59 turns UIFORCEVPDW into a MODE knob and the two accessors below share ONE latch, so
+	// they cannot disagree about what the launcher set. ui_force_vp_depth_write_enabled() keeps
+	// meaning "value != 0" for every reader that existed before, so 0 and 1 are byte-identical to
+	// round 52; only the new mode reader can tell 2 from 1.
+	namespace
+	{
+		u32 ui_force_vp_depth_write_value()
+		{
+			static const u32 value = env_u32(L"RPCS3_REMIX_UIFORCEVPDW", 0);
+			return value;
+		}
+	}
+
+	bool ui_force_vp_depth_write_enabled()
+	{
+		return ui_force_vp_depth_write_value() != 0;
+	}
+
+	u32 ui_force_vp_depth_write_mode()
+	{
+		return ui_force_vp_depth_write_value();
+	}
+
+	bool ui_force_only_enabled()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_UIFORCEONLY", 0);
+		return value != 0;
+	}
+
+	bool ui_tint_texcoord_enabled()
+	{
+		// Default ON, so env_u32(...,1) != 0 rather than env_flag - "=0" has to be expressible,
+		// and it is the whole A/B: 0 restores the ATTR3-only tint AND the pre-round-52 fragment
+		// classification in one relaunch.
+		static const u32 value = env_u32(L"RPCS3_REMIX_UITINTTEXCOORD", 1);
+		return value != 0;
+	}
+
+	bool ui_uv_ucode_enabled()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_UIUVUCODE", 1);
+		return value != 0;
+	}
+
 	bool nocam_enabled()
 	{
 		static const bool value = env_flag(L"RPCS3_REMIX_NOCAM");
@@ -9897,6 +11887,70 @@ namespace remix_rsx
 		return value != 0;
 	}
 
+	// --- ROUND 58 -------------------------------------------------------------------------------
+	// All three default OFF and all three read with env_u32, so an explicit 0 in the conf takes and
+	// arming one is one line and one relaunch. See the doc blocks on the declarations for the ucode
+	// each is designed from and for the offline blast radius.
+	bool fp_lerp_unit_enabled()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_FPLERPUNIT", 0);
+		return value != 0;
+	}
+
+	namespace
+	{
+		u64 read_hash_env(const wchar_t* name);
+	}
+
+	u64 force_albedo_vp_hash()
+	{
+		static const u64 value = read_hash_env(L"RPCS3_REMIX_FORCEALBEDOVP");
+		return value;
+	}
+
+	u64 force_albedo_fp_hash()
+	{
+		static const u64 value = read_hash_env(L"RPCS3_REMIX_FORCEALBEDOFP");
+		return value;
+	}
+
+	u32 force_albedo_unit()
+	{
+		static const u32 value = std::min<u32>(env_u32(L"RPCS3_REMIX_FORCEALBEDOUNIT", 16), 16);
+		return value;
+	}
+
+	bool uv_lanes_enabled()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_UVLANES", 0);
+		return value != 0;
+	}
+
+	bool uv_scale2_enabled()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_UVSCALE2", 0);
+		return value != 0;
+	}
+
+	const char* fp_lanes_name(u8 lanes)
+	{
+		switch (lanes)
+		{
+		case s_fp_lanes_xy:    return "xy";
+		case s_fp_lanes_zw:    return "zw";
+		case s_fp_lanes_mixed: return "mix";
+		default:               return "-";
+		}
+	}
+
+	bool uv_scale_hop_enabled()
+	{
+		// Same env_u32 reason as above: the useful setting is the explicit off, and it is the whole
+		// A/B for the Eat Lead world divisor - 0 puts every hopped program back on the fixed 4096.
+		static const u32 value = env_u32(L"RPCS3_REMIX_UVSCALEHOP", 1);
+		return value != 0;
+	}
+
 	bool uv_range_census_enabled()
 	{
 		static const u32 value = env_u32(L"RPCS3_REMIX_UVRANGECENSUS", 1);
@@ -9913,6 +11967,30 @@ namespace remix_rsx
 	{
 		static const u32 value = env_u32(L"RPCS3_REMIX_CAMRELATCH", 1);
 		return value != 0;
+	}
+
+	// ROUND 52. How far the mid-frame relatch may reach for "this frame's version of the active
+	// camera". 0.8 is s_camera_discontinuity_tolerance, i.e. exactly the test consider_camera_
+	// candidate applies today, so the default is BIT-EXACT and the knob is a pure narrowing.
+	//
+	// Why it needs narrowing, measured on Eat Lead (BLUS30267) run 13 of remix_dump.log
+	// (build=Sep 6 2026 12:08:47 pid=26984, 6,045 elected frames): in the main menu the 9-vote
+	// winner 001e6e3d1495ee54 sits static at [-1.6456 2.4655 -0.5667] with view_delta=0.40, while
+	// the cluster the active camera was actually refreshed from (view_delta=0) is a ONE-vote
+	// 633ba74c6b235af7 cluster - one of four near-identical clusters, i.e. parts of one animated
+	// thing - whose position drifts -2.3212 -> -2.3270 -> -2.3329 frame to frame. The relatch takes
+	// the FIRST candidate within 0.8, so the submitted camera rode the prop. Over the 1,074
+	// contested menu frames the winner was >= 0.05 from what was submitted in 727 (68%).
+	//
+	// 0.1 is the armed value: the animated parts sit at 0.40 (4x over), while the true camera's own
+	// per-frame motion is |view delta| p50 0.054 / p90 0.17 / p99 0.33 units in gameplay and
+	// 0 / 0.002 / 0.17 in the menu against a matrix norm of ~8-35, i.e. a relative delta of a few
+	// hundredths - >= 3x under. env_float rejects <= 0, so the knob cannot be used to disable the
+	// relatch; RPCS3_REMIX_CAMRELATCH=0 is that switch.
+	f32 camera_relatch_tolerance()
+	{
+		static const f32 value = env_float(L"RPCS3_REMIX_CAMRELATCHTOL", 0.8f);
+		return value;
 	}
 
 	bool gauge_anchor_enabled()
@@ -10153,6 +12231,210 @@ namespace remix_rsx
 		return value;
 	}
 
+	// --- vertex normals -----------------------------------------------------------------
+	//
+	// Until this knob existed the backend wrote a CONSTANT object-space normal of (0,0,1) into
+	// every vertex it handed Remix (RemixGSRender.cpp, the m_scratch_vertices fill). Remix shades
+	// from the submitted normal - and skins it, dxvk-remix's skinning.h rotates srcNormal by the
+	// blended bone matrix exactly as it does the position - so a constant normal is a flat-shaded
+	// lie on every curved surface in every title. It is least visible on flat walls and most
+	// visible on characters, which is where it was reported.
+	//
+	// 1 (the default) decodes the guest's own normal attribute and submits it. 0 restores the
+	// constant bit-exactly.
+	bool vertex_normals_enabled()
+	{
+		static const bool value = env_u32(L"RPCS3_REMIX_VTXNORMAL", 1) != 0;
+		return value;
+	}
+
+	// Which vertex attribute carries it. ATTR2 is the RSX convention (NV40 fixed-function
+	// semantic) and is what every title measured so far uses, but the attribute map is fully
+	// programmable, so this is a knob and not a constant - round 50 is the standing lesson that a
+	// documented hard-coded index is still an assumption. 'Remix vtxattr:' is the census that
+	// picks it: it reports, per program, the decoded length statistics of EVERY present attribute,
+	// so the unit-length 3-vector can be read off rather than guessed.
+	u32 normal_attribute_index()
+	{
+		static const u32 value = std::min<u32>(env_u32(L"RPCS3_REMIX_NORMALATTR", 2), 15);
+		return value;
+	}
+
+	// One 'Remix vtxattr:' line per vertex program per run.
+	bool normal_census_enabled()
+	{
+		static const bool value = env_u32(L"RPCS3_REMIX_NORMALCENSUS", 1) != 0;
+		return value;
+	}
+
+	// The UI texcoord scale must be applied ONCE. is_demons_menu_draw()'s block in
+	// composite_ui_draw already reads the program's own scale and bias out of c467 - derived
+	// from the replayed ucode, and correct - and round 52 then added the GENERAL ucode scale to
+	// the same 2D path, immediately below it. For f2577d351159c828, whose texcoord write is
+	// 'MUL o[7](TEX0).xy <- v8.xyxx, c[467].zzzz', both blocks resolve the SAME c467.z and the
+	// coordinate is multiplied by it twice, collapsing every item icon onto one texel. With this
+	// on, the general block stands down wherever the title-specific one already fired. `0`
+	// restores the round-52 double application bit-exactly.
+	bool ui_uv_apply_once()
+	{
+		static const bool value = env_u32(L"RPCS3_REMIX_UIUVONCE", 1) != 0;
+		return value;
+	}
+
+	// ROUND 53. The texcoord scale is not always a constant OPERAND - it can be a constant
+	// forwarded into a temp by a MOV one instruction earlier. Demon's Souls writes every world
+	// texcoord that way:
+	//     5: MOV r2.x            <- c[466].xxxx
+	//     6: MAD o[13](TEX6).xy  <- v8(tc0).xyxx, r2.xxxx, c[120].xyxx
+	// so resolve_texcoord_scale_slot saw a temp where it required a constant, refused
+	// 'no_multiply', and the draw fell back to the fixed 1/UVINTSCALE divisor -
+	// uv_scale_fixed=66845 on a measured run, ALL of it through that one exit.
+	//
+	// This is the same relaxation round 10 shipped for the POSITION matcher (MADACCUM arm A),
+	// with the same guards, because it is the same shape: last_component_writer to find the
+	// definition live at that point, then a MOV of a constant with no indexing, no negation, no
+	// abs, no saturate and no condition. Broadcast reads only - a per-lane swizzle is a 2x2 and
+	// belongs to the affine form, not to a scalar divisor. `0` restores the refusal bit-exactly.
+	bool texcoord_scale_mov_walk()
+	{
+		static const bool value = env_u32(L"RPCS3_REMIX_UVSCALEMOV", 1) != 0;
+		return value;
+	}
+
+	// The game's OWN lights, out of its own DrawParam banks. Demon's Souls submits no guest lights
+	// this backend can see (guest_lights=0 on every measured run) and rtx.conf sets
+	// rtx.fallbackLightMode = Never, so the entire scene has been lit by ONE synthesised distant
+	// light. The disc ships unpacked and its LIGHT_BANK authors, per preset, three directional
+	// lights and a hemisphere ambient; RemixDemonsLights.inl is that data, keyed on the
+	// LIGHT_SCATTERING_BANK sun so the live c111 read identifies the preset with no level hook.
+	//
+	// This also RETARGETS the sun. The scattering sun and LIGHT_BANK dir0 are two different
+	// directions in the authored data - (20,-40) against (30,-50) on the measured level - and the
+	// backend has been casting every shadow from the SKY's sun rather than the one the game shades
+	// with. `0` restores the scattering sun and submits none of the authored lights.
+	// WHICH of the game's two suns drives the one distant light a path tracer can have.
+	// Demon's Souls authors them 13.48 degrees apart on the measured level and uses both: the
+	// LIGHT_SCATTERING_BANK sun paints the sky, LIGHT_BANK dir0 shades the geometry. A raster
+	// renderer gets away with that; one raytraced sun cannot satisfy both.
+	//   1 (default) = LIGHT_BANK dir0  - shadows and shading match the artists' intent.
+	//   0           = the scattering sun - god rays line up with the PAINTED sun in the sky.
+	// This is a judgement about which artefact is worse, so it is a knob and not a decision.
+	u32 demons_sun_source()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_DEMONSSUNSRC", 1);
+		return value;
+	}
+
+	// The hemisphere fill, separable from the rest. Remix has no hemisphere light, so it is
+	// approximated by two 150-degree distant lights - and a wide fill is exactly what makes a
+	// previously-black alpha card visible as a rectangle. Splitting it off means "did the fill
+	// reveal the cards" is one variable instead of being tangled with the sun retarget.
+	bool demons_hemisphere_enabled()
+	{
+		static const bool value = env_u32(L"RPCS3_REMIX_DEMONSHEMI", 1) != 0;
+		return value;
+	}
+
+	// THE ALPHA IS A SEPARATE QUESTION FROM THE COLOUR, and apply_vertex_colour was answering
+	// both with the colour's answer. Its first gate is vcol_route_replayable(), which demands the
+	// FRAGMENT program prove where ATTR3's RGB reaches COL0 - a strict test, and rightly so,
+	// because replaying a colour the guest never computes repaints geometry. But when that test
+	// fails the function returns before it reaches the alpha lane it already treats separately,
+	// so the vertex keeps 0xFFFFFFFF and every blended draw arrives FULLY OPAQUE.
+	//
+	// Measured on Demon's Souls: vp=0314c853c971ceae is a flat 50x84 unit ground plane at y=-0.4
+	// with albedo=0, blend=1, depth_write=0 and a vertex alpha gradient of 255..0 - a raster
+	// ground fade. Its vcolroute reads `route=none`, so the gradient was dropped and it reached
+	// the path tracer as an opaque black slab lying over the courtyard floor. Same mechanism on
+	// the particle and lock-on cards, which is why they read as solid rectangles.
+	//
+	// The RGB gate is NOT relaxed. This submits the alpha only, and only where the blend equation
+	// is what consumes it. `0` restores the all-or-nothing behaviour bit-exactly.
+	bool vcol_alpha_only_enabled()
+	{
+		static const bool value = env_u32(L"RPCS3_REMIX_VCOLALPHAONLY", 1) != 0;
+		return value;
+	}
+
+	// RPCS3_REMIX_DEMONSWATERANYTARGET=0 restores the colour-target==1 term that stopped the
+	// water material from ever being created. See the gate for the evidence.
+	bool demons_water_any_target()
+	{
+		static const bool value = env_u32(L"RPCS3_REMIX_DEMONSWATERANYTARGET", 1) != 0;
+		return value;
+	}
+
+	// THE COLOUR IS NOT ALWAYS IN COL0. Some programs carry the vertex tint through a TEXCOORD
+	// interpolator instead, and the fragment stage modulates the sampled texture by it. The
+	// classifier already recognises that shape and records it as fp_fingerprint::out_tint_texcoord
+	// (round 52's texcoord_pass / texcoord_modulate classes) - but until now only the 2D
+	// compositor consumed it. A WORLD draw of the same shape reached apply_vertex_colour, found
+	// vcol_route::none because the vertex program writes COL0 nowhere, and gave up: the draw was
+	// submitted white.
+	//
+	// Measured on Demon's Souls' messages, vp=9fac8d0968bbceb8 fp=5e89966865402082 (stored as
+	// bin/remix_ucode/C0BEEFD11A0A5C97.fp - the store names files by the RAW fp hash, the
+	// censuses print it XORed with the fp32-exports bit). Read with docs/remix/fpdis.py:
+	//     1: TEX R0     <- f[4](tc0)  [tex0]      sample the glyph
+	//     3: MUL R1     <- R0, f[5](tc1)          MODULATE BY TC1  <- the tint
+	//    11: MUL R0.xyz <- R0, f[6](tc2)
+	//    12: ADD R0.xyz <- f[7](tc3), R0
+	// so the red the messages are missing is in TEX1, and vp_fingerprint::texcoord_input[1]
+	// already names the attribute that feeds it. Both hops existed; only the world-side consumer
+	// was absent.
+	//
+	// Its own knob rather than sharing UITINTTEXCOORD, so the world path can be bisected without
+	// disturbing the 2D one - UITINTTEXCOORD still gates whether the field is POPULATED at all,
+	// so `0` there disables both and this knob then has nothing to read.
+	bool world_tint_texcoord_enabled()
+	{
+		static const bool value = env_u32(L"RPCS3_REMIX_WORLDTINT", 1) != 0;
+		return value;
+	}
+
+	bool demons_lights_enabled()
+	{
+		static const bool value = env_u32(L"RPCS3_REMIX_DEMONSLIGHTS", 1) != 0;
+		return value && Emu.GetTitleID() == "BLUS30443";
+	}
+
+	// Authored intensity is a fraction (rgb 0..1 times a percent); Remix wants radiance. This is the
+	// one free parameter in the whole path and it is deliberately a knob rather than a constant:
+	// 3.0 makes a 100%% white authored light land on the radiance the synthesised sun already used,
+	// so the key light does not change brightness when it changes direction.
+	f32 demons_light_scale()
+	{
+		static const f32 value = env_float(L"RPCS3_REMIX_DEMONSLIGHTSCALE", 3.f);
+		return value;
+	}
+
+	// How close the live c111 scattering sun must be to a table row to accept it, as a squared
+	// distance between unit vectors. The authored values are integer degrees, so a real match is
+	// exact to ~1e-6; anything loose enough to matter is a different preset.
+	f32 demons_light_tolerance()
+	{
+		static const f32 value = env_float(L"RPCS3_REMIX_DEMONSLIGHTTOL", 1e-4f);
+		return value;
+	}
+
+	bool demons_menu_enabled()
+	{
+		static const bool value = env_flag(L"RPCS3_REMIX_DEMONSMENU");
+		return value;
+	}
+
+	bool demons_world_enabled()
+	{
+		static const bool value = env_flag(L"RPCS3_REMIX_DEMONSWORLD");
+		return value && Emu.GetTitleID() == "BLUS30443";
+	}
+
+	bool primitive_restart_enabled()
+	{
+		static const bool value = env_u32(L"RPCS3_REMIX_PRIMITIVERESTART", 1) != 0;
+		return value;
+	}
+
 	bool draw_indexed_const()
 	{
 		static const bool value = env_flag(L"RPCS3_REMIX_DRAWINDEXED");
@@ -10196,6 +12478,18 @@ namespace remix_rsx
 		// Resistance 2's (NPEA00431) 16 four-bone character programs took 541960 draws into
 		// skin_unrecognised and no character was drawn at all - see RemixTransforms.h for the list.
 		static const u32 value = env_u32(L"RPCS3_REMIX_BONEBLEND", 1);
+		return value != 0;
+	}
+
+	bool vertex_blend_enabled()
+	{
+		// env_u32 rather than env_flag: the useful setting here is the *off* one, and env_flag
+		// cannot tell "set to 0" from "not set at all". Default on for the same reason BONEBLEND
+		// and INDEXEDWORLD are - match_vertex_blend runs only after every existing arm refused, so
+		// it cannot change a program that matches today. Off restores the round-51 behaviour, where
+		// Eat Lead (BLUS30267) took 117183 draws into skin_unrec_indexed over eight programs with
+		// skin_submitted=0 and no character drawn at all.
+		static const u32 value = env_u32(L"RPCS3_REMIX_VERTEXBLEND", 1);
 		return value != 0;
 	}
 
@@ -10251,10 +12545,22 @@ namespace remix_rsx
 
 	f32 streak_extent_ratio()
 	{
-		// env_u32 rather than env_flag: 0 is the meaningful setting (it restores 81af315) and
-		// env_flag cannot tell "set to 0" from "not set at all".
+		// env_u32 rather than env_flag: 0 is the meaningful no-refusal setting and env_flag cannot
+		// tell "set to 0" from "not set at all".
 		static const u32 value = env_u32(L"RPCS3_REMIX_STREAKGATE", 128);
 		return static_cast<f32>(value);
+	}
+
+	u64 streak_allow_vp_hash()
+	{
+		static const u64 value = read_hash_env(L"RPCS3_REMIX_STREAKALLOWVP");
+		return value;
+	}
+
+	u64 streak_allow_fp_hash()
+	{
+		static const u64 value = read_hash_env(L"RPCS3_REMIX_STREAKALLOWFP");
+		return value;
 	}
 
 	u32 skin_index_span()
@@ -10280,6 +12586,15 @@ namespace remix_rsx
 	{
 		static const u32 value = env_u32(L"RPCS3_REMIX_WBUFFERZ", 1);
 		return value != 0;
+	}
+
+	bool split_rows_enabled()
+	{
+		// umax is the "unset" sentinel, not a fallback. `env != 0 || g_cfg` would make an explicit
+		// SPLITROWS=0 a silent no-op against a config default of true, which is exactly the trap
+		// SMOOTHNORMALS and TEXBUDGET fell into.
+		static const u32 env = env_u32(L"RPCS3_REMIX_SPLITROWS", umax);
+		return env != umax ? env != 0 : g_cfg.video.remix.split_rows.get();
 	}
 
 	bool alpha_state_disabled()
@@ -11294,12 +13609,25 @@ namespace remix_rsx
 				wchar_t buffer[400]{};
 				const DWORD written = GetEnvironmentVariableW(L"RPCS3_REMIX_SKYEMISSIVE", buffer, static_cast<DWORD>(std::size(buffer)));
 
+				// The environment wins when it is SET AT ALL, including when it is set to empty --
+				// that is how a launcher clears a list the config carries. Only an absent (or
+				// over-long) variable falls through to the config, which is parsed by the same
+				// loop below rather than by a second copy of it.
+				std::wstring from_config;
+
 				if (written == 0 || written >= std::size(buffer))
 				{
-					return result;
+					const std::string& listed = g_cfg.video.remix.sky_emissive.to_string();
+
+					if (listed.empty())
+					{
+						return result;
+					}
+
+					from_config.assign(listed.begin(), listed.end());
 				}
 
-				wchar_t* cursor = buffer;
+				wchar_t* cursor = from_config.empty() ? buffer : from_config.data();
 
 				while (*cursor && result.count < result.values.size())
 				{
@@ -11383,13 +13711,46 @@ namespace remix_rsx
 		// which is the value the dome renders at today. Matching it makes the conf-list -> knob
 		// handover invisible, so the first thing the user judges is placement and occlusion rather
 		// than a brightness change nobody asked for.
-		static const f32 value = env_float(L"RPCS3_REMIX_SKYEMISSIVEINT", 2.f);
+		// Presence is tested as a STRING rather than through a numeric sentinel: env_float returns
+		// its fallback for any non-positive value, so a float can carry no "unset" marker without
+		// also swallowing a legitimate one. Read the variable, and only then decide.
+		static const f32 value = []() -> f32
+		{
+			wchar_t buffer[64]{};
+			const DWORD written = GetEnvironmentVariableW(L"RPCS3_REMIX_SKYEMISSIVEINT", buffer, static_cast<DWORD>(std::size(buffer)));
+
+			if (written == 0 || written >= std::size(buffer))
+			{
+				return static_cast<f32>(g_cfg.video.remix.sky_emissive_intensity);
+			}
+
+			const f32 parsed = static_cast<f32>(::_wtof(buffer));
+			return std::isfinite(parsed) && parsed > 0.f ? parsed : static_cast<f32>(g_cfg.video.remix.sky_emissive_intensity);
+		}();
+
 		return value;
 	}
 
 	bool sky_emissive_blend_enabled()
 	{
-		static const u32 value = env_u32(L"RPCS3_REMIX_SKYEMISSIVEBLEND", 1);
+		static const u32 env = env_u32(L"RPCS3_REMIX_SKYEMISSIVEBLEND", umax);
+		return env != umax ? env != 0 : g_cfg.video.remix.sky_emissive_blend.get();
+	}
+
+	bool sky_emissive_wext_exempt_enabled()
+	{
+		// ROUND 53. env_u32 rather than a bool helper for the reason the SKYANCHOR=0 trap taught:
+		// env_float rejects a non-positive value and silently falls back to the default, so a knob
+		// whose OFF value is 0 has to be read as an unsigned. The default is 1 and it is a no-op
+		// for every title whose sky-emissive set is empty, so this is today's behaviour bit for bit
+		// everywhere except a title that has declared a sky texture.
+		static const u32 value = env_u32(L"RPCS3_REMIX_SKYEMISSIVEWEXT", 1);
+		return value != 0;
+	}
+
+	bool sky_tag_enabled()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_SKYTAG", 1);
 		return value != 0;
 	}
 
@@ -11701,6 +14062,18 @@ namespace remix_rsx
 		return value != 0;
 	}
 
+	bool skip_colour_mask_off_enabled()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_SKIPCMASK", 1);
+		return value != 0;
+	}
+
+	bool skip_no_colour_target_enabled()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_SKIPNOTARGET", 1);
+		return value != 0;
+	}
+
 	bool walk_sampled_enabled()
 	{
 		static const u32 value = env_u32(L"RPCS3_REMIX_WALKSAMPLED", 1);
@@ -11912,6 +14285,12 @@ namespace remix_rsx
 		return value;
 	}
 
+	bool guest_light_fixture_material_enabled()
+	{
+		static const bool value = env_u32(L"RPCS3_REMIX_GUESTLIGHTFIXTUREMAT", 0) != 0;
+		return value;
+	}
+
 	// --- ROUND 41: mode 2 is "glow cards only", and it is the discriminator ----------------------
 	// 0 = off (default, round-40 behaviour). 1 = the whole census population, fixtures AND glow
 	// cards - the round-6 meaning, unchanged. 2 = glow cards only.
@@ -12046,6 +14425,258 @@ namespace remix_rsx
 	u32 guest_light_stable_frames()
 	{
 		static const u32 value = std::min(env_u32(L"RPCS3_REMIX_GUESTLIGHTSTABLE", 0), 600u);
+		return value;
+	}
+
+	// --- ROUND 52: refuse an AUX-PASS draw of a fixture ------------------------------------------
+	// A guest light's position is the fixture's local AABB centre pushed through that draw's world
+	// transform. The bulb program on BLUS30267 (30086232b02bc73a) also draws into 128x128 targets --
+	// 'Remix notex: vp=30086232b02bc73a ... clip=128x128 surf=0x3220000 target=1', the only notex
+	// rows this program has -- and an aux-pass draw divided by the MAIN camera's inverse lands at a
+	// projectively wrong scale and place. It shows up as an extent 2.2-4.1x the main-pass value for
+	// the same albedo: run pid=29940 frame 1258 gave extent=1.281 at [50.27 23.17 4.82] and
+	// extent=1.732 at [31.82 54.56 6.00]; run pid=20656 frame 2724 gave 1.556 and 2.068 -- against
+	// 0.5 and 0.578 on every main-pass row. The guest-light path has no clip gate, so those mint.
+	//
+	// The rule is the camera candidate gate's own: same / double / half of the session main clip.
+	// Default 0 per this project's standing rule; armed from bin\BLUS30267.conf. Counter
+	// guest_light_auxclip, census 'Remix guest-light-refused: reason=auxclip'.
+	bool guest_light_main_clip_enabled()
+	{
+		static const bool value = env_u32(L"RPCS3_REMIX_GUESTLIGHTMAINCLIP", 0) != 0;
+		return value;
+	}
+
+	// --- ROUND 52: frame-invariant identity, per-frame placement ---------------------------------
+	// In an un-projection backend the world is a per-frame quantity, so anything persistent in world
+	// space is wrong by construction. On BLUS30267 there is no gauge anchor at all (gauge_used=0
+	// gauge_prev=0 against gauge_absent=2055599 -- every draw of every run), so each draw's world is
+	// `fused * m_active_camera.reference_inverse`: the model space of whichever draw last won the
+	// camera election, divided out as of the last latch. Geometry is re-divided every frame; a light
+	// was minted once and never touched again, so it stays in whatever basis was current when it was
+	// created.
+	//
+	// MEASURED, run pid=29940 frames 1255-1258: the same FC43120CE463D306 bulb minted a light on
+	// four consecutive frames at [17.29 9.106] -> [16.68 10.89] -> [15.93 12.68] -> [15.04 14.46],
+	// a straight line at ~1.9 units/frame, while the camera on those four frames was identical to
+	// five decimals (cam=[-10.832 -0.90791 -1.122]) with cam_age = 0,1,2,3. The lights do not move;
+	// the world moves under them.
+	//
+	// With this on, a fixture is keyed on (albedo, vp, quantised LOCAL AABB centre) -- vertex data,
+	// not world data -- and every frame it is drawn its light is re-placed at that frame's recovered
+	// position with a same-hash CreateLight, which the runtime applies in place
+	// (rtx_light_manager.cpp addExternalLight -> updateLightStaticSleep). isDynamic is then REQUIRED:
+	// updateLightStaticSleep stops copying position into a non-dynamic light once isStaticCount
+	// reaches getNumFramesToPutLightsToSleep() (rtx_fork_light.cpp:123-145), which is round 26's sun
+	// defect one level down. No DestroyLight is issued -- destroys are deferred to Present and
+	// applied BEFORE same-frame creates with a tombstone, so destroy-then-create in one frame is a
+	// delete, not a replace.
+	//
+	// Default 0, and with it off the drift is still MEASURED (guest_light_drift /
+	// guest_light_drift_stale), so the A/B is one conf edit. Counters guest_light_replaced,
+	// guest_light_track_conflict; census 'Remix guest-light-drift:'.
+	bool guest_light_track_enabled()
+	{
+		static const bool value = env_u32(L"RPCS3_REMIX_GUESTLIGHTTRACK", 0) != 0;
+		return value;
+	}
+
+	// --- ROUND 52: AUTHORED LEVEL LIGHTS ---------------------------------------------------------
+	// Declarations and the derivation for every knob below are in RemixTransforms.h beside
+	// authored_light_mode(). Two helpers first, because this file had neither.
+	namespace
+	{
+		// The FIRST string knob accessor in this file. Every other one here is bool / f32 / u32 /
+		// hex-list; RPCS3_REMIX_DLL is the only existing string knob and it uses a `read_env` local
+		// to RemixRuntime.cpp. This is that same pattern, narrowed to UTF-8 for a path and a level
+		// name. Both are ASCII in practice; WideCharToMultiByte is used anyway rather than a
+		// truncating cast, so a non-ASCII directory does not silently become mojibake.
+		std::string env_string(const wchar_t* name, const char* fallback)
+		{
+			wchar_t buffer[512]{};
+			const DWORD written = GetEnvironmentVariableW(name, buffer, static_cast<DWORD>(std::size(buffer)));
+
+			if (written == 0 || written >= std::size(buffer))
+			{
+				return fallback;
+			}
+
+			const int needed = WideCharToMultiByte(CP_UTF8, 0, buffer, static_cast<int>(written), nullptr, 0, nullptr, nullptr);
+
+			if (needed <= 0)
+			{
+				return fallback;
+			}
+
+			std::string out(static_cast<usz>(needed), '\0');
+			WideCharToMultiByte(CP_UTF8, 0, buffer, static_cast<int>(written), out.data(), needed, nullptr, nullptr);
+			return out;
+		}
+
+		// env_float() above refuses anything that is not `> 0`, so a legitimate 0 or a negative value
+		// falls back to the default. That is right for a radius and wrong for a cone softness, which
+		// has 0 as a meaningful value. Round 13 already needed exactly this and already wrote it:
+		// env_float_signed is DEFINED further down this file, beside sun_card_min_elevation(). An
+		// anonymous namespace re-opened in the same translation unit is the SAME namespace, so this
+		// declaration and that definition are one function -- which is what lets an accessor sitting
+		// this far up the file use it without a second copy.
+		f32 env_float_signed(const wchar_t* name, f32 fallback);
+	}
+
+	u32 authored_light_mode()
+	{
+		// Clamped to 2: mode 3 would silently run as "both" and the run would be unreadable.
+		static const u32 value = std::min(env_u32(L"RPCS3_REMIX_AUTHOREDLIGHTS", 0), 2u);
+		return value;
+	}
+
+	std::string authored_light_level()
+	{
+		static const std::string value = env_string(L"RPCS3_REMIX_AUTHOREDLIGHTLEVEL", "");
+		return value;
+	}
+
+	std::string authored_light_dir()
+	{
+		static const std::string value = env_string(L"RPCS3_REMIX_AUTHOREDLIGHTDIR", "eatlead_lights");
+		return value;
+	}
+
+	f32 authored_light_radiance()
+	{
+		static const f32 value = env_float(L"RPCS3_REMIX_AUTHOREDLIGHTRADIANCE", 30.f);
+		return value;
+	}
+
+	u32 authored_light_max()
+	{
+		// 512 covers the largest level (03_Warehouse_Long, 416 placed) with headroom.
+		static const u32 value = std::min(env_u32(L"RPCS3_REMIX_AUTHOREDLIGHTMAX", 64), 512u);
+		return value;
+	}
+
+	f32 authored_light_distance()
+	{
+		static const f32 value = env_float(L"RPCS3_REMIX_AUTHOREDLIGHTDIST", 40.f);
+		return value;
+	}
+
+	f32 authored_light_min_radius()
+	{
+		static const f32 value = env_float(L"RPCS3_REMIX_AUTHOREDLIGHTMINRADIUS", .2f);
+		return value;
+	}
+
+	f32 authored_light_cone_softness()
+	{
+		static const f32 value = std::clamp(env_float_signed(L"RPCS3_REMIX_AUTHOREDLIGHTCONESOFT", .1f), 0.f, 1.f);
+		return value;
+	}
+
+	bool authored_light_ignore_viewmodel()
+	{
+		static const bool value = env_u32(L"RPCS3_REMIX_AUTHOREDLIGHTIGNOREVM", 1) != 0;
+		return value;
+	}
+
+	u32 authored_light_axis()
+	{
+		// Clamped, not wrapped: a fat-fingered 96 must not silently run as permutation 0 and be
+		// mistaken for the identity. 47 is the last real value (permutation 5, all three signs).
+		static const u32 value = std::min(env_u32(L"RPCS3_REMIX_AUTHOREDLIGHTAXIS", 0), 47u);
+		return value;
+	}
+
+	void authored_light_offset(f32 (&out)[3])
+	{
+		static const std::array<f32, 3> value = []() -> std::array<f32, 3>
+		{
+			std::array<f32, 3> parsed{ 0.f, 0.f, 0.f };
+
+			wchar_t buffer[128]{};
+			const DWORD written = GetEnvironmentVariableW(L"RPCS3_REMIX_AUTHOREDLIGHTOFFSET", buffer,
+				static_cast<DWORD>(std::size(buffer)));
+
+			if (written == 0 || written >= std::size(buffer))
+			{
+				return parsed;
+			}
+
+			const wchar_t* cursor = buffer;
+
+			for (usz i = 0; i < parsed.size() && *cursor; ++i)
+			{
+				while (*cursor == L',' || *cursor == L' ' || *cursor == L';' || *cursor == L'\t')
+				{
+					++cursor;
+				}
+
+				if (!*cursor)
+				{
+					break;
+				}
+
+				wchar_t* end = nullptr;
+				const f64 component = ::wcstod(cursor, &end);
+
+				if (end == cursor)
+				{
+					// Not a number: skip the token rather than spinning on it, and leave this
+					// component at 0. Same recovery shape as parse_hash_list above.
+					while (*cursor && *cursor != L',' && *cursor != L' ' && *cursor != L';')
+					{
+						++cursor;
+					}
+
+					continue;
+				}
+
+				if (std::isfinite(component))
+				{
+					parsed[i] = static_cast<f32>(component);
+				}
+
+				cursor = end;
+			}
+
+			return parsed;
+		}();
+
+		out[0] = value[0];
+		out[1] = value[1];
+		out[2] = value[2];
+	}
+
+	s32 authored_light_only()
+	{
+		static const s32 value = []() -> s32
+		{
+			wchar_t buffer[32]{};
+			const DWORD written = GetEnvironmentVariableW(L"RPCS3_REMIX_AUTHOREDLIGHTONLY", buffer,
+				static_cast<DWORD>(std::size(buffer)));
+
+			if (written == 0 || written >= std::size(buffer))
+			{
+				return -1;
+			}
+
+			wchar_t* end = nullptr;
+			const long parsed = ::wcstol(buffer, &end, 10);
+
+			if (end == buffer || parsed < 0 || parsed > 0x7ffffffel)
+			{
+				return -1;
+			}
+
+			return static_cast<s32>(parsed);
+		}();
+
+		return value;
+	}
+
+	u32 authored_light_dump()
+	{
+		static const u32 value = std::min(env_u32(L"RPCS3_REMIX_AUTHOREDLIGHTDUMP", 0), 128u);
 		return value;
 	}
 
@@ -12814,6 +15445,151 @@ namespace remix_rsx
 		return ui_force_vps().count;
 	}
 
+	// --- ROUND 52: RPCS3_REMIX_UCODESTOREFPHASH ---------------------------------------------------
+	//
+	// Deliberately a straight copy of ui_force_vps() above in shape: same buffer size, same
+	// "written == 0 || written >= size" refusal, same base-16 parse, same separators, same bound of
+	// 8, same "a zero entry is dropped" rule. Two list knobs that mean the same thing should not
+	// have two different failure modes for a mistyped hash.
+	namespace
+	{
+		struct ucode_store_fp_hash_list
+		{
+			std::array<u64, 8> values{};
+			u32 count = 0;
+		};
+
+		const ucode_store_fp_hash_list& ucode_store_fp_hashes()
+		{
+			static const ucode_store_fp_hash_list list = []()
+			{
+				ucode_store_fp_hash_list result{};
+				wchar_t buffer[400]{};
+				const DWORD written = GetEnvironmentVariableW(L"RPCS3_REMIX_UCODESTOREFPHASH", buffer,
+					static_cast<DWORD>(std::size(buffer)));
+
+				if (written == 0 || written >= std::size(buffer))
+				{
+					return result;
+				}
+
+				wchar_t* cursor = buffer;
+
+				while (*cursor && result.count < result.values.size())
+				{
+					while (*cursor == L',' || *cursor == L';' || *cursor == L' ' || *cursor == L'\t')
+					{
+						++cursor;
+					}
+
+					wchar_t* end = nullptr;
+					const u64 value = ::_wcstoui64(cursor, &end, 16);
+
+					if (end == cursor)
+					{
+						break;
+					}
+
+					if (value != 0)
+					{
+						result.values[result.count++] = value;
+					}
+
+					cursor = end;
+				}
+
+				return result;
+			}();
+
+			return list;
+		}
+	}
+
+	bool ucode_store_fp_hash_matches(u64 fp_hash)
+	{
+		const ucode_store_fp_hash_list& list = ucode_store_fp_hashes();
+		const auto end = list.values.begin() + list.count;
+		return fp_hash != 0 && std::find(list.values.begin(), end, fp_hash) != end;
+	}
+
+	u32 ucode_store_fp_hash_count()
+	{
+		return ucode_store_fp_hashes().count;
+	}
+
+	// --- ROUND 59: RPCS3_REMIX_UIREFUSEFP ---------------------------------------------------------
+	//
+	// The THIRD deliberate copy of ui_force_vps() in shape: same 400-wchar buffer, same
+	// "written == 0 || written >= size" refusal, same base-16 parse, same ', ; space tab'
+	// separators, same bound of 8, same "a zero entry is dropped" rule. Three list knobs that mean
+	// the same thing should not have three different failure modes for a mistyped hash, and folding
+	// them into a shared helper would touch two knobs that are already measured working.
+	namespace
+	{
+		struct ui_refuse_fp_list
+		{
+			std::array<u64, 8> values{};
+			u32 count = 0;
+		};
+
+		const ui_refuse_fp_list& ui_refuse_fps()
+		{
+			static const ui_refuse_fp_list list = []()
+			{
+				ui_refuse_fp_list result{};
+				wchar_t buffer[400]{};
+				const DWORD written = GetEnvironmentVariableW(L"RPCS3_REMIX_UIREFUSEFP", buffer,
+					static_cast<DWORD>(std::size(buffer)));
+
+				if (written == 0 || written >= std::size(buffer))
+				{
+					return result;
+				}
+
+				wchar_t* cursor = buffer;
+
+				while (*cursor && result.count < result.values.size())
+				{
+					while (*cursor == L',' || *cursor == L';' || *cursor == L' ' || *cursor == L'\t')
+					{
+						++cursor;
+					}
+
+					wchar_t* end = nullptr;
+					const u64 value = ::_wcstoui64(cursor, &end, 16);
+
+					if (end == cursor)
+					{
+						break;
+					}
+
+					if (value != 0)
+					{
+						result.values[result.count++] = value;
+					}
+
+					cursor = end;
+				}
+
+				return result;
+			}();
+
+			return list;
+		}
+	}
+
+	bool ui_refuse_fp_matches(u64 fp_hash)
+	{
+		const ui_refuse_fp_list& list = ui_refuse_fps();
+		const auto end = list.values.begin() + list.count;
+		return fp_hash != 0 && std::find(list.values.begin(), end, fp_hash) != end;
+	}
+
+	u32 ui_refuse_fp_count()
+	{
+		return ui_refuse_fps().count;
+	}
+
 	// --- round 36: the (vp, fp) pair form of the same route. Derivation in RemixTransforms.h -----
 	//
 	// Deliberately a straight copy of hide_pair_vp_hash()/hide_pair_fp_hash() in shape: same buffer
@@ -12903,17 +15679,250 @@ namespace remix_rsx
 
 	// --- round 10 --------------------------------------------------------------------------------
 
+	// env_u32, not env_flag: 0 has to restore today's admission bit-exactly, because this knob
+	// is the attribution A/B for the far-away "portal" frames coming back.
+	//
+	// ROUND 52 makes it a MODE. 1 is round 10 unchanged (the gate runs only with a camera lock
+	// configured); 2 lifts that scoping and runs the same ladder with no lock. Eat Lead cannot use
+	// a lock at all - no VP exceeds 60.6% frame presence and pinning one was measured live as
+	// cam_resolved=0, 100% fallback, a black screen - yet its 128x128 fov=90 aspect=1.0 near=0.01
+	// cube-face pass (1b20d02263aa8ee4 / f5265372e9f61872) won 14 frames of run 13 by votes,
+	// including the FIRST camera of the run (frame 931, candidates=1, position 30 units off).
+	// Clamped to 2 because a third mode does not exist.
+	u32 camera_clip_gate_mode()
+	{
+		static const u32 value = std::min(env_u32(L"RPCS3_REMIX_CAMCLIPGATE", 1), 2u);
+		return value;
+	}
+
 	bool camera_clip_gate_enabled()
 	{
-		// env_u32, not env_flag: 0 has to restore today's admission bit-exactly, because this knob
-		// is the attribution A/B for the far-away "portal" frames coming back.
-		static const u32 value = env_u32(L"RPCS3_REMIX_CAMCLIPGATE", 1);
-		return value != 0;
+		return camera_clip_gate_mode() != 0;
 	}
 
 	bool camera_fallback_relatch_enabled()
 	{
 		static const u32 value = env_u32(L"RPCS3_REMIX_CAMFBRELATCH", 1);
+		return value != 0;
+	}
+
+	// ROUND 52. Identity hysteresis in the NO-LOCK vote: a cluster that is the active camera's own
+	// cluster (the mid-frame relatch's predicate, at CAMRELATCHTOL) outranks any cluster that is
+	// not, regardless of votes. Among equals the vote then the score decide, exactly as today, and
+	// a frame with no own cluster elects by vote as today - so a real cut still goes through the
+	// existing 12-frame confirm.
+	//
+	// Measured on Eat Lead run 13: 72 identity changes in 4,806 gameplay frames (15 per 1,000,
+	// winners 10-25 units apart, e.g. frames 4515 -> 4528 -> 4573 -> 4590), of which 54 happened
+	// while a cluster continuous with the previous winner (view <= 0.8, same lens) was present and
+	// was simply OUT-VOTED, mean margin 2.3 votes; 42 while one within 0.1 was present.
+	//
+	// This is the lock path's own continuous_with_active_primary rank generalised to the no-lock
+	// path, so the shape is not new. Default 0 so this lands dark and is armed from a config, per
+	// this project's standing rule. MUST be armed together with CAMRELATCHTOL below 0.8: with the
+	// relatch still taking props, "own cluster" would be measured against a prop.
+	bool camera_sticky_enabled()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_CAMSTICKY", 0);
+		return value != 0;
+	}
+
+	// --- round 53 --------------------------------------------------------------------------------
+
+	// ROUND 53. CAMSTICKY did not move the identity-change rate and the counters say why. The rank
+	// as implemented is ABSOLUTE PRECEDENCE - an own cluster present in the frame cannot lose - so
+	// cam_sticky_lost=195 is not "the incumbent lost 195 contests", it is "195 frames had NO own
+	// cluster at all". Re-read with a position-continuity tracker over run 13's 83,257 cluster rows,
+	// the winner track changed 84 times in 4,761 gameplay frames and IN 80 OF THE 84 THE PREVIOUS
+	// WINNER'S TRACK WAS ABSENT. Every cluster is split(M_obj x V x P) - a placed object's basis -
+	// and the most persistent one is drawn in only 30.8% of frames, so there is no ranking rule that
+	// can help: the fix has to be continuity of identity OVER TIME.
+	//
+	// Simulated on the logged clusters (tenure election, hold through 3 unmatched frames, hand over
+	// only on track death): 16 handovers in 4,761 frames (3.4 per 1,000) against 84, of which 14 had
+	// a co-present predecessor and 2 were real cuts. Incumbent duration p50 252, p90 827, max 1,021
+	// frames; the vote disagreed with the tenure incumbent on 55.7% of frames, so this rule decides
+	// most frames and must be its own knob with its own counters. Clamped to 1 because a second mode
+	// does not exist. Default 0 so this lands dark and is armed from a config, per this project's
+	// standing rule; 0 restores today's vote bit-exactly.
+	u32 camera_track_mode()
+	{
+		// Same unset sentinel as split_rows_enabled(); still clamped to 1 because a second mode
+		// does not exist, and the config is a bool for the same reason.
+		static const u32 value = []() -> u32
+		{
+			const u32 env = env_u32(L"RPCS3_REMIX_CAMTRACK", umax);
+			return env != umax ? std::min(env, 1u) : (g_cfg.video.remix.camera_track ? 1u : 0u);
+		}();
+
+		return value;
+	}
+
+	// The same-object test. 1.0 world unit is 1.35x the largest per-frame step of any long track in
+	// run 13 (p99 0.12-0.28 depending on the track, max 0.74) and at least 10x under the 10-30-unit
+	// separation of 47 of the 84 winner jumps, so it survives a flick turn without ever letting a
+	// handover pass as continuity. Too tight shows up as cam_track_missed bursts and an expire
+	// followed by a handover on the same id (raise to 2.0); too loose lets a track hop between
+	// stacked instances 0.13-1.2 units apart (lower to 0.5).
+	f32 camera_track_position_tolerance()
+	{
+		static const f32 value = env_float(L"RPCS3_REMIX_CAMTRACKPOS", 1.0f);
+		return value;
+	}
+
+	// Unmatched frames the incumbent's track survives before it dies. 3 bridged 14 of the 16
+	// simulated handovers and 8 bridged 11 of 13 - the extra five frames buy nothing and lengthen
+	// every hold, during which the camera is held stale and the lights drift.
+	u32 camera_track_miss_frames()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_CAMTRACKMISS", 3);
+		return value;
+	}
+
+	// Mechanism B. With the true camera unobservable - no cluster is the bare V x P - the only way a
+	// handover can be invisible is to keep the previous witness's basis alive through the relation
+	// both witnesses expressed while they were co-present. For two static witnesses
+	// C = V_new x V_old^-1 = M_new x M_old^-1 and the true camera cancels, which the light census
+	// measures directly: light 878edd2ba07c8089 sits at exactly [-11.81 -7.136 1.844] whenever
+	// 1b20d02263aa8ee4's cluster is the winner (frames 7851, 7988, 8933, 9085 - over 1,200 frames of
+	// player motion) and at exactly [-3.219 12.5 1.274] under 7565b4cbd93682d9. A recurring position
+	// per winner means a recurring, constant reference, i.e. each winner is a static object.
+	//
+	// Applied as submitted view = R x raw view with reference_inverse and view_proj_inverse
+	// re-expressed by R^-1, so world' x (R x V) x P = fused stays exact. Clamped to 2; mode 2 (act
+	// on a moving incumbent) is documented and NOT implemented - this round only counts it. Default
+	// 0 so this lands dark and is armed from a config; requires CAMTRACK.
+	u32 camera_rebase_mode()
+	{
+		static const u32 value = std::min(env_u32(L"RPCS3_REMIX_CAMREBASE", 0), 2u);
+		return value;
+	}
+
+	// ROUND 54, MEASUREMENT ONLY. Every 'Remix guest-light-drift:' row already says the light moved;
+	// none of them says whether the DIVISOR moved. The row's new ref_same field answers that with one
+	// hash comparison, but a reader who wants to split "the guest moved the lamp" (a translation row
+	// only) from "the decode wobbled" (spread through the entries) needs the matrices themselves. At
+	// 1 a second line, 'Remix guest-light-drift-mat:', carries this draw's raw fused matrix and the
+	// active reference_inverse in %a hex - the only decimal-free form a float survives a log in - so
+	// that split can be made from an existing run instead of costing another one. Shares the drift
+	// census's 64-per-window cap, so an armed run cannot flood the dump. Clamped to 1 because a second
+	// mode does not exist; 0 restores today's output bit-exactly.
+	u32 guest_light_drift_matrices()
+	{
+		static const u32 value = std::min(env_u32(L"RPCS3_REMIX_GLDRIFTMAT", 0), 1u);
+		return value;
+	}
+
+	// ROUND 54, MEASUREMENT ONLY. The mid-frame relatch is the one thing that refreshes the reference
+	// between the flip latch and a draw, and nothing logs what it took. At 1, 'Remix cam-relatch:'
+	// prints one line per relatch (the eye it moved to, the step it applied, whether that draw lay
+	// within CAMTRACKPOS of the incumbent WITNESS TRACK, and how many world draws had already been
+	// placed on the stale reference), and 'Remix cam-relatch-disagree:' one line per frame in which
+	// the relatch's draw and the tracker's own match for the incumbent are more than 0.05 units apart.
+	// Those two rows are what turn a drift row into a named branch: reference refreshed from another
+	// object, or the same object one frame later. Both capped 64 per stats window. Clamped to 1;
+	// 0 restores today's output bit-exactly - the counters accumulate either way.
+	u32 camera_relatch_trace_mode()
+	{
+		static const u32 value = std::min(env_u32(L"RPCS3_REMIX_CAMRELATCHTRACE", 0), 1u);
+		return value;
+	}
+
+	// ROUND 55. On a flip where the witness tracker's incumbent is ALIVE BUT NOT DRAWN, the flip
+	// discards the frame candidate and keeps last flip's m_active_camera - matrices AND identity
+	// frozen together. Every world draw and every injected light of that frame is then placed by a
+	// reference that belongs to a camera one or more frames old, so the scene slides by exactly the
+	// camera's motion during the hold and snaps when the hold ends. Mode 1 breaks the two apart: the
+	// identity stays frozen (that is the tracker's decision and it is correct), but the REFERENCE is
+	// re-synthesised for that one frame from a co-present static witness J and the rigid relation the
+	// two objects expressed while both were drawn, rel = M_J x M_I^-1, so view_I = rel^-1 x view_J.
+	// The synthesised candidate is installed through the ordinary latch, so latch_frame is stamped,
+	// m_camera_track_incumbent, track.missed, expiry and the tenure election are all untouched. Mode 1
+	// also makes the mid-frame relatch honour the tracker's identity: on a synthesised frame every
+	// candidate near the synthesised view is by definition a DIFFERENT object, so a relatch whose draw
+	// is outside CAMTRACKPOS of the live incumbent is refused (cam_relatch_foreign_refused) instead of
+	// hijacking the basis to a sibling's frame. Mode 2 adds one thing: a flip whose candidate was
+	// elected by a tracker handover/reset skips the 12-frame discontinuity confirm, so the switch
+	// happens at the handover frame rather than 12 flips later (cam_ref_synth_install) - more switches,
+	// no confirm-window slide. Requires CAMTRACK; inert without it.
+	//
+	// Counters: cam_ref_synth / _nowitness / _short / _rigid / _basis / _badrel partition
+	// cam_track_missed exactly while this is non-zero, and cam_ref_synth_install counts mode-2
+	// bypasses. Rows: 'Remix cam-synth:' (under CAMRELATCHTRACE) names the witness, the co-presence
+	// length, the rigidity residual and the eye step the synthesis implies.
+	//
+	// NOTE cam_held changes meaning on this arm: a synthesised flip is NOT a hold, so cam_track_missed
+	// and cam_held stop counting the same frame (the CAMTRACKMISS row's wording assumes they do).
+	//
+	// 0 restores today's output bit-exactly - the measurement fields (refsrc= and switch= on every
+	// drift row, refused= on every cam-relatch row, and cam_basis_switch / cam_discontinuity_held /
+	// cam_switch_confirmed on 'Remix live:') print on both arms. Clamped to 2.
+	u32 camera_ref_synth_mode()
+	{
+		static const u32 value = std::min(env_u32(L"RPCS3_REMIX_CAMREFSYNTH", 0), 2u);
+		return value;
+	}
+
+	// ROUND 56. The submitted view's right vector is mirrored, and the projection has been hiding it.
+	//
+	// try_split_once does not RECOVER the view, it CONSTRUCTS it: forward and up_hint are unprojected
+	// out of the fused matrix (convention-free), then right = up_hint x forward. That cross-product
+	// ORDER assumes a left-handed world. Eat Lead's is right-handed, so the constructed row 0 points
+	// screen-LEFT, and the recovered P = viewToWorld x fused absorbs the error as a negative x-scale.
+	// The picture is right because V x P is right; each factor alone is not.
+	//
+	// MEASURED with no rebuild, from score_perspective's own -0.5 dock for m[0][0] < 0 (an integer
+	// score is impossible once it fires): on 'Remix camera trace:' rows, run pid27232 = 8167 x
+	// score=5.500 + 672 x score=4.500, run pid30572 = 8475 x score=5.500, ZERO integer scores in
+	// 17,314 resolved frames. So P[0][0] < 0 on 100% of frames and P[1][1] > 0 on all of them (a
+	// -1.0 dock would have restored an integer).
+	//
+	// A determinant test on the view would clear it and be WRONG: right = up x forward makes
+	// (right, up, forward) orthonormal with det +1 BY CONSTRUCTION, whatever the world's handedness.
+	// The mirror only ever shows in the sign of P[0][0]. That is the round-20 viewmodel trap again.
+	//
+	// Why it is a user-visible bug and only in one axis: RtCamera::getRight() is viewToWorld[0].xyz()
+	// verbatim, and the runtime's free camera strafes along it (currentPosition += moveLeftRight *
+	// freeCamViewToWorld.data[0].xyz(), rtx_camera.cpp) and ties yaw to the same row, while pitch
+	// uses row 1 and forward/back row 2. Reported symptom: left/right reversed for both movement and
+	// turning, pitch and forward correct. One cause, exactly that symptom set.
+	//
+	// 1 inserts S = diag(-1,1,1,1) between the SUBMITTED V and P, at the API boundary only:
+	// V' = V x S (negate the view's COLUMN 0) and P' = S x P (negate the projection's ROW 0). Then
+	// V'P' = V S S P = VP exactly, so the rendered image is invariant - primary rays come from the
+	// inverse of the product and the runtime's winding test reads the product. What changes is that
+	// viewToWorld' row 0 is now true screen-right (det -1, which is what Remix's convention for a
+	// right-handed world under a left-handed projection IS) and P'[0][0] > 0. P[2][2] is untouched,
+	// so DecomposeProjection's bLeftHanded = a22 > 0 still says Left-handed; the dev menu's
+	// 'Overall Handedness' (isLHS ^ isMirrorTransform(viewToWorld)) must FLIP to Right-handed.
+	//
+	// Applied in submit_camera after both to_camera_matrix copies, so m_active_camera, the split, the
+	// tracker, the relatch, the rebase, the reference synthesis, the drift census and every light
+	// placement never see it; the sky and viewmodel twins copy camera_info below it and inherit it.
+	// Counters cam_xmirror (P[0][0] < 0 was submitted, counted on BOTH arms) and cam_xflip (the flip
+	// was applied); fields vdet= / p00= on every 'Remix camera trace:' row, also on both arms.
+	// 0 restores today's output bit-exactly.
+	bool camera_xflip_enabled()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_CAMXFLIP", 0);
+		return value != 0;
+	}
+
+	// ROUND 57. See the doc block in RemixTransforms.h. Pure measurement: one stash per followed
+	// draw and one row per followed frame, nothing on the submit path.
+	// 0 restores today's output bit-exactly.
+	bool pick_fresh_enabled()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_PICKFRESH", 0);
+		return value != 0;
+	}
+
+	// ROUND 57. See the doc block in RemixTransforms.h. This one CHANGES SUBMIT ORDER: about twelve
+	// instances per frame move from their draw ordinal to the mid-frame relatch ordinal.
+	// 0 restores today's output bit-exactly.
+	bool defer_pre_relatch_enabled()
+	{
+		static const u32 value = env_u32(L"RPCS3_REMIX_DEFERPRERELATCH", 0);
 		return value != 0;
 	}
 

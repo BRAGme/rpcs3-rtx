@@ -513,7 +513,17 @@ std::unique_ptr<gs_frame> gui_application::get_gs_frame()
 		// Make sure we run the same config
 		const bool is_same_renderer = m_game_window->renderer() == g_cfg.video.renderer;
 
-		if (is_same_renderer && (Emu.IsChildProcess() || continuous_mode_enabled))
+		// The Remix backend cannot take this window back. It drives an out-of-process ray tracer
+		// through a D3D9 device that dxvk-remix creates on the gs_frame's HWND, and tearing that
+		// runtime down does not release the Vulkan surface bound to the window: the next
+		// remixapi Startup's vkCreateSwapchainKHR fails with VK_ERROR_NATIVE_WINDOW_IN_USE_KHR,
+		// Startup returns GENERAL_FAILURE, and the renderer degrades to a no-op -- a frozen
+		// picture rather than an error the user can see. Measured on Ratchet & Clank Collection
+		// (BCUS98282), whose menu exitspawns into RC1 and so takes exactly this path. A fresh
+		// window costs one recreate and is the only thing that makes the surface available again.
+		const bool renderer_can_reuse_window = g_cfg.video.renderer != video_renderer::remix;
+
+		if (is_same_renderer && renderer_can_reuse_window && (Emu.IsChildProcess() || continuous_mode_enabled))
 		{
 			gui_log.notice("gui_application: Re-using old game window (IsChildProcess=%d, ContinuousModeEnabled=%d)", Emu.IsChildProcess(), continuous_mode_enabled);
 
@@ -524,7 +534,8 @@ std::unique_ptr<gs_frame> gui_application::get_gs_frame()
 			return std::unique_ptr<gs_frame>(m_game_window);
 		}
 
-		// Clean-up old game window. This should only happen if the renderer changed or there was an unexpected error during boot.
+		// Clean-up old game window. This should only happen if the renderer changed, the renderer
+		// cannot reuse its window, or there was an unexpected error during boot.
 		Emu.GetCallbacks().close_gs_frame();
 	}
 

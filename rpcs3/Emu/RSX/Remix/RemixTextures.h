@@ -115,6 +115,30 @@ namespace remix_rsx
 		// housing has a max of white, which would throw away the very hue this exists to carry.
 		f32 mean_rgb[3] = { 1.f, 1.f, 1.f };
 
+		// ROUND 58 (step 2a). Two more numbers off the SAME texel pass as mean_rgb, in 0..255:
+		//   sat_mean - mean per-texel saturation, max(r,g,b) - min(r,g,b). 0 = perfectly grey.
+		//   lum_sd   - standard deviation of (r+g+b)/3, i.e. how much contrast the map carries.
+		// Together they name a black-and-white MACRO/GRIME map, which is the shape Eat Lead's
+		// interior programs blend in at 5-15% and which this backend was electing as the albedo.
+		// MEASURED on the dumped BMPs (bin\remix_tex\, script in the round's Verification, which
+		// self-tests on a synthetic grey = 0 and a synthetic red = 255 before printing):
+		//   grime  27D6FC610B1D8589 1.8/82.1   06C0DE253F644772 2.0/60.9   53D24F0E9E5C0BF5 1.3/95.3
+		//          E9999467C4497210 1.1/78     6E6636E1AE1EBEC2 1.9/45
+		//   paint  6783D9E9B684BDC8 33.3/19.6  5C3C5C5C3FCBC761 14/36      00AB039769B4D019 13/31
+		//          A07705F9A64D430E 4.9/8      D70E73AA4E0D3468 1.8/12.1  <- grey AND flat
+		// Zero by default so an entry that never reached upload() reads as "not a greymap".
+		f32 sat_mean = 0.f;
+		f32 lum_sd = 0.f;
+
+		// A COUNTER's predicate, never an election input - see the round's Out of scope. The sd
+		// band 36..45 is unobserved in the fixture set above, so no measured texture sits on the
+		// edge of this test; plain concrete D70E73AA4E0D3468 is grey (1.8) but flat (12.1) and is
+		// correctly NOT a greymap. Only the fragment ucode separates grime from plain grey paint.
+		bool greymap() const
+		{
+			return sat_mean < 4.f && lum_sd > 40.f;
+		}
+
 		// Round 23. Where the BRIGHTEST region of this texture sits, in normalised texel
 		// coordinates (u = column / width, v = row / height, row 0 = the first decoded row).
 		// peak_uv[0] < 0 means "never measured" - the walk below only runs for textures whose
@@ -165,6 +189,14 @@ namespace remix_rsx
 		// handful of bad descriptors inflate it without bound and it cannot be read as "how
 		// many textures does this title bind that we cannot decode". This split can.
 		u64 tombstone_hits = 0;
+
+		// ROUND 60, the RPCS3_REMIX_TEXREMAP pair. remap_seen counts decoded textures whose
+		// NV4097_SET_TEXTURE_CONTROL1 is NOT the identity 0xAAE4 - it is counted whether or not the
+		// knob is on, so a run can say "this title has N remapped textures" before anyone flips it.
+		// remap_applied counts the subset this build actually rewrote, so remap_seen>0 with
+		// remap_applied==0 reads as "knob off", not as "nothing to fix".
+		u64 remap_seen = 0;
+		u64 remap_applied = 0;
 
 		// Materials created while the RSX alpha test was disabled, i.e. whose alphaTestType is
 		// ALWAYS and whose transparency - if it has any - can only come from the per-draw blend
@@ -345,6 +377,43 @@ namespace remix_rsx
 		void destroy_all(const remixapi_Interface& api);
 
 		usz live() const { return m_entries.size(); }
+
+		// ROUND 58. What the live entries actually COST, for the 'Remix memory:' line.
+		//
+		// Summed on demand rather than tracked incrementally, deliberately: this is read once per
+		// stats window, while an incremental total would have to be decremented on every erase
+		// path in reap(), destroy_all() and the tombstone handling - and a running total that has
+		// drifted is worse than no total at all, because it reads as authoritative.
+		//
+		// 4 bytes per texel is exact rather than an estimate: upload() declares
+		// REMIXAPI_FORMAT_B8G8R8A8_UNORM or _SRGB and nothing else, and this backend uploads mip 0
+		// alone. It is the size of the decoded copy handed to the runtime, NOT of the guest's own
+		// (possibly DXT-compressed) source, which is the number that matters for a leak hunt.
+		usz live_bytes() const
+		{
+			usz total = 0;
+
+			for (const auto& [key, entry] : m_entries)
+			{
+				total += usz{entry.width} * entry.height * 4;
+			}
+
+			return total;
+		}
+
+		// Live entries carrying a material handle. Distinct from the cumulative mat_created
+		// counter, which never comes down and so can never show a leak.
+		usz live_materials() const
+		{
+			usz total = 0;
+
+			for (const auto& [key, entry] : m_entries)
+			{
+				total += entry.material ? 1 : 0;
+			}
+
+			return total;
+		}
 		const texture_stats& stats() const { return m_stats; }
 
 		// True once this frame's CreateTexture budget is spent. A caller walking several texture
@@ -470,6 +539,42 @@ namespace remix_rsx
 	// both halves (alpha test at :687-693, alpha blend at :705-709), so a build that took blend
 	// from the instance and alpha test from the material is not expressible.
 	bool blend_state_enabled();
+
+	// --- ROUND 60: RPCS3_REMIX_TEXREMAP, DEFAULT 0 (off) ------------------------------------------
+	// Apply the RSX per-texture channel remap (NV4097_SET_TEXTURE_CONTROL1, fragment_texture::
+	// decoded_remap()) to the decoded BGRA8 image. This cache has never read that register: decode()
+	// converts the guest bytes according to the FORMAT alone, which is only correct when the remap is
+	// identity (0xAAE4).
+	//
+	// MEASURED on Eat Lead (BLUS30267), the boot logo sequence. vp=f2b6988e84056628
+	// fp=cc1755fe0ee916bf draws four 1280x720 contents with fmt=a5 (CELL_GCM_TEXTURE_A8R8G8B8 |
+	// CELL_GCM_TEXTURE_LN). The dumped BMPs (bin/remix_ui_<content>_1280x720.bmp) read, per texel,
+	// exactly B=255 with G, R and A all carrying the same greyscale value - e.g.
+	// 91146F0B0628B3A0 is 921600/921600 texels at B=255 G=0 R=0 A=0, and 2321C4A9240E9220 (the
+	// D3Publisher legal screen) is 94.58% at that value with the text at B=255 G=178 R=178 A=178.
+	// The fragment program (bin/remix_ucode/52202C4771A36AAA.fp) is a plain modulate -
+	// "TEX R0.xyz <- tc0 [tex0]" then "MUL R0.xyz <- R1.xyw, R0.xyz" against a white vertex colour -
+	// so it samples the texture's RGB with no swizzle of its own. RGB = (luma, luma, 255) is a
+	// full-strength blue field, which is the reported defect.
+	//
+	// Working back through the decode: dest BGRA (255, L, L, L) is host u32 0xLLLLLLFF, which is the
+	// big-endian guest word 0xLLLLLLFF, i.e. guest bytes [L][L][L][0xFF]. That is an RGBA8 image
+	// (R, G, B, A with A opaque) sitting in memory that the texture register declares A8R8G8B8
+	// (A, R, G, B). Declaring RGBA8 data as A8R8G8B8 and correcting it with a channel remap is
+	// ordinary RSX practice; nothing else explains a shipped logo screen whose blue channel is
+	// pinned to 255. Contrast a correctly-decoded UI texture from the same title -
+	// remix_ui_07459087fa45aecb_512x512.bmp is B=G=R=luma with A=255 everywhere.
+	//
+	// WRONG-DIRECTION FAILURE, stated so it is recognisable: a title whose textures already look
+	// right has, by definition, identity remaps on them, so this knob is a no-op there and
+	// tex_remap_applied stays 0. If it is non-zero and a texture that used to be right turns wrong,
+	// the remap decode is being applied where the guest expected the raw format - set the knob back
+	// to 0 and the picture returns in one restart. That is why the default is off.
+	//
+	// The remap also joins the content hash, but ONLY for a texture this knob actually rewrites, so
+	// a run with the knob off has byte-identical hashes to every previous round and any existing
+	// bin/remix_tex replacement keeps matching.
+	bool texture_remap_enabled();
 
 	// RPCS3_REMIX_TEXBMP=1: write each unique decoded texture out as a BMP next to the executable.
 	bool dump_texture_images();

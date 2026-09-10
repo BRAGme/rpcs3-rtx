@@ -40,6 +40,8 @@ namespace remix_rsx
 
 	// An existing triangle-strip index list, appended to 'out' as a triangle list.
 	void strip_to_list(const u32* indices, u32 count, std::vector<u32>& out);
+
+	void restart_to_list(const u32* indices, u32 count, u32 restart, rsx::primitive_type prim, std::vector<u32>& out);
 }
 
 #endif

@@ -260,6 +260,41 @@ namespace remix_rsx
 		return true;
 	}
 
+	void restart_to_list(const u32* indices, u32 count, u32 restart, rsx::primitive_type prim, std::vector<u32>& out)
+	{
+		// Disjoint triangle lists follow BufferUtils: restart markers are removed.
+		if (prim == rsx::primitive_type::triangles)
+		{
+			const usz first = out.size();
+			for (u32 i = 0; i < count; ++i)
+				if (indices[i] != restart) out.push_back(indices[i]);
+			out.resize(first + (out.size() - first) / 3 * 3);
+			return;
+		}
+
+		u32 begin = 0;
+		for (u32 end = 0; end <= count; ++end)
+		{
+			if (end != count && indices[end] != restart) continue;
+			const u32 length = end - begin;
+			if (prim == rsx::primitive_type::triangle_strip)
+			{
+				strip_to_list(indices + begin, length, out);
+			}
+			else if (prim == rsx::primitive_type::quads)
+			{
+				for (u32 i = begin; i + 3 < end; i += 4)
+					out.insert(out.end(), {indices[i], indices[i+1], indices[i+2], indices[i+2], indices[i+3], indices[i]});
+			}
+			else if (prim == rsx::primitive_type::triangle_fan || prim == rsx::primitive_type::polygon)
+			{
+				for (u32 i = begin + 1; i + 1 < end; ++i)
+					out.insert(out.end(), {indices[begin], indices[i], indices[i+1]});
+			}
+			begin = end + 1;
+		}
+	}
+
 	void strip_to_list(u32 first, u32 count, std::vector<u32>& out)
 	{
 		if (count < 3)

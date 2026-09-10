@@ -72,6 +72,12 @@ namespace remix_rsx
 		void draw_quad(f32 x0, f32 y0, f32 x1, f32 y1, f32 u0, f32 v0, f32 u1, f32 v1,
 			const texture_entry* tex, u32 tint_bgra, bool clamp_uv);
 
+		// Composites everything drawn so far OVER an opaque background of 'bgra', leaving the
+		// whole buffer opaque. Used for frames the title painted with a framebuffer CLEAR and
+		// nothing else -- see RemixGSRender::submit_compositor(). Straight-alpha in, straight
+		// (fully opaque) alpha out, so it must run after the frame's draws, never before.
+		void underlay(u32 bgra);
+
 		// Single-channel coverage source (rpcs3's font atlas is R8).
 		void draw_glyph_quad(f32 x0, f32 y0, f32 x1, f32 y1, f32 u0, f32 v0, f32 u1, f32 v1,
 			const u8* coverage, u32 cov_width, u32 cov_height, u32 tint_bgra);
@@ -118,6 +124,12 @@ namespace remix_rsx
 
 	// RPCS3_REMIX_NOUI=1 disables the compositor entirely.
 	bool compositor_disabled();
+
+	// RPCS3_REMIX_CLEARBG. Whether a frame that submitted no world geometry gets the title's own
+	// framebuffer clear colour painted under the 2D overlay. Defaults to ON, so the accessor is
+	// deliberately tri-state: an `env != 0` test against a true fallback would make CLEARBG=0 a
+	// silent no-op, which is the shape several knobs in this backend were already caught by.
+	bool clear_background_enabled();
 
 	// RPCS3_REMIX_KEEPRT=1 restores the old behaviour of compositing the title's own
 	// render-target blits (its post-process chain) through the CPU rasterizer. Off by default:

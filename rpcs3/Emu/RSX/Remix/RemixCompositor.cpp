@@ -5,6 +5,7 @@
 
 #include "Emu/RSX/Remix/RemixRuntime.h"
 #include "Emu/RSX/Remix/RemixTextures.h"
+#include "Emu/RSX/Remix/RemixTransforms.h"
 #include "Emu/system_config.h"
 
 #include <algorithm>
@@ -17,6 +18,25 @@ namespace remix_rsx
 	{
 		// Sanity ceiling on the overlay target. 4K RGBA8 is 32 MiB.
 		constexpr u32 s_max_dimension = 4096;
+
+		bool demons_flare_bilinear(const texture_entry& tex)
+		{
+			if (!demons_world_enabled())
+			{
+				return false;
+			}
+
+			switch (tex.content_hash)
+			{
+			case 0xEF05AD7EB0FFA8D5ull: // 64x64 white disk
+			case 0x998989659002A614ull: // 64x64 Gaussian core
+			case 0x817ABB299B3EEB42ull: // 64x64 chromatic ring
+			case 0x61A94501E60650AEull: // 128x128 starburst
+				return true;
+			default:
+				return false;
+			}
+		}
 
 		// RPCS3_REMIX_UIRECTSHRINK, parsed once. See RemixCompositor.h for what it is for; the
 		// parse is byte-for-byte the shape clamp_albedos() uses (hex, comma/semicolon/space
@@ -387,6 +407,39 @@ namespace remix_rsx
 				return 0x00FFFFFFu | ((texel & 0xFFu) << 24);
 			}
 
+			if (demons_flare_bilinear(tex))
+			{
+				const f32 fx = (su * static_cast<f32>(tex.width)) - 0.5f;
+				const f32 fy = (sv * static_cast<f32>(tex.height)) - 0.5f;
+				const s32 x0 = static_cast<s32>(std::floor(fx));
+				const s32 y0 = static_cast<s32>(std::floor(fy));
+				const u32 x1 = std::min(tex.width - 1, static_cast<u32>(std::max(0, x0 + 1)));
+				const u32 y1 = std::min(tex.height - 1, static_cast<u32>(std::max(0, y0 + 1)));
+				const u32 bx = static_cast<u32>(std::max(0, x0));
+				const u32 by = static_cast<u32>(std::max(0, y0));
+				const f32 tx = std::clamp(fx - static_cast<f32>(x0), 0.f, 1.f);
+				const f32 ty = std::clamp(fy - static_cast<f32>(y0), 0.f, 1.f);
+
+				u32 samples[4]{};
+				std::memcpy(&samples[0], tex.pixels.data() + ((usz{by} * tex.width + bx) * 4), sizeof(u32));
+				std::memcpy(&samples[1], tex.pixels.data() + ((usz{by} * tex.width + x1) * 4), sizeof(u32));
+				std::memcpy(&samples[2], tex.pixels.data() + ((usz{y1} * tex.width + bx) * 4), sizeof(u32));
+				std::memcpy(&samples[3], tex.pixels.data() + ((usz{y1} * tex.width + x1) * 4), sizeof(u32));
+
+				u32 filtered = 0;
+				for (u32 channel = 0; channel < 4; ++channel)
+				{
+					const u32 shift = channel * 8;
+					const f32 top = static_cast<f32>((samples[0] >> shift) & 0xFF) * (1.f - tx)
+						+ static_cast<f32>((samples[1] >> shift) & 0xFF) * tx;
+					const f32 bottom = static_cast<f32>((samples[2] >> shift) & 0xFF) * (1.f - tx)
+						+ static_cast<f32>((samples[3] >> shift) & 0xFF) * tx;
+					filtered |= static_cast<u32>(std::clamp(top * (1.f - ty) + bottom * ty, 0.f, 255.f) + 0.5f) << shift;
+				}
+
+				return filtered;
+			}
+
 			return texel;
 		}
 
@@ -436,13 +489,40 @@ namespace remix_rsx
 		return env || g_cfg.video.remix.no_ui;
 	}
 
+	bool clear_background_enabled()
+	{
+		static const bool value = []
+		{
+			wchar_t buffer[16]{};
+			const DWORD written = GetEnvironmentVariableW(L"RPCS3_REMIX_CLEARBG", buffer, static_cast<DWORD>(std::size(buffer)));
+
+			// Unset (or unreadable) falls through to the config; an explicit 0 really does turn it
+			// off rather than being ORed away behind a config default of true.
+			if (written == 0 || written >= std::size(buffer))
+			{
+				return g_cfg.video.remix.clear_background.get();
+			}
+
+			return ::wcstol(buffer, nullptr, 10) != 0;
+		}();
+
+		return value;
+	}
+
 	bool keep_render_target_blits()
 	{
 		static const bool value = []
 		{
 			wchar_t buffer[16]{};
 			const DWORD written = GetEnvironmentVariableW(L"RPCS3_REMIX_KEEPRT", buffer, static_cast<DWORD>(std::size(buffer)));
-			return written > 0 && written < std::size(buffer) && ::wcstol(buffer, nullptr, 10) != 0;
+
+			// Unset falls through to the config; KEEPRT=0 still overrides a config that says true.
+			if (written == 0 || written >= std::size(buffer))
+			{
+				return g_cfg.video.remix.keep_render_targets.get();
+			}
+
+			return ::wcstol(buffer, nullptr, 10) != 0;
 		}();
 
 		return value;
@@ -955,6 +1035,55 @@ namespace remix_rsx
 
 		m_dirty = true;
 		++m_draws;
+	}
+
+	void compositor::underlay(u32 bgra)
+	{
+		const usz texels = usz{m_width} * m_height;
+
+		if (texels == 0 || m_buffer.size() < texels * 4)
+		{
+			return;
+		}
+
+		const u32 bg_b = bgra & 0xFF;
+		const u32 bg_g = (bgra >> 8) & 0xFF;
+		const u32 bg_r = (bgra >> 16) & 0xFF;
+
+		u8* p = m_buffer.data();
+
+		for (usz i = 0; i < texels; ++i, p += 4)
+		{
+			const u32 a = p[3];
+
+			if (a == 0xFF)
+			{
+				continue;
+			}
+
+			if (a == 0)
+			{
+				p[0] = static_cast<u8>(bg_b);
+				p[1] = static_cast<u8>(bg_g);
+				p[2] = static_cast<u8>(bg_r);
+				p[3] = 0xFF;
+				continue;
+			}
+
+			// The buffer is straight alpha (see blend()), so this is plain 'src over opaque dst':
+			// out = src*a + bg*(1-a), and the result is opaque by construction. Doing it with
+			// premultiplied maths here would darken every partially covered glyph edge.
+			const u32 inv = 0xFFu - a;
+			p[0] = static_cast<u8>((u32{p[0]} * a + bg_b * inv + 127) / 255);
+			p[1] = static_cast<u8>((u32{p[1]} * a + bg_g * inv + 127) / 255);
+			p[2] = static_cast<u8>((u32{p[2]} * a + bg_r * inv + 127) / 255);
+			p[3] = 0xFF;
+		}
+
+		// Counted like any other shaded pixel: a full-screen pass is the compositor's largest
+		// single item and the timing line must not hide it.
+		m_pixels += texels;
+		m_dirty = true;
 	}
 
 	u32 compositor::submit(const remixapi_Interface& api)

@@ -4,6 +4,7 @@
 #ifdef _WIN32
 #include "Emu/RSX/Overlays/overlay_controls.h"
 #include "Emu/RSX/Remix/RemixCompositor.h"
+#include "Emu/RSX/Remix/RemixPreview.h"
 #include "Emu/RSX/Remix/RemixRuntime.h"
 #include "Emu/RSX/Remix/RemixTextures.h"
 #include "Emu/RSX/Remix/RemixTransforms.h"
@@ -42,6 +43,14 @@ public:
 private:
 	void end() override;
 
+	// There is no framebuffer here to clear -- the backend submits geometry to a path tracer and
+	// composites 2D on top -- so this records the colour instead of acting on it. On a frame that
+	// submits no world geometry at all (a splash, a loading screen, a full-screen menu) that
+	// colour IS the picture's background, and submit_compositor() paints it under the overlay.
+	// Without it such a frame shows Remix's empty scene: the grey field behind the Ratchet &
+	// Clank Collection splash and around its menu art.
+	void clear_surface(u32 arg) override;
+
 #ifdef _WIN32
 	struct mesh_entry
 	{
@@ -59,6 +68,14 @@ private:
 		// is the lifetime hole behind permanently-white surfaces (and, on handle reuse, wrongly
 		// textured ones). Not part of the key and never compared - purely a back-reference.
 		remixapi_MaterialHandle material = nullptr;
+
+		// ROUND 58. Geometry bytes handed to CreateMesh for this entry: vertices, indices, and the
+		// blend weight/index arrays when the surface was skinned. Recorded at creation because it
+		// is the only place the counts are in scope, and because the runtime exposes no size for a
+		// handle. Summed over the live map for the 'Remix memory:' line - the mesh cache is the
+		// backend's largest allocation by far (148,696 live meshes measured on RC1), and a count
+		// alone does not say whether that is a few large meshes or a hundred thousand small ones.
+		u64 bytes = 0;
 	};
 
 	struct static_triangle
@@ -139,6 +156,29 @@ private:
 		// before the hold existed. R2 (NPEA00431) measured cam_resolved=10438 cam_fallback=5352,
 		// i.e. 33.9% of frames dropped a perfectly good camera; those frames land here now.
 		u64 cam_held = 0;
+		// ROUND 56, the three the CAMXFLIP round adds. All three print on BOTH arms, because a
+		// measurement that only exists on the armed run cannot be compared with anything.
+		//
+		// cam_xmirror: the submitted WORLD projection had [0][0] < 0, i.e. try_split_once handed us a
+		// view whose row 0 points screen-LEFT and a projection that hides it in a negative x-scale.
+		// MEASURED before any rebuild off score_perspective's own -0.5 dock for m[0][0] < 0 (which
+		// makes an integer score impossible once it fires): 'Remix camera trace:' rows read 8167 x
+		// score=5.500 + 672 x score=4.500 on run pid27232 and 8475 x score=5.500 on run pid30572 -
+		// zero integer scores in 17,314 resolved frames. So the pre-registered reading on this title
+		// is cam_xmirror == cam_resolved on both arms.
+		u64 cam_xmirror = 0;
+		// cam_xflip: the S = diag(-1,1,1,1) insertion was actually applied (CAMXFLIP=1 and the
+		// projection was mirrored). 0 on the control arm by construction, == cam_xmirror on the arm.
+		u64 cam_xflip = 0;
+		// cam_dropped: the latch wiped a camera that WAS valid because the hold ran past
+		// camera_hold_frames (300 flips on this title). This is the number the "camera dropped,
+		// nothing submitted" reading of the MAIN-block flicker needs, and it turns a delta analysis
+		// across live-line windows into one field. MEASURED from the two frozen runs' 'Remix live:'
+		// series: cam_fallback climbed only while cam_resolved was 0 (37 -> 552 in pid30572,
+		// 38 -> 634 in pid27232) and then froze for the whole of gameplay, so the drop path never
+		// fired after the first camera resolved and the expected value here is 0. If it is not 0,
+		// the drop path IS firing and the fallback-keeps-last-camera knob becomes worth building.
+		u64 cam_dropped = 0;
 		// Camera selection is a vote over distinct view/projection pairs observed during a frame.
 		// These counters expose whether a title actually has competing cameras and whether the
 		// bounded census is large enough for it: clusters is the total distinct population,
@@ -290,10 +330,91 @@ private:
 		// live line: 0/0 means the user never clicked, n/0 means every click was seen and none
 		// resolved. Round 1 could not tell those two apart at all.
 		u64 pick_clicks = 0;
+
+		// --- ROUND 57: THE SUB-THRESHOLD BAND, AS A CENSUS ---------------------------------------
+		// The 0.25 drift-census threshold is NOT moved (that threshold is the row threshold of a
+		// capped census and every round-54/55/56 branch is defined on the population above it).
+		// The 0.05-0.25 band goes in counters instead, which is exactly what gl_step1 already is
+		// for lights, so the two mechanisms can be read side by side on one line.
+		//
+		// pf_rows is every 'Remix pick-follow:' row written, the only sound denominator here.
+		// pf_stale / pf_fresh split it by REFERENCE AGE (age = m_frame_counter - latch_frame): a
+		// stale row was divided by the previous frame's flip latch because the draw arrived before
+		// the frame's mid-frame relatch, and that age is the partition that explains the band -
+		// MEASURED 298/298 stale on the two props that visibly swim, 93% fresh on the three level
+		// chunks that do not. pf_step0..4 are d_origin in the gl_step buckets VERBATIM
+		// ([0,0.05) [0.05,0.25) [0.25,1) [1,5) [5,inf)), on non-first rows.
+		// pf_age_unknown counts a row whose camera is invalid or whose latch_frame is somehow in
+		// the future (age reported 0); pf_rot_degenerate a row with a non-positive basis length,
+		// where d_rot cannot be normalised and prints 0.
+		// Partitions by construction, and they are the acceptance check for the whole instrument:
+		//     pf_stale + pf_fresh == pf_rows
+		//     pf_first + pf_step0 + .. + pf_step4 == pf_rows
+		u64 pf_rows = 0;
+		u64 pf_first = 0;
+		u64 pf_stale = 0;
+		u64 pf_fresh = 0;
+		u64 pf_step0 = 0;
+		u64 pf_step1 = 0;
+		u64 pf_step2 = 0;
+		u64 pf_step3 = 0;
+		u64 pf_step4 = 0;
+		u64 pf_age_unknown = 0;
+		u64 pf_rot_degenerate = 0;
+
+		// The 'Remix pick-fresh:' side (RPCS3_REMIX_PICKFRESH=1 only). pf_fresh_rows is every row
+		// written; pf_norelatch the share of those frames that never relatched at all, where the
+		// fresh reference does not exist and origin_fresh is copied from origin; pf_recheck_fail a
+		// row whose re-division by the SAME stale reference did not reproduce the submitted origin
+		// (>1e-5) - if this is not 0 the recomputation is not the live arithmetic and err must not
+		// be read; pf_place_refused a non-finite recomputed matrix. pf_err0..4 are the POSE ERROR
+		// |origin - origin_fresh| in the same buckets, on fresh=1 rows only.
+		// Partition: pf_norelatch + pf_place_refused + pf_err0 + .. + pf_err4 == pf_fresh_rows.
+		u64 pf_fresh_rows = 0;
+		u64 pf_norelatch = 0;
+		u64 pf_recheck_fail = 0;
+		u64 pf_place_refused = 0;
+		u64 pf_err0 = 0;
+		u64 pf_err1 = 0;
+		u64 pf_err2 = 0;
+		u64 pf_err3 = 0;
+		u64 pf_err4 = 0;
+		// ROUND 57, the DEFERPRERELATCH arm only. The relatch flush rebuilds the followed instance's
+		// transform independently of trace_pick_fresh, so d_deferred - the L1 between the two - is a
+		// within-run proof that the transform the runtime actually received IS origin_fresh. It must
+		// be exactly 0; this counts the rows where it was not.
+		u64 pf_deferred_mismatch = 0;
 		// Of the world_fallback population, how many were refused rather than drawn at the
 		// identity. Counted separately so world_fallback stays comparable across every run
 		// taken before the refusal existed. RPCS3_REMIX_DRAWNOWORLD=1 drives this back to 0.
 		u64 world_refused = 0;
+
+		// Round 50. Draws (and the distinct programs behind them) whose position was decoded from
+		// an attribute other than ATTR0, because match_const_affine's widened MUL arm named one.
+		// Both zero on every title whose position really is ATTR0, and both zero on any title at
+		// RPCS3_REMIX_POSINPUT=0, which is what makes this pair the A/B: `pos_input=` climbing is
+		// the fix firing, and `pos_input=` climbing on a title that rendered correctly BEFORE this
+		// round is the regression tell the risk register names.
+		u64 pos_input_draws = 0;
+		u64 pos_input_programs = 0;
+
+		// The vertex-normal decode. Before it, every vertex this backend submitted carried the
+		// CONSTANT object-space normal (0,0,1), so Remix shaded (and skinned) every surface in
+		// every title as if it faced one fixed direction. Four exits, and the partition is exact:
+		// applied + absent + rejected + off == the draws that reached the vertex fill.
+		//   applied  - the attribute mapped and the draw passed the unit-length gate.
+		//   absent   - map_attribute could not reach it (not fed, register-sourced, or unreadable).
+		//   rejected - it mapped and the MEAN pre-normalisation length was outside [0.7, 1.4],
+		//              i.e. whatever is in that slot is not a unit 3-vector. This is the gate that
+		//              makes a wrong NORMALATTR safe: the draw falls back to the old constant
+		//              instead of shading from a texcoord.
+		//   degenerate - per-VERTEX, not per-draw: vertices inside an accepted draw whose own
+		//              length was unusable and which kept the constant.
+		u64 normal_applied = 0;
+		u64 normal_absent = 0;
+		u64 normal_rejected = 0;
+		u64 normal_degenerate = 0;
+		u64 normal_programs = 0;
 
 		// The world_refused subset that failed only because the frame had no camera at all -
 		// per_draw_transform refuses on !m_active_camera.valid before it looks at the program.
@@ -414,6 +535,35 @@ private:
 		// forms it newly resolves are the ones the uvscale-fixed census used to name with
 		// "affine:mul-two-components" or "affine:row-mismatch".
 		u64 uv_affine_lanes = 0;
+		// ROUND 52 (step 2a). S32K draws whose vertex program named a scale slot the constant file
+		// cannot hold (>= 468) and which therefore kept the fixed UVINTSCALE divisor. This is the
+		// population the old u8 store silently CLAMPED to c254 and then read as [0 0 0 0]; it should
+		// read 0 on every title, and a non-zero value is a real ucode form nobody has decoded rather
+		// than a bug that hides itself. Named "slot-range" on the uvscale-fixed census.
+		u64 uv_scale_slot_refused = 0;
+		// ROUND 52 (step 2b). Draws whose affine form was reached through the MOV hop - the
+		// 'MUL(o7, temp, cK)' shape whose temp is a plain move of the attribute. Every one of these
+		// was on the fixed divisor before, so this reads directly against uv_scale_fixed falling.
+		// RPCS3_REMIX_UVSCALEHOP=0 drives it to 0 and hands those draws back to the fixed divisor.
+		u64 uv_affine_hop = 0;
+		// ROUND 52 (step 2c). Draws refused with "affine:mul-two-scales": the program multiplies its
+		// UVs by TWO constants in series (the dequant and a material multiplier) and uv_affine_form
+		// carries one. Refused rather than half-applied; the scalar path still supplies the dequant
+		// alone. Non-zero means the census names the programs whose second constant is worth reading
+		// out of 'tc0consts:' before anyone adds a second scale slot.
+		u64 uv_affine_two_scales = 0;
+		// --- ROUND 58 -----------------------------------------------------------------------
+		// uv_lane_zw: draws that replayed the .zw lane pair's affine form instead of the .xy
+		// one, because the fragment program samples that unit through .zw
+		// (fp_fingerprint::coord_lanes). RPCS3_REMIX_UVLANES=0 drives it to 0.
+		// uv_lane_refused: draws whose unit is sampled through BOTH pairs, so there is no single
+		// form to apply. Reported, not judged - it names a shape, not a fault.
+		// uv_affine_scale2: draws that multiplied by a SECOND scale slot, i.e. the two-scale
+		// family resolved rather than refused. RPCS3_REMIX_UVSCALE2=0 drives it to 0, and
+		// uv_affine_two_scales is then what those draws count as instead.
+		u64 uv_lane_zw = 0;
+		u64 uv_lane_refused = 0;
+		u64 uv_affine_scale2 = 0;
 		// Draws whose *submitted* UVs left the unit square by more than a texel's slack, i.e. the
 		// material repeats at least once. Not a fault on its own - content tiles on purpose - but
 		// it is the size of the population the uvrange census names, and the number that has to
@@ -456,6 +606,26 @@ private:
 		// containment tests in albedo_unit_mask (no bindable unit, or the same unit either way)
 		// are what declined.
 		u64 tex_albedo_narrow = 0;
+		// --- ROUND 58: the two new election rules, and the greymap readout ---------------------
+		// Same shape and same reading as tex_albedo_narrow above: each counts only draws the rule
+		// actually MOVED, each is a subset of tex_albedo_guess on the declining path, and 0 with
+		// the knob armed means the containment test declined - not that the rule is broken.
+		//
+		// tex_albedo_lerp: the fragment program states colour = tex[a] + w*(tex[b]-tex[a]) with
+		// w > 0.5, so tex[a] is the minor term and was dropped (RPCS3_REMIX_FPLERPUNIT).
+		// tex_albedo_lane: the unit was sampled through the vertex program's MACRO lane pair while
+		// a wide colour unit sits on the other pair (RPCS3_REMIX_UVLANES).
+		u64 tex_albedo_lerp = 0;
+		u64 tex_albedo_lane = 0;
+		// MEASUREMENT ONLY, no knob and never an election input. tex_albedo_grey counts draws whose
+		// BOUND albedo entry reads as a black-and-white macro/grime map (texture_entry::greymap(),
+		// sat_mean < 4 && lum_sd > 40); tex_albedo_grey_alt counts the subset of those where the
+		// elected mask still held two or more wide colour units, i.e. an alternative existed. The
+		// ratio is the within-run statement of how much of the population the rules above address:
+		// on Eat Lead every greymap election measured offline has a wide alternative in the same
+		// mask, so the two should be close. A greymap with no alternative is a different problem.
+		u64 tex_albedo_grey = 0;
+		u64 tex_albedo_grey_alt = 0;
 		// Retries the ucode refused to sanction: the first unit yielded no material and the program
 		// named no *other* colour source to walk to. Before this refusal existed the loop walked to
 		// the next referenced unit regardless, which on Resistance 2 (NPEA00431) is unit 1 - 566
@@ -530,6 +700,70 @@ private:
 		// Large relative to the votes means the audit is looking at geometry it cannot read, and
 		// the ok/bad split above describes a minority of what is actually on screen.
 		u64 ui_vflip_abstain = 0;
+
+		// --- ROUND 52: the four 2D-compositor gaps, one counter per outcome ----------------------
+		// Appended at the END of the ui group on both 'Remix stats:' and 'Remix live:', with their
+		// arguments in the matching position - three other implementers are editing other groups of
+		// the same two format strings this round and an append is the only edit shape that cannot
+		// shift an unrelated pair.
+		//
+		// Every one of these is structurally 0 on a title whose 2D programs route their colour
+		// through ATTR3 and state no texcoord scale, i.e. on everything measured before Eat Lead, so
+		// a non-zero reading is proof the round-52 route is armed and firing rather than a number
+		// that needs interpreting.
+		//
+		// ui_tint_texcoord           draws whose tint came from the attribute the ucode names
+		//                            (fp_fingerprint::out_tint_texcoord -> texcoord_input[n])
+		//                            instead of the hardcoded ATTR3. Expect ~ui_draws for
+		//                            vp=f2b6988e84056628 on BLUS30267.
+		// ui_tint_texcoord_unmapped  the FRAGMENT program named a TEXn but the VERTEX program's
+		//                            table has no attribute for it. Refuse-and-count: the draw keeps
+		//                            ATTR3. Non-zero means resolve_output_input refused that write
+		//                            and the tc slice in the dump names which program.
+		// ui_tint_pass_rgbdrop       a texcoord_pass draw whose albedo is NOT a B8 coverage sheet.
+		//                            The ucode discards the sampled rgb there and the compositor's
+		//                            modulate multiplies it in, so this counts the population where
+		//                            the replay is approximate rather than exact.
+		// ui_force_opaque_skipped    full-screen draws that would have been slammed to alpha 255 by
+		//                            the Haze force_opaque rule and were not, because their alpha
+		//                            came from a resolved attribute. This is the counter behind
+		//                            "the wall is gone".
+		// ui_uv_ucode                draws whose texcoords were scaled by the constant the program
+		//                            itself multiplies by (texcoord_affine / texcoord_scale_slot).
+		// ui_uv_ucode_refused        the program named a slot and it could not be read, or the
+		//                            coefficients were not finite. The raw attribute is kept.
+		// ui_forced_dw               draws admitted to the compositor ONLY because
+		//                            RPCS3_REMIX_UIFORCEVPDW dropped the !depth_write term. A strict
+		//                            subset of ui_forced.
+		u64 ui_tint_texcoord = 0;
+		u64 ui_tint_texcoord_unmapped = 0;
+		u64 ui_tint_pass_rgbdrop = 0;
+		u64 ui_force_opaque_skipped = 0;
+		u64 ui_uv_ucode = 0;
+		u64 ui_uv_ucode_refused = 0;
+		// Draws where the general 2D ucode scale stood down because the title-specific block
+		// had already applied the same c467 component. Climbing == the double multiply that
+		// flattened Demon's Souls' inventory icons is being avoided.
+		u64 ui_uv_double_skipped = 0;
+		u64 ui_forced_dw = 0;
+		// ROUND 59, appended at the END of the ui group - two specifiers, two arguments, adjacent.
+		//
+		// ui_forced_dw_preworld    a UIFORCEVP-listed, DEPTH-WRITING draw that mode 1 would have
+		//                          admitted and RPCS3_REMIX_UIFORCEVPDW=2 refused, because the frame
+		//                          had submitted no world draw yet (m_frame_world_draws == 0). The
+		//                          draw is NOT dropped - it keeps the world path it takes today.
+		//                          Structurally 0 at modes 0 and 1 and with an empty UIFORCEVP.
+		//                          READING on Eat Lead's menu: ~1 per frame = the DXT1 backdrop
+		//                          fp=0bde04241aed1c6a, whose every census row reads world_before=0.
+		//                          0 while the mode is 2 and uiforce_vps>0 means the term never
+		//                          fired, so check the backdrop is not being composited instead.
+		// ui_refused_fp            2D draws dropped by RPCS3_REMIX_UIREFUSEFP after their census row
+		//                          and their UIDUMP BMP and before the triangle loop. Structurally 0
+		//                          with the list empty. Not counted in ui_draws, which keeps meaning
+		//                          "rasterised", so ui_draws + ui_refused_fp is what reached the
+		//                          compositor.
+		u64 ui_forced_dw_preworld = 0;
+		u64 ui_refused_fp = 0;
 		u64 skin_submitted = 0;
 		u64 skin_skipped = 0;
 		u64 skin_bones_max = 0;
@@ -580,6 +814,10 @@ private:
 		u64 idxbias_refused = 0;
 
 		u64 skip_vp = 0;
+		// ROUND 51. Draws refused before decode because the guest could not see them: RGB colour
+		// mask all off (SKIPCMASK), and no colour target at all (SKIPNOTARGET).
+		u64 skip_cmask = 0;
+		u64 skip_notarget = 0;
 		u64 skip_albedo = 0;
 
 		// ROUND 45. skip_albedo is the SUM of six independent gates, and for eleven rounds it was
@@ -640,6 +878,13 @@ private:
 		u64 vp_indexed_matched = 0;
 		u64 vp_indexed_unmatched = 0;
 
+		// Round 52. Programs, not draws: how many unique vertex programs matched as the TRANSPOSED
+		// blend (match_vertex_blend) rather than as match_blend_palette's row blend. A strict subset
+		// of vp_indexed_matched. Expected 8 on Eat Lead (BLUS30267) - the six main character
+		// programs plus the two colour-mask-skipped shadow passes - and 0 on Resistance 2, Haze and
+		// Demon's Souls, which is the check that the new arm changed no program that already matched.
+		u64 vp_vertex_blend = 0;
+
 		// Draws refused because a palette entry's 3x3 basis does not span three dimensions
 		// (has_usable_basis). Separate from the other refusals because it means the *index* is
 		// landing outside the palette, not that the palette is unreadable - it is the counter that
@@ -668,6 +913,14 @@ private:
 		// within 1/32 and were normalised. Non-zero means the weight attribute is not stored the
 		// way this assumes, and the number says how much of the scene is affected.
 		u64 skin_blend_submitted = 0;
+
+		// Round 52. Draws, not programs: skinned draws whose program matched as the transposed
+		// blend. Counted beside indexed_world_skinned so a play-test can say "the arm is on the
+		// characters in front of me" rather than only "the matcher liked the program". Bounded above
+		// by indexed_world_skinned; 0 while vp_vertex_blend is non-zero means the programs matched
+		// and every draw of them was then refused downstream - read skinblend_* for which gate.
+		u64 skin_vertex_blend = 0;
+
 		u64 skin_blend_refused_index = 0;
 		u64 skin_blend_refused_weight = 0;
 		u64 skin_blend_refused_bone = 0;
@@ -746,6 +999,15 @@ private:
 		//             extent at the point DrawInstance returned success, not at the gate.
 		u64 wext_examined = 0;
 		u64 wext_exempt = 0;
+
+		// ROUND 53. The subset of the exemption that RPCS3_REMIX_SKYEMISSIVEWEXT alone is
+		// responsible for: a draw whose albedo is on the sky-emissive set (list or promoted) and
+		// which was NOT already exempt as is_sky or as R2's visible backdrop. Marginal by
+		// construction, so it answers "what did this knob change" rather than "how many exemptions
+		// were there". On Eat Lead it is expected to climb one or two per frame while the dome is
+		// on screen, with wext_refused flat; 0 with a sky-emissive list set means the dome was
+		// never drawn in that run (an interior level), not that the knob failed.
+		u64 wext_exempt_sky = 0;
 		u64 wext_nonfinite = 0;
 		u64 wext_refused = 0;
 		u64 wext_flagged_drawn = 0;
@@ -783,6 +1045,15 @@ private:
 		// draw this stays 0, and on Haze it should absorb most of that population. High here with
 		// no visible sky improvement means the rule is admitting something that is not a ring.
 		u64 sky_learned_ring = 0;
+
+		// ROUND 53 (RPCS3_REMIX_SKYTAG=0). Draws that every rule above agreed to tag SKY and which
+		// were then NOT tagged, because the SKY category's meaning is fork-dependent (hidden on an
+		// aerial-descended runtime, re-cameraed on numos3) and a title whose sky is carried by
+		// SKYEMISSIVE does not need it. The counters above are untouched by the switch - they
+		// still say what each rule would have done - so this one against them is the whole reading:
+		// sky_tag_suppressed == the tags withheld, cat_sky == 0. cat_sky non-zero with skytag=0 on
+		// the banner means the switch is wired wrong, not that a rule found more sky.
+		u64 sky_tag_suppressed = 0;
 
 		// The subset of sky_refused_anchor measured against a *held* camera - a frame that resolved
 		// no candidate of its own and reused the previous frame's (m_camera_age != 0). Those are the
@@ -1095,6 +1366,99 @@ private:
 		// counts the ONE frame it was condemned; this counts every draw it is turned away after.
 		u64 guest_light_movingrepeat = 0;
 
+		// --- ROUND 52: the lights sit in the wrong place and move with the camera -----------------
+		// A guest light's position is the fixture's local AABB centre pushed through the draw's
+		// transform, and on BLUS30267 that transform is `fused * m_active_camera.reference_inverse`
+		// and nothing else -- the gauge-anchor branches never fire on this title (gauge_used=0
+		// gauge_prev=0 against gauge_absent=4466710 on run pid=29940, =2055599 on the independent
+		// re-read). So "world" is a per-frame camera-relative basis, and a light minted once and
+		// never re-placed is wrong from the next re-basing onwards. These five size the three
+		// measured mechanisms.
+		//
+		// Draws refused by RPCS3_REMIX_GUESTLIGHTMAINCLIP: the bulb program 30086232b02bc73a also
+		// draws into 128x128 targets, and divided by the MAIN camera's inverse such an aux copy
+		// lands at a projectively wrong scale -- measured extent 1.281 / 1.732 (run 29940 frame
+		// 1258) and 1.556 / 2.068 (run 20656 frame 2724) against 0.5 / 0.578 on the main pass.
+		u64 guest_light_auxclip = 0;
+		// Identity re-hits whose recovered world position moved more than 0.25 units since the last
+		// placement. Accumulated on BOTH arms (GUESTLIGHTTRACK=0 measures what TRACK=1 would have
+		// corrected), the camframe_corrected pattern. _stale is the subset seen with
+		// m_camera_age != 0, i.e. drift attributable to a HELD camera rather than a donor change:
+		// run 29940 frames 1255-1258 minted the same FC43 bulb at [17.29 9.106] -> [16.68 10.89] ->
+		// [15.93 12.68] -> [15.04 14.46], ~1.9 units/frame, while the camera was byte-identical
+		// with cam_age climbing 0,1,2,3.
+		u64 guest_light_drift = 0;
+		u64 guest_light_drift_stale = 0;
+		// Re-placements actually issued (TRACK=1 only): CreateLight on the SAME hash, which the
+		// runtime treats as an in-place update.
+		u64 guest_light_replaced = 0;
+		// A second draw claimed the same frame-invariant identity at a different place in the same
+		// frame -- an instanced fixture sharing one local AABB centre. Must read 0 on this title;
+		// non-zero means the identity needs an instance term.
+		u64 guest_light_track_conflict = 0;
+
+		// --- ROUND 54: THE DENOMINATOR AND THE STEP HISTOGRAM ------------------------------------
+		// gl_tracked is every identity re-hit, i.e. every frame a tracked lamp was drawn at all. It
+		// is the ONLY sound denominator for a drift rate. The A/B that produced "CAMREBASE made drift
+		// 5x more frequent" normalised drift rows per camera flip, and nothing in the build logs how
+		// many frames a lamp was on screen -- guest_light_replaced (moves over 0.05) read 168 in a
+		// 5,933-line run against 233 in a 4,619-line one, i.e. the player simply spent more of the
+		// second run looking at lamps. Every rate from here on is per gl_tracked, and a rate is only
+		// ever compared with another rate FROM THE SAME RUN.
+		u64 gl_tracked = 0;
+		// The same population split by the size of the step, buckets [0,0.05) [0.05,0.25) [0.25,1)
+		// [1,5) [5,inf). gl_step0+..+gl_step4 == gl_tracked is an acceptance check, not a hope: if it
+		// fails the instrumentation is wrong and the census must not be read. The reading is branch
+		// (d) of the decision table: mass at <0.05 and at 0.25-1 with a trough between means the
+		// drift rows are discrete events and the table is complete; a smooth tail through 0.05-0.25
+		// means a continuous sub-threshold jitter exists and the rows are only its tail. Report both.
+		// The 0.25 threshold is NOT moved on the strength of this - the histogram is what says
+		// whether moving it would even mean anything.
+		u64 gl_step0 = 0;
+		u64 gl_step1 = 0;
+		u64 gl_step2 = 0;
+		u64 gl_step3 = 0;
+		u64 gl_step4 = 0;
+		// Drift rows classified by the FRESHNESS TRANSITION: f = the placement was made on a
+		// reference latched in its own frame (age 0), s = on an older one. fs is one frame of camera
+		// motion appearing; sf is the snap-back; ss is the change of motion between two equally stale
+		// placements; ff is the population that needs the reference-identity test, because neither
+		// placement was stale and the light moved anyway.
+		u64 gl_drift_ff = 0;
+		u64 gl_drift_fs = 0;
+		u64 gl_drift_sf = 0;
+		u64 gl_drift_ss = 0;
+		// GLDRIFTMAT rows whose fused matrix was not available (the draw took a branch of
+		// per_draw_transform that does not set m_ref_pick_fused). The row still prints, with
+		// fused_valid=0; only the G-lamp translation/decode split needs the fused half.
+		u64 gl_mat_unavailable = 0;
+		// Insurance, and it must read 0: a drift row whose OLD placement had no frame or no latch
+		// stamped. The site sits inside the identity-match loop, which a never-placed entry cannot
+		// reach, so a non-zero value means an entry is reaching the census by some other route and
+		// old_age on those rows is a printed 0 rather than a measurement.
+		u64 gl_drift_noold = 0;
+
+		// --- ROUND 52: AUTHORED LEVEL LIGHTS ------------------------------------------------------
+		// The extracted list from bin/eatlead_lights/<Level>.lights. loaded/placed are set ONCE at
+		// load and are constants for the run (records read, and the subset carrying a world
+		// placement); the other four accumulate per frame.
+		//
+		// Reading them: submitted climbing while nothing new is lit says the lights reach the runtime
+		// and land somewhere the player is not -- which is the placement transform, not the plumbing.
+		// createfail non-zero is the runtime refusing them and is a different problem entirely.
+		// culled_dist + capped is how much of the level never left the CPU.
+		u64 authored_loaded = 0;
+		u64 authored_placed = 0;
+		u64 authored_submitted = 0;
+		u64 authored_culled_dist = 0;
+		u64 authored_capped = 0;
+		u64 authored_createfail = 0;
+		// Draws maybe_inject_guest_light() refused because AUTHOREDLIGHTS=1 (authored only). Counted
+		// rather than achieved by blanking GUESTLIGHTALBEDO, so the suppression is VISIBLE on
+		// 'Remix live:' and the run-start banner still states the derived path's real configuration.
+		// Structurally 0 at modes 0 and 2.
+		u64 guest_light_suppressed = 0;
+
 		// --- round 48 -------------------------------------------------------------------------
 		// AUTO candidates refused because the draw was the player's own viewmodel. Round 41's
 		// GUESTLIGHTAUTO=2 put lights on the arms/weapon and on soldiers; this counter sizes the
@@ -1147,6 +1511,22 @@ private:
 		// Non-zero here with DEFERPREANCHOR=0 is expected and harmless - the count is taken at the
 		// election, which runs regardless; it only changes behaviour when deferral is enabled.
 		u64 defer_absent_declined = 0;
+
+		// --- ROUND 57: the relatch deferral (RPCS3_REMIX_DEFERPRERELATCH) -------------------------
+		// armed   : world draws held because the frame's own camera reference had not arrived yet.
+		//           Its population is world_ref_stale, MEASURED at 207,124 of 3,087,767 (6.7%).
+		// flushed : those actually re-divided and submitted at the relatch. armed - flushed is the
+		//           residue that reached flip on a frame that never relatched, and goes out through
+		//           flush_deferred_at_flip with the transform it carried - today's behaviour, one
+		//           flush later, never a lost draw.
+		// vmop    : held draws carrying a viewmodel operator, which the relatch flush leaves with
+		//           their immediate transform rather than re-deriving. Structurally 0 here: the
+		//           viewmodel branch clears defer_candidate before this arm can set it.
+		// Partitions: defer_relatch_armed + defer_absent_declined == gauge_anchor_absent, and
+		// defer_buffered == defer_flushed_fresh + defer_relatch_flushed + defer_flushed_flip.
+		u64 defer_relatch_armed = 0;
+		u64 defer_relatch_flushed = 0;
+		u64 defer_relatch_vmop = 0;
 
 		// --- ROUND 46: the tag-only viewmodel population, and its operator replay -----------------
 		// A FUNNEL, and each stage is counted where it actually happens rather than where it is
@@ -1384,6 +1764,137 @@ private:
 		// that stops being reported: cam-elect lines go quiet while this climbs.
 		u64 cam_fallback_relatch = 0;
 
+		// --- round 52 ---------------------------------------------------------------------------
+		// Candidate observations that would have relatched the active camera under the shipped
+		// 0.8 discontinuity tolerance and do not under RPCS3_REMIX_CAMRELATCHTOL. This IS the Eat
+		// Lead menu population: the animated parts sitting 0.40 from the static winner that the
+		// submitted camera used to follow. Structurally 0 at CAMRELATCHTOL=0.8 (the default), so a
+		// non-zero value is proof the knob was armed and reached something; it must climb at
+		// roughly one per menu frame while cam_relatch keeps up with cam_resolved.
+		u64 cam_relatch_refused = 0;
+
+		// --- ROUND 54: WHAT THE MID-FRAME RELATCH TOOK -------------------------------------------
+		// The relatch takes the FIRST candidate of the frame that is within CAMRELATCHTOL of the
+		// active camera. That predicate is a relative delta on the raw view; the witness tracker's is
+		// a 1.0-unit distance on the implied eye. They are different tests on different quantities,
+		// and run B's rows already show them disagreeing (frames 1880-1881: the tracker had the
+		// incumbent unmatched for two frames while the relatch fired on both, moving every lamp by an
+		// identical [-0.01 +1.569 0] - a pure translation, i.e. a reference taken from a DIFFERENT
+		// OBJECT). These three say how often that happens and partition cam_relatch_midframe exactly:
+		//   incumbent - the relatched draw's eye was within CAMTRACKPOS of the incumbent track
+		//   foreign   - it was not: the reference came from something the tracker is not following
+		//   noinc     - there was no live incumbent to compare against (boot, or after a track death)
+		// The sum must equal cam_relatch. They accumulate whether or not CAMRELATCHTRACE is armed.
+		u64 cam_relatch_incumbent = 0;
+		u64 cam_relatch_foreign = 0;
+		u64 cam_relatch_noinc = 0;
+		// The flip-time cross-check on the frames that had both a relatch and a matched incumbent:
+		// how far the relatch's draw sat from the cluster the tracker matched the incumbent to.
+		// 0.05 units is the reading threshold (s_camera_witness_tolerance's magnitude, ~3x the p50
+		// per-frame eye step). disagree > 0 with X-relatch drift rows whose d equals the disagree d
+		// is the finding that the relatch is refreshing from siblings - an identity fault, not a
+		// tolerance one. Census 'Remix cam-relatch-disagree:' under CAMRELATCHTRACE.
+		u64 cam_relatch_agree = 0;
+		u64 cam_relatch_disagree = 0;
+
+		// ROUND 55. refused: a mid-frame relatch that CAMREFSYNTH turned down because the candidate
+		// draw was outside CAMTRACKPOS of a LIVE incumbent - the sibling-hijack of run-54 frame 1568,
+		// and structurally every candidate on a synthesised frame. It is NOT part of the
+		// incumbent/foreign/noinc partition: those count relatches that HAPPENED, and a refused one
+		// does not. 0 on the CAMREFSYNTH=0 arm; on the armed arm cam_relatch_foreign should read 0
+		// because every foreign candidate is refused before it installs.
+		u64 cam_relatch_foreign_refused = 0;
+		// ROUND 55, MEASUREMENT ONLY, accumulates on both arms. A flip that installed a submitted view
+		// more than s_camera_pending_match_tolerance (0.5) from the active one - the visible teleport,
+		// counted. Both sides are SUBMITTED views, so a CAMREBASE-bridged handover reads as continuous
+		// and is not a switch. 0.5 is a READING threshold, not a gate: nothing branches on this.
+		u64 cam_basis_switch = 0;
+
+		// RPCS3_REMIX_CAMSTICKY, the two outcomes that partition it. kept: the frame elected the
+		// active camera's own cluster over a cluster with STRICTLY MORE votes - the flip-flop that
+		// did not happen (baseline: 54 of Eat Lead's 72 gameplay identity changes, mean margin 2.3
+		// votes). lost: the frame had clusters but none of them was the active camera's own, so the
+		// vote moved the identity as it does today. lost is the reading that says whether a sticky
+		// HOLD is worth having - 48 gameplay frames of the baseline run were in that state, and
+		// whether those are real cuts or one-frame gaps is what this number answers.
+		u64 cam_sticky_kept = 0;
+		u64 cam_sticky_lost = 0;
+
+		// --- round 53 ---------------------------------------------------------------------------
+		// RPCS3_REMIX_CAMTRACK, the branches of the tenure election. Under CAMTRACK the two counters
+		// above still describe THE VOTE, not the elected identity: the vote runs unchanged and the
+		// track election then overrides its result, so cam_sticky_kept/lost no longer say anything
+		// about how often the camera identity moved. These do.
+		//   kept:      the incumbent track was matched this frame and kept the identity.
+		//   override:  the subset of kept where the frame's VOTE winner was a different cluster, so
+		//              the rule is what decided the frame. Simulation says 55.7% of frames; below 5%
+		//              means the mechanism is not deciding at all - check the banner and camlock.
+		//   missed:    the incumbent is alive but was not drawn this frame, so the frame's candidate
+		//              is discarded and the existing latch holds m_active_camera (cam_held counts
+		//              the same frame). Must stay under ~5% of gameplay frames.
+		//   handover:  the incumbent died and the longest-tenured matched track was elected. THIS is
+		//              the number the whole round is about: baseline 84 identity changes in 4,761
+		//              frames, simulated 16.
+		//   reset:     a handover with no live track that had been co-present with the dead incumbent
+		//              inside the miss window - a real cut. <= 4 per session in gameplay.
+		//   expired:   any track that went unmatched past CAMTRACKMISS and was dropped.
+		//   overflow:  a frame's cluster had no free track slot. Must read 0; non-zero means
+		//              s_max_camera_tracks is too small and the census is silently incomplete.
+		u64 cam_track_kept = 0;
+		u64 cam_track_override = 0;
+		u64 cam_track_missed = 0;
+		u64 cam_track_handover = 0;
+		u64 cam_track_reset = 0;
+		u64 cam_track_expired = 0;
+		u64 cam_track_overflow = 0;
+
+		// RPCS3_REMIX_CAMREBASE. applied: a handover bridged by the measured relation, so nothing
+		// Remix can see moved. refused: the bridge self-check residual exceeded the pending-match
+		// tolerance - the pair was not rigid, which is what a cut across a real shot change looks
+		// like - so R was reset instead. reset: R returned to the identity at a cut; under B this
+		// should equal cam_track_reset. bypassed: a TRIPWIRE, not a mechanism - a gauge-path write of
+		// m_active_camera.view happened while R was live, which would leave the camera and the
+		// per-draw worlds on different bases. gauge_absent is 100% on Eat Lead so it must read 0; a
+		// non-zero value on another title says the gauge path has to be taught the rebase before B
+		// can be armed there.
+		u64 cam_rebase_applied = 0;
+		u64 cam_rebase_refused = 0;
+		u64 cam_rebase_reset = 0;
+		u64 cam_rebase_bypassed = 0;
+
+		// Witness consistency, measured this round and acted on in none of it. A rigid pair's
+		// relation is constant to split noise (~1e-3); a witness whose relation to the incumbent
+		// drifts past s_camera_witness_tolerance is moving (an NPC, a vehicle, a door). When two or
+		// more witnesses drift in the SAME frame the common term is the incumbent, so it is the
+		// incumbent that is moving - the failure where the whole level slides while the player stands
+		// still. Printed as cam_witness_moving / cam_incumbent_moving on 'Remix live:'; a non-zero
+		// incumbent count is what would justify CAMREBASE mode 2 in a later round.
+		u64 cam_track_witness_moving = 0;
+		u64 cam_track_incumbent_moving = 0;
+
+		// ROUND 55, RPCS3_REMIX_CAMREFSYNTH. The first SIX partition cam_track_missed exactly while
+		// CAMREFSYNTH != 0 (and are all 0 while it is 0): every miss flip either synthesises the
+		// incumbent's reference from a co-present witness, or refuses for exactly one named reason and
+		// holds exactly as today. In test order:
+		//   basis     - the active camera is not in the incumbent's basis (a confirm is pending on a
+		//               new witness, or the incumbent's basis was never installed). Nothing to refresh.
+		//   nowitness - no other matched track shares the incumbent's identity keys AND carries a
+		//               relation anchored against THIS incumbent.
+		//   short     - the pair was co-present for a single frame, so rigidity cannot be tested at all.
+		//   rigid     - rel_last vs rel_first moved past s_camera_witness_tolerance: the "witness" is
+		//               moving, and synthesising from it would drag the world with it.
+		//   badrel    - the relation or the resulting view would not invert, the self-check residual
+		//               exceeded the bridge's own tolerance, or a matrix came out non-finite.
+		// cam_ref_synth_install is separate and counts MODE-2 bypasses of the 12-frame discontinuity
+		// confirm; it is not part of the partition.
+		u64 cam_ref_synth = 0;
+		u64 cam_ref_synth_nowitness = 0;
+		u64 cam_ref_synth_short = 0;
+		u64 cam_ref_synth_rigid = 0;
+		u64 cam_ref_synth_basis = 0;
+		u64 cam_ref_synth_badrel = 0;
+		u64 cam_ref_synth_install = 0;
+
 		// The continuity-elected gauge anchor, three counters that partition the new behaviour.
 		// parked: a frame's FIRST same-key candidate disagreed with the slot's previous-frame
 		//         gauge and was held aside instead of seizing the slot (the Selva fix firing).
@@ -1449,6 +1960,16 @@ private:
 		// reaches I3.w (the flower). This is the partition term against round 10's fpvcol_applied:
 		// a drop there of exactly this size is the route gate working as designed.
 		u64 vcol_route_blocked = 0;
+		// The vcol_route_blocked SUBSET whose alpha was submitted anyway because the draw is
+		// blended and ATTR3 carried a real gradient. Climbing == raster fades and sprite cards
+		// are no longer arriving opaque.
+		u64 vcol_alpha_only = 0;
+		// The vcol_route_blocked subset whose colour was recovered from the TEXCOORD the fragment
+		// program modulates by, rather than from COL0 the vertex program never wrote. `unmapped`
+		// is the refuse-and-count twin: the fp named a varying the vp table has no attribute for,
+		// or the decode failed part way and every vertex was put back.
+		u64 vcol_tint_texcoord = 0;
+		u64 vcol_tint_unmapped = 0;
 
 		// Draws whose replay multiplied the decoded ATTR3 by the transform constants the ucode
 		// multiplies it by. RPCS3_REMIX_VCOLFOLD=0 drives it to 0 without disabling the replay.
@@ -1831,6 +2352,82 @@ private:
 		// tested directly rather than inferred from a residual.
 		f32 viewport_scale[2] = { 0.f, 0.f };
 		f32 viewport_offset[2] = { 0.f, 0.f };
+
+		// ROUND 53, RPCS3_REMIX_CAMREBASE. When R is live the SUBMITTED view is R x raw view and
+		// reference_inverse / view_proj_inverse carry R^-1, so every continuity predicate that asks
+		// "is this the same camera one frame later" has to compare the RAW views - the rebased ones
+		// differ by a whole bridge at exactly the frame the predicate is being asked about. raw_view
+		// keeps the pre-rebase matrix for those readers (raw_view_of) and rebased says whether it is
+		// filled. Nothing reads either under CAMTRACK alone, where the rebase never runs.
+		bool rebased = false;
+		remix_rsx::mat4 raw_view{};
+	};
+
+	// ROUND 53. One witness object followed over time. The clusters of a frame are placed objects'
+	// bases (split(M_obj x V x P)), so "the camera" is a choice of witness; a track is that choice
+	// held across frames by POSITION CONTINUITY of the implied eye plus the camera_own_cluster
+	// identity keys, which is what the vote has no notion of.
+	struct camera_track
+	{
+		bool valid = false;
+		u32 id = 0;
+		u64 first_frame = 0;
+		u64 last_frame = 0;
+		// Consecutive frames with no matching cluster. Past camera_track_miss_frames() the track dies.
+		u32 missed = 0;
+		// Cumulative observations, the tie-break under tenure.
+		u64 votes = 0;
+		// Set when this witness's relation to the incumbent drifted (CAMREBASE only). A moving
+		// witness must not be elected; this round only counts and skips it.
+		bool moving = false;
+
+		// The camera_own_cluster identity keys, plus the program, which is a preference and not a
+		// key (a moving viewpoint's first-observed program alternates - cosmetic).
+		u64 vp_hash = 0;
+		u32 surface_offset = 0;
+		u32 color_target = 0;
+		u32 clip_width = 0;
+		u32 clip_height = 0;
+		remix_rsx::vp_archetype archetype = remix_rsx::vp_archetype::unknown;
+		bool has_reference = false;
+		u32 group_count = 0;
+
+		// Always the RAW view, never a rebased one: the tracker's whole job is to decide identity,
+		// and identity is a property of the title's matrices, not of the basis we submit.
+		remix_rsx::mat4 view{};
+		remix_rsx::mat4 projection{};
+		f32 position[3] = { 0.f, 0.f, 0.f };
+		f32 score = 0.f;
+
+		// This frame's claimed cluster index, umax when unmatched. Reset at the head of every flip.
+		u32 matched_index = umax;
+
+		// The last frame in which this track and the incumbent were BOTH matched. A handover can
+		// only be bridged from a track that was co-present inside the miss window; without one the
+		// handover is a real cut. Maintained under CAMTRACK alone as well, where it is the only
+		// thing that separates cam_track_handover from cam_track_reset.
+		u64 copresent_frame = umax;
+
+		// CAMREBASE or CAMREFSYNTH: rel = this.view x inverse(incumbent.view) = M_this x M_incumbent^-1,
+		// which is constant for a rigid pair because the true camera cancels. rel_first is the first one
+		// observed against the current incumbent and is what a drift is measured against; rel_last is
+		// the freshest, and the two raw views it was built from are kept so the bridge can self-check
+		// against the frame it was actually measured in. (Round 55 un-gated the table from CAMREBASE so
+		// the reference synthesis can read it; the 'moving' verdict above stays CAMREBASE-only.)
+		bool rel_valid = false;
+		remix_rsx::mat4 rel_first{};
+		remix_rsx::mat4 rel_last{};
+		u64 rel_first_frame = umax;
+		u64 rel_last_frame = umax;
+		remix_rsx::mat4 rel_last_view{};
+		remix_rsx::mat4 rel_last_incumbent_view{};
+
+		// ROUND 55. The incumbent id rel_first was anchored against; a relation is only ever used
+		// against that incumbent. The CAMREBASE handover loop clears every stored relation when the
+		// incumbent changes, but the refsynth arm reads relations on ordinary miss flips too, so the
+		// stamp is what makes "this rel belongs to the current incumbent" checkable at the point of use
+		// rather than depending on a clearing pass that only runs under CAMREBASE.
+		u32 rel_incumbent_id = umax;
 	};
 
 	// The gauge anchor: one render pass's own view x projection, taken from a draw the title
@@ -1932,10 +2529,63 @@ private:
 	void submit_camera();
 	void update_camera_candidate();
 	void consider_camera_candidate(const camera_candidate& candidate, bool reserved_attempt = false);
+	// ROUND 52. "This candidate is the active camera one frame later", factored out of the
+	// mid-frame relatch so the relatch and the CAMSTICKY vote cannot drift apart.
+	bool camera_own_cluster(const camera_candidate& value, f32 view_tolerance) const;
+
+	// ROUND 53, RPCS3_REMIX_CAMTRACK. Called once per flip, before anything else in the flip's
+	// camera block reads m_frame_candidate. Matches this frame's cluster census against the live
+	// tracks, elects by tenure, and expresses the result by REWRITING m_frame_candidate - the round-10
+	// CAMFBRELATCH shape - so the source-change test, the 12-frame confirm, the age and every counter
+	// below it still run exactly as they do today.
+	void update_camera_tracks();
+
+	// RPCS3_REMIX_CAMREBASE. Rewrites a candidate from the title's raw basis into the basis the
+	// session has been submitting: view = R x raw view, reference_inverse and view_proj_inverse
+	// post-multiplied by R^-1 so world' x (R x V) x P = fused stays exact, and position re-derived
+	// from the rebased view. Idempotent (a candidate already rebased is left alone) and a no-op while
+	// R is not live.
+	void rebase_camera(camera_candidate& value) const;
+
+	// ROUND 55, RPCS3_REMIX_CAMREFSYNTH. Builds the candidate the INCUMBENT would have produced this
+	// frame had it been drawn, out of a co-present static WITNESS's cluster and the rigid relation the
+	// pair expressed while both were drawn: rel = M_J x M_I^-1, so view_I = rel^-1 x view_J and
+	// reference_inverse_I = reference_inverse_J x rel. Same algebra as rebase_camera with R = rel^-1,
+	// and it uses the same self-check the bridge does (self_check is the residual, written on both the
+	// accept and the refuse path so a refusal can be read). Returns false - and writes nothing usable
+	// to out - whenever a matrix will not invert, the self-check exceeds the bridge's tolerance, or a
+	// result is non-finite; the caller then holds exactly as today. Writes NOTHING outside `out`: no
+	// track state, no identity, no counter.
+	bool synthesize_camera_from_witness(const camera_track& incumbent, const camera_track& witness,
+		const camera_candidate& cluster, camera_candidate& out, f32& self_check) const;
+
+	// The pre-rebase view of a candidate. Every continuity predicate compares these, because a
+	// bridged handover must read as CONTINUOUS at the flip discontinuity test and as the SAME
+	// identity to camera_own_cluster.
+	const remix_rsx::mat4& raw_view_of(const camera_candidate& value) const;
+
+	// One 'Remix cam-track:' line per handover / reset / incumbent expiry, bounded per stats window
+	// with the window rolled before the cap is tested.
+	void report_camera_track(const char* event, u32 incumbent_id, u64 incumbent_tenure,
+		u64 incumbent_vp, const f32 (&incumbent_position)[3], u32 elected_id, u64 elected_tenure,
+		u64 elected_vp, const f32 (&elected_position)[3], f32 distance, u32 elected_votes,
+		u32 max_votes, u32 live_tracks, bool bridged, f32 bridge_error, f32 rebase_determinant);
 
 	// Recreates the debug sphere light at 'position' so a derived camera can be judged
 	// visually at all. Extracting the title's own lights is out of scope for this milestone.
 	void place_debug_light(const f32 (&position)[3]);
+	bool apply_demons_particle_fade(u32 first_vertex, u32 vertex_count, u64 albedo_hash);
+	bool m_scratch_demons_particle_fade = false;
+	void place_demons_amulet_light(u64 albedo_hash, const remixapi_Transform& transform, u32 vertex_count);
+	void retire_stale_demons_amulet_light();
+	remixapi_MaterialHandle get_demons_water_material();
+	remixapi_MaterialHandle get_demons_fire_material(const remix_rsx::texture_entry& entry);
+	void track_demons_fire(bool fire_surface, u32 vertex_count);
+	void submit_demons_fire_lights();
+
+	// The rest of the matched Demon's Souls preset - LIGHT_BANK dir1/dir2 and the hemisphere
+	// ambient, on handles 0x10..0x13. dir0 retargets the sun on 0x4 instead.
+	void submit_demons_authored_lights();
 
 	// The scene's default readable light: one distant sun, created once and drawn every frame.
 	// RSX has no fixed-function light state to read - PS3 titles light in fragment-program
@@ -1950,6 +2600,28 @@ private:
 	// user's own instruction and is left alone.
 	void maybe_inject_guest_light(u64 vp_hash, u64 fp_hash, u64 albedo_hash,
 		const remixapi_Transform& transform, bool is_viewmodel);
+	// ROUND 52. Named refusals on the guest-light path: 'toobig' (the round-41 extent ceiling),
+	// 'auxclip' (RPCS3_REMIX_GUESTLIGHTMAINCLIP) and 'conflict' (two draws claiming one identity in
+	// one frame). `local`/`lext` are the LOCAL AABB centre and span, printed beside the world values
+	// because on this title only the local pair is basis-independent.
+	void report_guest_light_refused(const char* reason, u64 albedo_hash, const f32 (&position)[3],
+		f32 world_extent, const f32 (&local)[3], f32 lext);
+
+	// --- ROUND 52: AUTHORED LEVEL LIGHTS --------------------------------------------------------
+	// Read bin/<AUTHOREDLIGHTDIR>/<AUTHOREDLIGHTLEVEL>.lights once, on first use, and print exactly
+	// one `Remix authored-lights:` line saying what came back. Runs whenever AUTHOREDLIGHTLEVEL is
+	// non-empty, INDEPENDENT of AUTHOREDLIGHTS -- that split is what makes step 1 of the plan (prove
+	// the file loads, submit nothing) a real step rather than a claim. A failure prints too.
+	void load_authored_lights();
+	// Called from flip() immediately after submit_camera(), the same slot and the same shape as
+	// submit_demons_fire_lights(): a fixed set of lights re-derived from a stored mapping every
+	// frame. Returns immediately unless AUTHOREDLIGHTS != 0.
+	void submit_authored_lights();
+	// The world->render map for this frame, `view * projection * reference_inverse`, row-vector.
+	// False when there is no camera or no reference to divide by. Split out so the diagnostic line
+	// and the submission read one derivation.
+	bool authored_light_map(remix_rsx::mat4& out) const;
+
 	void publish_nectar_disruption();
 
 	// Remix instance categories for one draw, from the albedo hash lists. Replaces the
@@ -1961,6 +2633,9 @@ private:
 
 	// True when this draw is 2D / pre-projected and must not reach Remix.
 	bool is_screen_space_draw() const;
+	u32 demons_preview_target() const;
+	bool rasterize_demons_preview(u32 vertex_count, int albedo_unit);
+	bool is_demons_menu_draw() const;
 
 	// Which fragment texture units may be used as albedo for this draw, and whether the answer
 	// came from the fragment ucode. Non-null 'from_ucode' reports true only when the program named
@@ -1972,7 +2647,21 @@ private:
 	// dropping units that cannot carry RGB (fp_fingerprint::narrow_sample_mask). It does NOT
 	// imply from_ucode and must not be made to - see the note at the return site for why the
 	// retry policy is deliberately left alone.
-	u32 albedo_unit_mask(bool* from_ucode = nullptr, bool* from_narrow = nullptr) const;
+	//
+	// ROUND 58: 'from_lerp' and 'from_lane' report the two new rules, both default-OFF
+	// (RPCS3_REMIX_FPLERPUNIT / RPCS3_REMIX_UVLANES) and both containment-tested the same way as
+	// from_narrow. Like it, neither implies from_ucode.
+	// 'would_unit' reports what the two rules WOULD elect with their knobs off, so one measurement
+	// run sizes the change before anything is armed. -1 = no bindable unit.
+	u32 albedo_unit_mask(bool* from_ucode = nullptr, bool* from_narrow = nullptr,
+		bool* from_lerp = nullptr, bool* from_lane = nullptr, int* would_unit = nullptr) const;
+
+	// ROUND 58. The lerp and lane rules, applied to whichever candidate mask albedo_unit_mask()
+	// arrived at. Split out because all five of its exits need them and duplicating a containment
+	// test is how the copies drift apart. Returns the input mask unchanged on every refusal;
+	// 'force' evaluates them with the knobs bypassed, for would= only.
+	u32 apply_albedo_rules(u32 mask, bool force, bool* from_lerp, bool* from_lane) const;
+	u32 finish_albedo_mask(u32 mask, bool* from_lerp, bool* from_lane, int* would_unit) const;
 
 	// Lowest enabled 2D fragment texture unit in 'mask' at or above 'skip_below', or -1.
 	int albedo_texture_unit_in(u32 mask, u32 skip_below) const;
@@ -2380,6 +3069,20 @@ private:
 	// dome" test, and costs no hash scan per draw.
 	f32 m_scratch_albedo_peak_uv[2] = { -1.f, -1.f };
 
+	// ROUND 58. Did the texture this draw actually bound read as a black-and-white macro/grime map
+	// (texture_entry::greymap())? Filled at the bind site so the pick line can say 'grey=1' without
+	// a second lookup, and reset per sub-draw like every other scratch field here. Diagnostic ONLY:
+	// nothing elects, refuses or substitutes on it - plain concrete measures grey too, and only the
+	// fragment ucode separates the two.
+	bool m_scratch_albedo_grey = false;
+
+	// ROUND 58. Which rule elected this draw's albedo unit, and what the two new rules WOULD have
+	// elected with their knobs off. Filled at the submit walk, read at the pick-record fill site
+	// several hundred lines later - the same lifetime the UV provenance scratch fields have, and
+	// for the same reason: the flags are local to the walk and the pick line is not.
+	const char* m_scratch_elect_rule = "none";
+	s8 m_scratch_elect_would = -1;
+
 	// Round 23 defect fix. Did apply_texcoords actually WRITE this draw's texcoords? It has six
 	// early returns (uv_none / uv_absent / uv_layout / uv_memory), and m_scratch_vertices.resize()
 	// value-initialises texcoord to {0,0}, so a draw that took one of them still presents a
@@ -2641,6 +3344,23 @@ private:
 
 	remixapi_MeshHandle m_debug_mesh = nullptr;
 	remixapi_LightHandle m_debug_light = nullptr;
+	remixapi_LightHandle m_demons_amulet_light = nullptr;
+	remixapi_MaterialHandle m_demons_water_material = nullptr;
+	std::unordered_map<u64, remixapi_MaterialHandle> m_demons_fire_materials;
+	struct demons_fire_light
+	{
+		remixapi_LightHandle handle = nullptr;
+		f32 source[3]{}, tint[3]{};
+		u64 seen = 0;
+		bool active = false;
+	};
+	std::vector<demons_fire_light> m_demons_fire_lights;
+	remix_rsx::mat4 m_demons_fire_mapping{};
+	u64 m_demons_fire_mapping_frame = ~0ull;
+	u64 m_demons_amulet_frame = ~0ull;
+	u64 m_demons_attachment_start = ~0ull;
+	f32 m_demons_amulet_source[3]{};
+	bool m_demons_amulet_active = false;
 
 	// The default sun. Created once, not destroyed and recreated every frame the way the
 	// camera sphere is: its parameters come from knobs that cannot change mid-run.
@@ -2657,9 +3377,111 @@ private:
 		// slot freed. Default 0 = never, so the light survives the player looking away, which is
 		// the behaviour a room lit by its own ceiling fixtures needs.
 		u64 last_matched_frame = 0;
+
+		// --- ROUND 52: the FRAME-INVARIANT key ---------------------------------------------------
+		// `position` above is a world position, and on a title with no gauge anchor (gauge_absent =
+		// 100% of draws on BLUS30267) "world" is a per-frame camera-relative basis: the one key
+		// that changes when the basis moves. `identity` is hashed from (albedo, vp, quantised LOCAL
+		// AABB centre) instead, which is the fixture's own vertex data and does not depend on the
+		// camera at all -- the one key that cannot. It is also the light's runtime hash under
+		// GUESTLIGHTTRACK, so a re-place is a same-hash CreateLight (an in-place update) rather
+		// than a second light.
+		u64 identity = 0;
+		// The quantity `identity` was derived from, kept so a drift line can print it.
+		f32 local_centre[3]{};
+		// The frame this light was last placed on, and the camera latch_frame in force then.
+		// placed_frame == m_frame_counter with a distant position is the instanced-fixture
+		// collision the conflict counter names.
+		u64 placed_frame = umax;
+		u64 placed_latch = umax;
+
+		// --- ROUND 54: WHAT THE LIGHT WAS DIVIDED BY WHEN IT WAS PLACED --------------------------
+		// placed_latch alone cannot answer the one question the drift census exists to ask. A row
+		// whose OLD placement was itself made on a stale reference and whose NEW one is fresh is the
+		// snap-BACK, not a drift; run B's 68 rows at (cam_age=0, frame-latch=0) are a mixture of that
+		// and of a genuinely fresh re-place that still moved, and nothing on the row separated them.
+		//
+		// placed_ref_hash is hash_mat4(m_active_camera.reference_inverse) at the moment of placement,
+		// so ref_same on the next drift row is a DIRECT bit-identity test on the divisor rather than
+		// an inference from latch frames: equal means the divisor did not change and the light moved
+		// for some other reason (the guest moved it, or the decode wobbled - the G-lamp branch, which
+		// is expected to read 0). placed_rebase_gen is the CAMREBASE generation then; rgen != rgen_old
+		// with no cam-track handover or reset row between the two frames is impossible by code and is
+		// therefore a tripwire, not a measurement. Both read 0/inert while CAMREBASE is off.
+		u64 placed_ref_hash = 0;
+		u32 placed_rebase_gen = 0;
 	};
 
 	std::vector<guest_light_entry> m_guest_lights;
+
+	// --- ROUND 52: AUTHORED LEVEL LIGHTS --------------------------------------------------------
+	// One record of bin/eatlead_lights/<Level>.lights, which is line-oriented ASCII with a
+	// one-character record type and a fixed 35-token order:
+	//
+	//   L cls tmpl hasXform hasParams srcIdx  px py pz  m00..m22  A R G B  f0..f8
+	//     srcOffHex flagsHex guidHex name
+	//
+	// cls is the engine class id: 627 OmniLight, 631 SpotLight, 746 AreaLight,
+	// 1942927012 SpotOmniLight, 1111553989 DualAreaLight. `basis` is ROW-MAJOR and ROW 1
+	// (basis[3..5]) IS THE AIM DIRECTION. f[1] is range in metres, f[8] is cone angle in degrees,
+	// f[6]/f[7] are the source extent (equal on SpotOmniLight, independent on AreaLight), f[0] looks
+	// like an intensity multiplier; f[2]..f[5] are carried and NOT acted on, because they are
+	// unproven.
+	//
+	// has_xform == 0 marks the 137 records across all levels that are the light components of
+	// effect / weapon / prop prefabs. They carry a colour and parameters and NO static placement,
+	// because their owner places them at runtime. THE INJECTOR MUST SKIP THEM: a prefab light
+	// dropped at the region origin is a bug that would look exactly like a transform error.
+	struct authored_light
+	{
+		u32 cls = 0;
+		u8 tmpl = 0, has_xform = 0, has_params = 0, src = 0;
+		f32 pos[3]{};
+		f32 basis[9]{};
+		u8 argb[4]{};
+		f32 p[9]{};
+		u64 src_off = 0, flags = 0, guid = 0;
+		char name[32]{};
+	};
+
+	struct authored_light_entry
+	{
+		authored_light light{};
+
+		// FRAME-INVARIANT BY CONSTRUCTION: hash64 over (level name, source container index, source
+		// byte offset). On a camera-relative title an authored light's *position* changes every
+		// frame, so the identity can never come from the position -- the same lesson
+		// guest_light_entry::identity already records for the derived path. This is the light's
+		// runtime hash, so every frame's re-place is a same-hash CreateLight, i.e. an in-place
+		// update rather than a second light.
+		u64 hash = 0;
+
+		remixapi_LightHandle handle = nullptr;
+		// The second handle of a DualAreaLight, whose hash is `hash ^ 1`. Remix has no two-sided
+		// rect light, so the class is submitted as two rects with the direction and one axis
+		// negated.
+		remixapi_LightHandle handle_back = nullptr;
+
+		// Per-frame scratch, rewritten every submit. Kept on the entry rather than in a parallel
+		// array so the budget sort cannot pair a distance with the wrong light.
+		f32 render_pos[3]{};
+		f32 eye_distance = 0.f;
+	};
+
+	std::vector<authored_light_entry> m_authored_lights;
+	// Indices into m_authored_lights, sorted by eye_distance. A member so the per-frame sort does
+	// not allocate; submit_demons_fire_lights' loop is the precedent for "per frame, no allocation".
+	std::vector<u32> m_authored_order;
+	// Set by the FIRST call whether or not it found anything, so a missing file is reported once and
+	// not once per flip.
+	bool m_authored_lights_loaded = false;
+	// Cap on the one-off diagnostic that prints the world->render map. It answers section 6.4's
+	// question -- is `view * projection` the fused matrix of an identity-model world draw? -- from a
+	// live frame instead of from an argument, and 8 lines is enough to see whether it is stable.
+	u32 m_authored_map_lines = 0;
+	// Cap on `Remix authored-light:` rows, per frame, from AUTHOREDLIGHTDUMP.
+	u32 m_authored_dump_frame_lines = 0;
+	u64 m_authored_dump_frame = umax;
 
 	// --- ROUND 48: the static-fixture staging table --------------------------------------------
 	// Keyed by the SAME quantised-position hash the light itself uses, so a cell and its light are
@@ -2727,6 +3549,29 @@ private:
 	// here. Round 4 created four bulbs in the exact room the user called too dark and wrote them
 	// to rsx_log only, where nobody could read them until the emulator exited.
 	static constexpr u32 s_max_guest_light_lines = 128;
+
+	// --- ROUND 52: the two guest-light censuses that say WHY a placement is where it is -----------
+	// 'Remix guest-light:' as shipped printed pos/extent only, so an aux-pass mint, a held-camera
+	// mint and a good mint were indistinguishable, and the 96% toobig population
+	// (guest_light_toobig=22553 of guest_light_match=23518 on run pid=29940) had never been named.
+	//
+	// refused: one line per (reason, albedo, vp, clip) per stats window, the report_light_candidate
+	// shape. drift: one line per identity re-hit that moved more than 0.25 units, capped per window
+	// rather than deduplicated -- the population IS the repetition, so a seen-set would print the
+	// first drift of a session and hide the rest.
+	static constexpr u32 s_max_glrefused_lines = 32;
+	std::unordered_set<u64> m_glrefused_seen;
+	u32 m_glrefused_lines = 0;
+	u64 m_glrefused_window = umax;
+	static constexpr u32 s_max_gldrift_lines = 64;
+	u32 m_gldrift_lines = 0;
+	u64 m_gldrift_window = umax;
+
+	// The re-place deadband. A bulb on this title is ~0.5 units across and the runtime should not be
+	// churned by float noise on a static fixture, so a re-hit under this distance is measured (it is
+	// below the 0.25 drift threshold anyway) and not submitted. Well under the 1.5-unit dedup radius
+	// that decides two draws are the same fixture.
+	static constexpr f32 s_guest_light_track_eps = 0.05f;
 
 	// --- ROUND 48: the staging table's ceiling and its quiet window ------------------------------
 	// The table is keyed on a quantised world position and the population it exists to REJECT is
@@ -2798,6 +3643,13 @@ private:
 		// 'fused', both of which the flush already holds, so there is no captured matrix here to drift
 		// from the construction in the ladder.
 		bool used_projsplit = false;
+
+		// ROUND 57. This draw was held because the frame's own camera reference had not arrived yet
+		// (latch_frame != m_frame_counter), not because its gauge anchor had not. It waits on the
+		// mid-frame RELATCH, so flush_deferred_for_anchor must leave it alone however well its
+		// render-source key matches - an anchor flush would place it in the anchor's frame, which is
+		// not the frame it is waiting for.
+		bool waits_relatch = false;
 	};
 
 	std::vector<deferred_instance> m_deferred_instances;
@@ -2813,6 +3665,12 @@ private:
 	// only runs at that exit - so flushing it through 'fused * anchor.inverse' would hand it back the
 	// very residue the rescue removed. False on every other deferred draw.
 	bool m_scratch_defer_projsplit = false;
+
+	// ROUND 57, same lifetime and the same reason as the flag above: set by the DEFERPRERELATCH arm
+	// in the gauge_anchor_absent branch when this draw is being held for the mid-frame RELATCH
+	// rather than for a gauge anchor, cleared at the head of per_draw_transform so a draw that took
+	// another branch can never inherit it.
+	bool m_scratch_defer_relatch = false;
 
 	remix_rsx::mat4 m_scratch_defer_fused{};
 	remix_rsx::mat4 m_scratch_defer_object_space{};
@@ -2837,6 +3695,12 @@ private:
 	// Submits every buffered instance whose source key matches, re-divided by 'anchor'. Called from
 	// capture_gauge_anchor the moment a frame's anchor for that source lands.
 	void flush_deferred_for_anchor(const gauge_anchor& anchor);
+
+	// ROUND 57 (RPCS3_REMIX_DEFERPRERELATCH). Submits every buffered instance that was waiting on
+	// the frame's own camera reference, re-divided by m_active_camera.reference_inverse. Called from
+	// consider_camera_candidate the moment the mid-frame relatch installs it, so the held draw ends
+	// up placed by exactly the arithmetic a draw that had arrived after the relatch would have used.
+	void flush_deferred_for_relatch();
 
 	// Submits everything still buffered at flip, with the transform each draw already carried from
 	// the old prev/camera fallback. Nothing is ever lost, whatever the anchor did.
@@ -2957,6 +3821,22 @@ private:
 
 	// True once begin_frame() has run for the frame currently being built.
 	bool m_compositor_open = false;
+	struct demons_ui_frame_trace
+	{
+		u32 calls = 0, accepted = 0, full_texture = 0, full_flat = 0;
+		u32 target_refused = 0, copy_refused = 0, non_ui = 0;
+		u32 texture_address = 0, texture_width = 0, texture_height = 0, target = 0;
+		u64 full_vp = 0;
+	} m_demons_ui_frame;
+	u64 m_demons_copy_flips_held = 0;
+	struct demons_preview_surface
+	{
+		remix_rsx::preview_raster::surface raster;
+		remix_rsx::texture_entry texture;
+		u64 frame = ~u64{0};
+	};
+	std::unordered_map<u32, demons_preview_surface> m_demons_previews;
+	demons_preview_surface* prepare_demons_preview(u32 address, u32 width, u32 height);
 
 	// Diagnostic accumulator, reset every time it is logged.
 	ui_biggest_draw m_ui_biggest{};
@@ -3094,6 +3974,45 @@ private:
 		return "?";
 	}
 
+	// ROUND 58. fp_fingerprint::coord_lanes[0..15] packed two bits each, unit 0 in bits 0-1.
+	// Packed because pick_record is copied into a per-frame table sized in the thousands and a
+	// sixteen-byte array there would cost more than the field is worth.
+	static u32 pack_coord_lanes(const remix_rsx::fp_fingerprint& fp)
+	{
+		u32 packed = 0;
+
+		for (u32 unit = 0; unit < 16; ++unit)
+		{
+			packed |= (u32{fp.coord_lanes[unit]} & 3u) << (unit * 2);
+		}
+
+		return packed;
+	}
+
+	// "0:zw,1:xy" over the sampled units, or "-". Static-free: the caller owns the string.
+	static std::string describe_coord_lanes(u32 sampled_mask, u32 packed)
+	{
+		std::string out;
+
+		for (u32 unit = 0; unit < 16; ++unit)
+		{
+			if (!(sampled_mask & (1u << unit)))
+			{
+				continue;
+			}
+
+			if (!out.empty())
+			{
+				out += ',';
+			}
+
+			fmt::append(out, "%u:%s", unit,
+				remix_rsx::fp_lanes_name(static_cast<u8>((packed >> (unit * 2)) & 3u)));
+		}
+
+		return out.empty() ? std::string("-") : out;
+	}
+
 	struct pick_record
 	{
 		u64 vp_hash = 0;
@@ -3109,6 +4028,13 @@ private:
 		// and therefore cannot distinguish an identity from a reflection; this can. Negative means
 		// the instance was submitted mirrored.
 		f32 det = 0.f;
+		// ROUND 57. The 3x3 itself, rot[i][j] = transform.matrix[i][j], filled beside origin/basis
+		// from the same transform. basis[] cannot see a rotation at all: a row NORM is invariant
+		// under every rigid transform, which is why d_basis reads 1e-9 while d_origin reads 0.2 -
+		// that pair rules OUT every non-rigid mechanism and says nothing whatever about rotation.
+		// d_rot on the pick-follow row is the L1 delta of rot[i][j]/basis[i], i.e. of the row-
+		// normalised 3x3, so it is the missing half of the same reading.
+		f32 rot[3][3]{};
 		f32 camera_position[3]{};
 		// ROUND 30. The eye in origin='s OWN frame - the gauge anchor's - captured at the same submit
 		// as camera_position so one pick line carries both and 'Remix picked:' stops being the field
@@ -3211,6 +4137,21 @@ private:
 		u8 fp_out_rgb = 0;
 		u8 fp_out_alpha = 0;
 		bool fp_vcol_replayed = false;
+
+		// --- ROUND 58: the albedo election, per object --------------------------------------
+		// A Ctrl+Click on a black-and-white streak has to BE the diagnosis. elect= names the rule
+		// that chose albedo_unit (lowest / ucode / narrow / lerp / lane); would= is the unit the
+		// two new rules WOULD elect with their knobs off, so one run with nothing armed sizes the
+		// change before it is armed; lanes= is which lane pair of its TEXn varying each sampled
+		// unit reads; grey= is whether the texture actually bound reads as a macro/grime map.
+		// elect_rule points at a static string owned by this translation unit.
+		const char* elect_rule = "none";
+		s8 elect_would = -1;
+		bool albedo_grey = false;
+		// coord_lanes of the sampled units, packed two bits each (unit 0 in bits 0-1), values as
+		// remix_rsx::s_fp_lanes_*. Packed rather than an array because pick_record is copied into
+		// a per-frame table sized in the thousands.
+		u32 lanes_packed = 0;
 
 		// --- pick-deep -------------------------------------------------------------------------
 		// The vertex-data and ucode reading the brief demands, attached to the user's own clicks so
@@ -3342,6 +4283,58 @@ private:
 	bool m_pick_follow_have_previous = false;
 	f32 m_pick_follow_previous_origin[3]{};
 	f32 m_pick_follow_previous_basis[3]{};
+	// ROUND 57. The row-normalised 3x3 of the previous frame's copy, for d_rot. Kept beside the
+	// other two previous-frame fields and cleared with them on a generation change, so a d_rot can
+	// never be measured across two different clicks. The _valid flag is its own: a row whose basis
+	// lengths are non-positive cannot be normalised and stores nothing, and the NEXT row must then
+	// print d_rot=0 rather than an L1 against three rows of zeros.
+	f32 m_pick_follow_previous_rot[3][3]{};
+	bool m_pick_follow_previous_rot_valid = false;
+
+	// --- round 57: the pick-fresh stash (RPCS3_REMIX_PICKFRESH) ---------------------------------
+	// What the followed draw actually divided, captured at the draw and consumed at the flip that
+	// ends the same frame. Three operands and nothing else: the fused matrix, the object-space
+	// composite (obtained by running per_draw_transform's own prepend_object_space lambda on an
+	// identity - the deferral's trick, so there is no second copy of that composition to drift
+	// from the live one), and *reference, THE DIVISOR the draw used rather than the member, so a
+	// draw that took the viewmodel or anchor branch would stash what it really divided by.
+	//
+	// Two-stage on purpose. per_draw_transform writes m_scratch_pick_* for any draw that passes
+	// the cheap vp/window pre-filter; only trace_pick_follow, which has already applied every
+	// identity test the follow makes (vp, albedo, vertex count, one row per frame), promotes the
+	// scratch into the stash. The first row after a click has no stash - the identity is published
+	// at that row - so it is simply absent from 'Remix pick-fresh:', which the analyser expects.
+	bool m_scratch_pick_valid = false;
+	remix_rsx::mat4 m_scratch_pick_fused{};
+	remix_rsx::mat4 m_scratch_pick_object_space{};
+	remix_rsx::mat4 m_scratch_pick_reference{};
+
+	bool m_pick_follow_stash_valid = false;
+	u64 m_pick_follow_stash_frame = umax;
+	remix_rsx::mat4 m_pick_follow_stash_fused{};
+	remix_rsx::mat4 m_pick_follow_stash_object_space{};
+	remix_rsx::mat4 m_pick_follow_stash_reference{};
+	// The camera as it stood AT THE DRAW, so cam_step and cam_rot measure what happened between
+	// the reference the draw used and the reference the frame ended with.
+	remix_rsx::mat4 m_pick_follow_stash_view{};
+	f32 m_pick_follow_stash_cam_position[3]{};
+	f32 m_pick_follow_stash_origin[3]{};
+	u64 m_pick_follow_stash_ord = 0;
+	u64 m_pick_follow_stash_age = 0;
+	// The value picking.objectPickingValue is about to be given for this draw (m_pick_table.size()
+	// + 1 at trace time, because the record is pushed after the trace). Only read by step 8's
+	// relatch flush, to recognise the followed instance among the held ones.
+	u32 m_pick_follow_stash_pick_index = 0;
+	// Frame-to-frame of origin_fresh, which is the followed object's motion with the reference
+	// error removed. Cleared on a generation change with the follow's own previous-row state.
+	bool m_pick_follow_fresh_have_previous = false;
+	f32 m_pick_follow_fresh_previous_origin[3]{};
+	// ROUND 57, the DEFERPRERELATCH arm. Written by flush_deferred_for_relatch when it recognises
+	// the followed instance among the held ones, read (and cleared) by trace_pick_fresh at the flip
+	// that ends the same frame. Both are false/zero on the control arm and the row omits nothing:
+	// deferred= prints 0 and d_deferred= prints the 0 it is.
+	bool m_pick_follow_stash_deferred = false;
+	f32 m_pick_follow_stash_deferred_origin[3]{};
 
 	// One line per (vp, unit) that ends up on the fixed UVINTSCALE divisor, naming the refusal
 	// exit and the slot the strict matcher would have used if it named one. Bounded like every
@@ -3349,6 +4342,14 @@ private:
 	static constexpr u32 s_max_uvscale_fixed_lines = 128;
 	std::unordered_set<u64> m_uvscale_fixed_seen;
 	u32 m_uvscale_fixed_lines = 0;
+
+	// ROUND 58. One line per (vertex program, fragment program) pair naming which rule elected the
+	// albedo unit, which unit the two new rules WOULD elect with their knobs off, the lerp the
+	// fragment ucode states, and the lane pair each sampled unit reads. Same bound and the same
+	// dedupe as the census above; a title has tens of program pairs, not thousands.
+	static constexpr u32 s_max_albedo_elect_lines = 128;
+	std::unordered_set<u64> m_albedo_elect_seen;
+	u32 m_albedo_elect_lines = 0;
 
 	// One line per (program, texcoord output, albedo) whose submitted UVs leave the unit square.
 	// Keyed on the albedo too, because one program draws many meshes and it is the texture that
@@ -3387,6 +4388,12 @@ private:
 	static constexpr u32 s_max_wdiv_shadowed_lines = 32;
 	std::unordered_set<u64> m_wdiv_shadowed_seen;
 	u32 m_wdiv_shadowed_lines = 0;
+
+	// The 'Remix vtxattr:' cap. 64 programs is well above the count any one title has shown in a
+	// census run (Demon's Souls resolves 26 distinct world programs in the whole dump), and the
+	// line is one-per-program-per-run, so this is a floor on completeness rather than a budget.
+	static constexpr u32 s_max_vtxattr_lines = 64;
+	u32 m_vtxattr_lines = 0;
 
 	// Round 9: one line per (vertex program, fragment program) per stats window for every
 	// submitted draw that has no guest material OR whose fragment program names a vertex-colour
@@ -3538,6 +4545,14 @@ private:
 	// i.e. already negated from camera -> card; see the sign derivation in RemixTransforms.h).
 	// Latched per frame and consumed by update_sun_light at the end of the frame, so a card drawn
 	// after the light would otherwise have been a frame late.
+	// The authored LIGHT_BANK preset the live c111 scattering sun matched, and the frame it was
+	// last confirmed on. Null means no row matched, which is the honest state on any title but
+	// Demon's Souls and on any Demon's Souls preset the table does not carry - the sun then
+	// keeps the scattering direction exactly as before.
+	const void* m_demons_preset = nullptr;
+	u64 m_demons_preset_frame = umax;
+	remixapi_LightHandle m_demons_lights[4] = {};
+
 	bool m_sun_track_have = false;
 	f32 m_sun_track_travel[3] = { 0.f, 0.f, 0.f };
 	f32 m_sun_track_score = 0.f;
@@ -3638,6 +4653,20 @@ private:
 	// c1f88035801f88de, 61ed1d272c0653aa, 1d22398b18a0e97d and 5888b152531b2d91.
 	std::unordered_set<u64> m_madlanemap_seen;
 
+	// Round 50: one 'Remix posinput:' line per vertex program whose position was decoded from an
+	// attribute other than ATTR0, once per run. Same shape and lifetime as m_madmix_seen - it
+	// names a permanent property of the program, not of the draw. Expected population on Eat Lead
+	// from the replayed ucode: f2b6988e84056628 at input=1, and the world family (1b20d02263aa8ee4
+	// among them) at input=2.
+	std::unordered_set<u64> m_posinput_seen;
+
+	// One 'Remix vtxattr:' line per vertex program per run: every attribute the layout feeds it,
+	// with the decoded length statistics of the 3- and 4-component ones. This is what NAMES the
+	// normal attribute rather than assuming it - the same method round 50 used to find that the
+	// position was not always ATTR0. A program whose ATTR2 reads mean_len ~= 1.00 is carrying a
+	// unit normal; one whose ATTR2 reads 0.0 or 40.0 is not, and the line says which slot does.
+	std::unordered_set<u64> m_vtxattr_seen;
+
 	// Round 9 (new user report, instrument only): a bounded once-per-window census of which
 	// camera the election settled on and why it changed. The user watches the dev menu's camera
 	// list flicker and occasionally gets a frame with everything far away; cam_resolved /
@@ -3647,6 +4676,27 @@ private:
 	u32 m_cam_elect_lines = 0;
 	u64 m_cam_elect_window = umax;
 	u64 m_cam_elect_last_key = umax;
+
+	// ROUND 53. cam-elect's twin one level up: cam-elect reports which (vp, surface, clip) the
+	// election settled on, which under CAMTRACK becomes cosmetic - one moving viewpoint's
+	// first-observed program alternates between frames. This reports the events that actually move
+	// the basis, one line per handover / reset / incumbent expiry, with the outgoing and incoming
+	// witness, their tenures, the distance between them and (under CAMREBASE) the bridge's
+	// self-check residual. Steady play should print none of these.
+	static constexpr u32 s_max_cam_track_lines = 48;
+	u32 m_cam_track_lines = 0;
+	u64 m_cam_track_window = umax;
+
+	// ROUND 54, RPCS3_REMIX_CAMRELATCHTRACE. cam-track's twin one level DOWN: cam-track reports the
+	// events that move the basis at a flip, this reports the one that moves it mid-frame. Two rows
+	// share the budget - 'Remix cam-relatch:' (one per relatch) and 'Remix cam-relatch-disagree:'
+	// (one per frame the relatch and the tracker chose draws more than 0.05 units apart) - because
+	// they are read together and one cap is one thing to reason about. 64 rather than cam-track's 48
+	// to match the drift census it is read against, and the window is rolled BEFORE the cap is
+	// tested, for the reason report_camera_track's own comment gives.
+	static constexpr u32 s_max_cam_relatch_lines = 64;
+	u32 m_cam_relatch_lines = 0;
+	u64 m_cam_relatch_window = umax;
 
 	// --- round 10 -----------------------------------------------------------------------------
 	// One line per (vp, clip) the candidate clip gate refuses, per window. Bounded small on
@@ -3742,6 +4792,71 @@ private:
 	void report_ui_wrap(const remix_rsx::texture_entry& entry, f32 u_lo, f32 u_hi, f32 v_lo, f32 v_hi,
 		bool subrect_u, bool subrect_v);
 
+	// --- ROUND 52: the UI ROUTING census, 'Remix ui-route:' ---------------------------------------
+	// One line per (vp, fp, albedo, depth_write, route) per stats window, from BOTH sides of the
+	// screen-space decision: the draws the compositor rasterized, and the draws that were
+	// orthographic-but-depth-writing and therefore went to the world path instead. That second
+	// population is the one no instrument in this backend has ever named, and it is the whole of
+	// "the UI looks world space" - on Eat Lead the menu text carries depth_write=1, so
+	// is_screen_space_draw()'s `is_orthographic(outer) && !depth_write_enabled()` clause refuses it
+	// and it renders as lit, perspective-divided geometry however the compositor is configured.
+	//
+	// It also carries the three numbers the rest of round 52 is decided from, none of which any log
+	// has ever printed: 'world_before' (how many world draws had already been submitted this frame
+	// when this 2D draw arrived - a frame-covering draw with world_before=0 is a BACKGROUND, which
+	// an overlay compositor cannot place), the guest blend state per draw, and 'uvval' - the live
+	// value of the constant slot the vertex program multiplies its texcoords by. uvval settles gap
+	// 2 before a single line of the UV replay changes anything: if it reads 1 the replay is a
+	// measured no-op on this title.
+	//
+	// Modelled on report_ui_wrap exactly - same budget shape, same per-window dedup, same dump_line
+	// sink so it lands in remix_dump.log rather than the exclusively-locked RPCS3.log.
+	struct ui_route_report
+	{
+		const char* route = "world";     // "2d" | "world"
+		const char* reason = "";         // screenarch | identity | ortho | ortho-dw | forced | persp
+		u64 albedo = 0;                  // content hash, 0 when the route did not resolve one
+		u32 tex_width = 0;
+		u32 tex_height = 0;
+		u32 tex_format = 0;
+		// ROUND 60. NV4097_SET_TEXTURE_CONTROL1 for the albedo unit, raw. 0xAAE4 is identity;
+		// anything else means the guest's sampled channel order is NOT the one the format byte
+		// implies, and remix_rsx::texture_cache::decode() ignored it until RPCS3_REMIX_TEXREMAP.
+		// 0 here means "no unit resolved", which is distinguishable from identity.
+		u32 tex_remap = 0;
+		s32 tex_unit = -1;
+		u32 tex_address = 0;
+		bool have_box = false;           // 'box' is post-matrix and 2D-route only
+		f32 box[4] = { 0.f, 0.f, 0.f, 0.f };   // lo_x lo_y hi_x hi_y in compositor pixels
+		s32 tint_attr = -1;              // the attribute the tint was read from, -1 = none
+		u32 tint_min = 0;                // packed BGRA, per-channel min/max over the draw
+		u32 tint_max = 0;
+		u32 uv_output = 0;               // which TEXn output supplies the albedo's coordinates
+		// ROUND 52 (step 2a): the "none" value is remix_rsx::s_no_texcoord_scale, which is 0xffff
+		// now that the slot field is u16 - a 0xff default would read as the real slot c255 here and
+		// send report_ui_route down the "read the constant" branch on a draw that named none.
+		u32 uv_slot = 0xffff;            // constant slot the ucode scales that output by
+		f32 uv_value = 0.f;              // its live .x, when the slot could be read
+		bool uv_value_read = false;
+	};
+
+	static constexpr u32 s_max_uiroute_lines = 64;
+	std::unordered_set<u64> m_uiroute_seen;
+	u32 m_uiroute_lines = 0;
+	u64 m_uiroute_window = umax;
+	void report_ui_route(const ui_route_report& info);
+
+	// Why is_screen_space_draw() answered the way it did, as a static string. Mirrors that
+	// classifier's own order exactly so the census cannot disagree with the routing; const and
+	// side-effect free, like the classifier itself.
+	const char* screen_space_reason() const;
+
+	// The reason the CURRENT draw was routed the way it was, latched at the routing site (where the
+	// UIFORCEVP/UIFORCEPAIR overrides are visible) and read by composite_ui_draw. Inferring it a
+	// second time inside the compositor would get 'forced' wrong, which is exactly the row the
+	// step-4 conf list is built from.
+	const char* m_scratch_ui_route_reason = "";
+
 	// One line per (vp, albedo) the tail rescue touched, per window: the residue before and after,
 	// which retry answered, and how old the anchor was. This is what turns "world_refused dropped"
 	// into "these programs were rescued by an anchor this many frames old".
@@ -3805,6 +4920,18 @@ private:
 	remixapi_TextureHandle m_self_lit_texture = nullptr;
 	bool m_self_lit_material_failed = false;
 	remixapi_MaterialHandle self_lit_material(const remixapi_Interface& api);
+
+	// Warm masked materials for packed/procedural bulb shaders whose sampled atlas is not their
+	// final RGB. Each source gets a private remapped texture so its red-channel coverage survives.
+	struct guest_light_fixture_material_entry
+	{
+		remixapi_TextureHandle texture = nullptr;
+		remixapi_MaterialHandle material = nullptr;
+		bool failed = false;
+	};
+	std::unordered_map<u64, guest_light_fixture_material_entry> m_guest_light_fixture_materials;
+	remixapi_MaterialHandle guest_light_fixture_material(const remixapi_Interface& api,
+		const remix_rsx::texture_entry& source);
 
 	// The candidate clip gate's census: one line per (vp, clip) per window.
 	void report_clip_gate(u64 vp_hash, u32 surface_offset, u32 clip_width, u32 clip_height,
@@ -3920,6 +5047,12 @@ private:
 	// such a rule, never narrow it.
 	u64 main_clip_reference() const;
 
+	// ROUND 52 (RPCS3_REMIX_GUESTLIGHTMAINCLIP). True when THIS draw's clip is same / double / half
+	// of the session's main clip -- the camera candidate gate's rule replicated, not shared, because
+	// the camera work owns that block. Admits when no reference has latched yet, exactly as the
+	// camera gate does, so a boot frame is never refused for having no history.
+	bool guest_light_clip_ok() const;
+
 	// One line per (gate, vp, fp, albedo) for every gate that drops a draw after submission began.
 	// The instrument for "what ate the soldier's outfit" - which is a question about *which* rule
 	// fired, and every one of them used to increment a shared counter and return in silence.
@@ -4034,6 +5167,14 @@ private:
 	// pick-record fill site, where the instance transform for this draw already exists.
 	void trace_pick_follow(const pick_record& record);
 
+	// ROUND 57. One 'Remix pick-fresh:' line per followed frame, re-dividing the stashed fused by
+	// the frame's OWN relatched reference so the POSE ERROR of the followed object is a number.
+	// Called from flip immediately after flush_deferred_at_flip() and BEFORE
+	// apply_gauge_anchor_camera(), which is the only window in which m_frame_counter is still the
+	// ending frame's AND m_active_camera still holds the reference that frame's post-relatch draws
+	// were divided by. RPCS3_REMIX_PICKFRESH=0 makes it return on its first line.
+	void trace_pick_fresh();
+
 	// What apply_texcoords did, recorded for the pick line. Called from every path that writes a
 	// texcoord, including the two affine replays, so the pick line cannot report a provenance the
 	// draw did not take. Measures the submitted u/v range as it does so.
@@ -4079,6 +5220,13 @@ private:
 	// walk, once per run. Names the program and how many w-only writes shadowed its divide MUL.
 	void report_wdiv_shadowed();
 
+	// One 'Remix vtxattr:' line per vertex program, once per run: for every attribute the layout
+	// actually feeds this draw, its type, component count and - for the 3- and 4-component ones -
+	// the mean/min/max decoded vector length over a bounded sample. The unit-length slot is the
+	// normal, and reading it off is what the normal decode is aimed with. 'chosen' reports whether
+	// NORMALATTR's slot survived the per-draw unit-length gate on this draw.
+	void report_vertex_attributes(u32 first_vertex, u32 vertex_count, bool chosen_accepted);
+
 	// Round 9. One line per (vp, fp) per stats window for every submitted draw that is either
 	// material-less or FP-classified as vertex-coloured. Called from the submit path AFTER
 	// apply_vertex_colour so the measured colour variance is the one actually submitted.
@@ -4110,6 +5258,9 @@ private:
 	// general affine walk made of the same slice.
 	void report_uv_scale_fixed(u32 output, u32 attribute, remix_rsx::texcoord_scale_refusal refusal);
 
+	// ROUND 58. The albedo-election census - see s_max_albedo_elect_lines.
+	void report_albedo_elect(u32 unit_mask, int elected, int would, const char* rule);
+
 	camera_candidate m_active_camera{};
 	// A radically different camera must persist before it can replace the established gameplay
 	// view. This filters Haze's short auxiliary-camera passes without delaying normal movement.
@@ -4128,6 +5279,102 @@ private:
 	// time a frame resolves one; once it passes remix_rsx::camera_hold_frames() the camera is
 	// dropped and submit_camera() goes back to the origin fallback.
 	u32 m_camera_age = 0;
+
+	// --- round 53: the witness tracks -----------------------------------------------------
+	// 48 slots: a frame can present up to s_max_camera_candidates_per_frame (32) clusters and the
+	// tracks that are inside their miss window survive alongside them. cam_track_overflow says if
+	// that was ever wrong; it must read 0.
+	static constexpr u32 s_max_camera_tracks = 48;
+	std::array<camera_track, s_max_camera_tracks> m_camera_tracks{};
+	// The elected witness, held by ID rather than by slot index so a recycled slot can never be
+	// mistaken for the incumbent. umax = no incumbent (boot, or every track died at a cut).
+	u32 m_camera_track_incumbent = umax;
+	u32 m_camera_track_next_id = 0;
+
+	// RPCS3_REMIX_CAMREBASE. R and its inverse, composed at every bridged handover. Only meaningful
+	// while m_camera_rebase_valid; a reset returns both to the identity and clears the flag, which is
+	// today's behaviour exactly.
+	bool m_camera_rebase_valid = false;
+	remix_rsx::mat4 m_camera_rebase{};
+	remix_rsx::mat4 m_camera_rebase_inverse{};
+
+	// ROUND 54, a TRIPWIRE and nothing else. Incremented at each of the three sites that write
+	// m_camera_rebase (the bridge, the refused/unbridged reset, the no-predecessor reset) - and grep
+	// says there are exactly three, all inside update_camera_tracks' handover / reset arms. Stamped
+	// onto every guest light at placement and printed as rgen / rgen_old on the drift row, so a row
+	// whose generation moved with NO 'Remix cam-track:' handover or reset row at any frame in between
+	// would mean R changed outside a handover, which is impossible by code: seeing it means revert
+	// CAMREBASE before reading anything else. Structurally frozen at 0 while CAMREBASE is off, where
+	// the field costs nothing and keeps an off-arm run comparable with an on-arm one.
+	u32 m_camera_rebase_generation = 0;
+
+	// Set by update_camera_tracks() for the flip it ran in, so 'Remix camera trace:' can state
+	// whether THIS frame's identity came from a handover. The acceptance script pairs light jumps
+	// with handovers by frame, and the cosmetic cam_vp cannot do that job.
+	bool m_camera_track_handover_frame = false;
+
+	// ROUND 54, the same per-flip lifetime and the same reason: the drift census runs mid-frame and
+	// needs the LAST FLIP'S verdict on whether the incumbent witness was itself judged to be moving,
+	// which is the M-witness branch of the decision table. Set beside cam_track_incumbent_moving,
+	// cleared at the head of update_camera_tracks. It describes the last completed flip when read
+	// from a draw, and the drift row's inc_moving field is documented as exactly that.
+	//
+	// STRUCTURALLY 0 WHILE CAMREBASE IS OFF: the witness-relation block that sets it runs only under
+	// `invertible = rebase && ...`, so on the off arm the M-witness branch has to be decided by the
+	// script comparing the drift d against the incumbent's own eye step on the cam-relatch row
+	// instead. Un-gating that block is NOT instrumentation - track.moving feeds the tenure election -
+	// so it is deliberately not done here.
+	bool m_camera_incumbent_moving_frame = false;
+
+	// ROUND 55, same per-flip lifetime, both cleared in flip() immediately before update_camera_tracks
+	// so they read 0/false even on the non-CAMTRACK path (update_camera_tracks does not run there).
+	// They DESCRIBE THE LAST COMPLETED FLIP when read from a draw, exactly as the two flags above do.
+	//
+	// m_camera_basis_switch_frame: this flip's latch installed a submitted view more than
+	// s_camera_pending_match_tolerance from the outgoing one - a change of witness BASIS, which is the
+	// visible teleport. Printed as switch= on every guest-light-drift row so a snap that ends a hold
+	// is named on the row instead of being reconstructed afterwards. Accumulates on both arms.
+	//
+	// m_camera_ref_state: WHERE this flip's reference came from -
+	//   0 fresh          latched from the incumbent's own cluster this frame (or CAMTRACK is off)
+	//   1 synth          CAMREFSYNTH synthesised it from a co-present witness (cam_ref_synth)
+	//   2 miss_nowitness   miss, refused: no qualifying witness            (cam_ref_synth_nowitness)
+	//   3 miss_short       miss, refused: one co-present frame only        (cam_ref_synth_short)
+	//   4 miss_rigid       miss, refused: the witness was moving           (cam_ref_synth_rigid)
+	//   5 miss_basis       miss, refused: active camera not in I's basis   (cam_ref_synth_basis)
+	//   6 miss_badrel      miss, refused: relation/inverse/self-check bad  (cam_ref_synth_badrel)
+	//   7 confirm        the 12-frame discontinuity confirm held the flip  (cam_discontinuity_held)
+	//   8 nocam          no candidate for any other reason, or the camera dropped (cam_held / drop)
+	//   9 miss_knoboff   a tracker miss with CAMREFSYNTH off - today's behaviour
+	// Every remaining S-hold drift row must carry one of {2..8}; a row with refsrc=1 and new_age >= 2
+	// is a tripwire (a synthesised flip that did not stamp latch_frame), and refsrc=0 or 9 on an
+	// S-hold row means the state was not stamped where it should have been.
+	bool m_camera_basis_switch_frame = false;
+	u32 m_camera_ref_state = 0;
+
+	// --- ROUND 54: what the mid-frame relatch did THIS frame ------------------------------------
+	// Written by consider_camera_candidate's relatch arm, read by the drift census (which runs later
+	// in the same frame) and by update_camera_tracks (which runs at the flip that ends it), then
+	// reset beside m_frame_world_draws at the head of the next frame. The relatch fires at most once
+	// per frame - the latch_frame != m_frame_counter guard - so a count rather than a list is the
+	// whole state.
+	u32 m_frame_relatch_count = 0;
+	// Distance the relatch moved the SUBMITTED eye (both sides rebased, so this is comparable with
+	// the drift row's d). An S-order drift row's d should match this.
+	f32 m_frame_relatch_step = 0.f;
+	// 1 = the relatched draw lay within CAMTRACKPOS of the incumbent witness track, 0 = it did not,
+	// -1 = there was no live incumbent. No float sentinel: this is the flag, m_frame_relatch_inc_d
+	// is the number, and a row with inc = -1 prints inc_d as the measured 0 it is.
+	s32 m_frame_relatch_inc = -1;
+	f32 m_frame_relatch_inc_d = 0.f;
+	// World draws already submitted this frame when the relatch fired, i.e. how much of the frame was
+	// placed on the previous flip's reference. This is the S-order population's own size, per frame.
+	u64 m_frame_relatch_ordinal = 0;
+	// The relatched candidate's RAW eye and its program. Raw on purpose: the flip-time cross-check
+	// compares it against a track position, which is also raw, and mixing the two bases would read as
+	// |translation of R| on every row after the first bridge.
+	f32 m_frame_relatch_position[3]{};
+	u64 m_frame_relatch_vp = 0;
 
 	// --- gauge anchors ------------------------------------------------------------------
 	// One slot per render source, each carrying the frame it was captured in. No rotation at
@@ -4349,6 +5596,15 @@ private:
 	// to know nothing about the title's units; the previous frame's median is used because the
 	// current frame's is not knowable while the frame is still being submitted. Reset per flip.
 	std::vector<f32> m_scratch_world_extents;
+	// The last audited draw's world-space AABB, published by audit_world_extent so a census can
+	// ask WHERE a submitted draw landed rather than only how big it is.
+	f32 m_world_box_lo[3] = {};
+	f32 m_world_box_hi[3] = {};
+	bool m_world_box_valid = false;
+	std::unordered_set<u64> m_worldbox_seen;
+	u32 m_worldbox_lines = 0;
+	static constexpr u32 s_max_worldbox_lines = 96;
+
 	f32 m_world_extent_median = 0.f;
 	u64 m_world_extent_samples = 0;
 
@@ -4397,6 +5653,28 @@ private:
 	stat_counters m_stats{};
 	frame_timing m_timing{};
 	u64 m_frame_counter = 0;
+
+	// ROUND 52. World draws submitted so far THIS frame, reset in flip() beside ++m_frame_counter
+	// and incremented beside ++m_stats.draws_submitted. The 'Remix ui-route:' census prints it, and
+	// it is the one fact that separates a background from an overlay: a frame-covering 2D draw that
+	// arrives with world_before == 0 was issued BEFORE the scene, and an overlay compositor - which
+	// only ever paints on top of the finished Remix image - has no way to place it. Cheap by
+	// construction: one increment on a path that already does far more per draw.
+	u64 m_frame_world_draws = 0;
+
+	// This frame's full-channel colour clear, in the compositor's 0xAARRGGBB packing, and whether
+	// one was seen at all. Both are reset in flip() beside m_frame_world_draws, so they describe
+	// exactly one frame; a partial-channel clear or a surface format whose clear register this
+	// backend will not guess at leaves the pair untouched. See clear_surface().
+	u32 m_frame_clear_bgra = 0;
+	bool m_frame_clear_valid = false;
+
+	// Bounds the clear-background notice to a line per distinct colour rather than per frame,
+	// and the unsupported-surface-format refusal to a single line for the run. Separate flags on
+	// purpose: sharing one would let a refusal swallow the first background notice.
+	u32 m_clear_bg_logged_bgra = 0;
+	bool m_clear_bg_logged = false;
+	bool m_clear_fmt_logged = false;
 
 	// Flip heartbeat. When the picture stops moving, "blocked inside Present", "grinding
 	// through draws without ever reaching flip" and "the guest stopped asking to flip" are

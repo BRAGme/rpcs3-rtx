@@ -752,6 +752,8 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 			tr("Makes every material opaque. Alpha-cutout foliage will render as solid cards."));
 		add_check(emu_settings_type::RemixSmoothNormals, tr("Generate smooth normals"),
 			tr("Has Remix compute area-weighted smooth normals on the GPU from each mesh's own triangles. This backend does not recover the game's normals - it submits a constant one on every vertex - so without this every surface is lit as if it faced the same direction. Costs a compute dispatch whenever a mesh's acceleration structure is built or updated."));
+		add_check(emu_settings_type::RemixSplitRows, tr("Recover split matrix rows (restart)"),
+			tr("Recovers a projection whose rows do not all arrive as dot products in the same register - one row written into a different temporary and copied across, or overwritten by a multiply-add carrying a correction term. Without this such a program reports no matrix chain at all, no camera can be derived from it, and every world draw that depends on it is refused. Turning it off restores the previous classification of every program exactly; it is tried only after every other matcher has refused."));
 		add_int(emu_settings_type::RemixRenderTargetVerts, tr("Post-process quad vertex limit (restart)"),
 			tr("A draw sampling a render target is treated as a post-process blit and refused when it has no more vertices than this. Shadow maps and probes are also render targets, so the limit is what separates them."));
 		add_double(emu_settings_type::RemixSkyExtent, tr("Sky detection extent"),
@@ -767,6 +769,20 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 		add_int(emu_settings_type::RemixCameraHold, tr("Camera hold frames"),
 			tr("How many frames the last resolved camera is kept when a frame resolves none of its own. Without a hold, a single frame with no perspective world draw - looking at the sky, for instance - drops the camera and the scene is rendered from the world origin. 0 restores that behaviour."));
 
+		add_check(emu_settings_type::RemixCameraTrack, tr("Camera identity tracking"),
+			tr("Follows the camera by identity over time instead of re-electing one every frame: the longest-serving candidate keeps the camera, survives a few frames in which it is not drawn at all, and hands over only when it truly disappears. Use it when the view flickers or snaps between nearby positions while the camera is otherwise being resolved. Off restores the plain per-frame vote exactly."));
+
+		begin_group(tr("Sky"), remix_right);
+		QLabel* sky_note = new QLabel(tr("Comma-separated 16-hex-digit texture hashes, listed the same way as the categories below. This makes the sky self-lit rather than tagging it: the sky category is a poor fit for a dome, because a runtime that hides what it tags removes the dome from the scene entirely."), current_group);
+		sky_note->setWordWrap(true);
+		current_form->addRow(sky_note);
+		add_text(emu_settings_type::RemixSkyEmissive, tr("Emissive sky textures"),
+			tr("Draws using one of these textures are made emissive, so the sky reads as a lit backdrop instead of unlit geometry that the scene's own lights have to reach."));
+		add_double(emu_settings_type::RemixSkyEmissiveIntensity, tr("Emissive intensity"),
+			tr("Radiance multiplier applied to the textures listed above."));
+		add_check(emu_settings_type::RemixSkyEmissiveBlend, tr("Emissive keeps blending"),
+			tr("Keeps the draw's own alpha blending while it is emissive. Turn this off if a layered sky - a cloud sheet over a gradient, for instance - comes out doubled or washed out."));
+
 		begin_group(tr("Instance categories"), remix_right);
 		QLabel* cat_note = new QLabel(tr("Comma-separated 16-hex-digit texture hashes. Remix's own rtx.*Textures lists cannot categorise draws from this backend, so they are set here instead."), current_group);
 		cat_note->setWordWrap(true);
@@ -781,6 +797,11 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 			tr("Stops rasterising the game's own 2D draws. Menus, HUD and text will be invisible."));
 		add_int(emu_settings_type::RemixUIWidth, tr("UI compositor width (restart)"),
 			tr("Width of the CPU-rasterised overlay buffer. The overlay is stretched to the output, so this trades UI sharpness against CPU cost. 0 uses the window size."));
+
+		add_check(emu_settings_type::RemixKeepRenderTargets, tr("Composite render target draws (restart)"),
+			tr("Rasterises 2D draws that target an offscreen render target rather than the screen. A title that composes its HUD into a render target and then blits the result loses the HUD entirely without this. Off by default because each such draw costs a full-screen fill, which on some titles is the difference between playable and not."));
+		add_check(emu_settings_type::RemixClearBackground, tr("Paint clear colour on 2D frames"),
+			tr("On a frame that submits no world geometry - a splash screen, a loading screen, a full-screen menu - paints the game's own framebuffer clear colour underneath the overlay. There is no framebuffer to clear in this backend, so without this those frames show the empty ray-traced scene wherever the 2D draws leave gaps."));
 
 		begin_group(tr("Diagnostics"), remix_left);
 		add_check(emu_settings_type::RemixDump, tr("Log draw diagnostics (restart)"),

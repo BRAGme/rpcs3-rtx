@@ -51,6 +51,22 @@ namespace remix_rsx
 		bool check_fork_slots();
 		bool probe_create_texture();
 
+		// ROUND 56, child-process boot crash (Ratchet & Clank Collection -> RC1). The runtime
+		// SUBCLASSES the HWND it is started on -- dxvk-remix's D3D9SwapChainEx::HookWindowProc
+		// installs D3D9WindowProc and files a raw D3D9SwapChainEx* against the window in a static
+		// map. Nothing in remixapi Shutdown() takes that hook back off, and the module stays
+		// mapped after FreeLibrary, so the window goes on routing every message into
+		// D3D9WindowProc -- whose second statement dereferences the swapchain that teardown has
+		// already freed. RPCS3 hits this because gui_application::get_gs_frame RE-USES the game
+		// window across a child-process boot (IsChildProcess=1) and Qt sends it WM_SETICON, which
+		// lands in the dead proc before the new runtime has even loaded.
+		//
+		// Taking the hook back off is the host's job: we own the window, and we are the ones
+		// unloading the module the proc code lives in. Only a proc that is still the exact
+		// pointer the runtime installed is restored, so a foreign subclass chain is never
+		// clobbered.
+		void unhook_window_proc();
+
 		// ROUND 39. Negative probe of remixapi_Interface::SetConfigVariable, the only route by
 		// which this client could ever drive rtx.* options (per-zone volumetric fog is the reason
 		// it was asked). Writes nothing and gates nothing - it reports, and the reading is spelled
@@ -61,6 +77,11 @@ namespace remix_rsx
 		HMODULE m_dll = nullptr;
 		bool m_ok = false;
 		bool m_fork_features = false;
+
+		// Set only when Startup() actually changed the window's proc; all three move together.
+		HWND m_hwnd = nullptr;
+		WNDPROC m_original_wndproc = nullptr;
+		WNDPROC m_remix_wndproc = nullptr;
 	};
 
 	// SEH-guarded leaf calls. POD parameters only: __try/__except cannot coexist with
