@@ -6,6 +6,7 @@
 
 #include "Emu/RSX/Remix/remix_c.h"
 
+#include <array>
 #include <vector>
 
 namespace remix_rsx
@@ -105,6 +106,33 @@ namespace remix_rsx
 		// like m_draws/m_frames and unlike m_pixels (which the timing line resets per window).
 		const uv_address_counters& uv_counters() const { return m_uv; }
 
+		// Round 61. The span rasterizer's bill and its proof counters, reset per timing window
+		// with m_pixels. bbox_px is counted per triangle on BOTH paths (it is what the reference
+		// loop visits); every other field is counted only inside the span path, so an
+		// UIFASTRASTER=0 run pays nothing for them and stays a clean baseline.
+		struct raster_counters
+		{
+			u64 bbox_px = 0;       // bounding-box pixels of every rasterized triangle
+			u64 fast_tris = 0;     // triangles the span path drew
+			u64 ref_tris = 0;      // triangles the reference loop drew (knob off, or ineligible)
+			u64 visited = 0;       // span-path pixels that reached the inside test
+			u64 opaque = 0;        // span-path alpha == 255 stores
+			u64 translucent = 0;   // span-path 0 < alpha < 255 blends: the reciprocal-divide population
+			u64 transparent = 0;   // span-path alpha == 0 early-outs
+			u64 verify_tris = 0;   // UIFASTRASTER=2: triangles drawn by both paths and compared
+			u64 verify_bad_px = 0; // ... and how many 32-bit pixels differed, summed
+		};
+
+		const raster_counters& raster() const { return m_raster; }
+		void reset_raster() { m_raster = {}; }
+
+		// UIFASTRASTER=2: x, y, reference pixel, span pixel of the first difference in the latest
+		// triangle that differed. All zero until one does.
+		const std::array<u32, 4>& verify_first() const { return m_verify_first; }
+
+		// Order-sensitive 64-bit digest of the whole buffer, for the per-frame identity check.
+		u64 checksum() const;
+
 	private:
 		void blend(u32 x, u32 y, u32 src_bgra);
 
@@ -120,6 +148,10 @@ namespace remix_rsx
 		u64 m_frames = 0;
 		u64 m_pixels = 0;
 		uv_address_counters m_uv{};
+
+		raster_counters m_raster{};
+		std::vector<u8> m_verify;
+		std::array<u32, 4> m_verify_first{};
 	};
 
 	// RPCS3_REMIX_NOUI=1 disables the compositor entirely.
@@ -250,6 +282,16 @@ namespace remix_rsx
 	bool ui_rect_shrink_matches(u64 content_hash);
 	u32 ui_rect_shrink_count();
 	u32 ui_rect_shrink_percent();
+
+	// RPCS3_REMIX_UIFASTRASTER: 0 = the reference rasterizer for every triangle; 1 = the span
+	// rasterizer for the dominant textured/flat-tint case (pixel-identical by construction, see
+	// fast_span in RemixCompositor.cpp); 2 = the span rasterizer with every eligible triangle also
+	// drawn by the reference into a shadow buffer and compared, mismatches counted on the timing
+	// line. Tri-state on purpose: an explicit 0 is a real 0, not "unset".
+	u32 ui_fast_raster_mode();
+
+	// RPCS3_REMIX_UISUM=1 logs 'Remix ui-sum:' with the buffer digest once per submitted frame.
+	bool ui_sum_enabled();
 }
 
 #endif

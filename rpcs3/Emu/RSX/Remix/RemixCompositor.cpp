@@ -475,6 +475,129 @@ namespace remix_rsx
 
 			return out;
 		}
+
+		// --- round 61: blend()'s divisor ---------------------------------------------------------
+		// ((src * alpha) + dst_term + out_alpha / 2) / out_alpha divides by a value that changes per
+		// pixel, which no compiler can strength-reduce. ceil(2^32 / d) as a 64-bit multiplier with
+		// a 32-bit shift is exact for every numerator below 2^32 / 255; blend()'s largest is
+		// 255 * 254 + 64770 + 127 = 129667. PROVEN, not argued: every divisor 1..255 against every
+		// numerator in [0, 2^18) - 66,846,720 cases - matched the division with zero mismatches
+		// (docs/remix/uifastraster-reciptest.cpp, run 2026-09-10).
+		struct alpha_reciprocals
+		{
+			u64 values[256]{};
+
+			constexpr alpha_reciprocals()
+			{
+				for (u32 d = 1; d < 256; ++d)
+				{
+					values[d] = (0xFFFFFFFFull / d) + 1;
+				}
+			}
+		};
+
+		constexpr alpha_reciprocals s_alpha_recip{};
+
+		inline u32 div_by_alpha(u32 n, u32 d)
+		{
+			return static_cast<u32>((u64{n} * s_alpha_recip.values[d]) >> 32);
+		}
+
+		// --- round 61: the span rasterizer's scanline bound --------------------------------------
+		// The reference loop visits every bounding-box pixel and rejects with
+		// `w0 < 0 || w1 < 0 || w2 < 0`. Each w is affine in fx in exact arithmetic, so the accepted
+		// pixels of a scanline form one interval - but the reference evaluates them in binary32,
+		// and the point of this path is to visit fewer pixels WITHOUT changing which ones survive.
+		// So the interval solved here is the exact one widened by a bound on the reference's own
+		// rounding error, and the reference test then runs verbatim on every pixel inside it. A
+		// pixel outside has some exact w_j at least e_j below zero, where e_j bounds
+		// |binary32 w_j - exact w_j| over the scanline, so the reference rejects it as well. That
+		// is the identity argument; it needs finite vertices, which draw_triangle already
+		// guarantees through its area test, and anything non-finite here falls back to the box.
+		//
+		// The bound, with u = 2^-24 the binary32 unit roundoff, in the reference's operand order:
+		// raw_j = fl(fl(fl(xa - fx) * A) - fl(fl(xb - fx) * B)) with A, B the float-rounded
+		// scanline constants, then w_j = fl(raw_j * inv_area). With M_j the scanline maximum of
+		// |(xa - fx) A| and |(xb - fx) B|: |raw_j - exact| <= 6.3u M_j (8u used), and after the
+		// inv_area multiply, whose own error is u|w| plus u|w| for inv_area = fl(1 / area),
+		// |w_j - exact| <= 12.2u M_j / |area| (14u used). w2 = fl(fl(1 - w0) - w1) adds at most
+		// 3u (1 + |w0| + |w1|). A contracted multiply-subtract only lowers the raw error, so the
+		// bound holds under either code generation.
+		bool fast_span(const f32 (&x)[3], const f32 (&y)[3], f32 fy, f32 area, s32 min_x, s32 max_x,
+			s32& px_lo, s32& px_hi)
+		{
+			constexpr f64 u = 5.9604644775390625e-8; // 2^-24
+			const f64 fx_lo = static_cast<f64>(min_x) + 0.5;
+			const f64 fx_hi = static_cast<f64>(max_x) + 0.5;
+			const f64 abs_area = std::abs(static_cast<f64>(area));
+
+			// a + b * fx >= -e is "not provably rejected by edge j", in units of w.
+			f64 a[3]{}, b[3]{}, e[3]{}, bound[2]{};
+
+			for (u32 j = 0; j < 2; ++j)
+			{
+				// j = 0 is the reference's w0: xa = x[1], A = y[2] - fy, xb = x[2], B = y[1] - fy.
+				// j = 1 is its w1: xa = x[2], A = y[0] - fy, xb = x[0], B = y[2] - fy. A and B are
+				// rounded to binary32 exactly as the reference rounds them.
+				const f32 xa = (j == 0) ? x[1] : x[2];
+				const f32 xb = (j == 0) ? x[2] : x[0];
+				const f32 fa = (j == 0) ? (y[2] - fy) : (y[0] - fy);
+				const f32 fb = (j == 0) ? (y[1] - fy) : (y[2] - fy);
+				const f64 A = fa;
+				const f64 B = fb;
+				const f64 dxa = std::max(std::abs(f64{xa} - fx_lo), std::abs(f64{xa} - fx_hi));
+				const f64 dxb = std::max(std::abs(f64{xb} - fx_lo), std::abs(f64{xb} - fx_hi));
+				const f64 M = std::max(std::abs(A) * dxa, std::abs(B) * dxb);
+				// Both products are exact: 24-bit operands into a 53-bit mantissa.
+				const f64 c = (f64{xa} * A) - (f64{xb} * B);
+				const f64 s = B - A;
+				a[j] = c / static_cast<f64>(area);
+				b[j] = s / static_cast<f64>(area);
+				e[j] = 14.0 * u * M / abs_area;
+				bound[j] = 2.1 * M / abs_area;
+			}
+
+			a[2] = 1.0 - a[0] - a[1];
+			b[2] = -(b[0] + b[1]);
+			e[2] = (3.0 * u * (1.0 + bound[0] + bound[1])) + e[0] + e[1];
+
+			f64 lo = fx_lo;
+			f64 hi = fx_hi;
+
+			for (u32 j = 0; j < 3; ++j)
+			{
+				if (!std::isfinite(a[j]) || !std::isfinite(b[j]) || !std::isfinite(e[j]))
+				{
+					px_lo = min_x;
+					px_hi = max_x;
+					return true;
+				}
+
+				if (b[j] > 0.0)
+				{
+					lo = std::max(lo, (-e[j] - a[j]) / b[j]);
+				}
+				else if (b[j] < 0.0)
+				{
+					hi = std::min(hi, (-e[j] - a[j]) / b[j]);
+				}
+				else if (a[j] < -e[j])
+				{
+					return false;
+				}
+			}
+
+			// fx = px + 0.5. The 1e-6 is double-rounding slack for a boundary that lands within it
+			// of a pixel centre: that pixel stays in, which is the safe side.
+			if (lo - 1e-6 > hi + 1e-6)
+			{
+				return false;
+			}
+
+			px_lo = std::max(min_x, static_cast<s32>(std::ceil(lo - 0.5 - 1e-6)));
+			px_hi = std::min(max_x, static_cast<s32>(std::floor(hi - 0.5 + 1e-6)));
+			return px_lo <= px_hi;
+		}
 	}
 
 	bool compositor_disabled()
@@ -641,6 +764,39 @@ namespace remix_rsx
 			}
 
 			return static_cast<u32>(std::clamp<long>(parsed, 10, 100));
+		}();
+
+		return value;
+	}
+
+	u32 ui_fast_raster_mode()
+	{
+		static const u32 value = []() -> u32
+		{
+			wchar_t buffer[16]{};
+			const DWORD written = GetEnvironmentVariableW(L"RPCS3_REMIX_UIFASTRASTER", buffer, static_cast<DWORD>(std::size(buffer)));
+
+			// Unset falls through to the default; an explicit 0 is a real 0. Not `env || default`,
+			// the shape that made SMOOTHNORMALS=0 and TEXBUDGET=0 silent no-ops.
+			if (written == 0 || written >= std::size(buffer))
+			{
+				return 0;
+			}
+
+			const long parsed = ::wcstol(buffer, nullptr, 10);
+			return static_cast<u32>(std::clamp<long>(parsed, 0, 2));
+		}();
+
+		return value;
+	}
+
+	bool ui_sum_enabled()
+	{
+		static const bool value = []
+		{
+			wchar_t buffer[16]{};
+			const DWORD written = GetEnvironmentVariableW(L"RPCS3_REMIX_UISUM", buffer, static_cast<DWORD>(std::size(buffer)));
+			return written > 0 && written < std::size(buffer) && ::wcstol(buffer, nullptr, 10) != 0;
 		}();
 
 		return value;
@@ -820,46 +976,260 @@ namespace remix_rsx
 			return;
 		}
 
-		for (s32 py = min_y; py <= max_y; ++py)
+		// Round 61. The reference loop, verbatim: every bounding-box pixel, the inside test, the
+		// sampler, blend(). It is what RPCS3_REMIX_UIFASTRASTER=0 runs for every triangle, what
+		// every primitive the span path does not take still runs, and the oracle the span path is
+		// checked against under UIFASTRASTER=2.
+		const auto reference_loop = [&]()
 		{
-			const f32 fy = static_cast<f32>(py) + 0.5f;
-
-			for (s32 px = min_x; px <= max_x; ++px)
+			for (s32 py = min_y; py <= max_y; ++py)
 			{
-				const f32 fx = static_cast<f32>(px) + 0.5f;
+				const f32 fy = static_cast<f32>(py) + 0.5f;
 
-				const f32 w0 = (((x[1] - fx) * (y[2] - fy)) - ((x[2] - fx) * (y[1] - fy))) * inv_area;
-				const f32 w1 = (((x[2] - fx) * (y[0] - fy)) - ((x[0] - fx) * (y[2] - fy))) * inv_area;
-				const f32 w2 = 1.f - w0 - w1;
+				for (s32 px = min_x; px <= max_x; ++px)
+				{
+					const f32 fx = static_cast<f32>(px) + 0.5f;
 
-				if (w0 < 0.f || w1 < 0.f || w2 < 0.f)
+					const f32 w0 = (((x[1] - fx) * (y[2] - fy)) - ((x[2] - fx) * (y[1] - fy))) * inv_area;
+					const f32 w1 = (((x[2] - fx) * (y[0] - fy)) - ((x[0] - fx) * (y[2] - fy))) * inv_area;
+					const f32 w2 = 1.f - w0 - w1;
+
+					if (w0 < 0.f || w1 < 0.f || w2 < 0.f)
+					{
+						continue;
+					}
+
+					// Most Haze UI, including its full-screen loading image, uses one tint for the
+					// whole primitive. Avoid four channels of barycentric interpolation per pixel in
+					// that overwhelmingly common case; varying-colour HUD triangles retain the exact
+					// interpolation path below.
+					const u32 tint = flat_tint ? tint_bgra[0] : interpolate_bgra(tint_bgra, w0, w1, w2);
+					u32 colour = tint;
+
+					if (tex)
+					{
+						f32 su = (u[0] * w0) + (u[1] * w1) + (u[2] * w2);
+						f32 sv = (v[0] * w0) + (v[1] * w1) + (v[2] * w2);
+						apply_rect_shrink(su, sv, shrink, min_u, max_u, min_v, max_v);
+						colour = modulate(
+							sample_bgra(*tex, su, sv, clamp_uv, subrect_u, subrect_v, seam_rule, m_uv),
+							tint);
+
+						if (force_opaque)
+						{
+							colour |= 0xFF000000u;
+						}
+					}
+
+					blend(static_cast<u32>(px), static_cast<u32>(py), colour);
+				}
+			}
+		};
+
+		// Round 61. The span path for the dominant primitive - textured, one tint, no rect shrink,
+		// a plain colour sheet (not B8 coverage, not a flare) - which is every full-screen menu
+		// quad this backend has measured. Four changes against the reference, none of which moves
+		// a pixel:
+		//   1. per scanline only the interval fast_span() proves can hold accepted pixels is
+		//      visited, and the reference's inside test still runs on each of them, verbatim;
+		//   2. the row base, the texture's fields, the tint and the clip rectangle are read once
+		//      per triangle instead of reloaded per pixel behind every byte store;
+		//   3. blend()'s three variable-divisor divisions go through div_by_alpha();
+		//   4. the tint / texture / shrink / force_opaque branches are resolved once.
+		// The barycentrics and the UVs are recomputed per pixel exactly as the reference does -
+		// no incremental stepping, whose accumulated error could flip an edge test. m_pixels and
+		// the addressing partition are summed in from locals, so both read the same as the
+		// reference would have produced.
+		const auto fast_loop = [&]()
+		{
+			const texture_entry& t = *tex;
+			const u8* const texels = t.pixels.data();
+			const u32 tw = t.width;
+			const u32 th = t.height;
+			const f32 ftw = static_cast<f32>(tw);
+			const f32 fth = static_cast<f32>(th);
+			const u8 wrap_u = t.wrap_u;
+			const u8 wrap_v = t.wrap_v;
+			const u32 tint = tint_bgra[0];
+			const u32 opaque_mask = force_opaque ? 0xFF000000u : 0u;
+			u8* const buffer = m_buffer.data();
+			const usz stride = usz{m_width} * 4;
+			const bool clip_enabled = m_clip_enabled;
+			const f32 clip_x0 = m_clip[0];
+			const f32 clip_y0 = m_clip[1];
+			const f32 clip_x1 = m_clip[2];
+			const f32 clip_y1 = m_clip[3];
+
+			uv_address_counters counters{};
+			u64 pixels = 0;
+			u64 visited = 0;
+			u64 opaque = 0;
+			u64 translucent = 0;
+			u64 transparent = 0;
+
+			for (s32 py = min_y; py <= max_y; ++py)
+			{
+				const f32 fy = static_cast<f32>(py) + 0.5f;
+				s32 px_lo = 0;
+				s32 px_hi = -1;
+
+				if (!fast_span(x, y, fy, area, min_x, max_x, px_lo, px_hi))
 				{
 					continue;
 				}
 
-				// Most Haze UI, including its full-screen loading image, uses one tint for the
-				// whole primitive. Avoid four channels of barycentric interpolation per pixel in
-				// that overwhelmingly common case; varying-colour HUD triangles retain the exact
-				// interpolation path below.
-				const u32 tint = flat_tint ? tint_bgra[0] : interpolate_bgra(tint_bgra, w0, w1, w2);
-				u32 colour = tint;
+				u8* const row = buffer + (usz{static_cast<u32>(py)} * stride);
+				const f32 fpy = static_cast<f32>(py);
 
-				if (tex)
+				for (s32 px = px_lo; px <= px_hi; ++px)
 				{
+					++visited;
+					const f32 fx = static_cast<f32>(px) + 0.5f;
+
+					const f32 w0 = (((x[1] - fx) * (y[2] - fy)) - ((x[2] - fx) * (y[1] - fy))) * inv_area;
+					const f32 w1 = (((x[2] - fx) * (y[0] - fy)) - ((x[0] - fx) * (y[2] - fy))) * inv_area;
+					const f32 w2 = 1.f - w0 - w1;
+
+					if (w0 < 0.f || w1 < 0.f || w2 < 0.f)
+					{
+						continue;
+					}
+
 					f32 su = (u[0] * w0) + (u[1] * w1) + (u[2] * w2);
 					f32 sv = (v[0] * w0) + (v[1] * w1) + (v[2] * w2);
-					apply_rect_shrink(su, sv, shrink, min_u, max_u, min_v, max_v);
-					colour = modulate(
-						sample_bgra(*tex, su, sv, clamp_uv, subrect_u, subrect_v, seam_rule, m_uv),
-						tint);
 
-					if (force_opaque)
+					// sample_bgra() for this primitive class, 0 for a clipped coordinate included.
+					const bool keep_u = address_coordinate(su, wrap_u, clamp_uv, subrect_u, seam_rule, counters);
+					const bool keep_v = address_coordinate(sv, wrap_v, clamp_uv, subrect_v, seam_rule, counters);
+					u32 sampled = 0;
+
+					if (keep_u && keep_v)
 					{
-						colour |= 0xFF000000u;
+						const u32 tx = std::min(tw - 1, static_cast<u32>(su * ftw));
+						const u32 ty = std::min(th - 1, static_cast<u32>(sv * fth));
+						std::memcpy(&sampled, texels + ((usz{ty} * tw + tx) * 4), sizeof(u32));
 					}
-				}
 
-				blend(static_cast<u32>(px), static_cast<u32>(py), colour);
+					const u32 colour = modulate(sampled, tint) | opaque_mask;
+
+					// blend(), with the destination walked along the row instead of recomputed.
+					++pixels;
+					const u32 alpha = (colour >> 24) & 0xFF;
+
+					if (alpha == 0)
+					{
+						++transparent;
+						continue;
+					}
+
+					if (clip_enabled &&
+						(static_cast<f32>(px) < clip_x0 || static_cast<f32>(px) > clip_x1 ||
+						 fpy < clip_y0 || fpy > clip_y1))
+					{
+						continue;
+					}
+
+					u8* const dst = row + (usz{static_cast<u32>(px)} * 4);
+
+					if (alpha == 0xFF)
+					{
+						++opaque;
+						std::memcpy(dst, &colour, sizeof(u32));
+						continue;
+					}
+
+					++translucent;
+					const u32 inv = 255 - alpha;
+					const u32 dst_alpha = dst[3];
+					const u32 out_alpha = alpha + ((dst_alpha * inv + 127) / 255);
+
+					for (u32 c = 0; c < 3; ++c)
+					{
+						const u32 src = (colour >> (c * 8)) & 0xFF;
+						const u32 dst_term = (u32{dst[c]} * dst_alpha * inv + 127) / 255;
+						dst[c] = static_cast<u8>(div_by_alpha((src * alpha) + dst_term + (out_alpha / 2), out_alpha));
+					}
+
+					dst[3] = static_cast<u8>(out_alpha);
+				}
+			}
+
+			m_pixels += pixels;
+			m_uv.in += counters.in;
+			m_uv.wrap += counters.wrap;
+			m_uv.seam += counters.seam;
+			m_uv.mirror += counters.mirror;
+			m_uv.clip += counters.clip;
+			m_uv.clamp += counters.clamp;
+			m_raster.visited += visited;
+			m_raster.opaque += opaque;
+			m_raster.translucent += translucent;
+			m_raster.transparent += transparent;
+		};
+
+		const u32 fast_mode = ui_fast_raster_mode();
+		const bool fast = fast_mode != 0 && tex && flat_tint && shrink == 100
+			&& !tex->pixels.empty() && tex->width != 0 && tex->height != 0
+			&& !tex->b8_coverage && !demons_flare_bilinear(*tex);
+
+		m_raster.bbox_px += u64{static_cast<u32>(max_x - min_x + 1)} * static_cast<u32>(max_y - min_y + 1);
+
+		if (!fast)
+		{
+			++m_raster.ref_tris;
+			reference_loop();
+		}
+		else
+		{
+			const bool verify = fast_mode >= 2;
+
+			if (verify)
+			{
+				// The reference draws this triangle into a copy of the buffer, the span path draws
+				// it into the real one, and the two are compared whole. The counters the reference
+				// bumps are put back so the window's totals describe the span path alone.
+				const u64 pixels_before = m_pixels;
+				const uv_address_counters uv_before = m_uv;
+				m_verify.assign(m_buffer.begin(), m_buffer.end());
+				std::swap(m_buffer, m_verify);
+				reference_loop();
+				std::swap(m_buffer, m_verify);
+				m_pixels = pixels_before;
+				m_uv = uv_before;
+			}
+
+			++m_raster.fast_tris;
+			fast_loop();
+
+			if (verify)
+			{
+				++m_raster.verify_tris;
+
+				if (std::memcmp(m_buffer.data(), m_verify.data(), m_buffer.size()) != 0)
+				{
+					const usz texels = usz{m_width} * m_height;
+					u64 bad = 0;
+
+					for (usz i = 0; i < texels; ++i)
+					{
+						u32 got = 0;
+						u32 ref = 0;
+						std::memcpy(&got, m_buffer.data() + (i * 4), sizeof(u32));
+						std::memcpy(&ref, m_verify.data() + (i * 4), sizeof(u32));
+
+						if (got != ref)
+						{
+							if (bad == 0)
+							{
+								m_verify_first = { static_cast<u32>(i % m_width), static_cast<u32>(i / m_width), ref, got };
+							}
+
+							++bad;
+						}
+					}
+
+					m_raster.verify_bad_px += bad;
+				}
 			}
 		}
 
@@ -1097,6 +1467,29 @@ namespace remix_rsx
 
 		return guarded_draw_screen_overlay(api.DrawScreenOverlay,
 			m_buffer.data(), m_width, m_height, REMIXAPI_FORMAT_B8G8R8A8_UNORM, 1.f);
+	}
+
+	u64 compositor::checksum() const
+	{
+		// FNV-1a's constants over 64-bit words rather than bytes: eight times fewer dependent
+		// multiplies across a 7.7 MB buffer, still order-sensitive, and only read behind UISUM.
+		u64 hash = 0xcbf29ce484222325ull;
+		const u8* p = m_buffer.data();
+		const usz words = m_buffer.size() / sizeof(u64);
+
+		for (usz i = 0; i < words; ++i, p += sizeof(u64))
+		{
+			u64 word = 0;
+			std::memcpy(&word, p, sizeof(u64));
+			hash = (hash ^ word) * 0x100000001b3ull;
+		}
+
+		for (usz i = words * sizeof(u64); i < m_buffer.size(); ++i)
+		{
+			hash = (hash ^ m_buffer[i]) * 0x100000001b3ull;
+		}
+
+		return hash;
 	}
 }
 

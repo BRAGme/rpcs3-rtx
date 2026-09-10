@@ -2183,6 +2183,8 @@ private:
 		u64 submit = 0;   // submit_compositor -> DrawScreenOverlay
 		u64 present = 0;  // guarded_present
 		u64 ui = 0;       // composite_ui_draw, summed over the frame
+		u64 ui_raster = 0; // round 61: the compositor::draw_triangle calls inside 'ui', so the
+		                   // rasterizer's share of composite_ui_draw is measured, not inferred
 		u64 draw = 0;     // submit_subdraw, summed over the frame
 		u64 mesh_create = 0; // guarded_create_mesh, summed over the frame
 		// --- round 31: what the rest of 'draw' is -----------------------------------------------

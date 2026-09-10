@@ -868,7 +868,7 @@ void RemixGSRender::on_init_thread()
 			"uiclamp=%u clampalbedos=%u mainclipmax=%d skipccconst=%d "
 			// Round 25. uirectshrink is the HUD-font fix and is the first thing its play-test card
 			// checks; a run that shows doubled glyphs with uirectshrink=0 was launched without it.
-			"uirectshrink=%u uirectshrinkpct=%u "
+			"uirectshrink=%u uirectshrinkpct=%u uifastraster=%u "
 			// ROUND 52, appended at the END of the UI group with its four arguments in the matching
 			// position immediately after uirectshrinkpct's. uitinttexcoord and uiuvucode DEFAULT TO
 			// 1, which is exactly why they have to be here: a run that still shows a white opaque
@@ -1135,6 +1135,8 @@ void RemixGSRender::on_init_thread()
 			remix_rsx::skip_cc_const_writer_enabled() ? 1 : 0,
 			remix_rsx::ui_rect_shrink_count(),
 			remix_rsx::ui_rect_shrink_percent(),
+			// ROUND 61, in the position of "uifastraster=%u" above: 0 reference, 1 span, 2 span+verify.
+			remix_rsx::ui_fast_raster_mode(),
 			// ROUND 52, in the order of
 			// "uitinttexcoord=%d uiuvucode=%d uiforcevpdw=%d ucodestorefphashes=%u" above.
 			remix_rsx::ui_tint_texcoord_enabled() ? 1 : 0,
@@ -19072,7 +19074,11 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 			}
 		}
 		else
+		{
+			const u64 t_raster = now_us();
 			m_compositor.draw_triangle(x, y, u, v, have_uv ? entry : nullptr, tints, force_clamp_uv, force_opaque);
+			m_timing.ui_raster += now_us() - t_raster;
+		}
 	}
 
 	m_compositor.clear_clip();
@@ -19898,6 +19904,32 @@ void RemixGSRender::submit_compositor()
 	{
 		m_compositor_open = false;
 		return;
+	}
+
+	// Round 61. The identity instruments: the digest of the buffer exactly as it goes to the
+	// runtime (UISUM=1, one line per submitted frame), and the first mismatch UIFASTRASTER=2
+	// found this frame, bounded so a broken path cannot drown the log.
+	if (remix_rsx::ui_sum_enabled())
+	{
+		rsx_log.notice("Remix ui-sum: frame=%llu size=%ux%u draws=%llu sum=%016llx",
+			m_frame_counter, m_compositor.width(), m_compositor.height(), m_compositor.draws(), m_compositor.checksum());
+	}
+
+	if (remix_rsx::ui_fast_raster_mode() >= 2)
+	{
+		static u64 bad_seen = 0;
+		static u32 bad_lines = 0;
+		const u64 bad = m_compositor.raster().verify_bad_px;
+
+		if (bad != 0 && bad != bad_seen && bad_lines < 16)
+		{
+			++bad_lines;
+			const auto& first = m_compositor.verify_first();
+			rsx_log.error("Remix ui-verify: frame=%llu bad_px=%llu first=(%u,%u) ref=%08x got=%08x",
+				m_frame_counter, bad, first[0], first[1], first[2], first[3]);
+		}
+
+		bad_seen = bad;
 	}
 
 	const u32 status = m_compositor.submit(m_remix.api());
@@ -34052,7 +34084,8 @@ void RemixGSRender::log_stats()
 			// against their own format text rather than appended to the end of the argument list -
 			// rounds 18 and 19 both shipped an ordering bug here by appending. They are siblings of
 			// the five that were already here, so rest= below subtracts all nine.
-			" | draw=%.2f (ui=%.2f mesh_create=%.2f tex_bind=%.2f uv=%.2f draw_instance=%.2f"
+			// ROUND 61: ui_raster is a child of ui, not of draw - it is NOT in the rest= subtraction.
+			" | draw=%.2f (ui=%.2f ui_raster=%.2f mesh_create=%.2f tex_bind=%.2f uv=%.2f draw_instance=%.2f"
 			" decode=%.2f audit=%.2f hash=%.2f xform=%.2f rest=%.2f) | deferred_instance=%.2f"
 			// ROUND 32: scene= and meshes= answer "which level was this sample taken in", which the
 			// line could not say. The round-31 log's three largest frame_ms samples were all
@@ -34061,7 +34094,13 @@ void RemixGSRender::log_stats()
 			// done on the wrong frames. scene= is m_active_camera.position, freshly written by
 			// apply_gauge_anchor_camera earlier in this same flip().
 			" | other=%.2f | scene=[%.4g %.4g %.4g] meshes=%llu | ui_px/frame=%.0f"
-			" | mesh_creates/frame=%.1f peak=%llu buckets=%llu/%llu/%llu/%llu/%llu",
+			" | mesh_creates/frame=%.1f peak=%llu buckets=%llu/%llu/%llu/%llu/%llu"
+			// ROUND 61, appended at the END so no position above moves. ui_fast=<span>/<reference>
+			// triangles is the proof the UIFASTRASTER route is armed; bbox_px/frame is what the
+			// reference loop visits; fast_px = visited/opaque/translucent/transparent is the span
+			// path's own partition (translucent is the reciprocal-divide population); verify =
+			// triangles compared / pixels that differed under UIFASTRASTER=2.
+			" | ui_fast=%llu/%llu bbox_px/frame=%.0f fast_px=%llu/%llu/%llu/%llu verify=%llu/%llu",
 			m_timing.frames,
 			ms(m_timing.window),
 			ms(m_timing.flip),
@@ -34070,6 +34109,7 @@ void RemixGSRender::log_stats()
 			ms(m_timing.present),
 			ms(m_timing.draw),
 			ms(m_timing.ui),
+			ms(m_timing.ui_raster),
 			ms(m_timing.mesh_create),
 			ms(m_timing.tex_bind),
 			ms(m_timing.uv),
@@ -34100,7 +34140,17 @@ void RemixGSRender::log_stats()
 			m_timing.mesh_create_buckets[1],
 			m_timing.mesh_create_buckets[2],
 			m_timing.mesh_create_buckets[3],
-			m_timing.mesh_create_buckets[4]);
+			m_timing.mesh_create_buckets[4],
+			// ROUND 61, in the order of "ui_fast=%llu/%llu bbox_px/frame=%.0f fast_px=... verify=..." above.
+			m_compositor.raster().fast_tris,
+			m_compositor.raster().ref_tris,
+			static_cast<f64>(m_compositor.raster().bbox_px) / n,
+			m_compositor.raster().visited,
+			m_compositor.raster().opaque,
+			m_compositor.raster().translucent,
+			m_compositor.raster().transparent,
+			m_compositor.raster().verify_tris,
+			m_compositor.raster().verify_bad_px);
 
 		// --- ROUND 58: what the backend is HOLDING, beside what it is spending ---------------------
 		//
@@ -34328,6 +34378,7 @@ void RemixGSRender::log_stats()
 
 		m_timing = {};
 		m_compositor.reset_pixels();
+		m_compositor.reset_raster();
 	}
 
 	if (m_ui_biggest.area > 0.f)
@@ -34931,7 +34982,7 @@ void RemixGSRender::log_stats()
 			// explains a "smaller than the main pass" rule firing or not.
 			"uiclamp=%u clampalbedos=%u mainclipmax=%d "
 			// Round 25. The HUD-font lever, stated where every other UI knob is stated.
-			"uirectshrink=%u uirectshrinkpct=%u "
+			"uirectshrink=%u uirectshrinkpct=%u uifastraster=%u "
 			// ROUND 52, appended at the END of the UI group with its four arguments in the matching
 			// position immediately after uirectshrinkpct's - same edit as the run-start banner, for
 			// the same reason: RPCS3.log is exclusively locked while the game runs, so a run's UI
@@ -35644,6 +35695,8 @@ void RemixGSRender::log_stats()
 			remix_rsx::main_clip_max_enabled() ? 1 : 0,
 			remix_rsx::ui_rect_shrink_count(),
 			remix_rsx::ui_rect_shrink_percent(),
+			// ROUND 61, in the position of "uifastraster=%u" above: 0 reference, 1 span, 2 span+verify.
+			remix_rsx::ui_fast_raster_mode(),
 			// ROUND 52, in the order of
 			// "uitinttexcoord=%d uiuvucode=%d uiforcevpdw=%d ucodestorefphashes=%u" above.
 			remix_rsx::ui_tint_texcoord_enabled() ? 1 : 0,
