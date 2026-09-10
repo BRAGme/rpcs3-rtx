@@ -1061,6 +1061,19 @@ namespace remix_rsx
 		// "vertex colour is a 0..2 lighting multiplier packed into 0..1" convention. 1.0 means the
 		// chain was a plain copy. Only ever applied to rgb: the ucode scales .xyz and copies .w.
 		f32 out_vcol_scale = 1.f;
+
+		// --- ROUND 62: COL0.rgb is an inline literal ---------------------------------------------
+		// True when the terminal writer of COL0.rgb (the same index the classifier above reads) is
+		// an unconditional 'MOV col0.xyz, c[]' writing all three lanes, with no negate and no abs.
+		// out_rgb_const_rgb is the literal read THROUGH the operand's swizzle - 'c[].xyyx' of
+		// [0.263 0.231 0 0] is the colour (0.263, 0.231, 0.231), and 'c[].xxxx' of 0.1725 is a grey.
+		// The swizzle is part of the value, not a discriminator between colours and scalars.
+		//
+		// A flag beside out_rgb_source rather than a fifth fp_out_source value, so that field stays
+		// 'other' for these programs and its consumers - the ucode-store gate, the fpother census,
+		// fpclass= - are byte-identical with RPCS3_REMIX_FPCONSTALBEDO off. Clamped to 0..1.
+		bool out_rgb_const = false;
+		f32 out_rgb_const_rgb[3] = { 1.f, 1.f, 1.f };
 	};
 
 	// Reads the fragment ucode and reports which sampled units feed the final colour. 'ucode' is
@@ -1129,6 +1142,20 @@ namespace remix_rsx
 	// come out still white / washed out, or that show flat white patches where the x2 clips. There
 	// is no brighter setting: at 1 the ceiling is the 8-bit unorm Modulate factor itself.
 	bool fp_vcol_deep_scale_enabled();
+
+	// RPCS3_REMIX_FPCONSTALBEDO=1 (default 0 = OFF, byte-identical to today). ROUND 62.
+	//
+	// For a draw whose fragment program's terminal writer of COL0.rgb is an unconditional
+	// 'MOV col0.xyz, c[]' (fp_fingerprint::out_rgb_const), state that literal as the surface colour
+	// through the instance blend extension: textureColorArg1Source = TFactor, SelectArg1, tFactor =
+	// the literal, linearised to match what the runtime does with the material's texture format.
+	// Applies whether the draw carries a guest material - the texture then only ever fed alpha, it
+	// is a mask, and its alpha channel keeps doing exactly that - or round 6's grey (an untextured
+	// draw of a flat-painted program). No new material, no mesh-key change.
+	// Counter: fpconst_applied (draws) on 'Remix live:'. Census: one 'Remix fpconst:' per program.
+	//
+	// Tri-state parse copied from ui_fast_raster_mode(): unset = default, an explicit 0 is a real 0.
+	u32 fp_const_albedo_mode();
 
 	fp_fingerprint scan_fragment_program(const void* ucode, u32 ucode_length, bool fp32_outputs);
 

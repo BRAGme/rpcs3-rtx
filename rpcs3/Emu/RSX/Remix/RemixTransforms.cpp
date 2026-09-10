@@ -9535,6 +9535,29 @@ namespace remix_rsx
 		return value;
 	}
 
+	// ROUND 62. Shaped like ui_fast_raster_mode() (RemixCompositor.cpp) rather than 'env || default':
+	// unset falls through to the default and an explicit 0 is a real 0 - the shape that made
+	// SMOOTHNORMALS=0 and TEXBUDGET=0 silent no-ops is not used.
+	u32 fp_const_albedo_mode()
+	{
+		static const u32 value = []() -> u32
+		{
+			wchar_t buffer[16]{};
+			const DWORD written = GetEnvironmentVariableW(L"RPCS3_REMIX_FPCONSTALBEDO", buffer,
+				static_cast<DWORD>(std::size(buffer)));
+
+			if (written == 0 || written >= std::size(buffer))
+			{
+				return 0;
+			}
+
+			const long parsed = ::wcstol(buffer, nullptr, 10);
+			return static_cast<u32>(std::clamp<long>(parsed, 0, 1));
+		}();
+
+		return value;
+	}
+
 	fp_fingerprint scan_fragment_program(const void* ucode, u32 ucode_length, bool fp32_outputs)
 	{
 		fp_fingerprint result{};
@@ -10192,6 +10215,50 @@ namespace remix_rsx
 			};
 
 			rgb_index = hop_copies(rgb_index, 0x7);
+
+			// --- ROUND 62: is the rgb terminal a LITERAL? -------------------------------------------
+			// 'MOV col0.xyz, c[]' is the program's own statement that the surface colour is a
+			// constant. Read at the index the classifier below reads, so the two can never disagree
+			// about which instruction is the terminal. MEASURED on Eat Lead, 9 of the 61 programs in
+			// bin\remix_ucode\ - the decals and flat-painted surfaces:
+			//   C91606BCC3890030  4: MOV R0.xyz <- c[].xxxx   c=[0.172549 0 0 0]
+			//   D0D82B380F6466F3  6: MOV R0.xyz <- c[].xyyx   c=[0.262745 0.231373 0 0]
+			//   D0D83B38196466F3  6: MOV R0.xyz <- c[].xyzw   c=[0.215686 0.196078 0.137255 0]
+			// The value is read THROUGH the swizzle (the second is (0.263, 0.231, 0.231)); all three
+			// lanes must come from this one instruction, because a partial write leaves lanes from an
+			// earlier writer; the write must be unconditional; neg/abs are refused - a negated
+			// colour is not a colour.
+			if (rgb_index >= 0)
+			{
+				const fp_instr& out = code[rgb_index];
+
+				if (out.opcode == RSX_FP_OPCODE_MOV && out.writes
+					&& (out.write_mask & 0x7) == 0x7
+					&& out.exec_lt && out.exec_eq && out.exec_gr
+					&& out.has_constant
+					&& out.src_type[0] == RSX_FP_REGISTER_TYPE_CONSTANT
+					&& !(out.src_neg & 1u) && !(out.src_abs & 1u))
+				{
+					f32 rgb[3]{};
+					bool finite = true;
+
+					for (u32 lane = 0; lane < 3; ++lane)
+					{
+						rgb[lane] = out.constant[(u32{out.src_swizzle[0]} >> (lane * 2)) & 3u];
+						finite = finite && std::isfinite(rgb[lane]);
+					}
+
+					if (finite)
+					{
+						result.out_rgb_const = true;
+
+						for (u32 lane = 0; lane < 3; ++lane)
+						{
+							result.out_rgb_const_rgb[lane] = std::clamp(rgb[lane], 0.f, 1.f);
+						}
+					}
+				}
+			}
 
 			// --- ROUND 52: one more operation that is provably the identity function ---------------
 			// 'MUL dst, <src>, K' where the inline literal K is exactly 1.0 on every lane the caller

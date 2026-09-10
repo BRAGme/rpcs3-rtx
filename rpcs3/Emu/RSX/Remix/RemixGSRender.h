@@ -1705,6 +1705,11 @@ private:
 		// the nectar pulse must go back to flat grey with it.
 		u64 fpvcol_applied = 0;
 
+		// ROUND 62. Draws whose instance blend extension stated the fragment program's literal
+		// COL0.rgb through SelectArg1(TFactor) - see fp_fingerprint::out_rgb_const. A draw, not a
+		// program, like its sibling above. RPCS3_REMIX_FPCONSTALBEDO=0 (the default) holds it at 0.
+		u64 fpconst_applied = 0;
+
 		// Strict subset of vcol_applied: TEXTURED draws that got their ATTR3 decoded into the
 		// submitted mesh because their fragment program proved the modulate. This is the half
 		// that moves mesh content hashes, so it is counted apart from the material-less
@@ -4426,6 +4431,12 @@ private:
 	std::unordered_set<u64> m_vcol_route_seen;
 	u32 m_vcol_route_lines = 0;
 
+	// ROUND 62. One 'Remix fpconst:' line per fragment program per run whose literal COL0 colour
+	// was stated through TFactor. Same per-run seen-set and cap as the vcolroute census.
+	static constexpr u32 s_max_fpconst_lines = 64;
+	std::unordered_set<u64> m_fpconst_seen;
+	u32 m_fpconst_lines = 0;
+
 	// One line per (vp, albedo) per window for the haze card whose fade is being replayed. Prints
 	// both ramps' ranges so a wrong term is visible numerically before it is visible aesthetically.
 	static constexpr u32 s_max_hazefade_lines = 16;
@@ -5233,6 +5244,11 @@ private:
 	// material-less or FP-classified as vertex-coloured. Called from the submit path AFTER
 	// apply_vertex_colour so the measured colour variance is the one actually submitted.
 	void report_effect_draw(u64 albedo_hash, bool has_material);
+
+	// ROUND 62. One line per fragment program per run at the moment its literal COL0 colour is
+	// stated through TFactor: the literal as decoded, the packed factor the runtime received, and
+	// whether a guest material (the elected mask) or round 6's grey sat under it.
+	void report_fpconst_draw(u64 albedo_hash, bool guest_material, u32 tfactor);
 
 	// Round 9. Write one refused vertex program's raw ucode to bin\remix_ucode\%016llX.vp.
 	// Once per program per run; no behaviour change.

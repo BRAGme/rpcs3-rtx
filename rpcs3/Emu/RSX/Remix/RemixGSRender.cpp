@@ -868,7 +868,7 @@ void RemixGSRender::on_init_thread()
 			"uiclamp=%u clampalbedos=%u mainclipmax=%d skipccconst=%d "
 			// Round 25. uirectshrink is the HUD-font fix and is the first thing its play-test card
 			// checks; a run that shows doubled glyphs with uirectshrink=0 was launched without it.
-			"uirectshrink=%u uirectshrinkpct=%u uifastraster=%u "
+			"uirectshrink=%u uirectshrinkpct=%u uifastraster=%u fpconstalbedo=%u "
 			// ROUND 52, appended at the END of the UI group with its four arguments in the matching
 			// position immediately after uirectshrinkpct's. uitinttexcoord and uiuvucode DEFAULT TO
 			// 1, which is exactly why they have to be here: a run that still shows a white opaque
@@ -1137,6 +1137,9 @@ void RemixGSRender::on_init_thread()
 			remix_rsx::ui_rect_shrink_percent(),
 			// ROUND 61, in the position of "uifastraster=%u" above: 0 reference, 1 span, 2 span+verify.
 			remix_rsx::ui_fast_raster_mode(),
+			// ROUND 62, in the position of "fpconstalbedo=%u" above: 1 applies a fragment
+			// program's output RGB constant as the draw's albedo.
+			remix_rsx::fp_const_albedo_mode(),
 			// ROUND 52, in the order of
 			// "uitinttexcoord=%d uiuvucode=%d uiforcevpdw=%d ucodestorefphashes=%u" above.
 			remix_rsx::ui_tint_texcoord_enabled() ? 1 : 0,
@@ -13238,6 +13241,49 @@ void RemixGSRender::report_effect_draw(u64 albedo_hash, bool has_material)
 		m_frame_counter,
 		m_effect_lines,
 		s_max_effect_lines));
+}
+
+// ROUND 62. See the declaration. Emitted at the apply site, so a line here is proof the factor was
+// written into the instance's blend extension for a draw that reached submission.
+void RemixGSRender::report_fpconst_draw(u64 albedo_hash, bool guest_material, u32 tfactor)
+{
+	if (!remix_rsx::diag_lines_enabled() || !m_current_fp_fingerprint
+		|| m_fpconst_lines >= s_max_fpconst_lines)
+	{
+		return;
+	}
+
+	if (!m_fpconst_seen.insert(m_current_fp_hash).second)
+	{
+		return;
+	}
+
+	++m_fpconst_lines;
+
+	const f32* rgb = m_current_fp_fingerprint->out_rgb_const_rgb;
+	const bool fp32_outputs = (rsx::method_registers.shader_control() & CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS) != 0;
+
+	dump_line(fmt::format(
+		"Remix fpconst: vp=%016llx fp=%016llx fpraw=%016llX rgb=[%.4g %.4g %.4g] tfactor=%08X "
+		"guest_material=%d albedo=%016llX sampled=0x%02x blend=%d clip=%ux%u target=%u "
+		"frame=%llu line=%u/%u",
+		m_current_vp_hash,
+		m_current_fp_hash,
+		m_current_fp_hash ^ (fp32_outputs ? 0x9e3779b97f4a7c15ull : 0ull),
+		static_cast<f64>(rgb[0]),
+		static_cast<f64>(rgb[1]),
+		static_cast<f64>(rgb[2]),
+		tfactor,
+		guest_material ? 1 : 0,
+		albedo_hash,
+		u32{m_current_fp_fingerprint->sampled_mask},
+		rsx::method_registers.blend_enabled() ? 1 : 0,
+		rsx::method_registers.surface_clip_width(),
+		rsx::method_registers.surface_clip_height(),
+		static_cast<u32>(rsx::method_registers.surface_color_target()),
+		m_frame_counter,
+		m_fpconst_lines,
+		s_max_fpconst_lines));
 }
 
 // Round 9. The permanent ucode capture.
@@ -31303,6 +31349,67 @@ void RemixGSRender::submit_subdraw()
 			blend_state.isVertexColorBakedLighting = 0;
 		}
 
+		// --- ROUND 62: the fragment program's COL0.rgb is a literal ------------------------------
+		// Eat Lead is a deferred renderer: every world program writes four targets (target=31,
+		// fp32=1), and R0 is the albedo its composite multiplies by the lighting
+		// (A59484C9C738C0CB: '13: TEX R0.xyz [tex0]' then '14: MUL R0.xyz <- R0, R1'). Nine of the
+		// 61 stored programs write that albedo as a literal - the decals and flat-painted surfaces
+		// (see scan_fragment_program's round-62 block for the three quoted shapes) - while the
+		// texture they DO sample feeds only alpha: 'MUL R1.w <- R0.xxxx, tc0.w', a mask times the
+		// vertex alpha. This backend elects that mask as the albedo, so the decal renders as its
+		// own greyscale mask, and an untextured draw of the same program takes round 6's grey.
+		// Either way the colour the guest actually states is discarded.
+		//
+		// Stated through the same fixed-function stage round 9 uses for COL0, one enum value along:
+		// SelectArg1(TFactor). tFactor is D3DRS_TEXTUREFACTOR and the runtime offers it as the
+		// albedo argument (opaque_surface_material_interaction.slangh:717, chooseTextureArgument
+		// (..., tFactor.rgb, ...)). No new material and no per-colour material cache: the colour
+		// rides on the instance, the material underneath - grey, or the elected mask whose alpha
+		// channel is exactly what the alpha stage keeps reading - is untouched, and so is the mesh
+		// key. albedoConstant would have needed a material per literal and could not have covered
+		// the textured-mask half at all. static_submit_signature already folds tFactor.
+		//
+		// GAMMA. The literal is what the guest writes to its 8-bit G-buffer, i.e. gamma-encoded,
+		// the same space as its textures. The runtime linearises an albedo in software ONLY when it
+		// did not come from an sRGB-format texture (the ALBEDO_TEXTURE_IS_SRGB skip at
+		// opaque_surface_material_interaction.slangh:755), and SelectArg1 replaces the sampled
+		// value AFTER that flag was decided by the texture - so on the default sRGB materials the
+		// factor is consumed as linear and is linearised here, once; under RPCS3_REMIX_TEXLINEAR the
+		// materials are UNORM, the runtime converts, and the literal goes in untouched. D3DCOLOR
+		// byte order, from the unpack unorm4x8ToFloat4x32(tFactor).bgra: A:R:G:B.
+		//
+		// MRT3 (R4) is NOT the colour. Its literal is (x, y, 1.0)-shaped in 9 of the corpus's 14
+		// constant writers - [0 0.0627 1], [0.854 0.196 1], [0.7626 0.098 1], [0 0.008 1] - with the
+		// middle lane stepping through 2, 16, 25, 50 / 255, and it is shared by textured, grey and
+		// white surfaces alike: a material-parameter target. The [0 0.0627 1] in it read as a
+		// saturated blue; it never reaches COL0 in any program on disk.
+		if (remix_rsx::fp_const_albedo_mode() != 0 && m_current_fp_fingerprint
+			&& m_current_fp_fingerprint->out_rgb_const && submit_material)
+		{
+			const f32* rgb = m_current_fp_fingerprint->out_rgb_const_rgb;
+			const bool runtime_linearises = remix_rsx::textures_linear();
+			u32 packed = 0xFF000000u;
+
+			for (u32 lane = 0; lane < 3; ++lane)
+			{
+				f32 v = rgb[lane];
+
+				if (!runtime_linearises)
+				{
+					v = v <= 0.04045f ? v / 12.92f : std::pow((v + 0.055f) / 1.055f, 2.4f);
+				}
+
+				packed |= static_cast<u32>(std::clamp(v, 0.f, 1.f) * 255.f + 0.5f) << (16 - lane * 8);
+			}
+
+			blend_state.textureColorArg1Source = 3;  // RtTextureArgSource::TFactor
+			blend_state.textureColorArg2Source = 0;  // RtTextureArgSource::None
+			blend_state.textureColorOperation = 1;   // DxvkRtTextureOperation::SelectArg1
+			blend_state.tFactor = packed;
+			++m_stats.fpconst_applied;
+			report_fpconst_draw(albedo_hash, material != nullptr, packed);
+		}
+
 		// ONE/ZERO with ADD is the runtime's "Opaque Alias" (rtx_instance_manager.cpp:717-719):
 		// the pair that means "this draw is not really blended". Correct rest state for the
 		// blend-disabled majority, and correct fallback for anything the mapping refuses.
@@ -34892,7 +34999,9 @@ void RemixGSRender::log_stats()
 			// vcol_fold_applied is the constant fold; ucode_fp_stored is the offline capture.
 			"hazefade=%llu fpvcol_skygate=%llu vcol_route_blocked=%llu vcol_alpha_only=%llu "
 			"vcol_tint=%llu/%llu vcol_fold=%llu "
-			"ucode_fp=%llu/%llu | "
+			// ROUND 62. fpconst is the literal-COL0 replay (SelectArg1(TFactor)); 0 with
+			// RPCS3_REMIX_FPCONSTALBEDO unset is the default, not a failure.
+			"ucode_fp=%llu/%llu fpconst=%llu | "
 			// Round 12. vcol_const is the flat-constant COL0 replay ('MOV o1, c[K]'), the second
 			// mechanism that was sending the HUD gauges to a wrong colour. It can only climb on
 			// draws that reach apply_vertex_colour at all - i.e. UNTEXTURED draws while
@@ -34982,7 +35091,7 @@ void RemixGSRender::log_stats()
 			// explains a "smaller than the main pass" rule firing or not.
 			"uiclamp=%u clampalbedos=%u mainclipmax=%d "
 			// Round 25. The HUD-font lever, stated where every other UI knob is stated.
-			"uirectshrink=%u uirectshrinkpct=%u uifastraster=%u "
+			"uirectshrink=%u uirectshrinkpct=%u uifastraster=%u fpconstalbedo=%u "
 			// ROUND 52, appended at the END of the UI group with its four arguments in the matching
 			// position immediately after uirectshrinkpct's - same edit as the run-start banner, for
 			// the same reason: RPCS3.log is exclusively locked while the game runs, so a run's UI
@@ -35597,6 +35706,7 @@ void RemixGSRender::log_stats()
 			m_stats.vcol_fold_applied,
 			m_stats.ucode_fp_stored,
 			m_stats.ucode_fp_store_failed,
+			m_stats.fpconst_applied,
 			m_stats.vcol_const_applied,
 			m_textures.stats().materials_sky_emissive,
 			m_textures.stats().materials_sky_unordered,
@@ -35697,6 +35807,9 @@ void RemixGSRender::log_stats()
 			remix_rsx::ui_rect_shrink_percent(),
 			// ROUND 61, in the position of "uifastraster=%u" above: 0 reference, 1 span, 2 span+verify.
 			remix_rsx::ui_fast_raster_mode(),
+			// ROUND 62, in the position of "fpconstalbedo=%u" above: 1 applies a fragment
+			// program's output RGB constant as the draw's albedo.
+			remix_rsx::fp_const_albedo_mode(),
 			// ROUND 52, in the order of
 			// "uitinttexcoord=%d uiuvucode=%d uiforcevpdw=%d ucodestorefphashes=%u" above.
 			remix_rsx::ui_tint_texcoord_enabled() ? 1 : 0,
