@@ -26,7 +26,7 @@ It now follows those two extra steps. After the fix, 18,137,400 draws go through
 
 ## New settings
 
-Six settings that used to be environment variables are now in the **Settings → RTX Remix** tab. Everything on that tab is also still an `RPCS3_REMIX_*` variable and still settable per game in a `<TITLEID>.conf` file, and a variable always wins over the tab.
+Seven settings that used to be environment variables are now in the **Settings → RTX Remix** tab. Everything on that tab is also still an `RPCS3_REMIX_*` variable and still settable per game in a `<TITLEID>.conf` file, and a variable always wins over the tab.
 
 **Geometry**
 - **Recover split matrix rows** *(on)* — the Ratchet & Clank fix above. Finds a camera in games that write their projection maths across several places instead of one. Turning it off restores exactly how every game was read before.
