@@ -1,7 +1,7 @@
 **RPCS3 RTX Remix — preview 3**
 <https://github.com/BRAGme/rpcs3-rtx/releases/tag/remix-preview-3>
 
-304 commits on from preview 2. **Ratchet & Clank Collection renders**, and the build has caught up with upstream RPCS3.
+306 commits on from preview 2. **Ratchet & Clank Collection renders**, and the build has caught up with upstream RPCS3.
 
 🎮 Ratchet & Clank was a black screen. Three faults, stacked:
 • Picking a game from the collection menu **crashed** — Remix takes over the game window and never hands it back, and RPCS3 re-used that window for the next game
@@ -14,9 +14,15 @@
 • Insert Disc / Eject Disc menu entries, and a Disc Games category
 • Encrypted ISOs read keys from a `data\redump` folder you make yourself
 
+⚙️ New in **Settings → RTX Remix** (all still work as env vars / `<TITLEID>.conf` too):
+• **Recover split matrix rows** *(on)* — the Ratchet fix above; finds a camera in games that split their projection maths across several places
+• **Camera identity tracking** *(off)* — for a view that flickers between two nearby positions
+• **Emissive sky textures** + intensity + keeps blending *(new Sky group)* — makes a sky glow instead of sitting there dark. The right tool for a dome; the Sky *category* isn't, it deletes it
+• **Composite render target draws** *(off)* — turn on if a game's HUD is missing entirely. Ratchet needs it
+• **Paint clear colour on 2D frames** *(on)* — see below
+
 ✅ Also:
 • **Splash screens and menus have a background again** — games clear the screen to a colour before drawing 2D, and this backend had nowhere to put it, so you saw the empty ray-traced scene through every gap
-• **Six settings moved into the Settings window** — sky brightness, camera tracking, HUD compositing and three more, instead of environment variables
 • **A `Remix memory:` line in the log** — live mesh/texture/material counts and what they weigh, so a leak is something you read instead of guess at. Borrowed from Dolphin RTX v0.0.7
 
 ⚠️ Known issues:
