@@ -169,7 +169,7 @@ void GLFragmentDecompilerThread::insertConstants(std::stringstream & OS)
 
 	if (m_prog.ctrl & RSX_SHADER_CONTROL_EMULATE_DEPTH_COMPARE)
 	{
-		const auto frag_depth_type = (m_prog.ctrl & RSX_SHADER_CONTROL_MULTISAMPLED_ZBUFFER)
+		const auto frag_depth_type = (m_prog.ctrl & RSX_SHADER_CONTROL_ROP_MULTISAMPLED)
 			? "sampler2DMS"
 			: "sampler2D";
 
@@ -240,6 +240,7 @@ void GLFragmentDecompilerThread::insertGlobalFunctions(std::stringstream &OS)
 	m_shader_props.ROP_alpha_to_coverage_test = !!(m_prog.ctrl & RSX_SHADER_CONTROL_ALPHA_TO_COVERAGE);
 	m_shader_props.ROP_polygon_stipple_test = !!(m_prog.ctrl & RSX_SHADER_CONTROL_POLYGON_STIPPLE);
 	m_shader_props.ROP_discard = !!(m_prog.ctrl & RSX_SHADER_CONTROL_USES_KIL);
+	m_shader_props.ROP_channel_remap = !!(m_prog.ctrl & RSX_SHADER_CONTROL_ROP_OUTPUT_REMAP);
 
 	m_shader_props.require_tex1D_ops = properties.has_tex1D;
 	m_shader_props.require_tex2D_ops = properties.has_tex2D;
@@ -248,7 +249,7 @@ void GLFragmentDecompilerThread::insertGlobalFunctions(std::stringstream &OS)
 	m_shader_props.require_alpha_kill = !!(m_prog.ctrl & RSX_SHADER_CONTROL_TEXTURE_ALPHA_KILL);
 	m_shader_props.require_color_format_convert = !!(m_prog.ctrl & RSX_SHADER_CONTROL_TEXTURE_FORMAT_CONVERT);
 	m_shader_props.emulate_depth_compare = !!(m_prog.ctrl & RSX_SHADER_CONTROL_EMULATE_DEPTH_COMPARE);
-	m_shader_props.depth_buffer_multisampled = !!(m_prog.ctrl & RSX_SHADER_CONTROL_MULTISAMPLED_ZBUFFER);
+	m_shader_props.ROP_output_multisampled = !!(m_prog.ctrl & RSX_SHADER_CONTROL_ROP_MULTISAMPLED);
 
 	glsl::insert_glsl_legacy_function(OS, m_shader_props);
 }
@@ -329,10 +330,10 @@ void GLFragmentDecompilerThread::insertMainStart(std::stringstream & OS)
 	if (m_prog.two_sided_lighting)
 	{
 		if (properties.in_register_mask & in_diff_color)
-			OS << "	vec4 diff_color = gl_FrontFacing ? diff_color1 : diff_color0;\n";
+			OS << "	vec4 diff_color = gl_FrontFacing ? diff_color0 : diff_color1;\n";
 
 		if (properties.in_register_mask & in_spec_color)
-			OS << "	vec4 spec_color = gl_FrontFacing ? spec_color1 : spec_color0;\n";
+			OS << "	vec4 spec_color = gl_FrontFacing ? spec_color0 : spec_color1;\n";
 	}
 }
 
@@ -343,7 +344,7 @@ void GLFragmentDecompilerThread::insertMainEnd(std::stringstream & OS)
 	OS << "void main()\n";
 	OS << "{\n";
 
-	::glsl::insert_rop_init(OS);
+	::glsl::insert_rop_init(OS, m_prog.mrt_buffers_count);
 
 	OS << "\n" << "	fs_main();\n\n";
 
