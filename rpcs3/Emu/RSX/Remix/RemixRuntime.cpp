@@ -15,7 +15,10 @@
 // the check and then misroute every slot after the first divergence.
 //
 //   Fork          : Kim2091/dxvk-remix ("Remix Plus", maintainer Kim2091)
-//   Source commit : 9303c633eced41d7d903c485d3d35c01d3a9df5a, branch revised-9-10
+//   Source commit : 9cc8f3e52ecc075c60f6ea5deed1ac8434b2fb90, branch fresnel-grazing-f90
+//                   (BRAGme/dxvk-remix) = Kim2091/dxvk-remix `revised-9-10` tip 52755122a with
+//                   one commit cherry-picked on top: the f90 / specular-level patch that kills
+//                   the white grazing sheen on legacy materials. Pushed for Kim to pick up.
 //   API version   : 0.1000.0  (NOTE: a DOWNGRADE of the patch field from the 0.1000.1 this file
 //                   previously vendored. Harmless -- isVersionCompatible() in rtx_remix_api.cpp
 //                   compares only the minor number while major is 0, so the patch field is not
@@ -26,12 +29,16 @@
 //                   (byte-identical to public/include/remix/remix_c.h at that commit, to the
 //                   copy PCSX2's backend already vendors, and to remix-plus-1.5.1's copy --
 //                   the same blob the old text of this block named as 0.1000.0)
-//   Runtime asset : GitHub Actions run 34558891381 of that commit, artifact
-//                   rtx-remix-for-x64-games-17-9303c63-release. Deployed to <exe dir>\remix\;
-//                   d3d9.dll is 241412096 bytes,
-//                   SHA-256 4499878918D884ADD2F0600A144821E8DB3D375F93459CC07702E64972AB0D39.
+//   Runtime asset : LOCAL release build of that commit, worktree GitHub\dxvk-remix-remixplus,
+//                   _Comp64Release. NOT a CI artifact -- rebuild it there, do not go looking
+//                   for a GitHub Actions run. Deployed to <exe dir>\remix\;
+//                   d3d9.dll is 241755136 bytes,
+//                   SHA-256 CB2C0AE1063FD120FEF71BD3A18C343CF7FF0FDD6906A3DEE278FFE7AEC6FE63.
+//                   This build is 17 commits ahead of the 9303c633 CI build that briefly sat
+//                   here; remix_c.h is byte-identical across that span, so nothing re-vendored.
+//                   The ABI note below still applies unchanged.
 //                   For this exact binary log_dll_identity prints
-//                   "size=241412096 fnv1a=4f9a11fbc016e3f8", so a run's log line can be
+//                   "size=241755136 fnv1a=6c0d467421fbd23a", so a run's log line can be
 //                   compared against this block character for character, with no rehashing
 //                   and no access to the build tree. Both values are mirrored below in
 //                   vendored_runtime_size / vendored_runtime_fnv1a, which warn at load if the
@@ -151,8 +158,8 @@ namespace remix_rsx
 		// 04C3AFFD-472B-4565-9AA0-08EBE452E439 Age 24, which is d3d9.dll.bak-0729's PDB, NOT the
 		// deployed DLL's. Symbolizing a crash in the deployed runtime with it gives WRONG function
 		// names. The matching lineage is dxvk-remix-numos3\_output\d3d9.pdb (GUID 228D2E7A..., Age 49).
-		constexpr u64 vendored_runtime_size  = 241412096;
-		constexpr u64 vendored_runtime_fnv1a = 0x4f9a11fbc016e3f8;
+		constexpr u64 vendored_runtime_size  = 241755136;
+		constexpr u64 vendored_runtime_fnv1a = 0x6c0d467421fbd23a;
 
 		// Identity of the DLL actually loaded, so a report can say which binary produced a run.
 		void log_dll_identity(const std::wstring& path)
