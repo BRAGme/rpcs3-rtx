@@ -14,42 +14,41 @@
 // minor number, so two builds of the same minor with a different interface layout would pass
 // the check and then misroute every slot after the first divergence.
 //
-//   Fork          : RemixProjGroup/dxvk-remix ("Remix Plus", maintainer Kim2091)
-//   Source commit : 6476faeaf148b0314c4e03480e48445e796afe5c, branch numos3 (BRAGme/dxvk-remix)
-//                   Past remix-plus-1.5.1, whose copy is still blob 3f4acf5f.../0.1000.0.
-//   API version   : 0.1000.1
-//   remix_c.h     : blob ae61b5db53fa40e1563a47b07822cbbcd4122e9f, 55351 bytes
-//                   SHA-256 693334BE266D380BFE324FCBF2675849E98757CCC5BEB4224A2ED9FB20C6C4F5
-//                   (byte-identical to public/include/remix/remix_c.h at that commit)
-//   Runtime asset : local build of that commit. Deployed to <exe dir>\remix\; d3d9.dll is
-//                   240657408 bytes,
-//                   SHA-256 16A0B512F33EBB66A89AC703E75289D9E008558A13D2C9A6A5455B0BE7C40858.
-//                   ROUND 34 RE-BASELINE: this block used to name
-//                   36A5641AF4FA848E... / fnv1a 63656dfe3da8f069, and no file on this machine
-//                   hashes to that -- it was an earlier incremental link of the same tree, since
-//                   overwritten, which is why the load-time warning fired on every run from
-//                   2026-08-16 onward and was read as noise for many rounds.
+//   Fork          : Kim2091/dxvk-remix ("Remix Plus", maintainer Kim2091)
+//   Source commit : 9303c633eced41d7d903c485d3d35c01d3a9df5a, branch revised-9-10
+//   API version   : 0.1000.0  (NOTE: a DOWNGRADE of the patch field from the 0.1000.1 this file
+//                   previously vendored. Harmless -- isVersionCompatible() in rtx_remix_api.cpp
+//                   compares only the minor number while major is 0, so the patch field is not
+//                   gated in either direction. Recorded because a version number moving
+//                   backwards looks like a mistake and is not one.)
+//   remix_c.h     : blob 3f4acf5f476bf96d71bdd09354ef0602b0a8e239, 55895 bytes
+//                   SHA-256 15DC98AACEF5398A5E653B99E0AF0978C8E48183DB47839755B907E5710BB064
+//                   (byte-identical to public/include/remix/remix_c.h at that commit, to the
+//                   copy PCSX2's backend already vendors, and to remix-plus-1.5.1's copy --
+//                   the same blob the old text of this block named as 0.1000.0)
+//   Runtime asset : GitHub Actions run 34558891381 of that commit, artifact
+//                   rtx-remix-for-x64-games-17-9303c63-release. Deployed to <exe dir>\remix\;
+//                   d3d9.dll is 241412096 bytes,
+//                   SHA-256 4499878918D884ADD2F0600A144821E8DB3D375F93459CC07702E64972AB0D39.
 //                   For this exact binary log_dll_identity prints
-//                   "size=240657408 fnv1a=09653f484ec94dc0", so a run's log line can be
+//                   "size=241412096 fnv1a=4f9a11fbc016e3f8", so a run's log line can be
 //                   compared against this block character for character, with no rehashing
 //                   and no access to the build tree. Both values are mirrored below in
 //                   vendored_runtime_size / vendored_runtime_fnv1a, which warn at load if the
 //                   DLL is a different one -- change them here and there in the same commit.
 //                   FNV-1a is not collision-resistant and is only meant to answer "is this the
 //                   binary the comment describes"; the SHA-256 above stays the identity for
-//                   anything stronger. Built from a dirty
-//                   tree (17 files modified as of round 34, none of them remix_c.h or the API
-//                   implementation -- verified by `git status --porcelain` on
-//                   src/dxvk/rtx_render/rtx_remix_api.cpp and public/include/remix/remix_c.h,
-//                   both clean -- so the surface still matches the header above), which means the
-//                   commit alone does not reproduce it -- identify the binary by hash.
-//                   RETRACTED CLAIM: this block used to say the Remix_Plus_v1.5.1 release zip
-//                   "predates the VIEW_MODEL category bit this backend relies on". Not supported.
-//                   The July CI build kept at bin\remix\d3d9.dll.bak-0729 (242589696 bytes,
-//                   SHA-256 7EA6282B5A242DD9..., API 0.1000.0) ALREADY carries a bit-26 arm
-//                   (bt eax,0x1a at RVA 0x001FAEB6), and 6476faea's own message says
-//                   "Both values match the remix-plus-1.5.1 tag, which already carried this work."
-//                   What 6476faea adds on top is the Sky->Main clamp and the 0.1000.1 bump.
+//                   anything stronger. Unlike every previous entry in this block this is a CI
+//                   build off a clean tree, so the commit alone DOES reproduce it.
+//
+// ABI CHANGE carried by this re-vendor: remixapi_StartupInfo grew a trailing
+// 'combineGuiInFinalColor' field, taking sizeof() from 36 to 40 (the runtime static_asserts on
+// 40 in remixapi_dxvk_CreateD3D9_legacy). remixapi_Startup() forwards the caller's struct to
+// remixapi_dxvk_CreateD3D9(), which reads that field into dxvk::g_combineGuiInFinalColor; that
+// global gates whether the Remix ImGui overlay is composited into the final colour buffer in
+// D3D9SwapchainExternal::Present(). Against the old 36-byte header the new runtime would have
+// read the field from 4 bytes past the end of our stack struct, so initialize() now sets it
+// explicitly -- value-initialising the struct leaves it false, which silently costs the dev menu.
 //
 // Never update bin\remix\ without re-vendoring remix_c.h in the same commit.
 // ---------------------------------------------------------------------------------------------
@@ -152,8 +151,8 @@ namespace remix_rsx
 		// 04C3AFFD-472B-4565-9AA0-08EBE452E439 Age 24, which is d3d9.dll.bak-0729's PDB, NOT the
 		// deployed DLL's. Symbolizing a crash in the deployed runtime with it gives WRONG function
 		// names. The matching lineage is dxvk-remix-numos3\_output\d3d9.pdb (GUID 228D2E7A..., Age 49).
-		constexpr u64 vendored_runtime_size  = 240657408;
-		constexpr u64 vendored_runtime_fnv1a = 0x09653f484ec94dc0;
+		constexpr u64 vendored_runtime_size  = 241412096;
+		constexpr u64 vendored_runtime_fnv1a = 0x4f9a11fbc016e3f8;
 
 		// Identity of the DLL actually loaded, so a report can say which binary produced a run.
 		void log_dll_identity(const std::wstring& path)
@@ -235,6 +234,10 @@ namespace remix_rsx
 		startup_info.disableSrgbConversionForOutput = 0;
 		startup_info.forceNoVkSwapchain = 0;
 		startup_info.editorModeEnabled = 0;
+		// Must be set explicitly: the runtime reads this to decide whether to composite its own
+		// ImGui overlay into the final colour buffer, and zero-init would turn the dev menu off.
+		// See the ABI note in the provenance block at the top of this file.
+		startup_info.combineGuiInFinalColor = 1;
 
 		if (!m_storage.api.Startup)
 		{
