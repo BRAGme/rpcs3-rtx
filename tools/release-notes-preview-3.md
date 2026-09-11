@@ -69,7 +69,7 @@ Everything else upstream did in those six weeks comes with it.
 
 - **Ratchet & Clank's sky is unlit.** It renders, but as ordinary geometry waiting for a light to reach it rather than as a backdrop. Fixing it needs the sky texture identified first, then added to Emissive sky textures above.
 - **Ratchet & Clank's HUD is missing** unless you turn on Composite render target draws.
-- **The framerate is low.** The mesh cache holds five seconds of geometry, most of which is used once. `BCUS98282.conf` ships with a shorter setting; whether it is enough is not yet measured.
+- **The framerate is low**, and the profile shipped in this build does not fix it. Two things are now measured on Ratchet & Clank: 18% of every frame goes on diagnostics that refuse nothing (`RPCS3_REMIX_DRAWAUDIT=0` reclaims it), and 39% goes on building meshes — almost all of it from a single vertex program whose geometry the game rewrites every frame, so it can never hit the cache. The mesh-cache setting in `BCUS98282.conf` cuts memory, not frames; that was stated the wrong way round when this build was cut.
 - Only a handful of titles have had real work done on them. Everything else is unexplored, not broken.
 - Needs a Remix Plus / extended-API runtime — stock RTX Remix will not connect — plus your own firmware.
 
