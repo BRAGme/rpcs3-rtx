@@ -29,16 +29,20 @@
 //                   (byte-identical to public/include/remix/remix_c.h at that commit, to the
 //                   copy PCSX2's backend already vendors, and to remix-plus-1.5.1's copy --
 //                   the same blob the old text of this block named as 0.1000.0)
-//   Runtime asset : LOCAL release build of that commit, worktree GitHub\dxvk-remix-remixplus,
-//                   _Comp64Release. NOT a CI artifact -- rebuild it there, do not go looking
-//                   for a GitHub Actions run. Deployed to <exe dir>\remix\;
-//                   d3d9.dll is 241755136 bytes,
-//                   SHA-256 CB2C0AE1063FD120FEF71BD3A18C343CF7FF0FDD6906A3DEE278FFE7AEC6FE63.
-//                   This build is 17 commits ahead of the 9303c633 CI build that briefly sat
-//                   here; remix_c.h is byte-identical across that span, so nothing re-vendored.
-//                   The ABI note below still applies unchanged.
+//   Runtime asset : GitHub Actions run 34609858028 of that commit (BRAGme/dxvk-remix),
+//                   artifact rtx-remix-for-x64-games-1-9cc8f3e-release. Deployed to
+//                   <exe dir>\remix\; d3d9.dll is 241757184 bytes,
+//                   SHA-256 B555A5C39B8CD6296793F84822EDF475A24080C49F81C081AD147EF81483EBD6.
+//                   NOTE: a local _Comp64Release build of THIS SAME COMMIT is a DIFFERENT
+//                   binary -- 241755136 bytes, SHA-256 CB2C0AE1...FE63, 2048 bytes apart,
+//                   and it reports the identical ProductName. ProductName identifies the
+//                   COMMIT, not the BINARY, which is exactly why the fnv1a guard below
+//                   exists: switching between the CI artifact and a local build of the same
+//                   commit still requires re-baselining it. Prefer the CI artifact, since
+//                   anyone can reproduce it with
+//                   `gh workflow run build.yml --repo BRAGme/dxvk-remix --ref fresnel-grazing-f90`.
 //                   For this exact binary log_dll_identity prints
-//                   "size=241755136 fnv1a=6c0d467421fbd23a", so a run's log line can be
+//                   "size=241757184 fnv1a=f877f25d65a74ca1", so a run's log line can be
 //                   compared against this block character for character, with no rehashing
 //                   and no access to the build tree. Both values are mirrored below in
 //                   vendored_runtime_size / vendored_runtime_fnv1a, which warn at load if the
@@ -158,8 +162,8 @@ namespace remix_rsx
 		// 04C3AFFD-472B-4565-9AA0-08EBE452E439 Age 24, which is d3d9.dll.bak-0729's PDB, NOT the
 		// deployed DLL's. Symbolizing a crash in the deployed runtime with it gives WRONG function
 		// names. The matching lineage is dxvk-remix-numos3\_output\d3d9.pdb (GUID 228D2E7A..., Age 49).
-		constexpr u64 vendored_runtime_size  = 241755136;
-		constexpr u64 vendored_runtime_fnv1a = 0x6c0d467421fbd23a;
+		constexpr u64 vendored_runtime_size  = 241757184;
+		constexpr u64 vendored_runtime_fnv1a = 0xf877f25d65a74ca1;
 
 		// Identity of the DLL actually loaded, so a report can say which binary produced a run.
 		void log_dll_identity(const std::wstring& path)
