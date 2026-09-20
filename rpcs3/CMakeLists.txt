@@ -193,6 +193,10 @@ if(BUILD_RPCS3_TESTS)
             tests/test_iso_extent.cpp
             tests/test_rsx_cfg.cpp
             tests/test_rsx_fp_asm.cpp
+            tests/test_remix_fp_const.cpp
+            tests/test_remix_sr2_skin.cpp
+            tests/test_remix_sr2_character.cpp
+            tests/test_remix_sr2_material.cpp
             tests/test_dmux_pamf.cpp
             tests/test_spu_analyser.cpp
             tests/test_types_util.cpp

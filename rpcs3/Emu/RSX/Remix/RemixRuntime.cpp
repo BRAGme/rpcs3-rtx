@@ -268,9 +268,7 @@ namespace remix_rsx
 		if (!m_storage.api.Startup)
 		{
 			rsx_log.error("Remix: runtime exposes no Startup entry point");
-			remixapi_lib_shutdownAndUnloadRemixDll(&m_storage.api, m_dll);
-			m_storage = {};
-			m_dll = nullptr;
+			shutdown_keeping_module();
 			return false;
 		}
 
@@ -311,9 +309,9 @@ namespace remix_rsx
 		{
 			rsx_log.error("Remix: Startup failed (%s)", error_name(startup_status));
 			unhook_window_proc();
-			remixapi_lib_shutdownAndUnloadRemixDll(&m_storage.api, m_dll);
-			m_storage = {};
-			m_dll = nullptr;
+			// A Startup that failed late can still have got far enough to create a device and
+			// with it the PCL-stats ping thread, so the module is kept mapped here too.
+			shutdown_keeping_module();
 			return false;
 		}
 
@@ -516,6 +514,44 @@ namespace remix_rsx
 		rsx_log.notice("Remix: restored the original window proc on HWND 0x%x", reinterpret_cast<u64>(hwnd));
 	}
 
+	void runtime::shutdown_keeping_module()
+	{
+		// ROUND 64, GRAW2 (NPUB30502) child-process boot crash. Shutdown() is called, FreeLibrary
+		// deliberately is NOT -- which is why this does the work by hand instead of calling
+		// remixapi_lib_shutdownAndUnloadRemixDll() (and remix_c.h stays byte-identical to the
+		// fork's public header, as it must).
+		//
+		// dxvk-remix's Reflex integration starts NVIDIA's PCL-stats ping thread in RtxReflex's
+		// constructor (PCLSTATS_INIT, rtx_reflex.cpp) and only ever stops it in ~RtxReflex, i.e.
+		// at DxvkDevice teardown. remixapi Shutdown() does not guarantee that destructor runs --
+		// the runtime is known to leak DxvkDevices -- so the ping thread routinely outlives the
+		// interface. FreeLibrary then unmaps the 241 MB module out from under a thread that is
+		// still looping inside it, and it faults the moment it next wakes:
+		//
+		//   d3d9.dll_unloaded + 0x20e8d3  ->  PCLStatsPingThreadProc (0x20e560..0x20e931)
+		//
+		// Every other title got away with this because nothing unloads the runtime until the
+		// process is already on its way out. GRAW2 does not: its EBOOT is a DRM launcher that
+		// calls sceNpDrmProcessExitSpawn ~2.5s after boot to hand off to USRDIR/OFFLINE/YETI.self,
+		// RPCS3 services that as a full Emu::Kill() plus reboot, and the process then goes on
+		// living with the module gone. Three runs, three identical 0xC0000005 at that offset.
+		//
+		// Keeping the module mapped costs one HMODULE that is never released and makes the
+		// dangling thread harmless: it keeps pinging into code and globals that still exist.
+		// The next boot's LoadLibraryW simply takes a reference on the image already in memory,
+		// which is the path Ratchet & Clank Collection -> RC1 has been re-initialising through
+		// since round 56.
+		if (m_storage.api.Shutdown)
+		{
+			m_storage.api.Shutdown();
+		}
+
+		m_storage = {};
+		m_dll = nullptr;
+		m_ok = false;
+		m_fork_features = false;
+	}
+
 	void runtime::shutdown()
 	{
 		// Ahead of Shutdown(), not after it. The window lives on the main thread and this runs on
@@ -525,19 +561,7 @@ namespace remix_rsx
 		// restores when the proc is still its own, and erases its map entry either way.
 		unhook_window_proc();
 
-		if (!m_dll)
-		{
-			m_storage = {};
-			m_ok = false;
-			m_fork_features = false;
-			return;
-		}
-
-		remixapi_lib_shutdownAndUnloadRemixDll(&m_storage.api, m_dll);
-		m_storage = {};
-		m_dll = nullptr;
-		m_ok = false;
-		m_fork_features = false;
+		shutdown_keeping_module();
 	}
 
 	u32 guarded_startup(PFN_remixapi_Startup fn, const remixapi_StartupInfo* info)

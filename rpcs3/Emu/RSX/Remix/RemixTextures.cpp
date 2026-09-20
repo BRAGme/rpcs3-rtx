@@ -811,6 +811,218 @@ namespace remix_rsx
 		return inserted.first->second.material;
 	}
 
+	const texture_entry* texture_cache::sr2_character_source(const rsx::fragment_texture& tex, u64 frame)
+	{
+		if (textures_disabled()) return nullptr;
+		const u32 format = tex.format() & ~(CELL_GCM_TEXTURE_LN | CELL_GCM_TEXTURE_UN);
+		auto refuse = [&](const char* reason) -> const texture_entry*
+		{
+			++m_stats.unsupported;
+			note_refusal(reason, format, tex.width(), tex.height());
+			return nullptr;
+		};
+		if (tex.format() & CELL_GCM_TEXTURE_UN) return refuse("sr2-source-unnormalized");
+		if (!tex.enabled() || tex.cubemap() || tex.dimension() != rsx::texture_dimension::dimension2d
+			|| tex.depth() != 1) return refuse("sr2-source-dimension");
+		if (tex.location() > 1) return refuse("sr2-source-location");
+		if (!tex.width() || !tex.height() || !tex.mipmap()
+			|| (is_bc_format(format) && (tex.width() < 4 || tex.height() < 4))) return refuse("sr2-source-dims");
+		// decode() deliberately gives B8 a spread/opaque interpretation, not guest remap parity.
+		if (format == CELL_GCM_TEXTURE_B8) return refuse("sr2-source-b8");
+		if (!is_direct_bgra8(format) && !expander_for(format) && !is_bc_format(format)) return refuse("sr2-source-format");
+		if (tex.remap() != RSX_TEXTURE_REMAP_IDENTITY && !texture_remap_enabled())
+			return refuse("sr2-source-remap-disabled");
+		if (tex.argb_signed() || tex.signed_remap() != CELL_GCM_TEXTURE_SIGNED_REMAP_NORMAL)
+			return refuse("sr2-source-signed");
+		if (tex.gamma()) return refuse("sr2-source-gamma");
+		if (tex.unsigned_remap() != CELL_GCM_TEXTURE_UNSIGNED_REMAP_NORMAL) return refuse("sr2-source-biased");
+		if (tex.alpha_kill_enabled()) return refuse("sr2-source-alpha-kill");
+		const auto supported_wrap = [](rsx::texture_wrap_mode mode)
+		{
+			return mode == rsx::texture_wrap_mode::wrap || mode == rsx::texture_wrap_mode::mirror
+				|| mode == rsx::texture_wrap_mode::clamp || mode == rsx::texture_wrap_mode::clamp_to_edge;
+		};
+		if (!supported_wrap(tex.wrap_s()) || !supported_wrap(tex.wrap_t())) return refuse("sr2-source-wrap");
+
+		texture_descriptor desc{};
+		desc.offset = tex.offset();
+		desc.location = tex.location();
+		desc.format = tex.format();
+		desc.pitch = tex.pitch();
+		desc.width = tex.width();
+		desc.height = tex.height();
+		desc.depth = tex.depth();
+		desc.mipmaps = static_cast<u8>(std::min<u32>(0xFF, tex.get_exact_mipmap_count()));
+		desc.border = tex.border_type();
+		desc.wrap_s = static_cast<u8>(tex.wrap_s());
+		desc.wrap_t = static_cast<u8>(tex.wrap_t());
+		desc.dimension = static_cast<u8>(tex.dimension());
+		u64 key = rpcs3::hash64(desc.key(), 0x535232534f555243ull); // SR2SOURC, CPU-only namespace.
+		key = rpcs3::hash64(key, tex.remap());
+		key = rpcs3::hash64(key, texture_remap_enabled() ? 1u : 0u);
+		if (!key) key = 1;
+
+		const usz size = rsx::get_texture_size(tex);
+		if (!size || size > s_max_decoded_bytes) return refuse("sr2-source-size");
+		const u32 address = rsx::get_address(desc.offset, desc.location);
+		if (!vm::check_addr(address, vm::page_readable, static_cast<u32>(size)))
+		{
+			++m_stats.unreadable;
+			note_refusal("sr2-source-unreadable", format, desc.width, desc.height);
+			return nullptr;
+		}
+
+		auto [it, inserted] = m_entries.try_emplace(key);
+		texture_entry& entry = it->second;
+		entry.last_used_frame = frame;
+		if (entry.texture || entry.material) return refuse("sr2-source-key-conflict");
+		if (entry.last_cpu_refresh_frame == frame) return entry.unsupported ? nullptr : &entry;
+		entry.last_cpu_refresh_frame = frame;
+		const u64 hash = fnv_bytes(vm::_ptr<const u8>(address), size, rpcs3::fnv_seed);
+		if (!inserted && entry.content_refresh == hash)
+		{
+			++m_stats.hits;
+			return entry.unsupported ? nullptr : &entry;
+		}
+
+		texture_entry decoded{};
+		decoded.last_used_frame = frame;
+		decoded.last_cpu_refresh_frame = frame;
+		decoded.content_refresh = hash;
+		decoded.wrap_u = to_remix_wrap(tex.wrap_s());
+		decoded.wrap_v = to_remix_wrap(tex.wrap_t());
+		if (!decode(tex, decoded))
+		{
+			decoded.unsupported = true;
+			decoded.pixels.clear();
+			entry = std::move(decoded);
+			return nullptr;
+		}
+		// Keep descriptor/remap interpretation in the derived material's source identity.
+		decoded.content_hash = rpcs3::hash64(decoded.content_hash, key);
+		if (!decoded.content_hash) decoded.content_hash = 1;
+		if (!inserted) ++m_stats.refreshed;
+		entry = std::move(decoded);
+		// unordered_map rehash invalidates iterators, not this entry's address.
+		return &entry;
+	}
+
+	const texture_entry* texture_cache::sr2_character_material(const remixapi_Interface& api, u64 frame,
+		const sr2_character_program& program, const std::array<const texture_entry*, 16>& sources,
+		const std::array<sr2_uv_map, 16>& maps)
+	{
+		if (textures_disabled() || !program.plan || !program.key || !program.plan->texture_mask
+			|| program.plan->base_unit >= sources.size()
+			|| !(program.plan->texture_mask & (1u << program.plan->base_unit))) return nullptr;
+		const texture_entry* base = sources[program.plan->base_unit];
+		if (!base || base->unsupported) return nullptr;
+		u32 width = 0, height = 0;
+		u64 key = rpcs3::hash64(program.key, 0x53523242414b4531ull); // SR2BAKE1, separate from sources/bind.
+		for (u32 unit = 0; unit < sources.size(); ++unit)
+		{
+			if (!(program.plan->texture_mask & (1u << unit))) continue;
+			const texture_entry* source = sources[unit];
+			if (!source || source->unsupported || !source->content_hash || !source->width || !source->height
+				|| usz{source->width} * source->height * 4 > s_max_decoded_bytes
+				|| source->pixels.size() != usz{source->width} * source->height * 4
+				|| source->wrap_u > 2 || source->wrap_v > 2
+				|| !std::all_of(maps[unit].begin(), maps[unit].end(), [](f32 value) { return std::isfinite(value); })) return nullptr;
+			width = std::max(width, source->width);
+			height = std::max(height, source->height);
+			key = rpcs3::hash64(key, unit);
+			key = rpcs3::hash64(key, source->content_hash);
+			key = rpcs3::hash64(key, u64{source->width} | (u64{source->height} << 32));
+			key = rpcs3::hash64(key, u64{source->wrap_u} | (u64{source->wrap_v} << 8));
+			key = fnv_bytes(reinterpret_cast<const u8*>(maps[unit].data()), sizeof(maps[unit]), key);
+		}
+		if (!width || !height || usz{width} * height * 4 > s_max_decoded_bytes) return nullptr;
+		u8 alpha_func = 7, alpha_ref = 0;
+		if (!alpha_state_disabled() && rsx::method_registers.alpha_test_enabled())
+		{
+			const u32 func = static_cast<u32>(rsx::method_registers.alpha_func());
+			const f32 reference = rsx::method_registers.alpha_ref();
+			if (func < 0x200 || func > 0x207 || !std::isfinite(reference)) return nullptr;
+			alpha_func = static_cast<u8>(func - 0x200);
+			alpha_ref = static_cast<u8>(std::clamp(reference, 0.f, 1.f) * 255.f + 0.5f);
+		}
+		key = rpcs3::hash64(key, u64{alpha_func} | (u64{alpha_ref} << 8)
+			| (u64{base->wrap_u} << 16) | (u64{base->wrap_v} << 24));
+		if (!key) key = 1;
+		if (auto it = m_entries.find(key); it != m_entries.end())
+		{
+			texture_entry& entry = it->second;
+			entry.last_used_frame = frame;
+			if (entry.unsupported || !entry.texture || !entry.material) return nullptr;
+			++m_stats.hits;
+			return &entry;
+		}
+		if (!m_budget_left)
+		{
+			++m_stats.deferred;
+			return nullptr;
+		}
+
+		texture_entry entry{};
+		entry.content_hash = key;
+		entry.last_used_frame = frame;
+		entry.width = std::min(width, 512u);
+		entry.height = std::min(height, 512u);
+		width = entry.width;
+		height = entry.height;
+		entry.wrap_u = base->wrap_u;
+		entry.wrap_v = base->wrap_v;
+		entry.alpha_func = alpha_func;
+		entry.alpha_ref = alpha_ref;
+		entry.pixels.resize(usz{width} * height * 4);
+		const auto address_coordinate = [](f32& value, u8 wrap)
+		{
+			if (!std::isfinite(value)) return false;
+			if (wrap == 1) value -= std::floor(value);
+			else if (wrap == 2)
+			{
+				value -= 2.f * std::floor(value / 2.f);
+				if (value > 1.f) value = 2.f - value;
+			}
+			value = std::clamp(value, 0.f, 1.f);
+			return true;
+		};
+		// Mip-0 nearest reconstruction approximates native-half arithmetic and guest filtering.
+		for (u32 y = 0; y < height; ++y)
+		{
+			const f32 v = (static_cast<f32>(y) + 0.5f) / static_cast<f32>(height);
+			for (u32 x = 0; x < width; ++x)
+			{
+				const f32 u = (static_cast<f32>(x) + 0.5f) / static_cast<f32>(width);
+				std::array<sr2_colour, 16> texels{};
+				for (u32 unit = 0; unit < sources.size(); ++unit)
+				{
+					if (!(program.plan->texture_mask & (1u << unit))) continue;
+					const texture_entry& source = *sources[unit];
+					const sr2_uv_map& map = maps[unit];
+					f32 su = map[0] * u + map[1] * v + map[2];
+					f32 sv = map[3] * u + map[4] * v + map[5];
+					if (!address_coordinate(su, source.wrap_u) || !address_coordinate(sv, source.wrap_v)) return nullptr;
+					const u32 sx = std::min(static_cast<u32>(su * source.width), source.width - 1);
+					const u32 sy = std::min(static_cast<u32>(sv * source.height), source.height - 1);
+					const u8* pixel = source.pixels.data() + (usz{sy} * source.width + sx) * 4;
+					texels[unit] = { pixel[2] / 255.f, pixel[1] / 255.f, pixel[0] / 255.f, pixel[3] / 255.f };
+				}
+				sr2_colour colour{};
+				if (!evaluate_sr2_character(program, texels, colour)) return nullptr;
+				u8* pixel = entry.pixels.data() + (usz{y} * width + x) * 4;
+				for (u32 lane = 0; lane < 4; ++lane)
+				{
+					const u32 bgra_lane = lane < 3 ? 2 - lane : lane;
+					pixel[bgra_lane] = static_cast<u8>(std::clamp(colour[lane], 0.f, 1.f) * 255.f + 0.5f);
+				}
+			}
+		}
+		--m_budget_left;
+		if (!upload(api, entry)) return nullptr;
+		// Content/map changes create a distinct entry; no old mesh's baked material is destroyed.
+		return &m_entries.emplace(key, std::move(entry)).first->second;
+	}
+
 	bool texture_cache::decode(const rsx::fragment_texture& tex, texture_entry& out)
 	{
 		const u32 raw_format = tex.format();

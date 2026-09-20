@@ -5,6 +5,7 @@
 #include "util/types.hpp"
 
 #include "Emu/RSX/Remix/remix_c.h"
+#include "RemixSR2Character.h"
 
 #include <unordered_map>
 #include <unordered_set>
@@ -161,6 +162,7 @@ namespace remix_rsx
 		bool b8_coverage = false;
 
 		u64 last_used_frame = 0;
+		u64 last_cpu_refresh_frame = ~0ull;
 		bool unsupported = false;
 
 		// Why the decode refused, when it did - the same static string note_refusal prints. Added
@@ -339,6 +341,11 @@ namespace remix_rsx
 			u64 frame,
 			const texture_entry** out_entry,
 			bool refresh_pixels = false);
+
+		const texture_entry* sr2_character_source(const rsx::fragment_texture& tex, u64 frame);
+		const texture_entry* sr2_character_material(const remixapi_Interface& api, u64 frame,
+			const sr2_character_program& program, const std::array<const texture_entry*, 16>& sources,
+			const std::array<sr2_uv_map, 16>& maps);
 
 		// 'live_materials' is the set of material handles that live meshes have baked into their
 		// Remix mesh objects. An idle entry whose material is in that set is KEPT rather than

@@ -369,8 +369,9 @@ namespace remix_rsx
 			return false;
 		}
 
-		u32 sample_bgra(const texture_entry& tex, f32 u, f32 v, bool force_clamp,
-			bool subrect_u, bool subrect_v, bool seam_rule, uv_address_counters& counters)
+			u32 sample_bgra(const texture_entry& tex, f32 u, f32 v, bool force_clamp,
+			bool subrect_u, bool subrect_v, bool seam_rule, uv_address_counters& counters,
+			bool b8_as_colour = false)
 		{
 			if (tex.pixels.empty() || tex.width == 0 || tex.height == 0)
 			{
@@ -399,11 +400,22 @@ namespace remix_rsx
 			u32 texel;
 			std::memcpy(&texel, tex.pixels.data() + ((usz{y} * tex.width + x) * 4), sizeof(u32));
 
-			if (tex.b8_coverage)
+			if (tex.b8_coverage && !b8_as_colour)
 			{
 				// B8 UI sheets are coverage masks. Treating the expanded grayscale byte as
 				// opaque colour makes every glyph's black padded quad erase the overlapping
 				// glyph before it; Haze's 512x512 font sheet exposes that as sliced letters.
+				//
+				// ROUND 64 adds the b8_as_colour escape, and ONLY for a draw whose fragment
+				// program samples more than one unit. A single-unit draw - every glyph sheet in
+				// every title measured, Eat Lead's 512x512 included (sampled=0x01) - keeps this
+				// branch and is bit-identical to before.
+				//
+				// What the escape buys, precisely: the plane stops doubling as a transparency
+				// mask, so the surface composites OPAQUE GREY instead of white ghosted by its own
+				// luma. It does NOT produce colour and it is not a fix for the greyscale. The
+				// other two planes are never sampled here; see the doc block on draw_triangle in
+				// RemixCompositor.h.
 				return 0x00FFFFFFu | ((texel & 0xFFu) << 24);
 			}
 
@@ -441,6 +453,87 @@ namespace remix_rsx
 			}
 
 			return texel;
+		}
+
+		u32 sample_b8_yuv(const b8_yuv_source& source, f32 u, f32 v, bool force_clamp,
+			bool subrect_u, bool subrect_v, bool seam_rule, uv_address_counters& counters)
+		{
+			f32 input[4] = { 0.f, 0.f, 0.f, source.input_w };
+			const texture_entry* first = source.planes[0];
+			const bool shared_addressing = first && source.planes[1] && source.planes[2]
+				&& first->wrap_u == source.planes[1]->wrap_u && first->wrap_u == source.planes[2]->wrap_u
+				&& first->wrap_v == source.planes[1]->wrap_v && first->wrap_v == source.planes[2]->wrap_v;
+
+			if (shared_addressing)
+			{
+				// Video planes use one sampler state. Resolve it once, then account for the three
+				// shader samples so the diagnostic partition stays identical to the reference path.
+				f32 su = u;
+				f32 sv = v;
+				const uv_address_counters before = counters;
+				const bool keep_u = address_coordinate(su, first->wrap_u, force_clamp,
+					subrect_u, seam_rule, counters);
+				const bool keep_v = address_coordinate(sv, first->wrap_v, force_clamp,
+					subrect_v, seam_rule, counters);
+				counters.in += (counters.in - before.in) * 2;
+				counters.wrap += (counters.wrap - before.wrap) * 2;
+				counters.seam += (counters.seam - before.seam) * 2;
+				counters.mirror += (counters.mirror - before.mirror) * 2;
+				counters.clip += (counters.clip - before.clip) * 2;
+				counters.clamp += (counters.clamp - before.clamp) * 2;
+
+				if (!keep_u || !keep_v)
+				{
+					return 0;
+				}
+
+				for (u32 plane = 0; plane < 3; ++plane)
+				{
+					const texture_entry& image = *source.planes[plane];
+					if (image.pixels.empty() || image.width == 0 || image.height == 0)
+					{
+						return 0;
+					}
+
+					const u32 x = std::min(image.width - 1,
+						static_cast<u32>(su * static_cast<f32>(image.width)));
+					const u32 y = std::min(image.height - 1,
+						static_cast<u32>(sv * static_cast<f32>(image.height)));
+					input[plane] = static_cast<f32>(image.pixels[(usz{y} * image.width + x) * 4]) / 255.f;
+				}
+			}
+			else
+			{
+				for (u32 plane = 0; plane < 3; ++plane)
+				{
+					if (!source.planes[plane])
+					{
+						return 0;
+					}
+
+					const u32 texel = sample_bgra(*source.planes[plane], u, v, force_clamp,
+						subrect_u, subrect_v, seam_rule, counters, true);
+					input[plane] = static_cast<f32>(texel & 0xFFu) / 255.f;
+				}
+			}
+
+			const auto dot = [&](u32 row)
+			{
+				return input[0] * source.rows[row][0]
+					+ input[1] * source.rows[row][1]
+					+ input[2] * source.rows[row][2]
+					+ input[3] * source.rows[row][3];
+			};
+			const auto byte = [](f32 value)
+			{
+				return static_cast<u32>(std::clamp(value, 0.f, 1.f) * 255.f + 0.5f);
+			};
+
+			const u32 r = byte(dot(0));
+			const u32 g = byte(dot(1));
+			const u32 b = byte(dot(2));
+			const u32 a = byte(source.output_alpha);
+			return b | (g << 8) | (r << 16) | (a << 24);
 		}
 
 		u32 modulate(u32 a_bgra, u32 b_bgra)
@@ -844,6 +937,125 @@ namespace remix_rsx
 		m_clip_enabled = false;
 	}
 
+	// ROUND 79. THE GUEST'S BLEND FACTORS, WHICH THIS COMPOSITOR HAS NEVER READ.
+	//
+	// blend() below implements exactly one blend equation - SRC_ALPHA / ONE_MINUS_SRC_ALPHA -
+	// and it is applied to every UI draw regardless of what the guest actually set. MEASURED on
+	// GRAW2 (NPUB30502) in-mission, over the 952 rows of the `Remix ui-route:` census:
+	//     637  blend=1 sfac=770 dfac=771     SRC_ALPHA / ONE_MINUS_SRC_ALPHA   <- implemented
+	//     144  blend=1 sfac=1   dfac=769     ONE / ONE_MINUS_SRC_COLOR
+	//      82  blend=1 sfac=1   dfac=1       ONE / ONE
+	//      66  blend=1 sfac=0   dfac=769     ZERO / ONE_MINUS_SRC_COLOR
+	//      21  blend=0                       blending disabled
+	//       2  sfac=1/dfac=771, sfac=0/dfac=768
+	// i.e. 292 of those 952 ROWS carry an equation the guest did not ask for. CAREFUL: rows are
+	// CAPPED AT 64 PER WINDOW AND DEDUPLICATED, so this is NOT a per-draw share and must
+	// not be read as one - a rare draw and a constant one contribute equally. The honest
+	// per-draw partition is the `Remix uiblend:` line this round adds; on the boot/menu
+	// sequence it reads identity=17 unhandled=152 with all four remapped families at ZERO,
+	// i.e. the populations below were measured IN-MISSION and are not present at the menu.
+	// The mechanism is proven by the black quads themselves; the MAGNITUDE is not yet.
+	//
+	// WHY THAT SHOWS UP AS BLACK SLABS. In every one of those families the source COLOUR, not
+	// its alpha, decides how much the element contributes, and a BLACK source contributes
+	// nothing. blend() keys on alpha, so a black source at alpha 254 - which is exactly what
+	// the census reports, `tint=[FE000000]` on a 30x28 quad - is painted as a nearly opaque
+	// black rectangle where the correct result is invisible. That is the reported HUD defect.
+	//
+	// WHAT THIS DOES NOT CLAIM, MEASURED rather than asserted. The compositor buffer carries
+	// ONE coverage value for all three channels, because the runtime's DrawScreenOverlay pass
+	// requires straight alpha. Per-channel blending is therefore STRUCTURALLY inexpressible
+	// here, and the single `peak` coverage below is the compromise. Verified offline against
+	// the true equations over 5 sources x 5 destinations per family:
+	//   * EXACT for a BLACK source and for a WHITE source, in all four families, against
+	//     every destination. The black case is the reported defect and it is exact.
+	//   * exact for any GREYSCALE source, for the same reason (all channels share a peak).
+	//   * WORST CASE 180/255 for a saturated COLOURED source mid-range, e.g. src=(200,50,25)
+	//     screened onto white: truth (255,255,255), this mapping (211,94,75). That is a big
+	//     error and it is stated here rather than buried - but today's unconditional
+	//     alpha-over is no better on the same input (max error 128 against truth) while ALSO
+	//     being wrong on the black case, which is the one on screen. A per-channel result
+	//     needs a real compositing stage in the runtime; that is a separate project.
+	// So: strictly better where the defect is, no worse where it is not, and honestly
+	// approximate for coloured additive elements (glows, muzzle flashes) - watch those.
+	compositor::blend_kind compositor::classify_blend(u32 sfactor, u32 dfactor, bool enabled)
+	{
+		// Spelled out rather than taken from rsx::blend_factor, which is not in scope in this
+		// translation unit: 0 ZERO, 1 ONE, 768 SRC_COLOR, 769 ONE_MINUS_SRC_COLOR,
+		// 770 SRC_ALPHA, 771 ONE_MINUS_SRC_ALPHA.
+		//
+		// A draw with blending DISABLED is deliberately left alone. The strictly correct result is
+		// an opaque store, but forcing that would newly paint 21 of this title's draws opaque -
+		// the exact failure mode this change exists to remove - to gain 21 draws. Not worth it
+		// without a measurement saying those 21 are wrong today.
+		if (!enabled)
+		{
+			return blend_kind::unhandled;
+		}
+
+		if (sfactor == 770 && dfactor == 771) return blend_kind::identity;
+		if (sfactor == 1 && dfactor == 769)   return blend_kind::screen;
+		if (sfactor == 1 && dfactor == 1)     return blend_kind::additive;
+		if (sfactor == 1 && dfactor == 771)   return blend_kind::premul;
+		if (sfactor == 0 && dfactor == 769)   return blend_kind::invmul;
+		if (sfactor == 0 && dfactor == 768)   return blend_kind::multiply;
+
+		return blend_kind::unhandled;
+	}
+
+	u32 compositor::resolve_blend_src(u32 src_bgra) const
+	{
+		const u32 b = src_bgra & 0xFF;
+		const u32 g = (src_bgra >> 8) & 0xFF;
+		const u32 r = (src_bgra >> 16) & 0xFF;
+		const u32 a = (src_bgra >> 24) & 0xFF;
+
+		// The source's own intensity. Every family below keys on this instead of on alpha.
+		const u32 peak = std::max(r, std::max(g, b));
+
+		const auto pack = [](u32 rr, u32 gg, u32 bb, u32 aa)
+		{
+			return bb | (gg << 8) | (rr << 16) | (aa << 24);
+		};
+
+		switch (m_blend_kind)
+		{
+		case blend_kind::screen:
+		case blend_kind::additive:
+			// out = src + dst*(1 - src), and out = src + dst.
+			// EXACT at both ends: a black source contributes nothing (coverage 0) and a white
+			// source leaves only itself (coverage 255). Additive under-brightens in between,
+			// for the straight-alpha reason given above.
+			return pack(r, g, b, peak);
+
+		case blend_kind::premul:
+			// out = src + dst*(1 - srcA): the source is already premultiplied by its own alpha.
+			// Undo that and let the ordinary alpha-over path re-apply it.
+			if (a == 0)
+			{
+				return 0;
+			}
+
+			return pack(std::min<u32>(255, ((r * 255) + (a / 2)) / a),
+				std::min<u32>(255, ((g * 255) + (a / 2)) / a),
+				std::min<u32>(255, ((b * 255) + (a / 2)) / a), a);
+
+		case blend_kind::invmul:
+			// out = dst*(1 - src): a darkening element, so black at coverage = intensity.
+			// EXACT at both ends: black leaves dst untouched, white drives dst to zero.
+			return pack(0, 0, 0, peak);
+
+		case blend_kind::multiply:
+			// out = dst*src. The mirror of invmul - here a WHITE source is the no-op.
+			return pack(0, 0, 0, 255 - peak);
+
+		case blend_kind::identity:
+		case blend_kind::unhandled:
+		default:
+			return src_bgra;
+		}
+	}
+
 	void compositor::blend(u32 x, u32 y, u32 src_bgra)
 	{
 		++m_pixels;
@@ -890,7 +1102,8 @@ namespace remix_rsx
 	}
 
 	void compositor::draw_triangle(const f32 (&x_in)[3], const f32 (&y_in)[3], const f32 (&u)[3], const f32 (&v)[3],
-		const texture_entry* tex, const u32 (&tint_bgra)[3], bool clamp_uv, bool force_opaque)
+		const texture_entry* tex, const u32 (&tint_bgra)[3], bool clamp_uv, bool force_opaque,
+		bool b8_as_colour, const b8_yuv_source* b8_yuv)
 	{
 		if (m_buffer.empty())
 		{
@@ -976,6 +1189,11 @@ namespace remix_rsx
 			return;
 		}
 
+		// ROUND 79. Hoisted once per triangle, not per pixel: the blend family is a per-draw
+		// quantity, and both loops below capture by reference. For the identity majority this
+		// is a single false branch per pixel and no call.
+		const bool remap_blend = blend_remap_active();
+
 		// Round 61. The reference loop, verbatim: every bounding-box pixel, the inside test, the
 		// sampler, blend(). It is what RPCS3_REMIX_UIFASTRASTER=0 runs for every triangle, what
 		// every primitive the span path does not take still runs, and the oracle the span path is
@@ -1011,14 +1229,23 @@ namespace remix_rsx
 						f32 su = (u[0] * w0) + (u[1] * w1) + (u[2] * w2);
 						f32 sv = (v[0] * w0) + (v[1] * w1) + (v[2] * w2);
 						apply_rect_shrink(su, sv, shrink, min_u, max_u, min_v, max_v);
-						colour = modulate(
-							sample_bgra(*tex, su, sv, clamp_uv, subrect_u, subrect_v, seam_rule, m_uv),
-							tint);
+						const u32 sampled = b8_yuv
+							? sample_b8_yuv(*b8_yuv, su, sv, clamp_uv, subrect_u, subrect_v, seam_rule, m_uv)
+							: sample_bgra(*tex, su, sv, clamp_uv, subrect_u, subrect_v, seam_rule, m_uv,
+								b8_as_colour);
+						colour = modulate(sampled, tint);
 
 						if (force_opaque)
 						{
 							colour |= 0xFF000000u;
 						}
+					}
+
+					// ROUND 79. Never on a draw that took force_opaque: that OR is a deliberate rescue
+					// for a full-frame zero-alpha sheet and must not be re-read as coverage.
+					if (remap_blend && !(tex && force_opaque))
+					{
+						colour = resolve_blend_src(colour);
 					}
 
 					blend(static_cast<u32>(px), static_cast<u32>(py), colour);
@@ -1098,19 +1325,32 @@ namespace remix_rsx
 					f32 su = (u[0] * w0) + (u[1] * w1) + (u[2] * w2);
 					f32 sv = (v[0] * w0) + (v[1] * w1) + (v[2] * w2);
 
-					// sample_bgra() for this primitive class, 0 for a clipped coordinate included.
-					const bool keep_u = address_coordinate(su, wrap_u, clamp_uv, subrect_u, seam_rule, counters);
-					const bool keep_v = address_coordinate(sv, wrap_v, clamp_uv, subrect_v, seam_rule, counters);
 					u32 sampled = 0;
 
-					if (keep_u && keep_v)
+					if (b8_yuv)
 					{
-						const u32 tx = std::min(tw - 1, static_cast<u32>(su * ftw));
-						const u32 ty = std::min(th - 1, static_cast<u32>(sv * fth));
-						std::memcpy(&sampled, texels + ((usz{ty} * tw + tx) * 4), sizeof(u32));
+						sampled = sample_b8_yuv(*b8_yuv, su, sv, clamp_uv,
+							subrect_u, subrect_v, seam_rule, counters);
+					}
+					else
+					{
+						// sample_bgra() for this primitive class, 0 for a clipped coordinate included.
+						const bool keep_u = address_coordinate(su, wrap_u, clamp_uv, subrect_u, seam_rule, counters);
+						const bool keep_v = address_coordinate(sv, wrap_v, clamp_uv, subrect_v, seam_rule, counters);
+
+						if (keep_u && keep_v)
+						{
+							const u32 tx = std::min(tw - 1, static_cast<u32>(su * ftw));
+							const u32 ty = std::min(th - 1, static_cast<u32>(sv * fth));
+							std::memcpy(&sampled, texels + ((usz{ty} * tw + tx) * 4), sizeof(u32));
+						}
 					}
 
-					const u32 colour = modulate(sampled, tint) | opaque_mask;
+					// ROUND 79. opaque_mask is force_opaque on this path and keeps precedence, exactly
+					// as in the reference loop above.
+					u32 colour = modulate(sampled, tint);
+					colour = opaque_mask ? (colour | opaque_mask)
+						: (remap_blend ? resolve_blend_src(colour) : colour);
 
 					// blend(), with the destination walked along the row instead of recomputed.
 					++pixels;
@@ -1168,9 +1408,17 @@ namespace remix_rsx
 		};
 
 		const u32 fast_mode = ui_fast_raster_mode();
-		const bool fast = fast_mode != 0 && tex && flat_tint && shrink == 100
+		// ROUND 64 deliberately does NOT relax the '!tex->b8_coverage' term for a b8_as_colour
+		// draw, even though the span loop's raw texel read would now agree with sample_bgra for
+		// one. Widening the fast path is a separate measurement with its own verify mode, and
+		// ui_fast_raster_mode() is 0 by default, so a b8_as_colour draw taking the reference loop
+		// costs nothing at the shipped settings.
+		// A verified YUV source is safe on the span path too: it changes only sampling, while the
+		// same barycentrics, UVs, matrix and blend code remain the reference oracle under mode 2.
+		const bool fast_texture = b8_yuv || (tex && !tex->b8_coverage && !demons_flare_bilinear(*tex));
+		const bool fast = fast_mode != 0 && tex && flat_tint && shrink == 100 && fast_texture
 			&& !tex->pixels.empty() && tex->width != 0 && tex->height != 0
-			&& !tex->b8_coverage && !demons_flare_bilinear(*tex);
+			&& (!b8_yuv || (b8_yuv->planes[0] && b8_yuv->planes[1] && b8_yuv->planes[2]));
 
 		m_raster.bbox_px += u64{static_cast<u32>(max_x - min_x + 1)} * static_cast<u32>(max_y - min_y + 1);
 
@@ -1248,10 +1496,11 @@ namespace remix_rsx
 	}
 
 	void compositor::draw_triangle(const f32 (&x)[3], const f32 (&y)[3], const f32 (&u)[3], const f32 (&v)[3],
-		const texture_entry* tex, u32 tint_bgra, bool clamp_uv, bool force_opaque)
+		const texture_entry* tex, u32 tint_bgra, bool clamp_uv, bool force_opaque,
+		bool b8_as_colour, const b8_yuv_source* b8_yuv)
 	{
 		const u32 tints[3] = { tint_bgra, tint_bgra, tint_bgra };
-		draw_triangle(x, y, u, v, tex, tints, clamp_uv, force_opaque);
+		draw_triangle(x, y, u, v, tex, tints, clamp_uv, force_opaque, b8_as_colour, b8_yuv);
 	}
 
 	void compositor::draw_quad(f32 x0, f32 y0, f32 x1, f32 y1, f32 u0, f32 v0, f32 u1, f32 v1,
@@ -1334,10 +1583,18 @@ namespace remix_rsx
 				f32 sv = base_v;
 				apply_rect_shrink(su, sv, shrink, min_u, max_u, min_v, max_v);
 
-				const u32 colour = tex
+				u32 colour = tex
 					? modulate(sample_bgra(*tex, su, sv, clamp_uv, subrect_u, subrect_v, seam_rule, m_uv),
 						tint_bgra)
 					: tint_bgra;
+
+				// ROUND 79. This overload has no force_opaque to defer to, so the remap is
+				// unconditional for the families that need it.
+				if (blend_remap_active())
+				{
+					colour = resolve_blend_src(colour);
+				}
+
 				blend(static_cast<u32>(px), static_cast<u32>(py), colour);
 			}
 		}

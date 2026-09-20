@@ -7,6 +7,8 @@
 #include "remix_c.h"
 
 #include <string>
+#include <utility>
+#include <vector>
 
 struct RSXVertexProgram;
 
@@ -321,6 +323,27 @@ namespace remix_rsx
 		// 'computed' and refused it, which is why the HUD gauge twin renders white rather than the
 		// amber the constant holds. See vcol_constant_route_enabled().
 		constant,
+		// ROUND 82. 'ADD o1.xyzw, I3.xyzw, c[K]' - the mesh's ATTR3 PLUS a vertex-program
+		// constant. Distinct from 'scaled', because the constant is a BIAS and folding it into a
+		// multiplicative fold would be arithmetically wrong; distinct from 'constant', because
+		// ATTR3 IS read, so replacing the colour with c[K] is only right while ATTR3 is zero.
+		// Reproducing it needs the SUM, and the sum is EXACT: 'decoded attribute + live constant,
+		// clamped to [0,1]' is what the hardware does to a vertex-program COL0 write.
+		//
+		// GRAW2 (NPUB30502) has exactly two, both 'ADD o1.xyzw, I3.xyzw, c[12].xyzw':
+		//   12433898c588b4a1  untextured HUD shapes - the yellow waypoint ring and the red
+		//                     target-direction markers. Its fragment program is one instruction,
+		//                     'MOV R0.xyzw <- f[1](diff_color).xyzw', so the pixel IS COL0, and
+		//                     the vtxattr census measures a3=ub4[len=0/0/0] - ATTR3.rgb is ZERO
+		//                     on every vertex. The whole colour is therefore c[12], and a
+		//                     compositor that reads ATTR3 and stops submits BLACK: measured
+		//                     'Remix ui-route: vp=12433898c588b4a1 ... tint=[FE000000..FE000000]'
+		//                     on a real on-screen box=[585.0 255.1]..[1347.0 685.3].
+		//   7e6d5cd0fbb52e6a  the textured menu/HUD sheet, which DOES carry per-vertex colours
+		//                     (measured tints 7F658D8D .. FEFEFEFE on one run). That program is
+		//                     the reason this route must add rather than substitute.
+		// See vcol_bias_route_enabled().
+		biased,
 	};
 
 	// Static string for the census/pick lines. Never null.
@@ -349,6 +372,13 @@ namespace remix_rsx
 		skinned_layered,
 	};
 
+	enum class skin_normal_form : u8
+	{
+		base_only,
+		morph,
+		refused,
+	};
+
 	struct vp_fingerprint
 	{
 		vp_archetype archetype = vp_archetype::unknown;
@@ -369,6 +399,33 @@ namespace remix_rsx
 		u32 group_rows[max_transform_groups] = {};
 		u32 group_w_slot[max_transform_groups] = {};
 		u32 group_w_component[max_transform_groups] = {};
+
+		// A 3-row group whose consumer read it through a DPH: the hardware supplied the homogeneous
+		// 1, so there is no w constant to find and none to validate against 1. group_w_slot stays
+		// umax for these, and read_group_matrix substitutes the same (0,0,0,1) column it substitutes
+		// for a proven w. GRAW2 (NPUB30502) is the whole population - 623B1DF38F268865 writes no
+		// r0.w anywhere, and 11D461B1B18A5FC3 writes one only as a light-loop counter whose constant
+		// is 0. Demanding a w there is what left every program in the game at groups=1 with
+		// areason=partial-xyz, its object matrix unseen and wext_median=65534.
+		bool group_w_implicit[max_transform_groups] = {};
+
+		// A 3-row group whose homogeneous 1 came from 'MOV r.w <- attrN.wwww' - the attribute's own
+		// w - rather than from a constant. This names N. group_w_slot stays umax for these, and
+		// read_group_matrix proves the w really is 1 per draw the way the constant case is proven:
+		// decode_position forces w to exactly 1.0 for any attribute carrying fewer than four
+		// components, so the proof is the vertex layout's component count. A 4-component attribute
+		// is refused there - its w is real per-vertex data, which is match_wdivide's business.
+		//
+		// Proven per draw and not at scan time for two reasons: the fingerprint is cached per
+		// program hash while the vertex layout is draw state, and position_input is not yet
+		// resolved when match_dp4_chain runs.
+		//
+		// GRAW2 (NPUB30502) is the population the user clicked. ATTR0 there is MEASURED as 'a0=f3',
+		// three floats, so v0.w IS 1 and the stand-in is the ordinary homogeneous one. Refusing it
+		// left F11CF56CA218F381 and its texcoord-packing twin F11C25DE2218F361 at groups=1 with
+		// their c[0..2] object matrix unseen: object space submitted as world space, the right SIZE
+		// in the wrong PLACE. Initialised to umax, not 0, because 0 is a legal attribute index.
+		u32 group_w_input[max_transform_groups] = { umax, umax, umax, umax };
 
 		// The innermost group's operand resolved to a vertex attribute. When false the
 		// vertices we submit are not in the space the innermost group expects.
@@ -416,6 +473,15 @@ namespace remix_rsx
 		u16 vcol_scale_slot[4][max_vcol_scale_factors] = {};
 		u8 vcol_scale_comp[4][max_vcol_scale_factors] = {};
 
+		// ROUND 82. The 'biased' route's constant, in its OWN fields rather than overloaded into
+		// the three arrays above. Those are consumed by apply_vertex_colour's fold loop as a
+		// PRODUCT, and a bias multiplied in would be silently wrong - the round-12 caveat on that
+		// overloading is exactly this hazard, and this is how it is not repeated. vcol_bias_comp
+		// [lane] is the component of c[vcol_bias_slot] that lane adds. Meaningful ONLY when
+		// vcol_route_kind == vcol_route::biased; 0xffff is "no slot resolved".
+		u16 vcol_bias_slot = 0xffff;
+		u8 vcol_bias_comp[4] = { 0, 1, 2, 3 };
+
 		// Round 10. This program's position decode was only reachable because match_const_affine
 		// stepped over an accumulate-in-place decoration, merged a per-lane assembly, or forwarded
 		// its scale operand through a MOV of a constant. Like mad_mixed_lanes, the replay is then
@@ -448,6 +514,8 @@ namespace remix_rsx
 		u32 affine_bias_slot = 0;
 		// The scale came from RCP(c[K].<c>) in a scalar slot, so the factor is 1/value.
 		bool affine_scale_reciprocal = false;
+		// ROUND 89: which arm of match_const_affine recorded the scale. Static literal.
+		const char* affine_scale_why = "none";
 		// '(attr + b) * s' rather than 'attr * s + b'. build_prescale composes scale then bias, so
 		// the translation row carries b*s when this is set.
 		bool affine_bias_before_scale = false;
@@ -456,6 +524,14 @@ namespace remix_rsx
 		// shape the grammar does not cover" and "this program has no decode" want opposite fixes.
 		// String literal, so this is a borrowed pointer with static lifetime, never freed.
 		const char* affine_reason = "untried";
+
+		// ROUND 74, RPCS3_REMIX_ATTROFFSET. The position is the raw attribute with one or more
+		// per-vertex offsets added on top of it ('pos = attr0 + T*s'), which no instance transform
+		// can express - so the draw is REFUSED in per_draw_transform rather than submitted with
+		// the offsets silently dropped. Set only where match_const_affine has already refused; see
+		// match_attr_offset for the derivation and the three GRAW2 (NPUB30502) programs it names.
+		bool has_attr_offset = false;
+		u8 attr_offset_terms = 0;
 
 		// Round 50. The vertex attribute this program's position was actually read from, as named
 		// by match_const_affine's MUL arm. 0 means ATTR0, which is both the default and the value
@@ -501,6 +577,57 @@ namespace remix_rsx
 		u32 ortho2d_slot_x = 0;
 		u32 ortho2d_slot_y = 0;
 
+		// ROUND 64. A 2D scale-and-bias into HPOS.xy, written as MUL-through-a-temp + ADD (or as
+		// one MAD) rather than the two DP4 rows match_ortho2d requires.
+		//
+		// GRAW2 (NPUB30502) draws every Bink surface with ab86464ca0d72796 - the studio logos
+		// (UbiLogo.bik, DW_MM_Splash_a.bik, Havok_splash.bik) AND the in-game commander-orders
+		// overlays (COM_*.bik) are the SAME draw class, which is why they appeared in the same
+		// wrong place. Four instructions:
+		//   0:MOV>o0.zw(I0.zzzw)   1:MOV>o7.xy(I8.xyxx)
+		//   2:MUL>r0.xy(I0.yxyy, C0.wzww)   3:ADD>o0.xy(T0.yxyy, C0.xyxx)
+		// i.e. o0.x = attr.x*c0.z + c0.x and o0.y = attr.y*c0.w + c0.y. ONE distinct constant, so
+		// scan_vertex_program returns screen_space at "0-1 constants feed HPOS" BEFORE the chain
+		// walk and before match_ortho2d's only call site - which is why the matcher is invoked
+		// from inside that early return and not next to match_ortho2d, where it would be inert
+		// for this entire population.
+		//
+		// With the transform dropped the compositor composited the raw unit quad: measured
+		// clip=[0.0000 -1.0000]..[1.0000 0.0000] ('Remix ui-biggest', RPCS3.log:31360) mapping to
+		// box=[960.0 504.5]..[1920.0 1009.0] on a 1920x1009 target - exactly one quadrant, on all
+		// 70 'Remix ui-route' rows of the 13:09:15 run.
+		//
+		// Slots and COMPONENTS only, never a sign. The y negation is a NEGATIVE RUNTIME VALUE in
+		// c[0].w, not a negate bit, so build_screen_mad2d reads both slots live per draw and this
+		// matcher models no orientation of its own. Which way up the result lands is owned by the
+		// compositor's own clip-y latch (RPCS3_REMIX_UIYFLIP) - see the note on that knob.
+		bool has_screen_mad2d = false;
+		u32 mad2d_scale_slot = 0;
+		u32 mad2d_bias_slot = 0;
+		u32 mad2d_input = 0;                    // vertex attribute index (ATTR0 for every shape seen)
+		u8 mad2d_input_component[2] = { 0, 1 }; // which attribute lane feeds HPOS.x / HPOS.y
+		u8 mad2d_scale_component[2] = { 0, 1 };
+		u8 mad2d_bias_component[2] = { 0, 1 };
+
+		// The position decode's scalar is the attribute's OWN W times a constant, not a constant
+		// alone: 'attr0.xyz * (attr0.w * c[K].w) + c[J].xyz'. GRAW2 (NPUB30502) writes all 57 of its
+		// captured world programs that way, and ATTR0.w measured varying per vertex (16931..32767
+		// across one 379-vertex draw), so the scale is genuinely per-vertex and no instance matrix
+		// can carry it.
+		//
+		// The decode is therefore split in two, and BOTH halves are set when this is true:
+		//   * the constant half - c[K].w uniform scale and c[J].xyz bias - lands in has_prescale /
+		//     prescale_scale_slot / prescale_scale_component / prescale_bias_slot, so build_prescale
+		//     and prepend_object_space handle it with no new code;
+		//   * the per-vertex half, 'position.xyz *= position.w', is applied in the mesh decode loop
+		//     beside the existing w_divide. It is constant-free by construction, which is what keeps
+		//     mesh-cache reuse valid - baking c[K]/c[J] into vertices would not be.
+		// Reading has_prescale without reading this flag yields a mesh that is a factor of ATTR0.w
+		// too small; reading this without has_prescale yields one with no scale or bias at all.
+		// RPCS3_REMIX_WPREMUL=0 refuses the match, which restores the pre-round behaviour exactly:
+		// groups=1, areason=partial-xyz, wext_median=65534.
+		bool has_wpremul = false;
+
 		// The matrix chain into HPOS was only found by following a writer through the register it
 		// was parked in. match_dp4_chain wants four writers of HPOS, each a DP4 writing one
 		// component; Resistance 2 (NPEA00431) writes the w row into a temp and moves it out
@@ -532,6 +659,15 @@ namespace remix_rsx
 		// is c[17], and the dropped term is exactly zero whenever c[17].x is.
 		bool hpos_split_rows = false;
 		u32 hpos_split_shear_const = umax;
+
+		// ROUND 72. The depth row of at least one group was not repaired but VERIFIED: no repair
+		// could reach the z lane, and the row was found instead by locating a clean DP4/DPH
+		// elsewhere in the program reading slot base + 2 with that group's own source (infer_z_row).
+		// Same standing as the two above - diagnostic, and the group it produces is an ordinary one
+		// - but kept SEPARATE from hpos_split_rows on purpose: a group whose depth row was read and
+		// one whose depth row was reconstructed are not the same evidential claim, and a census
+		// that cannot tell them apart cannot be used to judge whether ZROWINFER is too loose.
+		bool hpos_zrow_inferred = false;
 
 		// A MOV was reached whose definition could not be pinned down - defined by the SCA half of
 		// a co-issued word, written under a condition, or negated/saturated on the way out. Refused
@@ -700,6 +836,14 @@ namespace remix_rsx
 		// counters tell the two populations apart.
 		bool skin_vertex_blend = false;
 
+		// SR2's position before its indexed DPH bones: attr0 * (optional c19.xyz)
+		// + attr12 * c467.x. The delta is per vertex, so this cannot be a bone matrix.
+		bool has_skin_morph = false;
+		bool skin_morph_base_scaled = false;
+		// Independently proven SR2 normal input: normalize(attr2 + attr13 * c467.w).
+		// A failed normal proof must not become a guess that attr2 alone is correct.
+		skin_normal_form skin_normal = skin_normal_form::base_only;
+
 		u32 blend_bones = 0;
 		u32 blend_weight_attribute = 0;
 		u8 blend_weight_component[max_blend_bones] = {};
@@ -770,7 +914,7 @@ namespace remix_rsx
 
 	// Fingerprints the rebased ucode of an already-analysed vertex program. Never throws;
 	// anything it cannot follow comes back as vp_archetype::unknown with a reason in 'note'.
-	vp_fingerprint scan_vertex_program(const RSXVertexProgram& vp);
+	vp_fingerprint scan_vertex_program(const RSXVertexProgram& vp, bool exact_uv_scales = false);
 
 	const char* archetype_name(vp_archetype a);
 	const char* shape_name(chain_shape s);
@@ -1074,6 +1218,108 @@ namespace remix_rsx
 		// fpclass= - are byte-identical with RPCS3_REMIX_FPCONSTALBEDO off. Clamped to 0..1.
 		bool out_rgb_const = false;
 		f32 out_rgb_const_rgb[3] = { 1.f, 1.f, 1.f };
+
+		// --- ROUND 63: COL0.rgb is a hand-rolled lerp TOWARD an inline literal ------------------
+		// True when the terminal writer of COL0.rgb (the same index as above) is
+		// 'MAD col0.xyz <- t, Rn, Rx' closing an 'ADD Rn <- -Rx, c[]' - lerp(Rx, C, t) with no LRP
+		// opcode, which this title never emits - the endpoint C is finite and in [0,1] on all three
+		// lanes, and t is <varying> * k with k >= 0.5 (out_rgb_lerp_weight). out_rgb_lerp_rgb is C
+		// read through the COMPOSED swizzles: the two shapes on disk route the lanes differently
+		// (see scan_fragment_program). Mutually exclusive with out_rgb_const by construction - the
+		// terminal instruction is one opcode - and, like it, a flag beside out_rgb_source so every
+		// other consumer is byte-identical.
+		bool out_rgb_lerp = false;
+		f32 out_rgb_lerp_rgb[3] = { 1.f, 1.f, 1.f };
+		f32 out_rgb_lerp_weight = 0.f;
+
+		// --- ROUND 67: the sampled texel is TINTED by a per-channel literal ----------------------
+		// True when an unconditional 'MUL Rd.xyz <- Rs, c[]' multiplies a texel straight out of the
+		// sampler (Rs's last writer of .xyz is a sample that wrote all of .xyz; identity swizzle, no
+		// neg/abs on either operand) by a literal that is finite and >= 0 on all three lanes, all
+		// three lanes of the product are live into COL0.rgb by a lane-precise, KILL-AWARE backward
+		// walk, the lanes are not all (nearly) equal, exactly one such (unit, literal) exists, neither
+		// round 62 nor round 63 claimed the program, and the program writes NO MRT output register
+		// (R2/R3/R4 with fp32 exports, H4/H6/H8 with fp16) - COL0 is its only colour output. The
+		// ground truth, the other code-blood texture 921904970ADA8A23:
+		//   9F30538CBDE6C249   0: TEX R0.xyzw <- f[5](tc1).yzzw  [tex0]
+		//                      1: MUL R0.xyz  <- R0.xyzw, c[].xyzw   c=[0.5 0.8 1.5 0]
+		// out_rgb_tint_rgb is that literal read THROUGH the swizzle and stored RAW - (0.5, 0.8, 1.5),
+		// above 1 on the blue lane; the apply site decides what an 8-bit factor does with it.
+		// out_rgb_tint_unit is the sampled unit, which the apply site requires to be the unit it
+		// actually elected as the albedo.
+		//
+		// THE LAST TERM IS THE ROUND. MEASURED over the 793 programs in bin\remix_ucode
+		// (docs/remix/fptint.py, whose self-test pins the listing above): the shape alone matches 404
+		// programs; with the product reaching COL0.rgb, 140; non-neutral, 50; on the elected unit and
+		// unique, 46; unclaimed by rounds 62/63, 45. Of those 45, 43 write all of R2, R3 and R4 - the
+		// deferred G-buffer pass (target=31 on their draws) in which 'R0 = tex0 x c[]' is the
+		// MATERIAL'S DIFFUSE COLOUR of a lit surface. They draw the level: the concrete walls
+		// 2C62891E53AC7C89 (x228 in one run), FDF6489A939E6563 (x219), E6AE2AA616434545 (x355),
+		// marble E1F20A0B844B0E63, a character's skin FFBA203FD04E78D5. Stating those would repaint
+		// every wall and floor; if that material colour is ever wanted it is its own route over all
+		// 43, not a side effect of this one. 2 of 793 pass: the two constant-variants of one
+		// forward-pass effect program (fp 01072a35c2acbe5c and 01072a35c28cbe20, every draw target=1
+		// blend=1) - the code blood's speck sheet, splat and droplets, and a dust puff.
+		// "Only one sampled unit" was tried first and REJECTED: it leaves 5, one of which
+		// (A50DE5B1F5682CE2) draws the concrete wall E6AE2AA616434545 x355 while refusing its
+		// near-twin 1B98CE5D069789E2 - one wall of a family tinted blue-grey, the other raw.
+		bool out_rgb_tint = false;
+		f32 out_rgb_tint_rgb[3] = { 1.f, 1.f, 1.f };
+		u8 out_rgb_tint_unit = 0;
+
+		// --- ROUND 68: THE ENGINE'S OWN SUN, RECOVERED FROM THE UCODE PER PROGRAM ---------------
+		//
+		// WHY THIS IS REACHABLE LIVE AT ALL, and it is the one fact the whole round rests on:
+		// get_fragment_program_ucode_hash() SKIPS INLINE CONSTANTS by construction
+		// (ProgramStateCache.cpp:701-719, `if (is_any_src_constant(inst)) instIndex++`), so ONE
+		// fragment program keeps ONE hash while its literals change underneath it - which is
+		// exactly what a scripted time-of-day transition does to an engine global. And round 66
+		// already made the FINGERPRINT cache key constant-aware (fp_fingerprint_for mixes the
+		// ucode bytes), so a changed literal produces a NEW fingerprint rather than serving the
+		// first one scanned. Those two facts together mean the values below are live per draw at
+		// zero extra cost: no new decode, no new hook, no guest memory read.
+		//
+		// WHY NOT BY SLOT. The brief expected the sun to sit at a stable literal ORDINAL across
+		// the engine's world programs. MEASURED AND REFUTED over the 29 programs in
+		// bin\remix_ucode\ that carry GRAW2's sun literal: the ordinal ranges 0..28 for the vector
+		// and 4..39 for the radiance, and two programs carrying byte-identical values disagree
+		// (799B66DD6C860BFD has them at 3 and 13, 0F39427BC1262142 at 0 and 4). RSX fragment
+		// constants are inline literals following their instruction, not an indexed bank, so
+		// "slot" is a property of the instruction schedule and the schedule differs per program.
+		// The identification therefore has to be STRUCTURAL, and it is - see scan_fragment_program.
+		//
+		// sun_travel is the constant EXACTLY as the ucode stores it, unnegated and untransformed,
+		// which is the same convention RPCS3_REMIX_SUNDIR already carries for this title (the
+		// pinned config value IS this literal). So a frame whose recovered value equals the pinned
+		// one submits a bit-identical light, and no new coordinate assumption is introduced.
+		bool sun_valid = false;
+		f32 sun_travel[3] = { 0.f, 0.f, 0.f };
+		f32 sun_rgb[3] = { 0.f, 0.f, 0.f };
+
+		// MEASURE-ONLY this round. The engine's ambient, as the SUM of the two literals the
+		// program adds together ('MOV Hn.xyz, c[A]' then 'ADD Hm.xyz, Hn, c[B]'). MEASURED over
+		// the 34 GRAW2 light-pre-pass programs in the store: 22 report (0.307843, 0.305882,
+		// 0.386275), 4 report (0.658824, 0.709804, 0.833333) and 8 do not carry the shape.
+		// Nothing is submitted from this - Remix has no ambient input; see the note on
+		// sun_fp_mode() for the two options and which one is recommended.
+		//
+		// ROUND 69: the gate is now "every component > 0 AND max/min < 4", not merely finite and
+		// non-negative, because this value is SUBMITTED as two lights from this round on. See the
+		// long audit note at the gate itself for the false-positive family that motivated it and
+		// for why the identity-swizzle requirement was already refusing all nine members of it.
+		bool ambient_valid = false;
+		f32 ambient_rgb[3] = { 0.f, 0.f, 0.f };
+		// Why a candidate ambient pair was refused, for the census. Static string, never null.
+		const char* ambient_note = "not-scanned";
+
+		// MEASURE-ONLY. The broadcast literal the program's terminal MUL applies to its own output
+		// - the guest's exposure. MEASURED as 0.25 with saturate on 34 of 34 GRAW2 light-pre-pass
+		// programs. 0 means the terminal instruction was not that shape. NOT submitted, and must
+		// not be: it belongs to the guest's tonemap and Remix runs its own.
+		f32 out_scale = 0.f;
+
+		// Why the sun matcher refused, for the census. Static string, never owned, never null.
+		const char* sun_note = "not-scanned";
 	};
 
 	// Reads the fragment ucode and reports which sampled units feed the final colour. 'ucode' is
@@ -1143,7 +1389,13 @@ namespace remix_rsx
 	// is no brighter setting: at 1 the ceiling is the 8-bit unorm Modulate factor itself.
 	bool fp_vcol_deep_scale_enabled();
 
-	// RPCS3_REMIX_FPCONSTALBEDO=1 (default 0 = OFF, byte-identical to today). ROUND 62.
+	// RPCS3_REMIX_FPCONSTALBEDO=<bits> (default 0 = OFF, byte-identical to today). ROUND 62.
+	// A bitmask since ROUND 63: 1 = the MOV literal described below (round 62, unchanged), 2 = the
+	// lerp ENDPOINT (fp_fingerprint::out_rgb_lerp) stated through the same stage - the surface
+	// becomes a flat field of the colour it fades toward, the accepted approximation of a per-pixel
+	// t this backend cannot replay - and 3 = both. ROUND 67 adds 4 = the per-channel TINT on the
+	// sampled texel (fp_fingerprint::out_rgb_tint) Modulated against the elected texture, so 7 =
+	// all three; the range is 0..7. Any route can be disabled alone.
 	//
 	// For a draw whose fragment program's terminal writer of COL0.rgb is an unconditional
 	// 'MOV col0.xyz, c[]' (fp_fingerprint::out_rgb_const), state that literal as the surface colour
@@ -1152,10 +1404,189 @@ namespace remix_rsx
 	// Applies whether the draw carries a guest material - the texture then only ever fed alpha, it
 	// is a mask, and its alpha channel keeps doing exactly that - or round 6's grey (an untextured
 	// draw of a flat-painted program). No new material, no mesh-key change.
-	// Counter: fpconst_applied (draws) on 'Remix live:'. Census: one 'Remix fpconst:' per program.
+	// Counters: fpconst_applied (bit 1), fplerp_applied (bit 2) and fptint_applied (bit 4), draws,
+	// on 'Remix live:'. Census: one 'Remix fpconst:' per program, route=mov|lerp|tint.
 	//
 	// Tri-state parse copied from ui_fast_raster_mode(): unset = default, an explicit 0 is a real 0.
 	u32 fp_const_albedo_mode();
+
+	// RPCS3_REMIX_GUESTLIGHTCARD: how to build the guest-light bulb card. 0 = shipped (alpha from
+	// the RED channel, which the bulb program never samples - the card is ~97% transparent).
+	// 1 = the program's own base from G and A with its flat 0.6 alpha. 2 = the same, emissive.
+	// Default 0. See guest_light_fixture_material() for the disassembly this is derived from.
+	u32 guest_light_card_mode();
+
+	// RPCS3_REMIX_FPHASHCONSTS: mix the fragment ucode's inline constants into the fingerprint
+	// cache key. Default 1. get_fragment_program_ucode_hash() skips constants by design, so
+	// without this every constant-variant of a program shares one cached fingerprint and the
+	// first scan wins - the defect that made the sky dome report rgb=[1 1 1]. 0 restores it.
+	bool fp_hash_constants_enabled();
+
+	// RPCS3_REMIX_FPCONSTMRT=1: a route-0 literal (out_rgb_const) on a draw whose colour target is
+	// a multi-render-target set keeps SelectArg1(TFactor) - the round-62 stage - instead of the
+	// round-65 Modulate(TFactor, Texture). On such a draw the literal IS the pass's albedo target
+	// and the sampled texel is exported to the other targets (Eat Lead's light fixtures,
+	// E8D848B4B615E26E: 'MOV R0.xyzw <- 1' with tex.x/y/w written to R2.w/R3.w/R4.w), so it never
+	// reaches COL0.rgb and modulating it in paints the surface with its parameter pack. Default 0
+	// = round 65 unchanged. Counter fpconst_mrt_select; 'Remix fpconst:' mrtsel=. Tri-state parse
+	// like fp_hash_constants_enabled(): unset = off, an explicit 0 is a real 0.
+	bool fp_const_mrt_select_enabled();
+
+	// RPCS3_REMIX_SUNFP=<mode>. ROUND 68. Default 0 = OFF, byte-identical to today on every title.
+	//   0  the recovered sun is measured and censused only. Nothing is submitted.
+	//   1  the per-frame ELECTED (direction, radiance) pair drives the distant sun on handle 0x4,
+	//      ranked BELOW every authored/file-derived source in update_sun_light()'s chain and ABOVE
+	//      the sun-card heuristic. RPCS3_REMIX_SUNDIR / SUNRGB remain the fallback for a frame
+	//      that recovers nothing, and remain the OVERRIDE via mode 3 below.
+	//   2  direction only. The radiance keeps coming from SUNRGB / sun_radiance(). This is the arm
+	//      to use if the recovered radiance turns out to be an unexposed pre-tonemap value: the
+	//      guest applies its own x0.25 (fp_fingerprint::out_scale) which this backend does not.
+	//   3  radiance only. The direction keeps coming from SUNDIR / the existing chain.
+	//
+	// PLAIN env_u32 with NO g_cfg disjunction, deliberately: the `env || g_cfg` shape makes an
+	// explicit 0 a silent no-op and has already cost this codebase two rounds (SMOOTHNORMALS,
+	// TEXBUDGET). Latched once like every sibling here - the MODE is a launch decision; the VALUES
+	// it submits are read live per draw, which is the whole point.
+	//
+	// =========================================================================================
+	// ROUND 69: THE SPACE VERDICT. THE SUN CONSTANT IS IN **VIEW SPACE**, AND THAT INVERTS WHAT
+	// THIS KNOB IS FOR. Round 68 read the five recovered directions as five times of day. That
+	// was WRONG and is retracted here; the corrected reading is below, with the evidence.
+	//
+	// WHAT THE UCODE SAYS. In bin\remix_ucode\799B66DD6C860BFD.fp the sun constant is dotted
+	// against H2, and H2 = NRM(f[13]) - a texcoord varying. So the question is what space the
+	// VERTEX program puts that normal in. CENSUSED over all 90 GRAW2 vertex programs in the
+	// store: 40 read v2(normal), and every single one of them transforms it by c[0], c[1], c[2] -
+	// with ZERO exceptions and no second matrix anywhere. From 15B7A8F03BE58C33.vp:
+	//
+	//      7: DP3 r1.z <- v2(normal).xyz, c[2].xyz     <- the NORMAL, rotation only
+	//      8: DP3 r1.y <- v2(normal).xyz, c[1].xyz
+	//      9: DP3 r1.x <- v2(normal).xyz, c[0].xyz
+	//     13: DPH r0.z <- r4.xyz,         c[2].xyzw    <- the POSITION, same block, with
+	//     14: DPH r0.y <- r4.xyz,         c[1].xyzw       translation (DPH not DP3)
+	//     15: DPH r0.x <- r4.xyz,         c[0].xyzw
+	//     17: DPH o[0](HPOS).w <- r0.xyz, c[7].xyzw    <- then the pure projection c[4..7]
+	//
+	// The normal and the position go through the SAME matrix, DP3 for the direction and DPH for
+	// the point, which is exactly the right distinction. And c[0..2] is WORLD x VIEW (YETI
+	// premultiplies the view on the CPU; corroborated by the camera census, cam_viewspace ==
+	// cam_resolved 12918/12918 with cam_worldspace = 0). So the normal is VIEW-space, and a
+	// constant dotted against it must be view-space too - the game rewrites it every frame.
+	//
+	// INDEPENDENTLY CORROBORATED BY ARITHMETIC, which is what makes this a measurement rather
+	// than a reading of one program. View-space up is +Z on this title. Two of the five recovered
+	// directions share their radiance BIT-EXACTLY and differ by a PURE YAW:
+	//     C = ( 0.608986,  0.290894, -0.737914)   elev -47.554 deg   azim  25.532 deg
+	//     D = (-0.517511, -0.431929, -0.738661)   elev -47.617 deg   azim 219.849 deg
+	// Elevation equal to 0.0635 degrees, azimuth swung 194.3 degrees, radiance identical. That is
+	// a player turning around. A time-of-day transition moves elevation and colour together; it
+	// has no mechanism to swing azimuth by 194 degrees while pinning elevation to a sixteenth of
+	// a degree.
+	//
+	// SO HOW MANY LIGHTING STATES ARE THERE? Grouped by the quantities that CANNOT change with
+	// camera rotation - the sun radiance and the ambient - the answer is TWO, not five:
+	//     28 programs  sun (2.564706, 1.152941, 0.905882)  ambient (0.307843, 0.305882, 0.386275)
+	//      4 programs  sun (5.929412, 5.552941, 5.082353)  ambient (0.658824, 0.709804, 0.833333)
+	//      1 program   sun (8.0,      6.839216, 6.211765)  ambient not recoverable
+	// Sun and ambient co-vary with no counterexamples. The five directions are two (at most
+	// three) environments seen from several camera orientations.
+	//
+	// AND YET THE KNOB IS STILL THE FIX - FOR A DIFFERENT AND BIGGER DEFECT.
+	//
+	// Remix's world space on this title IS the guest's view space: the view is baked into every
+	// instance transform, the eye never leaves the origin. A view-space light direction submitted
+	// into a view-space world therefore MATCHES, and needs no transform. The defect is not a
+	// missing view multiply - it is the LATCH. sun_direction() is read once into a static const,
+	// so the backend submits ONE frozen view-space vector while the geometry re-bakes against a
+	// new view every frame. That is exactly a sun that rotates with the player's head, which is
+	// the reported symptom (log: travel=[-0.94577 0.10551 -0.30722] aimed=0, bit-identical across
+	// 21 samples spanning 12,000 frames).
+	//
+	// Reading the constant LIVE per frame is the repair, and it is available today WITHOUT
+	// solving the view. That is what mode 1 does.
+	//
+	// !! COUPLED TO THE BAKED-VIEW REGIME !!  If RPCS3_REMIX_VIEWSOLVE's unbake ever lands, Remix's
+	// world space becomes the guest's true Y-up world and this live view-space vector becomes
+	// wrong BY THE VIEW. The fix at that point is to carry it back with the solved V (the same V
+	// that made the unbake possible), not to re-latch it. Whoever lands the unbake must set
+	// RPCS3_REMIX_SUNFP=0 in the same commit, or read this paragraph and do the multiply.
+	//
+	// The two pinned config lines remain the fallback, not the source: they are one frame's
+	// view-space snapshot, which is the defect, and SUNDIR still creates the light before any
+	// election exists.
+	// =========================================================================================
+	u32 sun_fp_mode();
+
+	// The three components of RPCS3_REMIX_SUNFP the backend actually asks about. Split out so the
+	// two apply sites cannot disagree about what a mode means.
+	bool sun_fp_direction_enabled();
+	bool sun_fp_radiance_enabled();
+
+	// =========================================================================================
+	// ROUND 69: THE AMBIENT, SUBMITTED. RPCS3_REMIX_AMBIENT=<mode>, default 0 = OFF.
+	//   0  off. Nothing is created. Byte-identical to round 68 on every title.
+	//   1  the LIVE ambient recovered from the fragment ucode (fp_fingerprint::ambient_rgb).
+	//   2  the literal in RPCS3_REMIX_AMBIENTRGB, ignoring the ucode entirely.
+	//
+	// WHY THIS IS THE HIGHEST-VALUE LIGHTING FIX AVAILABLE, and why it is the ONLY one that is
+	// unconditionally correct today:
+	//
+	//  * The game's own lighting model is one directional plus one ambient - that is what the
+	//    world programs compute and there is no light list to extract. So submitting both is not
+	//    an approximation of a richer model, it IS the model.
+	//  * It is quantitatively dominant. ambient:sun = 0.307843/1.4176 (mean sun) = 21.7%, so the
+	//    authored shadow-side floor is about 17.9% of full-sun luminance. Path-traced indirect
+	//    from a single distant light with an unlit sky dome delivers roughly 2-5%. The absent
+	//    ambient is most of the missing shadow detail, and it is the term the NPUB30502.conf note
+	//    already names as the first suspect for "too dark / too contrasty".
+	//  * IT IS IMMUNE TO THE CAMERA BLOCKER. This is the decisive property. A two-lobe distant
+	//    pair is isotropic about its axis pair, so unlike the sun (view-space direction, see the
+	//    verdict above) and unlike every positional light (world space is view space, so they are
+	//    pinned to the player's head) it does not care which space it is submitted in. A
+	//    hemisphere is the same hemisphere from any camera.
+	//
+	// WHY TWO DISTANT LIGHTS AND NOT A DOME LIGHT. remixapi_LightInfoDomeEXT (remix_c.h:677-682)
+	// carries only a transform and a colorTexture, and the header states plainly that
+	// remixapi_LightInfo::radiance is IGNORED when it is attached - so a dome light cannot carry a
+	// flat authored colour at all. Two very wide distant lights are this codebase's own accepted
+	// approximation for exactly this quantity; submit_demons_authored_lights() has shipped it for
+	// Demon's Souls' hemisphere ambient since round 26, and the argument is recorded there: the
+	// shader divides a distant light's radiance by sin^2(halfAngle) and samples the cone
+	// uniformly, so a 150-degree light delivers roughly pi * radiance of irradiance from its whole
+	// hemisphere. Hence the default gain of 1/pi below - the authored value is an irradiance and
+	// the light wants a radiance.
+	//
+	// THE GUEST'S x0.25 IS DELIBERATELY NOT APPLIED. fp_fingerprint::out_scale is 0.25 on 34 of 34
+	// world programs, but it is a scale on the guest's FINAL colour, applied equally to the sun
+	// term and the ambient term. Applying it to the ambient alone would destroy the sun:ambient
+	// ratio, which is the one quantity in this whole round that actually matters. It belongs to
+	// the guest's tonemap and Remix runs its own; if the combined result needs scaling, scale BOTH
+	// (SUNRGB and AMBIENTSCALE together) or neither.
+	// =========================================================================================
+	u32 ambient_mode();
+
+	// RPCS3_REMIX_AMBIENTRGB="r,g,b". The literal used at mode 2, and the FALLBACK at mode 1 for a
+	// frame whose ucode recovered nothing. Explicit validity latch, not the `env || g_cfg` shape:
+	// a component of 0 is a legitimate value and must not be swallowed, a negative one is refused.
+	// Returns false when unset or unparseable, leaving `out` untouched.
+	bool ambient_rgb_override(f32 (&out)[3]);
+
+	// RPCS3_REMIX_AMBIENTSCALE=<f>, default 1/pi = 0.3183. Multiplies the submitted radiance. See
+	// the sin^2 note above for why the default is not 1. Negative is refused (clamped to 0).
+	f32 ambient_scale();
+
+	// RPCS3_REMIX_AMBIENTCONE=<degrees>, default 150. The angularDiameterDegrees of each lobe, the
+	// same value submit_demons_authored_lights() uses. Clamped to [1, 180]: above 180 the runtime's
+	// half-angle is meaningless and at 0 the sin^2 divide explodes.
+	f32 ambient_cone_degrees();
+
+	// RPCS3_REMIX_AMBIENTUP="x,y,z", default 0,0,1. The axis the two lobes straddle. The default is
+	// +Z because Remix's world space on the title this was designed for IS the guest's view space,
+	// and that space is Z-up - the same derivation RPCS3_REMIX_ZUP=1 rests on (from the projection,
+	// right = +X, forward = +Y, screen up = +Z). Normalised here, so a hand-typed value need not be;
+	// a zero or non-finite vector falls back to the default rather than producing two lights aimed
+	// at nothing.
+	void ambient_up(f32 (&out)[3]);
 
 	fp_fingerprint scan_fragment_program(const void* ucode, u32 ucode_length, bool fp32_outputs);
 
@@ -1186,6 +1617,26 @@ namespace remix_rsx
 	// would run past the 468 legal slots.
 	bool read_slot(u32 index, f32 (&out)[4]);
 
+	struct skin_morph_decode
+	{
+		f32 base_scale[3] = { 1.f, 1.f, 1.f };
+		f32 delta_scale = 0.f;
+	};
+
+	bool read_skin_morph_decode(const vp_fingerprint& fp, skin_morph_decode& out);
+	bool evaluate_skin_morph_position(const skin_morph_decode& decode, const f32 (&base)[4],
+		const f32 (&delta)[4], f32 (&out)[4]);
+
+	struct skin_normal_morph_decode
+	{
+		f32 delta_scale = 0.f;
+	};
+
+	bool read_skin_normal_morph_decode(const vp_fingerprint& fp, skin_normal_morph_decode& out);
+	// A required but absent attr13 is refused, even when its live coefficient is zero.
+	bool evaluate_skin_normal_morph(const skin_normal_morph_decode& decode, const f32 (&base)[4],
+		const f32* delta, f32 (&out)[4]);
+
 	// Slots to the row-vector matrix the rest of this file works in.
 	mat4 slots_to_matrix(const slot_block& slots, chain_shape shape);
 
@@ -1203,6 +1654,13 @@ namespace remix_rsx
 	// The HPOS.xy-only transform described by has_ortho2d, as a row-vector matrix with an
 	// identity z/w. Reads the two slots live, so it is per draw like build_prescale.
 	bool build_ortho2d(const vp_fingerprint& fp, mat4& out);
+
+	// The HPOS.xy scale+bias described by has_screen_mad2d, as a row-vector matrix with an
+	// identity z/w. Reads both slots live, so it is per draw like build_ortho2d. Carries no sign
+	// of its own: whatever c[scale].<c> holds at draw time IS the guest's intent in the guest's
+	// own clip convention, and the up/down question is settled downstream by the compositor's
+	// clip-y latch, not here.
+	bool build_screen_mad2d(const vp_fingerprint& fp, mat4& out);
 
 	// Runs the recorded bone-index op chain over one vertex's attribute component and
 	// truncates like ARL does, yielding the palette slot offset 'a'. False when a constant is
@@ -1421,6 +1879,21 @@ namespace remix_rsx
 
 	bool ortho2d_enabled();
 
+	// RPCS3_REMIX_MAD2D=0: ignore vp_fingerprint::has_screen_mad2d, so a 2D program whose
+	// transform is a MUL/MAD scale+bias has it dropped and the compositor composites the raw
+	// attribute - the behaviour up to and including 65ad0592. Bisect knob: this is the only
+	// lever that restores the one-quadrant Bink placement, so if the next launch puts the logos
+	// somewhere new this separates "the matcher decoded the wrong slot" from "the matcher is
+	// right and something downstream moved it".
+	bool screen_mad2d_enabled();
+
+	// RPCS3_REMIX_MAD2DCENSUS, LOGGING ONLY. See the implementation's comment: with it at 1 the
+	// 'Remix mad2d:' census re-emits a row when the resolved rect changes instead of once per
+	// vertex program for the whole run, which is what makes a second draw of the same program
+	// (GRAW2's in-game Bink window, as against the boot logo that consumes the single row today)
+	// readable from the log at all. 0 restores the one-row-per-program dedup. No pixel moves.
+	bool mad2d_census_rect_enabled();
+
 	// RPCS3_REMIX_FULLCHAIN=0: under a *fused* active camera, fold only the outermost group of a
 	// layered program's matrix chain and divide that by the reference inverse - the behaviour up to
 	// and including 9c73eb0. For a layered program the outermost group is the projection alone, so
@@ -1535,6 +2008,41 @@ namespace remix_rsx
 	u64 force_albedo_vp_hash();
 	u64 force_albedo_fp_hash();
 	u32 force_albedo_unit();
+
+	// --- round 85: the albedo unit TABLE ---------------------------------------------------------
+	// RPCS3_REMIX_ALBEDOTABLE=<path>, defaulting to `<exe dir>/<TITLEID>.albedo`. The file's ABSENCE
+	// is the off switch: a title without one takes none of this and behaves bit-for-bit as before.
+	//
+	// WHY THIS EXISTS. albedo_unit_mask() reads the fragment ucode where it can and otherwise falls
+	// back to "lowest bound unit". On Saints Row 2 that fallback decides **99.6% of elections**
+	// (tex_albedo_ucode=1576 against tex_albedo_guess=387868 on one run), and "lowest" is a guess
+	// about authoring order, not a fact about the shader. The consequences are measured: 20% of
+	// submitted draws reach the compositor with no material at all (tex_none=360602 of
+	// tex_bound=1790071, notex_mat_applied=333731) and wear the RMXNOTEX mid-grey stand-in, which a
+	// user reported as black ground and ceiling.
+	//
+	// THE FACT THE GUESS IS STANDING IN FOR IS ON THE GAME DISC. SR2's shaders are Cg Binary with a
+	// NAMED parameter table, and for a fragment program a parameter whose resource is < 16 IS its
+	// texture unit -- so `Diffuse_MapSampler`, `Normal_MapSampler`, `Specular_MapSampler`,
+	// `V_Light_MapSampler` and `Decal_Map_1/2Sampler` each state their unit outright. The table maps
+	// the RPCS3 fragment-program hash to the unit the shader itself calls the diffuse.
+	//
+	// It can be built entirely offline because `get_fragment_program_ucode_hash`
+	// (ProgramStateCache.cpp:701) deliberately SKIPS constant-carrying instructions, and Volition
+	// patches fragment constants into the instruction stream at load - so a shipped shader and a
+	// live capture hash identically. Generator: docs/remix/gen_albedo_table.py, on top of
+	// docs/remix/cgbdis.py (the CGB parser) and docs/remix/vppdis.py (the archive reader).
+	//
+	// Format, one entry per line, '#' comments allowed:
+	//     <16 hex digits of the fp hash> <decimal texture unit 0..15>
+	//
+	// SAFETY. A table entry is a REQUEST, never an override: the named unit still has to be in the
+	// eligible mask and still has to bind, exactly as FORCEALBEDOUNIT's unit does, and a unit that
+	// fails either test falls back to the ordinary election. So a stale or wrong table degrades to
+	// today's behaviour rather than to a black screen. Returns -1 for "no entry".
+	int albedo_table_unit(u64 fp_hash);
+	u32 albedo_table_size();
+	u32 albedo_table_malformed();
 
 	// RPCS3_REMIX_UVLANES=1 (DEFAULT 0 = OFF): the same fact stated from the VERTEX side. Eat
 	// Lead's interior programs write one UV pair into o[7].xy at the 1/2048 dequant and the SAME
@@ -1681,6 +2189,44 @@ namespace remix_rsx
 	// RPCS3_REMIX_VTXNORMAL=0: submit the constant object-space normal (0,0,1) this backend wrote
 	// into every vertex before the normal decode existed. 1 (default) decodes the guest's own.
 	bool vertex_normals_enabled();
+
+	// RPCS3_REMIX_SMOOTHSKIN=1 (default): withhold REMIXAPI_INSTANCE_CATEGORY_BIT_SMOOTH_NORMALS
+	// from a SKINNED instance. 0 restores the previous behaviour bit-for-bit.
+	//
+	// TWO INDEPENDENT REASONS, and the second does not depend on the first being right.
+	//
+	// 1. THE BIT IS POINTLESS ON A SKINNED INSTANCE. The runtime computes smooth normals from the
+	//    DESTINATION positions, which at that point still hold the UNSKINNED pose, and then
+	//    dispatchSkinning overwrites the whole normal buffer immediately afterwards. So the pass
+	//    cannot contribute anything to a skinned mesh even when it behaves perfectly.
+	//
+	// 2. A FORMAT COLLISION IN THE DEPLOYED RUNTIME, traced through dxvk-remix-aerial.
+	//    SceneManager::processDrawCallState runs dispatchSmoothNormals first
+	//    (rtx_scene_manager.cpp:1379); its LAST line is
+	//    geo.normalBuffer.setVertexFormat(VK_FORMAT_R32_UINT) (rtx_geometry_utils.cpp:1135),
+	//    re-declaring the RT normal buffer as 32-bit octahedral. dispatchSkinning then runs on
+	//    that same buffer (:1388) but derives useOctahedralNormals from the SOURCE buffer
+	//    (rtx_geometry_utils.cpp:277, :308), which for an API mesh is the interleaved
+	//    remixapi_HardcodedVertex float3 (VK_FORMAT_R32G32B32_SFLOAT) - so it reads 0, and
+	//    skinning.h takes its else branch and writes THREE RAW FLOATS where one packed uint is
+	//    expected. The reader is then told "encoded" by rtx_instance_manager.cpp:935 ->
+	//    rtx_materials.h:119 -> surface_interaction.slangh:386 and floatBitsToUint()s a float.
+	//    Fires on exactly {SMOOTH_NORMALS} intersect {skinned}. GRAW2 world geometry is unskinned
+	//    and renders lit; its characters are skinned and render as black silhouettes, and
+	//    skinned=1 is the ONLY categorical difference measured between the two populations
+	//    (material, albedo_unit, blend, alpha test, a2c, depth flags and the vertex-colour route
+	//    are identical across four picked draws, two of each).
+	//
+	// HONEST LIMIT: measured over 20,000 random unit normals, the corruption scatters decoded
+	// normals over the WHOLE sphere (medians ~0, p10/p90 ~ -+0.79) rather than into a dead
+	// hemisphere, and surface_interaction.slangh:424 flips them into the triangle-normal
+	// hemisphere anyway - so this predicts NOISY AND DARK, not provably PURE black. Reason 1
+	// stands on its own regardless.
+	//
+	// UNRESOLVED COUNTEREXAMPLE: Eat Lead (BLUS30267) has working skinned characters on this same
+	// backend with the same global Generate Smooth Normals: true. If its characters submit with
+	// skinned=1 and look correctly lit, reason 2 is weakened. Not checked.
+	bool smooth_normals_skip_skinned();
 
 	// RPCS3_REMIX_NORMALATTR=<0..15>: which attribute carries it. Default 2, the RSX convention.
 	u32 normal_attribute_index();
@@ -1919,6 +2465,287 @@ namespace remix_rsx
 	// MAD instead of a DP4 (repair_split_rows). Hooked last in find_chain, so 0 restores the
 	// previous classification of every program bit for bit.
 	bool split_rows_enabled();
+
+	// --- ROUND 72: four widenings of the same walk, each independently revertible ----------------
+	//
+	// The measurement they answer to. bin\log\RPCS3.log, GRAW2 (NPUB30502), build Sep 11 2026
+	// 14:15:38 - which is at ROUND 64, not the worktree's round 70: its stats line carries
+	// ui_mad2d= (round 64) and no viewsolve= group (round 65). 'areason=no-chain' appears 597 times
+	// in that log and reads as 597 programs only if the census is misread. It is 324
+	// 'Remix world-refused:' lines + 272 'Remix layother:' + 1 'Remix ucode-store:', each census
+	// re-emitting ONCE PER PROGRAM PER STATS WINDOW over 243 windows, and the primary vp= field
+	// (space-anchored, so the substring camvp= cannot inflate it) holds exactly FOUR programs:
+	//
+	//   7e6d5cd0fbb52e6a  247 lines, 108 layother windows, consts=5 chain=5,  vtx=4/8
+	//   be3f71b62cb2a17c  216 lines, 108 layother windows, consts=8 chain=34, vtx=36..116
+	//   748d068fc1b6d948  113 lines,  56 layother windows, consts=7 chain=15, vtx=12..174
+	//   12433898c588b4a1   21 lines,   0 layother (fail=nocam only), menu-only, frames 1184..4320
+	//
+	// NONE of the four is correctly chainless. All 596 note= fields read 'no matrix chain into
+	// HPOS' - the >= 4-constant branch - and the two notes the genuinely chainless branches emit,
+	// 'no matrix chain, <4 constants' and '2D transform into HPOS.xy', appear ZERO times in the
+	// whole log. The Bink quad ab86464ca0d72796 appears 385 times and never in this census: it is
+	// claimed by match_screen_mad2d / the 2D compositor ('Remix mad2d:' line present,
+	// ui_mad2d=2470), which is why it never reaches a world refusal at all.
+	//
+	// What the four cost. Refused draws are DROPPED, not mis-placed: world_applied 2,512,145 minus
+	// wext_refused 301,618 is 2,210,527, which is submitted EXACTLY. world_refused = 740,964 is
+	// 22.7% of the 3,259,651 draws reaching the world stage (42.9/frame against 128.1 submitted),
+	// and the census names no other population that can account for it - the 21 wpremul and 2
+	// partial-xyz keys all read fail=nocam and appear in one window each, confined to the 4,335
+	// camera-less frames. Recovering them at the same 12% wext loss rate is about +29% on
+	// submitted. The per-program SPLIT of that 740,964 is NOT DETERMINED: this build emits no
+	// per-program draw counter, and window presence is only a presence proxy. world_refused_by_vp
+	// (RemixGSRender.cpp, not yet added) is the one run that would settle it.
+	//
+	// RPCS3_REMIX_SPLITADDEND. In repair_split_rows' MAD arm, prefer src[2] - the ADDEND - as the
+	// row whenever it is a temp, and fall back to round 66's single-TEMP search only when it is not.
+	// Defaults ON: this is a defect fix. Round 66 replaced "the row is the addend" with "the row is
+	// the single temp" on the strength of an invariance claim that does not hold when src[0] is
+	// also a temp, and that is the shape round 57 was written from - RC1's
+	// 'MAD r1.x <- r0.wwww, c[17].xxxx, r1.xxxx'. Replayed over all 238 .vp in bin\remix_ucode,
+	// round 66 as written loses six BCUS98282 programs; four of them (646DEC336DEBA29A,
+	// 24D3CAE7B3E1BD04, D032C3B0051293DB, 89C534B55683EA12) are submitted and drawn on
+	// bin\log\RC1.log. ACCEPTANCE: on BCUS98282, world_refused and submitted must not move against
+	// the PRE-ROUND-66 build - not against the current worktree, which is already regressed.
+	// Counter: split_addend_row_count(). 0 restores round 66 exactly.
+	bool split_addend_first_enabled();
+
+	// RPCS3_REMIX_SPLITADD. The MAD arm's degenerate sibling: a row plus a constant bias with no
+	// scale, 'ADD lane <- row, c[K].c'. GRAW2's 748D068FC1B6D948 writes
+	// '17: DP4 r3.w <- v0, c[2]' then '21: ADD o[0].z <- r3.wwww, c[13].wwww' with c[0], c[1] and
+	// c[3] arriving as plain DP4 rows, so c[0..3] is a complete consecutive matrix and only row 2
+	// detours. 113 of the 597 no-chain lines, 56 of 243 windows, and it writes a full tangent frame
+	// into TEX1 - lit world surface, not an effect. Counter: split_add_row_count(). 0 restores the
+	// refusal.
+	bool split_add_bias_enabled();
+
+	// RPCS3_REMIX_SPLITDOTLANES (default 1). repair_split_rows demanded that the DP4/DPH it hops
+	// back to write EXACTLY ONE lane. DP4 and DPH produce a scalar and splat it across the whole
+	// destination write mask (GLSLCommon.cpp:527-530, '$Ty(dot($0, $1))'), so a dual-lane DP4 holds
+	// the same row in both lanes and the lane count carries no information. MEASURED on Resistance:
+	// Fall of Man (BCUS98107): its skinned programs write '30: DP4 r3.xy <- r3, c[11]' and read
+	// r3.y back through a MOV, so the W row of an otherwise ordinary consecutive c[8..11]
+	// view-projection was discarded, all 26 stayed arch=unknown, and skin_unrec_indexed sat at
+	// 1,644,801 refused draws -- the missing NPCs and weapons. 0 restores the requirement.
+	// RPCS3_REMIX_LIVESCAXYZ (default 1). match_const_affine refused any position decode whose
+	// target register had EVER been written by a scalar op in x/y/z ("sca-xyz"), when the only
+	// question that matters is whether that write is still LIVE at the read. The dequantisation
+	// idiom it exists to accept parks RCP(c[K].w) in a lane the following MUL overwrites whole.
+	// MEASURED on BCUS98107: vp f306a29dbd6fc970 picked as exploded geometry covering the sky,
+	// with 'affine=0 areason=sca-xyz'; 19 of 378 dumped programs read SCA RCP off a constant,
+	// nine off c2. program_walker::has_live_sca_writer already exists for this distinction and
+	// find_chain already prefers it under LIVESCA; this was the one site that never learned it.
+	// 0 restores the any-write scan bit for bit.
+	// RPCS3_REMIX_ROWBLEND (default 1). The four-bone INDEXED-ROW blend rig: one ARL over all four
+	// a0 lanes, per bone three indexed DPH rows at c[a0.<k> + 52..54] (stride 1, no bias), weights
+	// v1.x/y/z/w, and the blended point divided by RCP(sum of weights). 47 of 378 dumped programs
+	// on BCUS98107; 45 match. Distinct from match_blend_palette's R2 shape (whose DP4s read no
+	// constant) and refused by match_indexed_affine (four addr_swz in one group). 0 reverts.
+	// RPCS3_REMIX_LIGHTVOLS (default 0) / RPCS3_REMIX_LIGHTVOLGAIN (default 1). The level's own
+	// per-region light volumes: ambient + key + FILL per oriented box, selected by which box the eye
+	// is inside. The fill is near-horizontal where the key is near-vertical, so it is what lights
+	// walls and characters; without it they sit in the dead band between the ambient's two lobes.
+	u32 light_volumes_enabled();
+	f32 light_volume_gain();
+
+	bool row_blend_enabled();
+
+	// RPCS3_REMIX_LIVESCAXYZ: see the definition for the full argument.
+	bool live_sca_xyz_enabled();
+
+	bool split_dot_lanes_enabled();
+
+	// RPCS3_REMIX_SELFACC. A row CORRECTED IN PLACE by a product of two non-constants:
+	// 'MAD lane <- a, b, <this same lane>' where the addend is a broadcast of the component being
+	// written. Round 57 requires one constant factor, so GRAW2's be3f71b62cb2a17c -
+	// '28: MAD r1.y <- v2.zzzz, r0.yyyy, r1.yyyy' over '9: DP4 r1.y <- v0, c[1]' - is refused and
+	// the c[0..2] object matrix behind it never seen. The dropped correction is a screen-space warp
+	// only, and the program corroborates that itself by shipping the UNWARPED M3(v0) to the
+	// fragment program in TEX3. Fires on be3f71b62cb2a17c and 7dd99d8c3d2c19d6 and on nothing else
+	// in the 238-file replay. Counter: split_selfacc_row_count(). 0 restores the refusal.
+	bool self_accum_row_enabled();
+
+	// RPCS3_REMIX_LIVESCA. find_chain's FIRST statement refuses any target with a scalar writer.
+	// This makes that test liveness-aware: a SCA write every lane of which a later write overwrites
+	// is not a value any matcher can read, so it must not veto the chain - the same argument
+	// LIVEWRITERS makes for the VEC writer list, applied to the one test that runs before it.
+	// GRAW2's be3f71b62cb2a17c is the population: '12: SCA RCP r2.w <- r0.yyyy' is dead by
+	// '34: MOV r2.w <- r3.xxxx', yet the walk returned empty at statement one and neither the
+	// c[4..7] projection nor the c[0..2] object matrix was ever looked at. Changes three NPUB30502
+	// programs and nothing in any other title. Counter: chain_sca_veto_count() - the vetoes that
+	// SURVIVE liveness, so it should fall, not rise. 0 restores the blanket refusal.
+	bool live_sca_enabled();
+
+	// RPCS3_REMIX_ZROWINFER. The depth row no repair can reach, VERIFIED rather than extrapolated.
+	// be3f71b62cb2a17c repairs x, y and w to clean DP4s at c[4], c[5] and c[7] and leaves z as
+	// '36: MAX r0.w <- r0.xxxx, c[467].yyyy' with cond_test_enable=1 and cond=5 - a CC-PREDICATED
+	// near-plane clamp set up by '14: SGT CC.x'. No repair may chase through a predicated selection
+	// and none should. But the missing slot is c[6] = base + 2 and the program reads exactly that
+	// slot with a clean DP4 over this group's own source, '34: DP4 r0.w <- r1.xyzw, c[6].xyzw', so
+	// the row is FOUND rather than guessed and the group is refused outright when no such
+	// instruction exists. What is dropped is the depth clamp, which never moved the world position;
+	// fold_viewport_z already models depth apart from the chain. Counters: zrow_inferred_count()
+	// against zrow_unverified_count() - the ratio is the honest measure of how often the row is
+	// there versus merely missing. 0 restores the refusal.
+	bool zrow_infer_enabled();
+
+	// --- ROUND 72 tallies ------------------------------------------------------------------------
+	// Once per vertex program ANALYSED, not once per draw: the fingerprint is cached per program.
+	// That is the number the acceptance tests above want - "six BCUS98282 programs took the addend
+	// arm" is the claim being checked, not a draw volume.
+	u64 split_addend_row_count();
+	u64 split_add_row_count();
+	u64 split_selfacc_row_count();
+	u64 chain_sca_veto_count();
+
+	// ROUND 85b, diagnostics only. Between "find_chain was called" and "groups=0" there are three
+	// silent exits and no census has ever printed any of them. split_repaired = repair_split_rows
+	// accepted at least one lane; split_lane_widened = a MULTI-lane DP4/DPH was taken as a row
+	// (the SPLITDOTLANES path); resolve_refused = the indirect MOV hop bailed. On a title where
+	// every program reports areason=no-chain these three partition the possibilities.
+	u64 split_repaired_count();
+	u64 split_lane_widened_count();
+	u64 resolve_refused_count();
+	u64 zrow_inferred_count();
+	u64 zrow_unverified_count();
+
+	// RPCS3_REMIX_LIVEWRITERS. find_chain hands its matchers only the LIVE lanes of each writer of
+	// the target - a lane a later instruction overwrites is stripped, and a writer left with no live
+	// lane is dropped. 0 restores the full-mask list every matcher saw before this round, bit for
+	// bit.
+	//
+	// It exists because collect_vec_writers counts dead writes and match_dp4_chain's first test is a
+	// writer COUNT, so one dead write hides an entire matrix group. GRAW2 (NPUB30502) is the title
+	// that exposed it: its 'MUL r0.x <- v0.wwww, c[118].wwww' is dead by the 'DPH r0.x <- r4, c[0]'
+	// three instructions later, but it made the walk see five writers of r0 instead of four, so
+	// every program in the game stopped at groups=1 with areason=partial-xyz - its object matrix
+	// unseen, its decode unreached, and 94.4% of submitted draws piled in the 1e4..1e5 extent decade
+	// at wext_median=65534, one full 16-bit span.
+	//
+	// This knob also governs chain_result::rows_dph reaching the next hop, i.e. whether a 3-row
+	// group whose consumer is a DPH may be accepted with no w write. The two are one change: the
+	// dead-writer strip is what lets GRAW2's object matrix be SEEN, and the implicit w is what lets
+	// it be ACCEPTED, and neither alone moves a pixel in that title.
+	//
+	// Shared by every matcher in find_chain and therefore by every title - unlike WPREMUL below,
+	// which only ever fires on a program shaped the way GRAW2 writes them. Bisect this one first
+	// when any other game regresses this round.
+	//
+	// SWEEP, before it was allowed to run: both rules replayed offline over all 228 vertex programs
+	// in bin\remix_ucode - every title this backend has met - comparing the group list the old rules
+	// resolve against the new ones. 177 unchanged, 51 reclassified, and all 51 are GRAW2's. Not one
+	// program from any other title changes its groups, bases or row counts. The replay models
+	// match_dp4_chain and the walk only, so it cannot speak for a program that matches through the
+	// mad / indexed / blend / repair arms; what it does establish is that the writer list those arms
+	// are handed is byte-identical outside this title.
+	bool live_writers_enabled();
+
+	// RPCS3_REMIX_INPUTW. Accept 'MOV r.w <- attrN.wwww' as a 3-row group's homogeneous stand-in,
+	// recording the attribute (vp_fingerprint::group_w_input) so read_group_matrix can prove per
+	// draw that its w really is 1 - which it is whenever the attribute carries fewer than four
+	// components, because decode_position forces it. 0 refuses the shape again.
+	//
+	// Admitting an INPUT here is not a general loosening. An input in a ROW position would mean the
+	// matrix multiplies something this backend cannot model, and that is still refused; this is the
+	// homogeneous 1, where the only thing that matters is the VALUE, and the value is proven per
+	// draw to exactly the standard the constant case is held to.
+	//
+	// GRAW2 (NPUB30502) is what it was written for - F11CF56CA218F381 and its twin
+	// F11C25DE2218F361, whose ATTR0 is 'a0=f3' so v0.w is literally 1, and which sat at groups=1
+	// with their object matrix unseen: the right SIZE in the wrong PLACE, the opposite signature
+	// from the raw-16-bit family and needing no position decode at all. SWEPT over all 233 vertex
+	// programs in bin\remix_ucode before it was allowed to run: 3 programs change classification,
+	// the two above plus 02E793A801950511, whose c[8] projection / c[32] object pairing is the
+	// exact family RemixTransforms.cpp already documents as "submitted object space as world
+	// space" for the constant-w variant - so the third is the same bug, one variant short of
+	// having been fixed when the 3-row rule was added. Its title could not be confirmed: no
+	// surviving log in bin\log carries that hash.
+	bool input_w_enabled();
+
+	// RPCS3_REMIX_BLENDDPH. Two halves of one shape, because no title presents either alone:
+	//   - a weighted bone palette may sum any number of bones from two to max_blend_bones, taken
+	//     from the accumulator's own 'MUL + N x MAD' run, instead of exactly four;
+	//   - its rows may be applied with DPH rather than DP4, in which case the operand's fourth
+	//     coordinate comes from the opcode and there is no w constant to read or to prove is 1
+	//     (chain_result::w_implicit -> vp_fingerprint::palette_implicit_w).
+	//
+	// GRAW2 (NPUB30502) is the population: nine character programs, all three-bone, all DPH, and
+	// 174893 draws of them refused into skin_unrec_indexed with skin_submitted = 0 and no soldier
+	// on screen. 1213E6433F848ADA is the reference - palette at c119, three rows, weights off
+	// ATTR1.x/.y/.z, indices off ATTR7 through a0.y/.z/.x. The three-bone count is corroborated
+	// independently of the ucode by the vtxattr census: a1=ub4 with len bottoming out at 0.5774,
+	// i.e. 1/sqrt(3), the length of three equal weights that sum to one.
+	//
+	// With the knob off, match_blend_row takes the same four-writer window it took before, a DPH
+	// row is held to the DP4 rules, and the operand w proof is required - so every four-bone DP4
+	// rig (Resistance 2, NPEA00431) is classified through exactly the instructions it always was.
+	// At four bones the relaxed distinctness test reduces to the 0xf test it replaces, so the knob
+	// changes nothing for them either way.
+	//
+	// DEFAULTS ON: env_u32(..., 1) != 0, no g_cfg twin and no env_flag. See wpremul_enabled below.
+	bool blend_dph_enabled();
+
+	// RPCS3_REMIX_SKINAUDITSLICE. Ask the palette-indexing hardening about the instructions the
+	// POSITION depends on (slice_position's set) instead of about the whole program, and let a
+	// blended chain satisfy either the exact 'rows x bones' read count or the range rule that was
+	// previously scoped to the vertex-blend family alone.
+	//
+	// Sound rather than lenient because slice_position absorbs the ARL behind every indexed read it
+	// walks, so a reload that really does sit between two palette reads on the position path stays
+	// in the slice and still trips arl_count > 1. What leaves the count is only what HPOS cannot
+	// reach. GRAW2 (NPUB30502) is again the population: each of its nine character programs runs a
+	// per-light loop AFTER its HPOS writes, with two to four more ARLs and about twelve more
+	// indexed reads feeding TEX1/TEX2, and the whole-program audit refused all nine on that alone.
+	//
+	// The exact count is still tried first and still accepts on its own, so nothing that passes
+	// today starts failing. DEFAULTS ON, same accessor shape.
+	bool skin_audit_slice_enabled();
+
+	// RPCS3_REMIX_WPREMUL. Recognise the position decode whose scalar is the attribute's own w times
+	// a constant - 'attr0.xyz * (attr0.w * c[K].w) + c[J].xyz' - and split it into the per-vertex
+	// multiply plus the constant prescale matrix (vp_fingerprint::has_wpremul). GRAW2 (NPUB30502) is
+	// the whole population; 0 refuses the match, which leaves those programs with their object
+	// matrix resolved (LIVEWRITERS above does that part) but their positions still submitted in raw
+	// s32k units. Setting BOTH to 0 is what restores the measured pre-round state.
+	//
+	// DEFAULTS ON, so env_u32(..., 1) != 0 and never env_flag: env_flag cannot tell "set to 0" from
+	// "not set", and the `env || g_cfg` accessor shape would make WPREMUL=0 a silent no-op - the
+	// trap SMOOTHNORMALS and TEXBUDGET each lost a round to. There is no g_cfg twin for this knob,
+	// so the env value alone decides and 0 really does turn it off.
+	bool wpremul_enabled();
+
+	// RPCS3_REMIX_WPREMULMASK: 1 (default) chases match_wpremul's per-vertex scale back with the
+	// mask-aware last_component_writer; 0 restores the component-blind last_temp_writer the
+	// matcher shipped with. The blind chase loses the decode outright - not subtly, but to RAW
+	// s16 attribute scale - whenever the ucode reloads other lanes of the scale's temp between
+	// the MUL and the MAD, which is just the compiler packing a texcoord into r0's spare lanes.
+	// Replayed over all 238 programs in bin\remix_ucode: acceptance 45 -> 76, 31 gains, 0 losses,
+	// every gain resolving to the same c[118].w / c[118].xyz decode. Full derivation and the
+	// worked 3FC9E3E155EF6DE1 disassembly are on the hunk in match_wpremul.
+	bool wpremul_mask_enabled();
+
+	// RPCS3_REMIX_ATTROFFSET=0|1 (default 1): refuse a draw whose vertex program builds its
+	// position as 'attr0 + T0*s0 + T1*s1 + ...', i.e. per-vertex offsets ADDED to the attribute
+	// this backend submits. Nothing in an instance transform can carry those offsets, so what
+	// reaches the scene is the un-expanded attribute box placed by a quotient of two projections -
+	// on GRAW2 (NPUB30502) that is the family of static translucent slivers sweeping the frame
+	// (B21803879233E34B, 13 vertices spanning 1864 units). 0 restores submitting them, and also
+	// skips the matcher, so the revert is exact.
+	bool attr_offset_refuse_enabled();
+
+	// RPCS3_REMIX_B8MULTIPLANE: 0 (DEFAULT) composites a B8 texture as a coverage mask exactly as
+	// it always has. 1 treats a B8 read by a fragment program that samples more than one unit as
+	// one plane of a colour image and composites it OPAQUE instead. Shipped unconditionally in
+	// round 66 and regressed GRAW2's on-screen effects into opaque black bars (1590 draws), hence
+	// the gate and the off-by-default -- the full argument is on the definition.
+	bool b8_multiplane_enabled();
+
+	// RPCS3_REMIX_B8YUVFP=<16 hex digits>: for one verified three-plane B8 fragment program,
+	// reproduce the shader's live 3x4 colour matrix in the CPU compositor instead of treating the
+	// elected plane as a greyscale coverage texture. Zero when unset; exact-program opt-in because
+	// a multi-sampler program alone does not prove that its B8 textures form one colour image.
+	u64 b8_yuv_fp_hash();
 
 	// RPCS3_REMIX_NOALPHA=1: create materials with the alpha state M3 shipped (alphaTestType 7 /
 	// always-pass, useDrawCallAlphaState 1) instead of the title's own alpha test. The bisect
@@ -3338,11 +4165,69 @@ namespace remix_rsx
 	// the residual solvable offline. 0 = off. Clamped to 128, like s_max_guest_light_lines.
 	u32 authored_light_dump();
 
+	// RPCS3_REMIX_AUTHOREDLIGHTAUTO=1: the active level follows the guest's own level loads -- the
+	// .map it opens under USRDIR/Maps/, whose 16-hex stem is the `M` field of every .lights file --
+	// and AUTHOREDLIGHTLEVEL is ignored. Default 0 = OFF, byte-identical to today. Tri-state parse
+	// like fp_const_albedo_mode(): unset = off, and an explicit 0 is a real 0.
+	bool authored_light_auto();
+
+	// RPCS3_REMIX_WORLDBOXCENSUS: turns the `Remix worldbox:` line from "one row per VERTEX PROGRAM per
+	// run" into a world-space INSTANCE census. 0 = today's behaviour, byte-identical (dedup on the
+	// vertex-program hash alone, capped at s_max_worldbox_lines). 1 = dedup on (vp, albedo, world-box
+	// centre quantised to 0.5 m) and raise the cap to s_max_worldbox_census_lines, so every distinct
+	// drawn INSTANCE contributes one row instead of every distinct SHADER.
+	//
+	// WHY IT EXISTS, AND WHAT IT IS THE INSTRUMENT FOR. `lo`/`hi` on that line are already expressed in
+	// the space per_draw_transform hands to Remix, and that space was MEASURED this round to be a
+	// stable, RUN-INDEPENDENT guest world frame: decoding the exact-hex `fused`/`ref` pair off
+	// `Remix guest-light-drift-mat:` gives model = fused x reference_inverse with unit scale to four
+	// decimals, and one static lamp lands on model_t=[15.22 16.09 -10.12] in two different processes
+	// while another lands on [14.70 17.38 -12.55] in three more. So the render frame is NOT
+	// viewer-anchored, and a CONSTANT axis+offset is the right shape of answer after all.
+	//
+	// What is missing is the CORRESPONDENCE, and the existing logs cannot supply it: they contain only
+	// TWO emissive glow-card meshes, and a 48-permutation Hough fit of their 47 decoded instance
+	// positions scores 9/47 for 01_JapaneseRestaurant1 against 6/47 for 06_Warehouse_Druglab and 5/47
+	// for three other wrong levels -- no discriminating power at all, exactly like the retracted
+	// "Z is negated" vote. This census is what turns that 47-point cloud into a several-hundred-point
+	// one, over which the same fit WITH its wrong-level control can actually decide.
+	//
+	// Diagnostic only: it changes no submitted geometry, no light, no matrix and no picture.
+	u32 worldbox_census();
+
+	// RPCS3_REMIX_VPTALLY: per-vertex-program submitted/refused counts on 'Remix stats:', as
+	// vptally_sub={hash=count ...} vptally_ref={hash=count ...}, descending by count. 1 (default)
+	// counts, 0 leaves both lists empty. Diagnostic only - it reads counters and submits nothing.
+	//
+	// WHY IT EXISTS. The refusal side of the partition is currently reported two ways and neither
+	// can name the program that lost a mesh. 'Remix world-fail:' gives the REASON histogram
+	// (GRAW2: nocam=108514 lay_other=632450 of 740964) but no hashes. 'Remix world-refused:'
+	// gives hashes but claims its census slot on a program's FIRST refusal, and on a title whose
+	// first ~4335 frames have no camera at all that means two dozen programs are permanently
+	// labelled "nocam" from frames they were never going to survive. Round 72 read one such row -
+	// ad7dca308485aaf2, 6894 vertices, terrain-scale - as a refused ground program, when the same
+	// run's 'Remix: drawn-extent' line (emitted past ++draws_submitted) shows it reaching the
+	// scene with a sane 255.8-unit world extent.
+	//
+	// The SUBMITTED side is the half that makes it decide anything, and is the reason this is not
+	// simply a hash added to the existing census: "absent from the refused list" and "drawn" are
+	// different claims, and only the submitted list separates them.
+	u32 vp_tally();
+
 	// RPCS3_REMIX_CAMSANITY: 0 = census only (shipped), 1 = refuse an insane camera before
 	// SetupCamera. RPCS3_REMIX_CAMSANITYTOL is the fractional FOV deviation from the title's own
 	// latched reference that counts as insane. Full derivation on the definitions.
 	u32 camera_sanity_mode();
 	f32 camera_sanity_tolerance();
+
+	// RPCS3_REMIX_CAMREFCOND: 0 = census only (shipped), 1 = refuse a camera whose
+	// reference_inverse - the matrix per_draw_transform divides every instance by - is
+	// ill-conditioned. RPCS3_REMIX_CAMREFCONDMAX is the largest |entry| of that 4x4 still
+	// accepted. The round-49 CAMSANITY gate reads the PROJECTION only and cannot see this at
+	// all. Full derivation, the measured GRAW2 numbers, and why a 3x3 or determinant test is
+	// the wrong quantity are on the definitions.
+	u32 camera_reference_gate_mode();
+	f32 camera_reference_max_scale();
 
 	// RPCS3_REMIX_SKYEXTENT=<units>: a draw that writes no depth, is anchored on the camera
 	// (sky_max_anchor) and spans at least this much in its widest axis *in world units* is the
@@ -3827,6 +4712,7 @@ namespace remix_rsx
 	// which is the opaque wall.
 	//
 	// env_u32(..., 1) != 0 rather than env_flag: a default-on knob has to be able to express "=0".
+	bool ui_blend_mode_enabled();
 	bool ui_tint_texcoord_enabled();
 
 	// --- ROUND 52: replay the program's own texcoord scale on the 2D path ------------------------
@@ -3846,6 +4732,30 @@ namespace remix_rsx
 	// is kept and the draw is counted rather than guessed at). 0 restores today's arithmetic
 	// bit-exactly and is the one-relaunch bisect for any UI that changes size.
 	bool ui_uv_ucode_enabled();
+
+	// --- ROUND 84: RPCS3_REMIX_UIUVSCALEGUARD (default 1) ----------------------------------------
+	// The 2D scalar texcoord-scale fallback tested only isfinite(); the 3D path has always ALSO
+	// demanded '> 0'. A zero divisor is not a texture transform, it is a collapse of every vertex
+	// onto texel (0,0). MEASURED on Resistance: Fall of Man (BCUS98107): its whole main menu is one
+	// 1280x720 quad whose vertex program states a full 2x2 UV matrix the affine matcher refuses
+	// ('affine:split-write' - u and v are reduced by two SEPARATE lane writes into one temp), so the
+	// scalar fallback fires with the v-row constant c37 and reads c37.x, which is 0 for a v-row.
+	// Run pid=33780: 'uvattr=0x02 uvstat=ok' (the attribute resolved fine), 'ui_uv_ucode=2691/0'
+	// (the scalar branch applied, never refused) and 'Remix uiwrap: u=[0..0] v=[0..0]'.
+	// 0 restores the 2D arithmetic bit for bit.
+	bool ui_uv_scale_guard_enabled();
+
+	// --- ROUND 84b: RPCS3_REMIX_UIUVSPLITREFUSE (default 1) --------------------------------------
+	// Refuse the 2D scalar texcoord scale on a program whose affine walk failed 'affine:split-write'
+	// -- the refusal that means "this program states a 2x2 written as two separate lane writes".
+	// The scalar matcher's MUL is one ROW of that matrix, and using a row component as a uniform
+	// divisor draws a different program. Measured on BCUS98107, where c37.x is animated from
+	// -9.9 to +6.7 within a run (the menu's wave effect) and drove tiled striped wedges.
+	// Refusing keeps the RAW attribute, which measures u=[0..1] v=[0..1] on that title.
+	// NOT the full fix: uv_affine_form indexes row_slot[] by ATTRIBUTE COMPONENT and Resistance
+	// stores one constant per OUTPUT LANE, so reproducing the animation needs a transposed form
+	// (a 'rows_by_lane' flag plus a unit-scale path) that does not exist yet. 0 reverts.
+	bool ui_uv_split_refuse_enabled();
 
 	// --- ROUND 52: store the ucode of a NAMED fragment program -----------------------------------
 	// RPCS3_REMIX_UCODESTOREFPHASH=<fp>[,<fp>...] (bound 8, base 16, same parser as UIFORCEVP).
@@ -3883,6 +4793,14 @@ namespace remix_rsx
 	// ui_refused_fp.
 	bool ui_refuse_fp_matches(u64 fp_hash);
 	u32 ui_refuse_fp_count();
+
+	// RPCS3_REMIX_UIREFUSEFULLFP + RPCS3_REMIX_UIREFUSEFULLALBEDO, both exactly 16 hex digits:
+	// refuse only screen-covering draws made by that exact fragment-program/content pair. Unlike
+	// UIREFUSEFP this leaves bounded draws from the same program alone, and unlike an FP-only full
+	// refusal it leaves unrelated full-screen content made by the same shader alone. Empty or
+	// malformed either half is inert. The caller owns the screen-coverage test.
+	u64 ui_refuse_full_fp_hash();
+	u64 ui_refuse_full_albedo_hash();
 
 	// --- round 36: the same route keyed on a (vp, fp) PAIR, for the helmet -----------------------
 	//
@@ -4265,6 +5183,250 @@ namespace remix_rsx
 	// cannot be A/B'd at the boundary. This is exact and complete for the API; the split is a later
 	// round with its own invariance proof. 0 restores today's output bit-exactly.
 	bool camera_xflip_enabled();
+
+	// --- ROUND 64: THE GUEST'S CLIP-Y SIGN, WHICH NOTHING IN THIS BACKEND HAS EVER READ ----------
+	//
+	// RPCS3_REMIX_CAMYFLIP. 0 = off, 1 = AUTO from the guest's own viewport registers (DEFAULT),
+	// 2 = force on. RPCS3_REMIX_UIYFLIP is the same three-way for the 2D compositor's NDC branch.
+	//
+	// WHAT THE BIT IS. RSX window space is y-DOWN: window_y = viewport_offset_y + viewport_scale_y *
+	// (clip.y / clip.w) with row 0 at the TOP of the surface. So a title that programs the standard
+	// cellGcmSetViewport form (scale_y = -h/2, offset_y = +h/2) maps clip.y = +1 to row 0, i.e. its
+	// clip +y is screen-UP - which is also Remix's NDC convention, so the two agree and nothing has
+	// to be done. A title that programs scale_y = +h/2 maps clip.y = +1 to row h: its clip +y is
+	// screen-DOWN, it has baked the inversion into its own projection, and submitting that matrix to
+	// remixapi renders the whole scene vertically MIRRORED. remixapi_SetupCamera validates nothing,
+	// so there is no error - only a wrong picture.
+	//
+	// WHY THE SIGN OF THE REGISTER IS THE WHOLE STORY, and not a guess: RPCS3's own renderer models
+	// exactly this and nothing more. draw_command_processor::fill_scale_offset_data
+	// (Emu/RSX/Core/RSXDrawCommands.cpp:572) normalises scale_y by clip_h/2 and the vertex shader
+	// applies it as gl_Position = clip * scale_offset_mat
+	// (Program/GLSLInterpreter/VertexInterpreter.glsl:629). This backend folds only Z
+	// (fold_viewport_z); the x/y half of that matrix has never been read anywhere on the camera
+	// path, which is the defect.
+	//
+	// MEASURED, and this is what makes it a fact about GRAW2 rather than a theory. The 2D
+	// compositor already carries an independent orientation audit: ui_vflip_ndc=OK/BAD is
+	// cov(composited row, texture v) over axis-aligned UI quads, so BAD means the composited image
+	// is upside down. Reading four runs of the same build family:
+	//     GRAW2    (NPUB30502)  ui_vflip_ndc =     0 / 3720     <- unanimously inverted
+	//     Eat Lead (BLUS30267)  ui_vflip_ndc = 28794 / 1199     <- upright  (ui_vpydown=94, yup=0)
+	//     Eat Lead (round 63)   ui_vflip_ndc = 72464 /  567     <- upright  (ui_vpydown=70, yup=0)
+	//     R&C      (BCUS98282)  ui_vpydown   = 17165, ui_vpyup = 61
+	// GRAW2 is the first title measured on the wrong side of this bit, and the user-visible tell is
+	// the one a rotation cannot produce: a STOP sign whose lettering is inverted AND mirrored.
+	//
+	// WHAT MODE 1 DOES, and where. In submit_camera only, after both to_camera_matrix copies and in
+	// the same boundary-only position as CAMXFLIP: negate the submitted view's COLUMN 1, i.e.
+	// V' = V x diag(1,-1,1,1), and touch nothing else.
+	//   * The submitted PRODUCT's clip-y column is negated (P's y row is (0,p11,0,0), so S x P is P
+	//     with p11 negated and V x S x P is the fused with clip.y flipped) - which is the whole
+	//     point, this arm is meant to change the picture.
+	//   * inverse(V') = S x inverse(V), so viewToWorld ROW 1 - RtCamera::getUp(), rtx_camera.cpp:72 -
+	//     becomes the guest's TRUE up, while ROW 3 (the eye) and ROW 2 (getDirection) are untouched.
+	//   * P is not modified at all, so P[1][1] stays positive, DecomposeProjection's near/far/fov and
+	//     bLeftHanded = a22 > 0 are bit-identical, and the runtime's own correctProjectionYFlip
+	//     (rtx_camera.h:122, default false) stays unnecessary.
+	//   * viewToWorld's 3x3 determinant goes +1 -> -1, which is round 56's conclusion restated for
+	//     the other axis: -1 IS Remix's convention for a right-handed guest world under a
+	//     left-handed projection. The dev menu's 'Overall Handedness' must therefore flip to
+	//     Right-handed, and that plus an upright picture is the whole acceptance test.
+	// The sky and viewmodel twins copy camera_info below this point and inherit it; the viewmodel
+	// twin's copysign reads projection[0][0] / [1][1], neither of which this touches.
+	//
+	// WHY IT IS THE VIEW AND NOT THE PROJECTION. Negating P's column 1 instead produces the same
+	// picture but leaves viewToWorld's up row pointing at the guest's floor and P[1][1] negative -
+	// the state round 56 spent a round removing on the x axis. Same image, worse camera.
+	//
+	// MEASURED EVIDENCE THAT GRAW2'S VERTICAL IS WHERE THIS SAYS IT IS. The elected camera's outer
+	// group on this title is a PURE projection (columns c4..c7 of
+	// bin\remix_ucode\B0596B76D83AC01A.vp) that reads, exactly:
+	//     clip.x = 1.540976 * p.x   clip.y = -2.739512 * p.z   clip.z = 1.0000477*p.y - 0.100005
+	//     clip.w = p.y              ->  near 0.100000, far 2097.25, fovy 40.107, aspect 1.777778
+	// so the guest's view-space vertical is Z and it enters clip.y NEGATED, and the depth axis is Y
+	// (which is why the dev menu reports Direction 0.00 1.00 0.00). The world's Z axis maps to
+	// (-0.012, 0.128, 0.9917) of that view space - a Z-UP world with the camera 7.4 degrees off
+	// level - so clip.y is negative for UP: the guest authored its clip y downward.
+	//
+	// AUTO IS SELF-DISARMING, and that is why it can default on. The latch reads the viewport
+	// registers captured on the ELECTED CAMERA'S OWN DRAW (camera_candidate::viewport_scale, filled
+	// at the split site) and refuses to fire unless that value is finite, non-zero and POSITIVE.
+	// Eat Lead, Haze, Demon's Souls and R&C all elect a fused camera, so all four capture the value;
+	// Eat Lead's own ui_vpydown=94 / ui_vpyup=0 says its registers are negative, and a title that
+	// never captures one is counted (cam_yunknown) and left alone rather than guessed at.
+	// Deliberately NOT the live register: submit_camera runs at flip, where the registers hold
+	// whatever the last draw of the frame left behind, and R&C's 61 y-up UI draws prove one title can
+	// present both signs in one frame.
+	//
+	// Counters, all printed on both arms: cam_clipydown / cam_clipyup / cam_yunknown partition
+	// cam_resolved by what the latch saw, cam_yflip counts the frames the flip was applied to, and
+	// ui_yflip counts the composited 2D draws that took the matching sign, and cam_ysign_disagree is
+	// the latch's own refutation - a later elected camera whose viewport sign contradicts the
+	// latched one, expected 0 everywhere. cam_viewspace / cam_worldspace, added in the same round,
+	// partition cam_resolved by whether the submitted view carries a translation at all. One
+	// 'Remix cam-yflip:' line is emitted when the latch closes.
+	// 0 restores today's output bit-exactly.
+	u32 camera_yflip_mode();
+
+	// RPCS3_REMIX_CAMDEPTHGATE=1 (default): reject a camera candidate whose projection has NO
+	// DEPTH RANGE. 0 restores the previous behaviour exactly.
+	//
+	// Round 49's sanity gate tests a describable projection, a finite FOV in (1,179) and a finite
+	// positive NEAR -- and never looks at FAR. It cannot: projection_params carries fov, aspect
+	// and near only. So an ortho or UI matrix with a perfectly ordinary FOV passes it.
+	//
+	// For a row-vector type-1 perspective, ndc_z = P[2][2] + P[3][2]/z, so
+	//     near = -P[3][2] / P[2][2]        (ndc_z = 0)
+	//     far  =  P[3][2] / (1 - P[2][2])  (ndc_z = 1)
+	// which means P[2][2] == 1 EXACTLY has no far plane at all: ndc_z never reaches 0 and the
+	// matrix maps no depth range. That is the structural signature of an ortho/2D matrix, not a
+	// heuristic about magnitudes.
+	//
+	// MEASURED on GRAW2 (NPUB30502), one in-mission run, 25 cam-basis rows / 5 distinct
+	// projections, TEN different programs winning the election:
+	//   vfov=45.00 near=0.25 far=2099.5       p22=+1.00012  overall=RH camyflip=1   <- the real one
+	//   vfov=34.46 near=0.15 far=1.2585e+06   p22=+1        overall=LH camyflip=0
+	//   vfov=26.23 near=0.15 far=1.2585e+06   p22=+1        overall=LH camyflip=0
+	//   vfov=26.23 near=0.15 far=0            p22=+1        overall=LH camyflip=0
+	//   vfov=26.23 near=0.15 far=-2.51699e+06 p22=+1        overall=LH camyflip=0
+	// Every bad row is p22 == 1 and every bad far is 0, negative, or a million. The good row is
+	// |1 - p22| = 1.2e-4, so the threshold below clears it by more than two orders of magnitude.
+	// A negative far plane accepted as a world camera is what silently destroys the scene, and
+	// cam_insane measured 0 through all of it -- the gate never had the term that would catch it.
+	bool camera_depth_gate_enabled();
+
+	// RPCS3_REMIX_UIYFLIP. The 2D compositor's half of CAMYFLIP above, same three-way and the same
+	// latch. Separate knob rather than one, because the two corrections live in different code -
+	// the camera's in submit_camera, the UI's in composite_ui_draw's NDC branch - and if the next
+	// launch comes back with the world upright and the HUD inverted (or the reverse) that has to be
+	// separable without a rebuild.
+	//
+	// The compositor's NDC branch maps row = (1 - ndc.y) * 0.5 * fh, which hard-codes "guest clip
+	// +y is the top row". Mode 1/2 negates ndc.y first. The PIXEL branch needs no equivalent: it
+	// already derives its row mapping from the same registers (ui_space_from_viewport) and so is
+	// correct for either sign already - which is the consistency argument for doing this at all.
+	// Default 1 (auto). 0 restores today's output bit-exactly.
+	u32 ui_yflip_mode();
+
+	// RPCS3_REMIX_VIEWSOLVE=1: the measurement round for a VIEW-SPACE title, diagnostic only.
+	// Default 0, so every title including the four regression titles is bit-exact without it, and
+	// GRAW2 turns it on from bin\NPUB30502.conf with no rebuild.
+	//
+	// WHY IT EXISTS. cam_viewspace == cam_resolved and cam=[0 0 0] on every 'Remix cam-elect:' line
+	// say GRAW2 premultiplies the view on the CPU: the only matrix the GPU gets per object is
+	// c[0..2] = WORLD x VIEW, and the outer group c[4..7] is a PURE projection. So the camera's
+	// ROTATION is in no candidate the election can see, every candidate is a projection, and the
+	// election has no unique correct answer - it is picking arbitrarily among matrices that all
+	// encode the same thing. That is why a grass program can win it.
+	//
+	// It is also why the RASTERISED PICTURE cannot be wrong whoever wins. Geometry is placed as
+	// world = chain x ref^-1 with chain = WORLD x VIEW x P_own and ref = P_elected, and the camera
+	// submitted is (V0, P0) with V0 x P0 = ref, so
+	//     p x chain x ref^-1 x V0 x P0 = p x chain
+	// EXACTLY, for any elected P. What IS wrong is everything that reads the world pose rather than
+	// the picture: instance = WORLD x VIEW x P_own x P_elected^-1 is not even affine unless
+	// P_own == P_elected, Remix's world space is the guest's VIEW space, the eye never leaves the
+	// origin, and the whole scene's pose teleports whenever the winner changes. World-space lights
+	// cannot work in that space at all.
+	//
+	// The exact fix is to submit the guest's real view V and post-multiply V^-1 into every
+	// instance: with P_own == P_elected == P,
+	//     instance' = chain x P^-1 x V^-1 = WORLD_i   and   V_sub = V, P_sub = P
+	// reproduces the same clip position (WORLD_i x V x P = chain) while giving Remix a genuine
+	// world space. No split is needed for it - the fused outer group ALREADY IS the projection, and
+	// try_split_once's constructed near-identity view is precisely the "no view present" tell.
+	//
+	// The one thing that fix needs and this build does not have is V. Every draw carries
+	// WORLD_i x V, never V, so V is only recoverable as the value SHARED by the draws whose
+	// WORLD_i is the identity - static world geometry, authored in world coordinates. Single-sample
+	// rigidity is NOT sufficient evidence for that (a rotated crate is rigid too); the sufficient
+	// evidence is CONSENSUS, many distinct programs and meshes carrying one bit-identical inner
+	// matrix. This census measures exactly that, and nothing else:
+	//
+	//   vs_draws        census-eligible world draws examined
+	//   vs_pown_match   draws whose own outer group IS the elected reference (pose is WORLD x VIEW)
+	//   vs_pown_differ  draws where it is not (pose is a projective smear - the real defect)
+	//   vs_inner_rigid  draws whose inner product G0..G(n-2) has an orthonormal 3x3 with det +1
+	//   vs_inner_loose  draws where it does not
+	//
+	// plus up to 64 'Remix viewsolve:' lines per stats window, one per (program, group count),
+	// carrying the inner matrix's 64-bit hash. The question the census answers is settled by
+	// grep + sort + uniq on that hash across programs: ONE hash dominating many distinct vps is V
+	// and the fix above is immediately available; many hashes with no mode means WORLD_i is not the
+	// identity for this title's world geometry and the view has to be solved some other way.
+	u32 view_solve_mode();
+
+	// RPCS3_REMIX_ZUP. Pushes rtx.zUp through remixapi_SetConfigVariable so a per-game conf can
+	// drive it without editing bin\rtx.conf, which is shared with another live project.
+	//   0 (default) leave the option alone - inherits rtx.conf exactly as today
+	//   1           force rtx.zUp = True
+	//   2           force rtx.zUp = False
+	// Anything else falls back to 0. The full argument - why SetConfigVariable is the right route
+	// of the three, why it is called from submit_camera and not from startup, and why True is the
+	// correct value for GRAW2 *while the view is still baked into the instance transforms* even
+	// though the game's own world is Y-up - is at the call site in submit_camera.
+	//
+	// zUp cannot reorient geometry. It is never read on worldToView, viewToProjection or ray
+	// generation; it drives sky/atmosphere orientation, distant-light directions, volumetrics,
+	// the particle/rain/terrain-baker up axis, planar view-distance fade, anti-culling and the
+	// free camera. A wrong value shows up in the SKY and FOG, never in the world.
+	u32 zup_mode();
+
+	// RPCS3_REMIX_DLFG: pushes rtx.dlfg.enable into the runtime's User layer per game.
+	// 0 = leave alone (default), 1 = force OFF, 2 = force ON.
+	// Not a tuning knob. On GRAW2 (NPUB30502) frame generation is deterministically fatal -- the
+	// DLFG feature fails to create, is evaluated 1282 times regardless, the pacer fence times out
+	// and the device is lost (exit 173). rtx.dlfg.enable lives in the SHARED bin/user.conf and a
+	// dev-menu toggle does not survive a relaunch, so a per-game push is the only scoped fix.
+	u32 dlfg_mode();
+
+	// RPCS3_REMIX_DENOISE: pushes rtx.useDenoiser into the runtime's User option layer per game,
+	// by the same mechanism and for the same reason as dlfg_mode() above.
+	// 0 = leave alone (default), 1 = force OFF, 2 = force ON.
+	//
+	// DIAGNOSTIC, and the last mechanism standing for the terrain streaking. Remix's world space
+	// on this title IS the guest's view space and the submitted eye is pinned at the origin by
+	// construction, so the RUNTIME SEES ZERO CAMERA MOTION while every static instance transform
+	// changes every frame. A temporal denoiser reprojecting on world position and motion vectors
+	// cannot converge under that, and the failure mode is exactly what is reported: streaking
+	// along camera motion, intermittent frame to frame, worst on large flat surfaces.
+	//
+	// WHY THIS RATHER THAN A CAMERA FIX. Election churn was MEASURED and REFUTED: the reference
+	// hash is one value on 2,485 of 3,228 viewsolve lines (77%) and pown=1 on 3,199 of 3,228
+	// (99.1%), i.e. reference_inverse IS the pure projection and is constant for a fixed FOV.
+	// CAMSTICKY / CAMTRACK / CAMREBASE / CAMREFSYNTH are all inert here (their counters read 0
+	// and cam-elect reports candidates=1 on ~80% of frames). The unbake that WOULD fix this
+	// properly is blocked: view_solve_mode()'s own decision rule wants one inner hash dominating
+	// many programs, and the measurement is the opposite - a median 20 programs carry a median 14
+	// distinct inner matrices, modal share 23%. So no consensus V exists to unbake with.
+	//
+	// Turning DENOISING OFF is the test, not swapping denoisers: ray reconstruction off falls
+	// back to NRD, which is also temporal and would not discriminate.
+	u32 denoise_mode();
+
+	// RPCS3_REMIX_RTXSET=<rtx.key>=<value>[,<rtx.key>=<value>...]  (empty = off, the default)
+	//
+	// THE GENERAL FORM OF THE dlfg/denoise PUSHES, and the reason it exists: every interesting
+	// runtime option lives in bin/user.conf or bin/rtx.conf, BOTH of which are shared with every
+	// other title this backend runs, and a dev-menu toggle does not survive a relaunch (the menu
+	// reports "(unsaved changes)" and the file is unchanged). So there has been no way to give one
+	// title a runtime setting without changing it for all five. Two one-off knobs were added for
+	// exactly two variables; this replaces the need for a third.
+	//
+	// Motivating case, MEASURED: bin/user.conf holds rtx.qualityDLSS = 1 (DLSS Performance, i.e.
+	// 50%% linear render scale) and rtx.enableRayReconstruction = True for ALL titles. On GRAW2
+	// that reads as low-resolution terrain. A per-game rtx.qualityDLSS is the fix and it needs no
+	// new code path - just a way to name the variable.
+	//
+	// Values are passed to SetConfigVariable VERBATIM as strings; the runtime parses them, so
+	// "True"/"False", integers and floats all work in whatever spelling rtx.conf uses. Bounded at
+	// 16 entries. An entry with no "=" is dropped. Applied once, after initializeSystemLayers(),
+	// which is required or SetConfigVariable returns SUCCESS and silently does nothing.
+	//
+	// It writes the User option layer, which the runtime re-applies every frame, so it overrides
+	// both conf files without touching either.
+	const std::vector<std::pair<std::string, std::string>>& rtx_config_sets();
 
 	// RPCS3_REMIX_PICKFRESH=1: measure the POSE ERROR of a followed object, not just its per-frame
 	// delta. Default 0.
@@ -5294,6 +6456,34 @@ namespace remix_rsx
 	//     route's entire safety argument is that its failure direction is white.
 	bool vcol_constant_route_enabled();
 
+	// --- round 82: the biased route's replay, RPCS3_REMIX_VCOLBIAS ------------------------------
+	//
+	// Gates ONLY the 2D compositor's consumption of vcol_route::biased, the same way VCOLCONST
+	// gates the constant route's replay: scan_vcol_route names the route unconditionally so the
+	// 'Remix vcolroute:' / 'Remix vcolbias:' census can print the live c[K] with the knob at 0.
+	//
+	// DEFAULT 1, and here is the safety argument, because this classifier is shared with Eat Lead,
+	// Haze, Demon's Souls and Ratchet & Clank:
+	//   * The classification alone moves no pixel anywhere. 'biased' is not in
+	//     vcol_route_replayable()'s accept list, so every 3D consumer refuses it exactly as it
+	//     refused 'computed' - which is what these programs were classified as before. The alpha
+	//     consumers test 'route != none', and both 'computed' and 'biased' satisfy that
+	//     identically, so that population does not move either.
+	//   * The one new consumer is the 2D compositor, and what it does is EXACT, not heuristic: it
+	//     adds the live constant to the attribute value it already decoded. If the constant is
+	//     zero - which is what a program of this shape on a title that does not use the bias would
+	//     hold - the sum is the previous number, bit for bit.
+	//   * It cannot admit a draw the compositor previously refused. The bias is applied only where
+	//     an ATTR3 was already decoded (have_colour was already true), so the ui_no_colour refusal
+	//     guard, and the opaque-white-slab regression it exists to prevent, are untouched.
+	//   * Blast radius, MEASURED over all 241 cached .vp in bin/remix_ucode
+	//     (scratchpad/sweep_biased.py, last-COL0-write shape tally): 178 write COL0 nowhere, 39
+	//     end in 'MOV .xyzw', 14 in 'MOV .w', 4 in 'MUL .xyz', 2 in 'MUL .xyzw', 1 in 'MAD .xyzw',
+	//     1 in 'MOV .xyz', and exactly 2 in 'ADD .xyzw' - the two GRAW2 programs named in the
+	//     vcol_route::biased comment. Nothing else in the corpus moves.
+	// 0 restores the previous behaviour on every draw.
+	bool vcol_bias_route_enabled();
+
 	// --- round 14: the sun, aimed at the game's own sun ------------------------------------------
 	//
 	// FIRST, THE CORRECTION THAT EVERYTHING HERE RESTS ON. The light this scene is lit by is the
@@ -5438,6 +6628,42 @@ namespace remix_rsx
 	u32 particle_billboard_vp_count();
 	bool particle_ribbon_vp_matches(u64 hash);
 	u32 particle_ribbon_vp_count();
+
+	// RPCS3_REMIX_ATTROFFSETVP - round 84, the third replay family, and the one the round-74
+	// attr_offset REFUSAL gate exists to make unnecessary. Empty by default. Listing a program
+	// replays its expansion on the CPU and submits the draw at identity, exactly as the two families
+	// above do; leaving it empty keeps the refusal, which is still the right default because a
+	// missing object beats a wrong one. The grammar, the title it was decoded from, and the two
+	// sibling programs that must NOT be listed are documented at the definition in
+	// RemixTransforms.cpp.
+	bool attr_offset_billboard_vp_matches(u64 hash);
+	u32 attr_offset_billboard_vp_count();
+
+	// RPCS3_REMIX_ATTROFFSETIDENTITY, default 0. Whether a replayed attr-offset draw is submitted at
+	// IDENTITY (1, how round 84 was first built) or at whatever transform per_draw_transform resolves
+	// for it (0, the default).
+	//
+	// THE MEASUREMENT THAT SET THIS DEFAULT, and it is the reason the applied census prints world=
+	// beside cam= at all. Round 84 inherited the round-27 particle route's assumption that a replayed
+	// vertex is in REMIX's world space, so identity is correct. On GRAW2 that holds. On Saints Row 2
+	// it does not, and the first run said so in one line:
+	//     world=[1661.88 44.2394 -1088.67]   cam=[10.3785 2.37203 12.9943]
+	// with the same ~2000-unit gap on every sample across a whole session while cam wandered inside
+	// +/-26 units of the origin. The replay itself was CORRECT - c467 read [0.00787402 1 0 0], i.e.
+	// exactly 1/127, a byte corner remap; c11 and c12 were unit length and orthogonal to 1e-4 on
+	// every sample and rotated with the player; offsets came out at 0.005-3.2 units. What is wrong is
+	// the SPACE: the expanded vertices are in the GUEST's absolute world coordinates, and this
+	// backend's world space is the camera-relative one every other draw is mapped into. The
+	// 'Remix worldbox:' rows from the same frames settle it - a 1308-vertex building submits at
+	// lo=[-52.8 -8.0 -402.6] hi=[221.9 80.5 -85.9] against cam=[0.357 -7.22 1.83], i.e. ordinary
+	// geometry lands beside the camera in small coordinates while the billboards landed 2000 units
+	// outside the scene.
+	//
+	// So the replay must NOT force identity here: it must take the same c[4..7] x reference^-1 the
+	// rest of the scene takes. per_draw_transform already classifies this program arch=fused and
+	// computes that transform - the round-74 gate simply refused before it could be used, which is
+	// the only thing the replay now suppresses.
+	bool attr_offset_identity_enabled();
 
 	// RPCS3_REMIX_PARTICLECENSUS=<lines>, default 0 = OFF, clamped to 64. One 'Remix particle:' line
 	// per (program, outcome) per window. This is the acceptance instrument: it prints the decoded

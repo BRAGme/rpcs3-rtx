@@ -19,6 +19,10 @@
 
 LOG_CHANNEL(sys_fs);
 
+// RTX Remix backend, defined in Emu/RSX/Remix/RemixGSRender.cpp: the guest's level loads, keyed on
+// the .map it opens. This is the one call site outside that directory, hence a prototype.
+void remix_note_guest_open(std::string_view vpath);
+
 lv2_fs_mount_point g_mp_sys_dev_usb{"/dev_usb", "CELL_FS_FAT", "CELL_FS_IOS:USB_MASS_STORAGE", 512, 0x100, 4096, lv2_mp_flag::no_uid_gid};
 lv2_fs_mount_point g_mp_sys_dev_dvd{"/dev_ps2disc", "CELL_FS_ISO9660", "CELL_FS_IOS:PATA1_BDVD_DRIVE", 2048, 0x100, 32768, lv2_mp_flag::read_only + lv2_mp_flag::no_uid_gid, &g_mp_sys_dev_usb};
 lv2_fs_mount_point g_mp_sys_dev_bdvd{"/dev_bdvd", "CELL_FS_ISO9660", "CELL_FS_IOS:PATA0_BDVD_DRIVE", 2048, 0x4D955, 2048, lv2_mp_flag::read_only + lv2_mp_flag::no_uid_gid, &g_mp_sys_dev_dvd};
@@ -1234,6 +1238,8 @@ error_code sys_fs_open(ppu_thread& ppu, vm::cptr<char> path, s32 flags, vm::ptr<
 
 		return {g_fxo->get<lv2_fs_mount_info_map>().lookup(vpath) == &g_mp_sys_dev_hdd1 ? sys_fs.warning : sys_fs.error, error, path};
 	}
+
+	remix_note_guest_open(vpath);
 
 	if (const u32 id = idm::import<lv2_fs_object, lv2_file>([&ppath = ppath, &file = file, mode, flags, &real = real, &type = type]() -> shared_ptr<lv2_file>
 	{

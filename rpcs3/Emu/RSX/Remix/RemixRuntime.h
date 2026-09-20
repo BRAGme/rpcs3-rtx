@@ -67,6 +67,11 @@ namespace remix_rsx
 		// clobbered.
 		void unhook_window_proc();
 
+		// ROUND 64, GRAW2 (NPUB30502) child-process boot crash. Calls Shutdown() and drops this
+		// object's claim on the runtime, but never FreeLibrary()s it -- the full reasoning, and
+		// the symbolised crash address, are on the definition.
+		void shutdown_keeping_module();
+
 		// ROUND 39. Negative probe of remixapi_Interface::SetConfigVariable, the only route by
 		// which this client could ever drive rtx.* options (per-zone volumetric fog is the reason
 		// it was asked). Writes nothing and gates nothing - it reports, and the reading is spelled

@@ -13,6 +13,18 @@ namespace remix_rsx
 {
 	struct texture_entry;
 
+	// A verified three-plane B8 draw and the exact matrix carried by its live fragment program.
+	// rows are R, G, B; each is dotted with {plane0, plane1, plane2, input_w}. Keeping the
+	// coefficients with the draw avoids baking one video's colour range or plane order into the
+	// compositor.
+	struct b8_yuv_source
+	{
+		std::array<const texture_entry*, 3> planes{};
+		f32 input_w = 0.f;
+		f32 output_alpha = 1.f;
+		f32 rows[3][4]{};
+	};
+
 	// Round 7. Which addressing path every sampled UI texel took, counted where the outcome is
 	// actually decided (per axis, inside address_coordinate) rather than inferred from draw state.
 	// This is the partition that says whether the seam fix below is firing and on how much: 'in'
@@ -64,10 +76,25 @@ namespace remix_rsx
 
 		// One textured/tinted triangle in pixel space, top-left origin.
 		// 'tex' may be null, in which case only 'tint' is used.
+		//
+		// ROUND 64. b8_as_colour: this draw's FRAGMENT PROGRAM samples more than one texture unit,
+		// so the single B8 plane the compositor can see is one channel of a combine it cannot
+		// perform - not a coverage mask. Take the expanded byte as OPAQUE GREY instead of as alpha
+		// over white.
+		//
+		// READ THIS BEFORE ASSUMING THE GREYSCALE IS FIXED: it is NOT. GRAW2's Bink surface
+		// (fp=07e8403b6b903b99, sampled=0x07 - units 0, 1 and 2) is three B8 planes combined by
+		// the guest's own fragment program. This flag stops one plane being reinterpreted as a
+		// transparency mask; it CANNOT invent the other two. The picture stays monochrome either
+		// way. Producing colour requires sampling all three planes and running the combine
+		// (a YUV->RGB matrix, most likely) inside the compositor - a multi-texture draw_triangle
+		// and a new blend stage. That is a separate project and nothing here starts it.
 		void draw_triangle(const f32 (&x)[3], const f32 (&y)[3], const f32 (&u)[3], const f32 (&v)[3],
-			const texture_entry* tex, const u32 (&tint_bgra)[3], bool clamp_uv, bool force_opaque = false);
+			const texture_entry* tex, const u32 (&tint_bgra)[3], bool clamp_uv, bool force_opaque = false,
+			bool b8_as_colour = false, const b8_yuv_source* b8_yuv = nullptr);
 		void draw_triangle(const f32 (&x)[3], const f32 (&y)[3], const f32 (&u)[3], const f32 (&v)[3],
-			const texture_entry* tex, u32 tint_bgra, bool clamp_uv, bool force_opaque = false);
+			const texture_entry* tex, u32 tint_bgra, bool clamp_uv, bool force_opaque = false,
+			bool b8_as_colour = false, const b8_yuv_source* b8_yuv = nullptr);
 
 		// Axis-aligned textured quad helper for rpcs3's overlay quads.
 		void draw_quad(f32 x0, f32 y0, f32 x1, f32 y1, f32 u0, f32 v0, f32 u1, f32 v1,
@@ -121,10 +148,43 @@ namespace remix_rsx
 			u64 transparent = 0;   // span-path alpha == 0 early-outs
 			u64 verify_tris = 0;   // UIFASTRASTER=2: triangles drawn by both paths and compared
 			u64 verify_bad_px = 0; // ... and how many 32-bit pixels differed, summed
+			// ROUND 79. The blend-mode remap, one counter per family so a widening cannot
+			// happen quietly. bm_identity is the SRC_ALPHA/ONE_MINUS_SRC_ALPHA majority
+			// (637 of 952 GRAW2 UI draws) and it must stay bit-identical.
+			u64 bm_identity = 0;    // SRC_ALPHA/ONE_MINUS_SRC_ALPHA - today's path, untouched
+			u64 bm_screen = 0;      // ONE/ONE_MINUS_SRC_COLOR
+			u64 bm_additive = 0;    // ONE/ONE
+			u64 bm_premul = 0;      // ONE/ONE_MINUS_SRC_ALPHA
+			u64 bm_invmul = 0;      // ZERO/ONE_MINUS_SRC_COLOR
+			u64 bm_multiply = 0;    // ZERO/SRC_COLOR
+			u64 bm_unhandled = 0;   // anything else - left on today's path, counted
 		};
 
 		const raster_counters& raster() const { return m_raster; }
 		void reset_raster() { m_raster = {}; }
+
+		// ROUND 79. The guest's blend state for the draw about to be rasterized. Set once
+		// per draw by composite_ui_draw; the compositor rasterizes one draw at a time, so
+		// per-draw state on the object is safe and costs no per-pixel argument.
+		// Classified ONCE PER DRAW, never per pixel: the mode is a per-draw quantity and the
+		// span rasterizer is already the dominant UI cost (37.86 ms measured on this title), so
+		// the identity majority must pay one branch on an in-cache member and nothing else.
+		// The family counters are therefore counted in DRAWS, which is also the useful unit.
+		void set_blend_mode(u32 sfactor, u32 dfactor, bool enabled)
+		{
+			m_blend_kind = classify_blend(sfactor, dfactor, enabled);
+
+			switch (m_blend_kind)
+			{
+			case blend_kind::identity:  ++m_raster.bm_identity;  break;
+			case blend_kind::screen:    ++m_raster.bm_screen;    break;
+			case blend_kind::additive:  ++m_raster.bm_additive;  break;
+			case blend_kind::premul:    ++m_raster.bm_premul;    break;
+			case blend_kind::invmul:    ++m_raster.bm_invmul;    break;
+			case blend_kind::multiply:  ++m_raster.bm_multiply;  break;
+			case blend_kind::unhandled: ++m_raster.bm_unhandled; break;
+			}
+		}
 
 		// UIFASTRASTER=2: x, y, reference pixel, span pixel of the first difference in the latest
 		// triangle that differed. All zero until one does.
@@ -135,6 +195,40 @@ namespace remix_rsx
 
 	private:
 		void blend(u32 x, u32 y, u32 src_bgra);
+
+		// ROUND 79. Re-express a source pixel produced under the guest's blend factors as
+		// the equivalent STRAIGHT-ALPHA (colour, coverage) pair, which is the only form
+		// this compositor's buffer and the runtime's DrawScreenOverlay pass can carry.
+		// Called where the source pixel is produced, so the reference loop and the span
+		// path both get it without duplicating the arithmetic.
+		u32 resolve_blend_src(u32 src_bgra) const;
+
+		// The families this compositor can express in a straight-alpha overlay. identity is
+		// the pair it has always hardcoded; unhandled is every other combination and is
+		// deliberately left on that same path rather than approximated.
+		enum class blend_kind : u8
+		{
+			identity,   // SRC_ALPHA / ONE_MINUS_SRC_ALPHA
+			screen,     // ONE / ONE_MINUS_SRC_COLOR
+			additive,   // ONE / ONE
+			premul,     // ONE / ONE_MINUS_SRC_ALPHA
+			invmul,     // ZERO / ONE_MINUS_SRC_COLOR
+			multiply,   // ZERO / SRC_COLOR
+			unhandled,
+		};
+
+		static blend_kind classify_blend(u32 sfactor, u32 dfactor, bool enabled);
+
+		// True only for the families that actually need the remap, so the hot loops can skip
+		// the call entirely for identity and unhandled.
+		bool blend_remap_active() const
+		{
+			return m_blend_kind != blend_kind::identity && m_blend_kind != blend_kind::unhandled;
+		}
+
+		// Defaults to the pair this compositor has always hardcoded, so a caller that never
+		// calls set_blend_mode is bit-for-bit unchanged.
+		blend_kind m_blend_kind = blend_kind::identity;
 
 		std::vector<u8> m_buffer;
 		u32 m_width = 0;

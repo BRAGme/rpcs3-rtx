@@ -1,0 +1,3 @@
+`find bin/remix_ucode -name "*.fp" | xargs python docs/remix/<tool>.py` splits the 793-file corpus into two invocations (679 + 114) on this machine, so any corpus-wide count printed that way is a partial count.
+
+Measured 2026-09-11 with `docs/remix/fplerp.py`: the first batch printed `programs=679` and the second batch failed the self-test because none of its fixture programs were in it. A per-file tool (`fpdis.py`) is unaffected; a tool that counts or self-tests across the corpus is silently wrong. Pass the directory instead (`python docs/remix/fplerp.py bin/remix_ucode`) — the scan tools expand `*.fp` themselves. This is separate from the mtime trap: never scope the corpus by file age either, because a program already dumped keeps its old timestamp.

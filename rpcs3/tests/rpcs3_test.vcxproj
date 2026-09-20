@@ -100,6 +100,10 @@
     <ClCompile Include="test_fmt.cpp" />
     <ClCompile Include="test_rsx_cfg.cpp" />
     <ClCompile Include="test_rsx_fp_asm.cpp" />
+    <ClCompile Include="test_remix_fp_const.cpp" />
+    <ClCompile Include="test_remix_sr2_skin.cpp" />
+    <ClCompile Include="test_remix_sr2_character.cpp" />
+    <ClCompile Include="test_remix_sr2_material.cpp" />
     <ClCompile Include="test_rsx_mm_queue.cpp" />
     <ClCompile Include="test_simple_array.cpp" />
     <ClCompile Include="test_address_range.cpp" />
