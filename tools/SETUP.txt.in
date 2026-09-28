@@ -23,6 +23,26 @@ TWO THINGS ARE NOT IN THIS ZIP AND IT WILL NOT RUN WITHOUT THEM
      Release tag: remix-plus-1.5.1
      Asset:       Remix_Plus_v1.5.1_x64_games_release.zip
 
+   That release is the one to use, and it is what this build is tested against.
+   The vendored API header is byte-identical to 1.5.1's copy, so the handshake
+   and every interface slot match exactly.
+
+   OPTIONAL, for SHARC. The backend is developed against a newer, untagged build
+   of the same fork -- Kim2091/dxvk-remix `revised-9-10`, commit 38082acf --
+   which adds SHARC, a spatially hashed world-space radiance cache, as
+   rtx.integrateIndirectMode = 3. There is no release tag for it; it exists only
+   as a CI artifact, reproducible with
+
+     gh workflow run build.yml --repo BRAGme/dxvk-remix --ref <branch at 38082acf>
+
+   The API is unchanged between the two, so this is purely opt-in. On that build
+   the f90 / specular-level options are spelled rtx.legacyMaterial.* rather than
+   rtx.opaqueMaterial.*. Your rtx.conf comes with the runtime, not with this
+   zip; writing both spellings into it is harmless and is correct on either
+   build. If the runtime beside rpcs3.exe is not the exact binary this build was
+   baselined on, the log says so at startup and carries on -- that line is a
+   note, not an error.
+
    Unzip it into a subfolder called  remix\  next to rpcs3.exe:
 
      rpcs3.exe
@@ -79,8 +99,10 @@ automatically when you run those titles.
 WHAT WORKS, AND WHAT DOES NOT
 -----------------------------
 
-Three titles have been run. They are not equally exercised, so what each one
-actually establishes is listed rather than a "works / doesn't" verdict.
+Nine titles have had real work done on them. They are not equally exercised, so
+what each one establishes is listed rather than a "works / doesn't" verdict.
+Eight of them ship a tuned <TITLEID>.conf beside rpcs3.exe -- those files are
+commented, and reading one is the fastest way to see what tuning a title means.
 
   Resistance 2 (NPEA00431)  -- the primary development title, and where nearly
     every measurement comes from: camera recovery from vertex-program ucode,
@@ -99,6 +121,37 @@ actually establishes is listed rather than a "works / doesn't" verdict.
     dragged mesh creation from 5,881 creates / 887 live to 188,427 / 31,793
     over 9,120 frames, because the albedo hash folds into the mesh key.
 
+  Ratchet & Clank Collection (BCUS98282) -- renders as of preview 3, once three
+    stacked faults were cleared: the window hand-off when the collection menu
+    exitspawns into a game, restarting the runtime afterwards, and a projection
+    matrix this title writes across several places instead of one. Its sky
+    renders but is unlit, its HUD needs Composite render target draws turned
+    on, and the framerate is low.
+
+  The Last of Us (BCUS98174) -- new in preview 4. Reaches the menu and Hometown
+    gameplay on update 1.11. Cutout coverage -- foliage, hair, the Hometown
+    window masks -- is taken from the texture channel the shader actually tests
+    rather than from the colour map's alpha channel, which is opaque in this
+    title and used to turn every card and pane solid.
+
+  Saints Row 2 (BLUS30201)  -- character, material and skinning work. It is
+    carried by four unit-test suites that run in every build, rather than by a
+    captured frame.
+
+  Eat Lead (BLUS30267)      -- the largest profile here at 57 settings. This
+    title paints its flat "digital" effects from fragment-program constants
+    rather than vertex colour, and a route for that exists
+    (RPCS3_REMIX_FPCONSTALBEDO). It is OFF by default and has NOT been observed
+    firing yet: unattended boots stop on the game's "reconnect the SIXAXIS
+    controller" dialog before any draw reaches it.
+
+  Demon's Souls (BLUS30443) -- the game's authored light tables, extracted and
+    compiled into the build.
+
+  GRAW 2 (NPUB30502)        -- boots through its child-process hand-off. The
+    runtime is shut down without being unloaded, because the Reflex PCL-stats
+    ping thread outlives Shutdown and unloading it crashes.
+
 Not working / known bad:
   - A subset of draws still lands at runaway positions and reads as white shards.
   - Frame rate swings hard with view complexity: ~55 fps in a bounded interior,
@@ -106,10 +159,9 @@ Not working / known bad:
   - Haze's shadow-receiving draws land untextured. They bind a 2048x2048 DEPTH16
     shadow map on the lowest referenced texture unit and the ucode names no
     albedo unit, so 55,360 draws in one capture reached Remix with no texture.
-    Commit 0d3d3517 walks past that refusal and IS in this build, but it is
-    build-verified and NOT run-verified. RPCS3_REMIX_RETRYUNSUP=0 reverts it.
-  - Only these three titles have ever been run. Anything not named above is
-    untested, which is not the same as broken.
+    The workaround that walks past that refusal is in this build and is
+    build-verified, not run-verified. RPCS3_REMIX_RETRYUNSUP=0 reverts it.
+  - Anything not named above is untested, which is not the same as broken.
   - Keyboard input is dead under Remix unless rtx.useNewGuiInputMethod = False
     is set in rtx.conf. Controllers are unaffected.
 
