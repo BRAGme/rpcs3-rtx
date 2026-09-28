@@ -624,6 +624,7 @@
     <ClInclude Include="Emu\config_mode.h" />
     <ClInclude Include="Emu\CPU\Hypervisor.h" />
     <ClInclude Include="Emu\CPU\sse2neon.h" />
+    <ClInclude Include="Emu\emu_callbacks.h" />
     <ClInclude Include="Emu\games_config.h" />
     <ClInclude Include="Emu\game_enumeration.h" />
     <ClInclude Include="Emu\Io\Buzz.h" />
@@ -810,6 +811,7 @@
     <ClInclude Include="util\atomic.hpp" />
     <ClInclude Include="util\bit_set.hpp" />
     <ClInclude Include="util\bless.hpp" />
+    <ClInclude Include="util\cctype.hpp" />
     <ClInclude Include="util\pair.hpp" />
     <ClInclude Include="util\tuple.hpp" />
     <ClInclude Include="util\video_sink.h" />
@@ -1063,6 +1065,7 @@
     <ClInclude Include="Emu\Io\PadHandler.h" />
     <ClInclude Include="Emu\RSX\Program\CgBinaryProgram.h" />
     <ClInclude Include="Emu\RSX\Common\BufferUtils.h" />
+    <ClInclude Include="Emu\RSX\Common\BufferUtils_avx512.h" />
     <ClInclude Include="Emu\RSX\Program\FragmentProgramDecompiler.h" />
     <ClInclude Include="Emu\RSX\Common\ring_buffer_helper.h" />
     <ClInclude Include="Emu\RSX\Program\ShaderParam.h" />
