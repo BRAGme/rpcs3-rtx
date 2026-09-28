@@ -120,9 +120,15 @@ Issues are open. A settings file for a title that isn't covered yet is the most 
 
 ## Release asset
 
-`rpcs3-rtx-remix-c68babbd-win64.zip`
-SHA256 `bb91437cd5b7f540f21826d99d16ad71631fbd166e832b2466daffe4f1f5c118`
+`rpcs3-rtx-remix-18179ba0-win64.zip`
+SHA256 `9c045b8c199aa6d078fc4ec823218b66519020e4f1b973441ea0f247892e8919`
 
-Built from `c68babbd8ba24b7dbe3717bbd210b783161f701f`, tag `remix-preview-4`. The
-exe reports `0.0.42-c68babbd Alpha | remix-backend | local_build`, and `SETUP.txt`
+Built from `18179ba005904b6c1e058c9d6b837c05dae0c90e`, tag `remix-preview-4`. The
+exe reports `0.0.42-18179ba0 Alpha | remix-backend | local_build`, and `SETUP.txt`
 inside the zip names the same commit.
+
+**Re-cut on 2026-09-28.** The first asset, `rpcs3-rtx-remix-c68babbd-win64.zip`
+(SHA256 `bb91437c...`), shipped a `SETUP.txt` claiming Eat Lead's constant-colour
+route had never been observed working. It had one download before replacement.
+Nothing in the emulator changed between the two builds -- the difference is that
+one sentence in the bundled instructions.
