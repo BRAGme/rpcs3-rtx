@@ -20,10 +20,37 @@ FILES=(
   Qt6Widgets.dll
   avcodec-61.dll avformat-61.dll avutil-59.dll
   swresample-5.dll swscale-8.dll
-  icuuc.dll opencv_world4130.dll
+  icuuc.dll
 )
+
+# OpenCV carries its version in the FILE NAME (opencv_world4130 -> 4140 when
+# upstream bumped it in b8816a1e0), so a hardcoded name here rots the moment
+# upstream updates the dependency -- and rots SILENTLY, because a previous
+# build's DLL is still sitting in bin/ to satisfy the copy. Preview 4 was cut
+# that way once: the zip shipped 4130 beside an exe linked against 4140 and
+# every download died on startup with STATUS_DLL_NOT_FOUND (0xC0000135).
+# Resolve it from the exe's own import table instead of naming it.
+OPENCV="$(grep -aoE 'opencv_world[0-9]+\.dll' "$BIN/rpcs3.exe" | sort -u | head -1)"
+[ -n "$OPENCV" ] || { echo "package-release: no opencv_world*.dll import in rpcs3.exe" >&2; exit 1; }
+FILES+=("$OPENCV")
+
 for f in "${FILES[@]}"; do
   cp -- "$BIN/$f" "$OUT/$f"
+done
+
+# The FFmpeg DLLs carry a soname number too (avcodec-61, swscale-8, ...) and rot
+# the same way, but unlike OpenCV they are not named in rpcs3.exe's own strings
+# -- Qt loads them -- so they cannot be resolved from the exe. Glob the family
+# instead and refuse to guess when bin/ holds more than one version, which is
+# exactly the stale-leftover situation that hid the OpenCV bump.
+for fam in avcodec avformat avutil swresample swscale; do
+  found=$(ls -1 "$BIN/$fam"-*.dll 2>/dev/null | wc -l)
+  if [ "$found" -eq 0 ]; then
+    echo "package-release: no $fam-*.dll in $BIN" >&2; exit 1
+  elif [ "$found" -gt 1 ]; then
+    echo "package-release: $found versions of $fam-*.dll in $BIN; delete the stale one:" >&2
+    ls -1 "$BIN/$fam"-*.dll >&2; exit 1
+  fi
 done
 
 # --- Qt plugins, icons, homebrew test elfs -------------------------------
