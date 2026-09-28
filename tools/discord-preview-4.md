@@ -18,13 +18,16 @@
 • These are settled per-title decisions that used to live in launcher scripts on one machine. They're commented — reading one is the fastest way to see what tuning a title means
 • Demon's Souls also carries its authored light tables, extracted and compiled in. GRAW 2 now boots through its child-process hand-off
 
+🩸 **Eat Lead's blue pixel blood works.** *(correction -- the notes as published said this had never been observed working, which was wrong.)* This title paints its "digital" effects from a **fragment-program constant**, not a vertex attribute, so the vertex-colour route could never reach them -- those draws carry no bound texture at all and rendered flat white.
+• `RPCS3_REMIX_FPCONSTALBEDO` states that literal through the instance's fixed-function stage. It's a bitmask: bit 1 the `MOV` literal, bit 2 the lerp endpoint, bit 4 the per-channel tint
+• It's `0` globally, but **`BLUS30267.conf` in the zip already sets it to `7`** plus `FPCONSTMRT=1` -- so it's on for this title as shipped, nothing to enable
+
 ✨ **SHARC, if you want it.** The backend is developed against an untagged Remix Plus build (`revised-9-10`, `38082acf`) that adds a spatially hashed world-space radiance cache as `rtx.integrateIndirectMode = 3`. The API is byte-identical to tagged `remix-plus-1.5.1`, so it's purely opt-in and 1.5.1 stays the tested runtime. `SETUP.txt` has the details.
 • One rename to know: the f90 / specular-level options are now `rtx.legacyMaterial.*`, not `rtx.opaqueMaterial.*`. The old spelling silently stops applying — writing both is harmless
 
 💿 **98 upstream commits** merged, the three weeks since preview 3. No headline this time (disc support already landed in preview 3), but it includes a CPU-thread teardown deadlock fix, ISO device-path fixes, `cellVdec` shutdown fixes and a batch of `vm`/`sys_mmapper` corrections.
 
 ⚠️ Known issues:
-• **Eat Lead's flat "digital" colours are still flat.** The route for it exists (`RPCS3_REMIX_FPCONSTALBEDO`) but is off by default and has *never been observed firing* — every unattended boot stops on the game's "reconnect the SIXAXIS controller" dialog first. A zero count there means no draws happened, not that it doesn't work
 • Ratchet's **sky is still unlit** and its **HUD still needs Composite render target draws** on
 • **Framerate is low**, and nothing in this build fixes it
 • **`docs/remix/KNOBS.md` is behind the source** — 106 settings exist with no entry in the table. What's documented is still correct, it's just incomplete

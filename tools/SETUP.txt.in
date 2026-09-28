@@ -139,11 +139,12 @@ commented, and reading one is the fastest way to see what tuning a title means.
     captured frame.
 
   Eat Lead (BLUS30267)      -- the largest profile here at 57 settings. This
-    title paints its flat "digital" effects from fragment-program constants
-    rather than vertex colour, and a route for that exists
-    (RPCS3_REMIX_FPCONSTALBEDO). It is OFF by default and has NOT been observed
-    firing yet: unattended boots stop on the game's "reconnect the SIXAXIS
-    controller" dialog before any draw reaches it.
+    title paints its flat "digital" effects from a colour held in a
+    fragment-program constant rather than in a vertex attribute, so the
+    vertex-colour route cannot reach them; RPCS3_REMIX_FPCONSTALBEDO states
+    that literal instead. The knob is 0 globally, but BLUS30267.conf sets it
+    to 7 -- all three routes -- so it is already on for this title. The blue
+    pixel blood is confirmed working by play-test.
 
   Demon's Souls (BLUS30443) -- the game's authored light tables, extracted and
     compiled into the build.

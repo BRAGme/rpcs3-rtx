@@ -60,6 +60,34 @@ One rename to know about: the f90 / specular-level patch this fork used to carry
 
 ---
 
+## Eat Lead's constant colours
+
+*Added 2026-09-28, after this build was published — the original notes said this had never
+been observed working, and that was wrong.*
+
+Eat Lead paints its "digital" effects from a colour held in a **fragment-program constant**
+rather than in a vertex attribute. A census of the title's 62 cached fragment programs found
+that no program reads `diff_color`, `spec_color`, `fogc` or `wpos`, and that there are no `LRP`
+opcodes at all — so the vertex-colour route was structurally a dead end here. Draws such as
+`fpraw=6FD147A3B666FC1E` carry `albedo=0000000000000000` with no texture bound, which is why
+the surface rendered flat white: the constant was the draw's only colour and nothing read it.
+
+`RPCS3_REMIX_FPCONSTALBEDO` states that literal through the instance's fixed-function stage.
+It is a bitmask: bit 1 the unconditional `MOV` literal, bit 2 the lerp endpoint, bit 4 the
+per-channel tint. The **blue pixel blood is confirmed working** by play-test.
+
+The knob is `0` globally, but **`BLUS30267.conf` in this zip already sets it to `7`** — all
+three routes — alongside `FPCONSTMRT=1`. So it is on for this title as shipped and there is
+nothing to enable.
+
+What the original notes got wrong: they repeated a caveat written on 2026-09-10, when the route
+had genuinely never fired because unattended boots stopped on the game's "reconnect the SIXAXIS
+controller" dialog before any draw reached it. The profile was tuned on 2026-09-20 and shipped
+switched on; the caveat was never re-checked against it. The `SETUP.txt` inside the downloaded
+zip carries the same stale sentence.
+
+---
+
 ## Caught up with upstream RPCS3 again
 
 98 upstream commits, the three weeks since preview 3, merged in. Nothing headline-sized this time — preview 3 already brought disc support — but it includes a deadlock fix for CPU threads terminating abnormally, several ISO device-path fixes, `cellVdec` decoder-shutdown fixes, and a batch of `vm::page_protect` and `sys_mmapper` corrections.
@@ -68,7 +96,7 @@ One rename to know about: the f90 / specular-level patch this fork used to carry
 
 ## What does not work
 
-- **Eat Lead's flat "digital" colours are still flat.** This title paints them from fragment-program constants rather than vertex colour, and a route for that exists in the build (`RPCS3_REMIX_FPCONSTALBEDO`). It is **off by default and has never been observed firing**, because every unattended boot stops on the game's "reconnect the SIXAXIS controller" dialog before a single draw reaches it. Do not read a zero count as evidence it doesn't work; no draws happened.
+- ~~**Eat Lead's flat "digital" colours are still flat.**~~ **Corrected after release — this works.** See "Eat Lead's constant colours" above.
 - **Ratchet & Clank's sky is unlit** and its **HUD is missing** unless Composite render target draws is on. Both carried over from preview 3.
 - **The framerate is low**, and no profile in this build fixes it.
 - **`docs/remix/KNOBS.md` is behind the source.** 106 environment settings exist in the backend with no entry in that table. The table is still correct about what it does document; it is just incomplete, and regenerating it is queued.
