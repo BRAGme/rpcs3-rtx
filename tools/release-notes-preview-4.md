@@ -100,7 +100,7 @@ zip carries the same stale sentence.
 
 ## What does not work
 
-- ~~**Eat Lead's flat "digital" colours are still flat.**~~ **Corrected after release — this works.** See "Eat Lead's constant colours" above.
+- **Eat Lead's object-destruction effects do not come through.** Objects disappearing and the destroyed-object warp are still missing. Its blood pixels and text *do* render — see "Eat Lead's constant colours" above. The original notes said the whole constant-colour route had never been observed working, which was wrong; the correction is that half of it works, not all of it.
 - **Ratchet & Clank's sky is unlit** and its **HUD is missing** unless Composite render target draws is on. Both carried over from preview 3.
 - **The framerate is low**, and no profile in this build fixes it.
 - **`docs/remix/KNOBS.md` is behind the source.** 106 environment settings exist in the backend with no entry in that table. The table is still correct about what it does document; it is just incomplete, and regenerating it is queued.
