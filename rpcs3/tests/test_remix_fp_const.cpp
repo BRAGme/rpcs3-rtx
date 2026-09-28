@@ -54,6 +54,31 @@ namespace remix_rsx
 			0x0004070e, 0x9d1c04c8, 0x00000200, 0x00000200, 0x003f0000, 0x00000000, 0x00000000, 0x00000000,
 		};
 
+		// The Last of Us C369DD0AC1D9CA71: coverage is tex0.g, not texture alpha.
+		// `SLTcc tex0.g, 0.5; KIL(ne)` discards low coverage, so surviving pixels use
+		// GREATER_OR_EQUAL (VkCompareOp 6) at 128.
+		constexpr u32 s_tlou_green_cutout[] = {
+			0x00178084, 0x9d1c01c8, 0x010000c8, 0xe13f00c8, 0x804a7e03, 0x9c1c00ab, 0x680102aa, 0x010000c8,
+			0x00000000, 0x003f0000, 0x00000000, 0x00000000, 0x401d8010, 0x9c1c0200, 0x010000c8, 0x010000c8,
+			0x24430000, 0x24430000, 0x24430000, 0x24430000, 0x4101883e, 0x9d1c01c8, 0x010000c8, 0xe13f00c8,
+			0x00527e06, 0x150000c8, 0x010000c8, 0x010000c8, 0x40828010, 0x9d1c00c9, 0x00000200, 0x010000c8,
+			0xcc3d00c0, 0x00000000, 0x00000000, 0x00000000, 0x400180ce, 0x9d1c01c8, 0x010000c8, 0xe13f00c8,
+			0x4004810e, 0x9d1c00c9, 0x00000200, 0x00000200, 0x003f0000, 0x00000000, 0x00000000, 0x00000000,
+		};
+
+		// Tail of The Last of Us D1254DA3BA89840C. The window mask is tex2.b, divided by
+		// 0.8, compared greater than 0.990234, then killed when true. Surviving coverage is
+		// therefore LESS_OR_EQUAL (VkCompareOp 3) at round(0.8 * 0.990234 * 255) = 202.
+		constexpr u32 s_tlou_blue_cutout_div[] = {
+			0x04178288, 0x9d1c01c8, 0x010000c8, 0xe13f00c8, 0x4001881e, 0x9c1c0200, 0x010000c8, 0x010000c8,
+			0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x40028e0e, 0x9d1c0cc9, 0x010008c9, 0x010000c8,
+			0x40ba8010, 0x9d1c0455, 0x00000200, 0x010000c8, 0x4c3fcdcc, 0x4c3fcdcc, 0x4c3fcdcc, 0x4c3fcdcc,
+			0x4004800e, 0x9d1c18c9, 0x010000c9, 0x01001cc9, 0x804d7e11, 0x9d1c00c9, 0x68010200, 0x010000c8,
+			0x7d3f0080, 0x00000000, 0x00000000, 0x00000000, 0x4009800e, 0x9d1c00c9, 0x00000200, 0x010000c8,
+			0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x40018010, 0x9d1c00c9, 0x010000c8, 0x010000c8,
+			0x00527f06, 0xf51f00c8, 0x010000c8, 0x010000c8,
+		};
+
 		// FF5CB727D10E58A5: '11: MOV R0.xyzw <- c[].xxxx   c=[1 0 0 0]   END' - white on COL0,
 		// with the sampled tex0 written to R2 (MRT1) instead.
 		constexpr u32 s_white[] = {
@@ -282,6 +307,30 @@ namespace remix_rsx
 		EXPECT_NEAR(fp.out_rgb_const_rgb[0], 0.172549f, 1e-5f);
 		EXPECT_NEAR(fp.out_rgb_const_rgb[1], 0.172549f, 1e-5f);
 		EXPECT_NEAR(fp.out_rgb_const_rgb[2], 0.172549f, 1e-5f);
+	}
+
+	TEST(RemixFpKil, RecoversPackedGreenCoverage)
+	{
+		const fp_fingerprint fp = scan(s_tlou_green_cutout);
+
+		ASSERT_TRUE(fp.kil_conditional);
+		EXPECT_EQ(fp.kil_texture_unit, 0u);
+		EXPECT_EQ(fp.kil_texture_channel, 1u);
+		EXPECT_EQ(fp.kil_alpha_compare, 6u);
+		EXPECT_EQ(fp.kil_ref_estimate, 128);
+		EXPECT_STREQ(fp.kil_note, "cmp-sample");
+	}
+
+	TEST(RemixFpKil, RecoversPackedBlueCoverageThroughDivide)
+	{
+		const fp_fingerprint fp = scan(s_tlou_blue_cutout_div);
+
+		ASSERT_TRUE(fp.kil_conditional);
+		EXPECT_EQ(fp.kil_texture_unit, 2u);
+		EXPECT_EQ(fp.kil_texture_channel, 2u);
+		EXPECT_EQ(fp.kil_alpha_compare, 3u);
+		EXPECT_EQ(fp.kil_ref_estimate, 202);
+		EXPECT_STREQ(fp.kil_note, "cmp-div-const");
 	}
 
 	TEST(RemixFpConst, WhiteFromLaneX)

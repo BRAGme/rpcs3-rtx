@@ -1023,6 +1023,75 @@ namespace remix_rsx
 		return &m_entries.emplace(key, std::move(entry)).first->second;
 	}
 
+	const texture_entry* texture_cache::cutout_material(const remixapi_Interface& api, u64 frame,
+		const texture_entry& albedo, const texture_entry& coverage, u8 channel,
+		u8 alpha_compare, u8 alpha_reference)
+	{
+		if (textures_disabled() || channel >= 4 || alpha_compare > 7
+			|| albedo.unsupported || coverage.unsupported
+			|| !albedo.content_hash || !coverage.content_hash
+			|| !albedo.width || !albedo.height || !coverage.width || !coverage.height
+			|| albedo.pixels.size() != usz{albedo.width} * albedo.height * 4
+			|| coverage.pixels.size() != usz{coverage.width} * coverage.height * 4
+			|| albedo.wrap_u != coverage.wrap_u || albedo.wrap_v != coverage.wrap_v)
+		{
+			return nullptr;
+		}
+
+		u64 key = rpcs3::hash64(albedo.content_hash, 0x4355544f55544131ull); // CUTOUTA1
+		key = rpcs3::hash64(key, coverage.content_hash);
+		key = rpcs3::hash64(key, u64{channel} | (u64{alpha_compare} << 8)
+			| (u64{alpha_reference} << 16));
+		key = rpcs3::hash64(key, u64{albedo.wrap_u} | (u64{albedo.wrap_v} << 32));
+		if (!key) key = 1;
+
+		if (auto it = m_entries.find(key); it != m_entries.end())
+		{
+			texture_entry& entry = it->second;
+			entry.last_used_frame = frame;
+			if (entry.unsupported || !entry.texture || !entry.material) return nullptr;
+			++m_stats.hits;
+			return &entry;
+		}
+
+		if (!m_budget_left)
+		{
+			++m_stats.deferred;
+			return nullptr;
+		}
+
+		texture_entry entry{};
+		entry.content_hash = key;
+		entry.last_used_frame = frame;
+		entry.width = albedo.width;
+		entry.height = albedo.height;
+		entry.wrap_u = albedo.wrap_u;
+		entry.wrap_v = albedo.wrap_v;
+		entry.alpha_func = alpha_compare;
+		entry.alpha_ref = alpha_reference;
+		entry.pixels = albedo.pixels;
+
+		// texture_entry pixels are BGRA, whereas the recovered shader lane is RGBA.
+		static constexpr u8 bgra_lane[4] = { 2, 1, 0, 3 };
+		for (u32 y = 0; y < entry.height; ++y)
+		{
+			const u32 sy = std::min<u32>((u64{y} * coverage.height) / entry.height,
+				coverage.height - 1);
+			for (u32 x = 0; x < entry.width; ++x)
+			{
+				const u32 sx = std::min<u32>((u64{x} * coverage.width) / entry.width,
+					coverage.width - 1);
+				const usz source = (usz{sy} * coverage.width + sx) * 4;
+				const usz target = (usz{y} * entry.width + x) * 4;
+				entry.pixels[target + 3] = coverage.pixels[source + bgra_lane[channel]];
+			}
+		}
+
+		--m_budget_left;
+		if (!upload(api, entry)) return nullptr;
+		return &m_entries.emplace(key, std::move(entry)).first->second;
+	}
+
 	bool texture_cache::decode(const rsx::fragment_texture& tex, texture_entry& out)
 	{
 		const u32 raw_format = tex.format();

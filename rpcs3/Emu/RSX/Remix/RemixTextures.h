@@ -347,6 +347,13 @@ namespace remix_rsx
 			const sr2_character_program& program, const std::array<const texture_entry*, 16>& sources,
 			const std::array<sr2_uv_map, 16>& maps);
 
+		// Builds one derived material whose RGB comes from 'albedo' and whose alpha comes from a
+		// named RGBA channel of 'coverage'. Used when a fragment program proves that the guest's
+		// cutout or blended opacity is not the elected colour texture's alpha channel.
+		const texture_entry* cutout_material(const remixapi_Interface& api, u64 frame,
+			const texture_entry& albedo, const texture_entry& coverage, u8 channel,
+			u8 alpha_compare, u8 alpha_reference);
+
 		// 'live_materials' is the set of material handles that live meshes have baked into their
 		// Remix mesh objects. An idle entry whose material is in that set is KEPT rather than
 		// destroyed, because destroying it leaves a dangling handle inside a mesh whose key -

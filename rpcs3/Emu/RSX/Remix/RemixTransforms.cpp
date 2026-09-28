@@ -12853,6 +12853,193 @@ namespace remix_rsx
 						continue;
 					}
 
+					// Naughty Dog's cutout programs use the comparison opcodes directly instead of
+					// the classic ADD-to-condition shape below. Trace the compared TEMP lane back to
+					// its TEX, accepting only identity MOVs and a positive constant DIV on the way.
+					// Those operations preserve a single scalar threshold exactly; anything wider is
+					// refused rather than guessed. Two observed The Last of Us shapes are:
+					//   TEX H0.y, tex0; SLTcc H0.y, 0.5; KIL(ne)
+					//   TEX H1.z, tex2; DIV H0.w, H1.z, 0.8; SGTcc H0.w, .990234; KIL(ne)
+					auto recover_sample_compare = [&]() -> bool
+					{
+						const auto refuse = [&](const char* reason)
+						{
+							result.kil_note = reason;
+							return false;
+						};
+
+						// A data-flow answer is only trustworthy for a straight-line program that
+						// was decoded in full. Predicated writers and source modifiers need their
+						// own replay model; refuse them instead of baking an approximate mask.
+						if (result.has_flow || result.truncated)
+						{
+							return refuse(result.has_flow ? "cmp-flow" : "cmp-truncated");
+						}
+
+						if (cc.opcode != RSX_FP_OPCODE_SLT && cc.opcode != RSX_FP_OPCODE_SLE
+							&& cc.opcode != RSX_FP_OPCODE_SGT && cc.opcode != RSX_FP_OPCODE_SGE)
+						{
+							return refuse("cmp-opcode");
+						}
+
+						if (!cc.exec_lt || !cc.exec_eq || !cc.exec_gr)
+						{
+							return refuse("cmp-predicated");
+						}
+
+						// The KIL condition must broadcast one lane, and that lane must be the one the
+						// comparison writes. This rejects a partially-updated condition vector.
+						const u8 cond_lane = kil.cond_swizzle[0] & 3;
+						if (!std::all_of(std::begin(kil.cond_swizzle), std::end(kil.cond_swizzle),
+							[&](u8 lane) { return (lane & 3) == cond_lane; })
+							|| !(cc.write_mask & (1u << cond_lane)))
+						{
+							return refuse("cmp-lane");
+						}
+
+						s32 temp_slot = -1;
+						s32 const_slot = -1;
+						for (u32 s = 0; s < 2; ++s)
+						{
+							if (cc.src_type[s] == RSX_FP_REGISTER_TYPE_TEMP) temp_slot = static_cast<s32>(s);
+							if (cc.src_type[s] == RSX_FP_REGISTER_TYPE_CONSTANT) const_slot = static_cast<s32>(s);
+						}
+
+						if (temp_slot < 0 || const_slot < 0 || !cc.has_constant
+							|| (cc.src_neg & ((1u << temp_slot) | (1u << const_slot)))
+							|| (cc.src_abs & ((1u << temp_slot) | (1u << const_slot))))
+						{
+							return refuse("cmp-operands");
+						}
+
+						const auto lane_from = [](const fp_instr& in, u32 slot, u8 lane) -> u8
+						{
+							return static_cast<u8>((in.src_swizzle[slot] >> (lane * 2)) & 3);
+						};
+
+						f32 threshold = cc.constant[lane_from(cc, const_slot, cond_lane)];
+						if (!std::isfinite(threshold) || threshold < 0.f) return refuse("cmp-threshold");
+
+						u32 relation = cc.opcode;
+						if (temp_slot == 1)
+						{
+							// Invert C relation X into X inverse-relation C.
+							switch (relation)
+							{
+							case RSX_FP_OPCODE_SLT: relation = RSX_FP_OPCODE_SGT; break;
+							case RSX_FP_OPCODE_SLE: relation = RSX_FP_OPCODE_SGE; break;
+							case RSX_FP_OPCODE_SGT: relation = RSX_FP_OPCODE_SLT; break;
+							case RSX_FP_OPCODE_SGE: relation = RSX_FP_OPCODE_SLE; break;
+									default: return refuse("cmp-relation");
+							}
+						}
+
+						u32 reg = cc.src_reg[temp_slot];
+						u8 lane = lane_from(cc, temp_slot, cond_lane);
+						u32 bound = static_cast<u32>(i);
+						const char* shape = "cmp-sample";
+						u8 source_unit = 0xff;
+						u8 source_channel = 0xff;
+
+						for (u32 hop = 0; hop < 4; ++hop)
+						{
+							s32 writer_index = -1;
+							for (u32 j = bound; j-- > 0;)
+							{
+								if (code[j].writes && code[j].dest == reg && (code[j].write_mask & (1u << lane)))
+								{
+									writer_index = static_cast<s32>(j);
+									break;
+								}
+							}
+
+							if (writer_index < 0) return refuse("cmp-no-writer");
+							const fp_instr& writer = code[writer_index];
+
+							if (!writer.exec_lt || !writer.exec_eq || !writer.exec_gr)
+							{
+								return refuse("cmp-writer-predicated");
+							}
+
+							if (writer.opcode == RSX_FP_OPCODE_TEX && !writer.dest_saturate
+								&& !writer.src_neg && !writer.src_abs)
+							{
+								source_unit = writer.tex_num;
+								source_channel = lane;
+								break;
+							}
+
+							if (writer.opcode == RSX_FP_OPCODE_MOV
+								&& writer.src_type[0] == RSX_FP_REGISTER_TYPE_TEMP
+								&& !writer.dest_saturate
+								&& !(writer.src_neg & 1) && !(writer.src_abs & 1))
+							{
+								reg = writer.src_reg[0];
+								lane = lane_from(writer, 0, lane);
+								bound = static_cast<u32>(writer_index);
+								continue;
+							}
+
+							if (writer.opcode == RSX_FP_OPCODE_DIV && writer.has_constant
+								&& writer.src_type[0] == RSX_FP_REGISTER_TYPE_TEMP
+								&& writer.src_type[1] == RSX_FP_REGISTER_TYPE_CONSTANT
+								// Saturating a quotient preserves every comparison against an interior
+								// [0,1] threshold; it is the exact form used by D1254DA3BA89840C.
+								&& (!writer.dest_saturate || (threshold > 0.f && threshold < 1.f))
+								&& !(writer.src_neg & 0x3) && !(writer.src_abs & 0x3))
+							{
+								const f32 divisor = writer.constant[lane_from(writer, 1, lane)];
+								if (!std::isfinite(divisor) || divisor <= 0.f) return refuse("cmp-divisor");
+								threshold *= divisor;
+								reg = writer.src_reg[0];
+								lane = lane_from(writer, 0, lane);
+								bound = static_cast<u32>(writer_index);
+								shape = "cmp-div-const";
+								continue;
+							}
+
+							return refuse("cmp-writer-shape");
+						}
+
+						if (source_unit >= 16 || source_channel >= 4
+							|| !std::isfinite(threshold) || threshold < 0.f || threshold > 1.f)
+						{
+							return refuse("cmp-range");
+						}
+
+						// Comparisons produce only 0 or 1. Therefore EQ selects false and GR selects
+						// true; LT is irrelevant. Require exactly one of the two so the keep relation
+						// below is unambiguous.
+						if (kil.exec_eq == kil.exec_gr) return refuse("cmp-kil-condition");
+						const bool kill_when_relation_true = kil.exec_gr;
+
+						switch (relation)
+						{
+						case RSX_FP_OPCODE_SLT: result.kil_alpha_compare = kill_when_relation_true ? 6 : 1; break;
+						case RSX_FP_OPCODE_SLE: result.kil_alpha_compare = kill_when_relation_true ? 4 : 3; break;
+						case RSX_FP_OPCODE_SGT: result.kil_alpha_compare = kill_when_relation_true ? 3 : 4; break;
+						case RSX_FP_OPCODE_SGE: result.kil_alpha_compare = kill_when_relation_true ? 1 : 6; break;
+						default: return refuse("cmp-relation");
+						}
+
+						result.kil_ref_estimate = static_cast<s16>(std::clamp(threshold, 0.f, 1.f) * 255.f + 0.5f);
+						result.kil_texture_unit = source_unit;
+						result.kil_texture_channel = source_channel;
+						result.kil_note = shape;
+						return true;
+					};
+
+					const bool sample_compare = cc.opcode == RSX_FP_OPCODE_SLT || cc.opcode == RSX_FP_OPCODE_SLE
+						|| cc.opcode == RSX_FP_OPCODE_SGT || cc.opcode == RSX_FP_OPCODE_SGE;
+					if (recover_sample_compare())
+					{
+						break;
+					}
+					if (sample_compare)
+					{
+						break;
+					}
+
 					if (cc.opcode != RSX_FP_OPCODE_ADD && cc.opcode != RSX_FP_OPCODE_MAD)
 					{
 						result.kil_note = "cc-not-add-mad";

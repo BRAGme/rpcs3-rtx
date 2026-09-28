@@ -3409,6 +3409,7 @@ private:
 	bool m_scratch_texkill = false;
 	bool m_scratch_kil_applied = false;
 	s16 m_scratch_kil_ref = -1;
+	u8 m_scratch_kil_compare = 7;
 
 	// --- round 10: the effects verdicts, decided once per draw --------------------------------
 	// The submitted vertex colour, measured once and reused. Three consumers need it in the same

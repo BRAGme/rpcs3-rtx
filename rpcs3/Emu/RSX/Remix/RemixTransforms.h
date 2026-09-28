@@ -1116,6 +1116,19 @@ namespace remix_rsx
 		// later round extend the matcher against real shapes instead of guessed ones.
 		s16 kil_ref_estimate = -1;
 
+		// When the discard comparison can be traced to one sampled channel, these fields name
+		// the channel the guest actually tests. 0..3 are RGBA, 0xff means the backward slice
+		// refused the shape. This matters for games that keep cutout coverage in (for example)
+		// tex0.g or tex2.b while the elected colour texture has an opaque alpha channel.
+		u8 kil_texture_unit = 0xff;
+		u8 kil_texture_channel = 0xff;
+
+		// VkCompareOp value that keeps the pixels the guest's conditional KIL does not discard.
+		// 7 (ALWAYS) means the comparison direction was not recovered. Kept separately from the
+		// threshold because SGT + KIL(ne) is a LESS_OR_EQUAL alpha test, not the GREATER test the
+		// original KIL replay assumed for every shader.
+		u8 kil_alpha_compare = 7;
+
 		// What the recovery walk actually saw, for the census. Points at a static string.
 		const char* kil_note = "";
 

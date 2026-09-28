@@ -21274,6 +21274,15 @@ void RemixGSRender::composite_ui_draw(u32 first_vertex, u32 vertex_count)
 		}
 	}
 
+	// The Last of Us menu VP writes ATTR2 directly to COL0. This exact program is the large
+	// black fade/dimming quad; reading the conventional ATTR3 instead replaces its authored black
+	// with the compositor's opaque-white default and blows out the menu background.
+	if (Emu.GetTitleID() == "BCUS98174" && m_current_vp_hash == 0xF77F4D4ECCD5EBA2ull
+		&& !tint_from_texcoord)
+	{
+		colour_attribute = 2;
+	}
+
 	// --- ROUND 82: THE BIAS THE VERTEX PROGRAM ADDS ON THE WAY TO COL0 ------------------------
 	//
 	// MEASURED DEFECT, not an inference. GRAW2's untextured HUD shapes - the yellow waypoint ring
@@ -30712,6 +30721,7 @@ void RemixGSRender::submit_subdraw()
 	m_scratch_texkill = false;
 	m_scratch_kil_applied = false;
 	m_scratch_kil_ref = -1;
+	m_scratch_kil_compare = 7;
 	m_scratch_a2c_ctrl = false;
 	m_scratch_a2c_reg = false;
 	m_scratch_a2c_applied = false;
@@ -31179,8 +31189,8 @@ void RemixGSRender::submit_subdraw()
 	}
 
 	remix_rsx::sr2_character_program character_program;
-	u64 character_material_hash = 0;
 	bool character_material_applied = false;
+	u64 derived_material_hash = 0;
 	if (Emu.GetTitleID() == "BLUS30201" && m_remix.fork_features() && material && selected_albedo_entry)
 	{
 		const auto plan = std::find_if(std::begin(sr2_character_generated::plans),
@@ -31260,7 +31270,7 @@ void RemixGSRender::submit_subdraw()
 						material = baked->material;
 						selected_albedo_entry = baked;
 						selected_albedo_unit = plan->base_unit;
-						character_material_hash = baked->content_hash;
+						derived_material_hash = baked->content_hash;
 						m_scratch_albedo_alpha_min = baked->alpha_min;
 						m_scratch_albedo_alpha_max = baked->alpha_max;
 						m_scratch_albedo_grey = baked->greymap();
@@ -31351,8 +31361,120 @@ void RemixGSRender::submit_subdraw()
 	// Held on the draw rather than read from the fingerprint at the replay site so the pick record
 	// and the census report the same number the replay used, including the -1 case.
 	m_scratch_kil_ref = kil_conditional && m_current_fp_fingerprint
+		&& m_current_fp_fingerprint->kil_alpha_compare >= 7
 		? m_current_fp_fingerprint->kil_ref_estimate
 		: static_cast<s16>(-1);
+	// Keep the legacy GREATER replay unless the title-specific path below successfully installs
+	// the sampled channel that the recovered comparison actually tested. Applying the comparison
+	// direction to the old opaque albedo when derivation refuses would erase a LEQUAL cutout.
+	m_scratch_kil_compare = 7;
+
+	// The Last of Us stores foliage/hair coverage in tex0.g and the Hometown window mask in
+	// tex2.b. The elected colour maps are opaque in alpha, so replaying KIL as a test of that alpha
+	// turns every card and pane solid. When the ucode scanner proves a sampled source channel and
+	// the source shares the albedo's UV varying/addressing, bake that channel into a derived
+	// material's alpha. Title-scoped while this path is new so established profiles cannot move.
+	if (Emu.GetTitleID() == "BCUS98174" && material && selected_albedo_entry
+		&& selected_albedo_unit >= 0 && kil_conditional && m_current_fp_fingerprint
+		&& m_current_fp_fingerprint->kil_texture_unit < 16
+		&& m_current_fp_fingerprint->kil_texture_channel < 4
+		&& m_current_fp_fingerprint->kil_alpha_compare < 7
+		&& m_current_fp_fingerprint->kil_ref_estimate >= 0)
+	{
+		const u8 recovered_compare = m_current_fp_fingerprint->kil_alpha_compare;
+		const s16 recovered_ref = m_current_fp_fingerprint->kil_ref_estimate;
+		const u32 mask_unit = m_current_fp_fingerprint->kil_texture_unit;
+		const u32 albedo_unit = static_cast<u32>(selected_albedo_unit);
+		const u32 mask_shift = mask_unit * 4;
+		const u32 albedo_shift = albedo_unit * 4;
+		const u32 mask_coord = static_cast<u32>((m_current_fp_fingerprint->coord_inputs >> mask_shift) & 0xf);
+		const u32 albedo_coord = static_cast<u32>((m_current_fp_fingerprint->coord_inputs >> albedo_shift) & 0xf);
+		const bool same_uv = !(m_current_fp_fingerprint->coord_ambiguous_mask & ((1u << mask_unit) | (1u << albedo_unit)))
+				&& mask_coord != 0xf && mask_coord == albedo_coord
+				&& m_current_fp_fingerprint->coord_lanes[mask_unit] != remix_rsx::s_fp_lanes_none
+				&& m_current_fp_fingerprint->coord_lanes[mask_unit]
+					== m_current_fp_fingerprint->coord_lanes[albedo_unit];
+
+		const remix_rsx::texture_entry* coverage = nullptr;
+		if (same_uv)
+		{
+			coverage = mask_unit == albedo_unit
+				? selected_albedo_entry
+				: m_textures.sr2_character_source(rsx::method_registers.fragment_textures[mask_unit], m_frame_counter);
+		}
+
+		const u64 source_hash = coverage ? coverage->content_hash : 0;
+		const u64 old_albedo_hash = albedo_hash;
+		const remix_rsx::texture_entry* cutout = coverage
+			? m_textures.cutout_material(api, m_frame_counter, *selected_albedo_entry, *coverage,
+				m_current_fp_fingerprint->kil_texture_channel, recovered_compare,
+				static_cast<u8>(recovered_ref))
+			: nullptr;
+
+		if (cutout)
+		{
+			m_scratch_kil_ref = recovered_ref;
+			m_scratch_kil_compare = recovered_compare;
+			material = cutout->material;
+			derived_material_hash = cutout->content_hash;
+			m_scratch_albedo_alpha_min = cutout->alpha_min;
+			m_scratch_albedo_alpha_max = cutout->alpha_max;
+			m_scratch_albedo_mean_rgb[0] = cutout->mean_rgb[0];
+			m_scratch_albedo_mean_rgb[1] = cutout->mean_rgb[1];
+			m_scratch_albedo_mean_rgb[2] = cutout->mean_rgb[2];
+		}
+
+		static std::unordered_map<u64, u32> cutout_lines;
+		u32& lines = cutout_lines[m_current_fp_hash];
+		if (remix_rsx::diag_lines_enabled() && lines++ < 4)
+		{
+			dump_line(fmt::format("Remix TLOU cutout: fp=%016llx albedo=%016llX mask=%016llX unit=%u channel=%u compare=%u ref=%d same_uv=%u applied=%u derived=%016llX frame=%llu",
+				m_current_fp_hash, old_albedo_hash, source_hash, mask_unit,
+				u32{m_current_fp_fingerprint->kil_texture_channel}, u32{recovered_compare},
+				s32{recovered_ref}, same_uv ? 1u : 0u, cutout ? 1u : 0u,
+				cutout ? cutout->content_hash : 0ull, m_frame_counter));
+		}
+	}
+
+	// The Hometown vehicle glass program blends with SRC_ALPHA and uses tex2.g as one additive
+	// contributor to H0.w after the selected tex0 colour has already been sampled. tex0 itself is
+	// fully opaque, so handing only that material to Remix turns every window into a solid panel.
+	// The remaining dynamic alpha terms cannot be represented by a Remix material; for this exact
+	// title/VP/FP pair, retain the guest blend state and use the recoverable authored opacity map
+	// instead of the provably-wrong opaque alpha. Both samples use tc0 in the captured ucode.
+	if (Emu.GetTitleID() == "BCUS98174" && material && selected_albedo_entry
+		&& m_current_vp_hash == 0x614700EB0C4C689Bull
+		&& m_current_fp_hash == 0x6F394EA3DC5020F4ull)
+	{
+		const u64 old_albedo_hash = albedo_hash;
+		const remix_rsx::texture_entry* opacity =
+			m_textures.sr2_character_source(rsx::method_registers.fragment_textures[2], m_frame_counter);
+		const remix_rsx::texture_entry* glass = opacity
+			? m_textures.cutout_material(api, m_frame_counter, *selected_albedo_entry, *opacity, 1, 7, 0)
+			: nullptr;
+
+		if (glass)
+		{
+			material = glass->material;
+			derived_material_hash = glass->content_hash;
+			m_scratch_albedo_alpha_min = glass->alpha_min;
+			m_scratch_albedo_alpha_max = glass->alpha_max;
+			m_scratch_albedo_mean_rgb[0] = glass->mean_rgb[0];
+			m_scratch_albedo_mean_rgb[1] = glass->mean_rgb[1];
+			m_scratch_albedo_mean_rgb[2] = glass->mean_rgb[2];
+		}
+
+		static u32 glass_lines = 0;
+		if (remix_rsx::diag_lines_enabled() && glass_lines++ < 4)
+		{
+			dump_line(fmt::format("Remix TLOU glass: albedo=%016llX opacity=%016llX channel=1 applied=%u derived=%016llX alpha=%u..%u frame=%llu",
+				old_albedo_hash,
+				opacity ? opacity->content_hash : 0ull, glass ? 1u : 0u,
+				glass ? glass->content_hash : 0ull,
+				glass ? u32{glass->alpha_min} : 255u, glass ? u32{glass->alpha_max} : 255u,
+				m_frame_counter));
+		}
+	}
 
 	// The main pass's clip, measured from textured draws only. A material-less pass can be larger
 	// than the world pass - Haze's shadow map is 2048x2048 - so letting one define "main" would
@@ -32916,7 +33038,7 @@ void RemixGSRender::submit_subdraw()
 		if (demons_water_surface)
 			hash = rpcs3::hash64(hash, 0x44454d4f57415452ull);
 		if (demons_fire_surface) hash = rpcs3::hash64(hash, reinterpret_cast<usz>(material));
-		if (character_material_applied) hash = rpcs3::hash64(hash, character_material_hash);
+		if (derived_material_hash) hash = rpcs3::hash64(hash, derived_material_hash);
 		if (albedo_hash)
 		{
 			hash = rpcs3::hash64(hash, albedo_hash);
@@ -35629,7 +35751,9 @@ void RemixGSRender::submit_subdraw()
 			// its blend state exactly as translated below, because double-cutting a translucent
 			// surface is the failure mode whose tell is foliage turning invisible rather than
 			// holed, and RPCS3_REMIX_FPKIL=0 has to be able to isolate it in one relaunch.
-			blend_state.alphaTestCompareOp = 4;
+			blend_state.alphaTestCompareOp = m_scratch_kil_compare < 7
+				? m_scratch_kil_compare
+				: 4;
 			blend_state.alphaTestReferenceValue = static_cast<uint8_t>(
 				m_scratch_kil_ref >= 0
 					? static_cast<u32>(m_scratch_kil_ref)
