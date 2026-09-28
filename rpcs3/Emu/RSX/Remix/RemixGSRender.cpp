@@ -1,6 +1,7 @@
 #include "stdafx.h"
 #include "RemixGSRender.h"
 #include "Emu/System.h"
+#include "Emu/system_config.h"
 #include "Emu/RSX/Host/MM.h"
 
 #ifdef _WIN32
