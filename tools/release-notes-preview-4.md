@@ -83,3 +83,14 @@ One rename to know about: the f90 / specular-level patch this fork used to carry
 Extract the zip anywhere and run `rpcs3.exe`. `SETUP.txt` inside covers the rest, including the two things that are deliberately *not* in the zip and without which it will not run.
 
 Issues are open. A settings file for a title that isn't covered yet is the most useful thing you can send; paste it into an issue and you're credited.
+
+---
+
+## Release asset
+
+`rpcs3-rtx-remix-c68babbd-win64.zip`
+SHA256 `bb91437cd5b7f540f21826d99d16ad71631fbd166e832b2466daffe4f1f5c118`
+
+Built from `c68babbd8ba24b7dbe3717bbd210b783161f701f`, tag `remix-preview-4`. The
+exe reports `0.0.42-c68babbd Alpha | remix-backend | local_build`, and `SETUP.txt`
+inside the zip names the same commit.
