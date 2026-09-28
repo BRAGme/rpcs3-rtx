@@ -143,8 +143,11 @@ commented, and reading one is the fastest way to see what tuning a title means.
     fragment-program constant rather than in a vertex attribute, so the
     vertex-colour route cannot reach them; RPCS3_REMIX_FPCONSTALBEDO states
     that literal instead. The knob is 0 globally, but BLUS30267.conf sets it
-    to 7 -- all three routes -- so it is already on for this title. The blue
-    pixel blood is confirmed working by play-test.
+    to 7 -- all three routes -- so it is already on for this title. The blood
+    pixels and the text render correctly under it, confirmed by play-test. The
+    title's other "digital" effects -- objects disappearing, the destroyed-
+    object warp -- still do not come through, and this route does not explain
+    them.
 
   Demon's Souls (BLUS30443) -- the game's authored light tables, extracted and
     compiled into the build.

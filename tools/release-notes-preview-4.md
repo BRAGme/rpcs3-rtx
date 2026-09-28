@@ -74,7 +74,11 @@ the surface rendered flat white: the constant was the draw's only colour and not
 
 `RPCS3_REMIX_FPCONSTALBEDO` states that literal through the instance's fixed-function stage.
 It is a bitmask: bit 1 the unconditional `MOV` literal, bit 2 the lerp endpoint, bit 4 the
-per-channel tint. The **blue pixel blood is confirmed working** by play-test.
+per-channel tint.
+
+**What this fixes, precisely: the blood pixels and the text render correctly.** Confirmed by
+play-test. It does **not** fix the title's other "digital" effects -- objects disappearing, the
+destroyed-object warp -- which still do not come through and are not explained by this route.
 
 The knob is `0` globally, but **`BLUS30267.conf` in this zip already sets it to `7`** — all
 three routes — alongside `FPCONSTMRT=1`. So it is on for this title as shipped and there is

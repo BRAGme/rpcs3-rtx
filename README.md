@@ -13,8 +13,8 @@ use. Recovering it is the central problem this fork solves -- see
 [How the camera is recovered](#how-the-camera-is-recovered).
 
 Trying a game, or want to share the settings that got one working? [CONTRIBUTING.md](CONTRIBUTING.md)
-covers it -- essentially all the work so far has been on one title, so anything you learn on a second
-is new ground. The project is discussed in the
+covers it -- nine titles have had real work done on them and everything else is unexplored, so
+anything you learn on a tenth is new ground. The project is discussed in the
 [PCSX2/Remix thread](https://discord.com/channels/1028444667789967381/1535734598317637782) on the RTX
 Remix Showcase Discord -- [join here](https://discord.gg/j6sh7JD3v9) if that link does not open.
 
@@ -102,10 +102,12 @@ capture carries two tracks and one of them is a microphone.
 ## Current status
 
 This is the further-along of the two backends: camera, textures, skinned characters, per-draw blend
-state, sky classification and UI compositing all work on at least one title. Three titles have been
-run -- **Resistance 2**, **Haze** and **Minecraft: PS3 Edition** -- and each carries the
-measurements it contributed; see [Titles](#titles) for what each one actually establishes. It is
-still a research backend, not a product.
+state, sky classification and UI compositing all work on at least one title. Nine titles have been
+run, and each carries the measurements it contributed; see [Titles](#titles) for what each one
+actually establishes. Eight of them ship a tuned Remix profile in the release zip. It is still a
+research backend, not a product.
+
+The current build is [preview 4](https://github.com/BRAGme/rpcs3-rtx/releases/tag/remix-preview-4).
 
 ### What has been measured
 
@@ -121,15 +123,29 @@ still a research backend, not a product.
 
 ### Titles
 
-Three titles appear anywhere in the branch log or the dump comments, and they are the only ones any
-claim above rests on. They are not equally exercised, so what each one actually demonstrates is
-listed rather than a single "works / doesn't" verdict.
+These are the titles any claim above rests on. They are not equally exercised, so what each one
+actually demonstrates is listed rather than a single "works / doesn't" verdict. "Remix profile"
+means a `<TITLEID>.conf` beside `rpcs3.exe`, read once at backend init -- that is the tuned,
+commented settings file, and is separate from RPCS3's own `config/custom_configs/config_*.yml`.
 
-| Title | Serial | What it demonstrates | Ships a config |
+| Title | Serial | What it demonstrates | Remix profile |
 |---|---|---|---|
-| **Resistance 2** | `NPEA00431` | The primary development title -- nearly every measurement above is from it. Camera, texcoords out of the vertex program, both skinning families, blend state, sky, 2D UI. | yes |
+| **Resistance 2** | `NPEA00431` | The primary development title -- nearly every measurement above is from it. Camera, texcoords out of the vertex program, both skinning families, blend state, sky, 2D UI. | no |
 | **Haze** | `BLUS30094` | A second, structurally different engine. It skins on the SPU, so vertices reach RSX already animated -- nothing in its position path is indexed, and it has no `layered` vertex programs at all. Matching `ADD`'s `src2` constant here recovered **71%** of world transforms that had been drawing at identity (`41d9adc`); its quantised positions are undone by `match_wdivide` (`e9a7956`). | yes |
-| **Minecraft: PS3 Edition** | `NPUB31419` | Camera parity, quantised chunk meshes through `match_prescale`, and the texture-cache design. Descriptor-only texture hashing was chosen *because* of a measurement here: content-rehashing took mesh creation from **5,881 creates / 887 live** to **188,427 / 31,793** over 9,120 frames, because the albedo hash folds into the mesh key (`RemixTextures.cpp:249-255`). | yes |
+| **Minecraft: PS3 Edition** | `NPUB31419` | Camera parity, quantised chunk meshes through `match_prescale`, and the texture-cache design. Descriptor-only texture hashing was chosen *because* of a measurement here: content-rehashing took mesh creation from **5,881 creates / 887 live** to **188,427 / 31,793** over 9,120 frames, because the albedo hash folds into the mesh key (`RemixTextures.cpp:249-255`). | no |
+| **Ratchet & Clank Collection** | `BCUS98282` | Renders as of preview 3, after three stacked faults: the window hand-off when the collection menu exitspawns into a game, restarting the runtime afterwards, and a projection matrix written across several places instead of one. After the fix 18,137,400 draws go through and 9,911 are refused -- 0.05%. Its sky renders but is unlit and its HUD needs `COMPOSITERT`. | yes |
+| **The Last of Us** | `BCUS98174` | New in preview 4. Reaches the menu and Hometown gameplay on update 1.11. Establishes that cutout coverage cannot be assumed to live in the elected colour texture's alpha: this title keeps foliage and hair in `tex0.g` and the Hometown window masks in `tex2.b`, and the `KIL` comparison direction has to be recovered rather than replayed as GREATER. | yes |
+| **Eat Lead: The Return of Matt Hazard** | `BLUS30267` | The largest profile at 57 settings, and the evidence for the fragment-program constant-colour route. This title paints effects from a colour held in an FP constant rather than a vertex attribute -- those draws bind no texture at all and rendered flat white. `FPCONSTALBEDO=7` states the literal through the instance's fixed-function stage; **the blood pixels and text render correctly** under it. See the caveat below. | yes |
+| **Saints Row 2** | `BLUS30201` | Character, material and skinning work, carried by four unit-test suites that run in every build rather than by a captured frame. | yes |
+| **Demon's Souls** | `BLUS30443` | The game's authored light tables, extracted and compiled into the build. | yes |
+| **Resistance: Fall of Man** | `BCUS98107` | Geometry, camera and UI are fine here; the open defect is lighting. | yes |
+| **GRAW 2** | `NPUB30502` | Boots through its child-process hand-off. The runtime is shut down without being unloaded, because the Reflex PCL-stats ping thread outlives `Shutdown()` and unloading it crashes. | yes |
+
+Eat Lead's constant-colour route is **partial**. The blood pixels and text render, confirmed by
+play-test. The other "digital" effects -- objects disappearing, the destroyed-object warp -- do
+**not** come through, and are not explained by this route. Note also that `FPCONSTALBEDO` is `0`
+globally but `BLUS30267.conf` sets it to `7`, so it is already on for this title: a knob's global
+default says nothing about the state of a title that ships a profile.
 
 Haze carries one known-bad of its own: its shadow-receiving draws bind a 2048x2048 `DEPTH16` shadow
 map on the lowest referenced texture unit and its ucode names no albedo unit, so **55,360 draws in

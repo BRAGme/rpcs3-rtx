@@ -21,6 +21,7 @@
 🩸 **Eat Lead's blue pixel blood works.** *(correction -- the notes as published said this had never been observed working, which was wrong.)* This title paints its "digital" effects from a **fragment-program constant**, not a vertex attribute, so the vertex-colour route could never reach them -- those draws carry no bound texture at all and rendered flat white.
 • `RPCS3_REMIX_FPCONSTALBEDO` states that literal through the instance's fixed-function stage. It's a bitmask: bit 1 the `MOV` literal, bit 2 the lerp endpoint, bit 4 the per-channel tint
 • It's `0` globally, but **`BLUS30267.conf` in the zip already sets it to `7`** plus `FPCONSTMRT=1` -- so it's on for this title as shipped, nothing to enable
+• Scope: this fixes the **blood pixels and the text**. The other "digital" effects -- objects disappearing, the destroyed-object warp -- still don't come through
 
 ✨ **SHARC, if you want it.** The backend is developed against an untagged Remix Plus build (`revised-9-10`, `38082acf`) that adds a spatially hashed world-space radiance cache as `rtx.integrateIndirectMode = 3`. The API is byte-identical to tagged `remix-plus-1.5.1`, so it's purely opt-in and 1.5.1 stays the tested runtime. `SETUP.txt` has the details.
 • One rename to know: the f90 / specular-level options are now `rtx.legacyMaterial.*`, not `rtx.opaqueMaterial.*`. The old spelling silently stops applying — writing both is harmless
